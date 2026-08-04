@@ -1,0 +1,23 @@
+[Unit]
+Description=Feishu to Codex session bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+Environment=NODE_ENV=production
+EnvironmentFile=@ENVIRONMENT_FILE@
+ExecStart=@NODE_BIN@ @PROJECT_DIR@/dist/src/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

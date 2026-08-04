@@ -1,0 +1,29 @@
+{
+  "name": "feishu-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mirror Codex sessions to Feishu and continue them from Feishu topics.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/src/index.js",
+    "dev": "tsx src/index.ts",
+    "doctor": "node scripts/doctor.mjs",
+    "install:local": "node scripts/install.mjs",
+    "rebind": "node scripts/rebind.mjs",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.72.0",
+    "chokidar": "4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  }
+}

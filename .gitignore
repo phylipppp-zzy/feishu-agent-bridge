@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*
+!.env.example
+env
+env.pending
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+coverage/
