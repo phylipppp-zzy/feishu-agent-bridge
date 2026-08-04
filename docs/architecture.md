@@ -1,5 +1,9 @@
 # Architecture
 
+This is the short architectural overview. For module ownership, durable state,
+state machines, extension rules, and test expectations, read the
+[detailed design](design.md).
+
 ```text
 ~/.codex/sessions/**/*.jsonl
             |

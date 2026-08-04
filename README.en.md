@@ -2,6 +2,8 @@
 
 [中文说明](README.md)
 
+Maintainer design: [docs/design.md](docs/design.md)
+
 This service mirrors local Codex conversations from `~/.codex/sessions` into a private Feishu topic group and lets you continue each conversation from its corresponding topic. It is a Feishu front end for the local Codex CLI: it does not install a Feishu desktop client, open an HTTP port, or require a public callback URL. Messages and card actions arrive over a Feishu WebSocket long connection.
 
 ## What It Does
