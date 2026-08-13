@@ -169,7 +169,7 @@ In the bound private group, known slash commands do not need an `@bot`. A normal
 - `/status`: show indexed sessions, active tasks, failures, and the allowed root.
 - `/sync`: rescan local sessions immediately.
 - `/pause`, `/resume-sync`: pause or resume synchronization and continuations.
-- `/retry`: process retryable infrastructure failures, refresh the model directory, and rescan from persistent offsets.
+- `/retry`: resolve infrastructure failures only after the model directory and app-server recover, then rescan from persistent offsets.
 - `/cancel`: cancel a bridge-started task, current wizard, or current choice in the topic.
 - `/model`: choose model and reasoning effort in a mapped session topic.
 

@@ -72,8 +72,9 @@ running -> awaiting_input | awaiting_approval | awaiting_sync
 running/awaiting_* -> completed | failed | cancelled | interrupted
 ```
 
-`awaiting_sync` is a compatibility/recovery state while a JSONL-backed session
-is being reconciled. Terminal states never transition back to executable work.
+`awaiting_sync` is retained only as a legacy upgrade marker; new tasks use
+`pending`, `awaiting_root_consent`, `running`, and terminal states. Terminal states
+never transition back to executable work.
 All cancellation sources call the same cancellation path: `/cancel`, a card,
 Root rejection, timeout, service shutdown, or app-server exit. It interrupts a
 turn when possible, cancels queue state and requests, removes task images, and
