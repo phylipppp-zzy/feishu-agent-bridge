@@ -67,19 +67,19 @@ function summary(cwd?: string, model?: string, effort?: string): string {
   return `项目：${cwd ? `\`${safeMarkdown(cwd)}\`` : "未选择"}　模型：${model ? `\`${safeMarkdown(model)}\`` : "未选择"}　强度：${effort ? `\`${safeMarkdown(effortLabel(effort))}\`` : "未选择"}`;
 }
 
-export function homeCard(status: { paused: boolean; sessions: number; active: number; failures: number }, notice = ""): CardDefinition {
+export function homeCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number }, notice = ""): CardDefinition {
   return card("Codex 控制台", status.paused ? "orange" : "blue", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
-    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　会话：**${status.sessions}**　当前任务：**${status.active}**　失败类别：**${status.failures}**`),
+    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　会话：**${status.sessions}**　运行中：**${status.active}**　排队：**${status.queued ?? 0}**　等待用户：**${status.waiting ?? 0}**　失败任务：**${status.failedTasks ?? 0}**　失败类别：**${status.failures}**`),
     actionRow([button("新建会话", "new", "primary"), button("继续最近", "recent"), button("项目", "projects")]),
     actionRow([button("服务管理", "service")]),
     note("会话话题内直接回复或使用 /model 均无需 @ 机器人；优先使用会话根卡的“修改模型”。"),
   ]);
 }
 
-export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number }): CardDefinition {
+export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number }): CardDefinition {
   return card("服务管理", status.paused ? "orange" : "blue", [
-    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**\n会话：${status.sessions}　任务：${status.active}　未解决失败类别：${status.failures}`),
+    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**\n会话：${status.sessions}　运行中：${status.active}　排队：${status.queued ?? 0}　等待用户：${status.waiting ?? 0}　失败任务：${status.failedTasks ?? 0}　未解决失败类别：${status.failures}`),
     actionRow([button("立即同步", "sync", "primary"), status.paused ? button("恢复同步", "resume", "primary") : button("暂停同步", "pause")]),
     actionRow([button("重试失败", "retry"), button("使用帮助", "help"), button("返回控制台", "home")]),
   ]);

@@ -183,6 +183,11 @@ export class FeishuClient implements FeishuPort {
     return openId;
   }
 
+  private retryable(error: unknown): boolean {
+    const detail = error instanceof Error ? error.message : String(error);
+    return /(?:\b429\b|\b5\d{2}\b|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|timeout)/i.test(detail);
+  }
+
   private async limited<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.sendQueue.then(async () => {
       const wait = Math.max(0, 220 - (Date.now() - this.lastSendAt));
@@ -195,6 +200,7 @@ export class FeishuClient implements FeishuPort {
           return value;
         } catch (error) {
           lastError = error;
+          if (!this.retryable(error) || attempt === 3) throw error;
           await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt)));
         }
       }

@@ -139,6 +139,11 @@ export class BridgeDatabase {
       expires_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS server_requests_session_status ON server_requests(session_id,status);
+    CREATE TABLE IF NOT EXISTS inbound_events (
+      event_id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('processing','completed','retryable_failed','permanent_failed')),
+      error TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS inbound_events_status ON inbound_events(status,updated_at_ms);
     CREATE TABLE IF NOT EXISTS task_root_grants (
       nonce TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES task_queue(id) ON DELETE CASCADE,
       session_id TEXT NOT NULL, canonical_cwd TEXT NOT NULL, open_id TEXT NOT NULL, chat_id TEXT NOT NULL,
@@ -687,6 +692,35 @@ export class BridgeDatabase {
   }
 
   deleteChoice(requestId: string): void { this.db.prepare("DELETE FROM choice_queue WHERE request_id=?").run(requestId); }
+
+  claimInboundEvent(eventId: string): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db.prepare("SELECT status FROM inbound_events WHERE event_id=?").get(eventId) as { status?: string } | undefined;
+      if (row && row.status !== "retryable_failed") { this.db.exec("COMMIT"); return false; }
+      if (row) this.db.prepare("UPDATE inbound_events SET status='processing',error=NULL,updated_at_ms=? WHERE event_id=? AND status='retryable_failed'").run(Date.now(), eventId);
+      else this.db.prepare("INSERT INTO inbound_events(event_id,status,created_at_ms,updated_at_ms) VALUES(?,'processing',?,?)").run(eventId, Date.now(), Date.now());
+      this.db.exec("COMMIT"); return true;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  completeInboundEvent(eventId: string): void { this.db.prepare("UPDATE inbound_events SET status='completed',updated_at_ms=? WHERE event_id=? AND status='processing'").run(Date.now(), eventId); }
+  failInboundEvent(eventId: string, error: unknown, retryable: boolean): void {
+    this.db.prepare("UPDATE inbound_events SET status=?,error=?,updated_at_ms=? WHERE event_id=? AND status='processing'")
+      .run(retryable ? "retryable_failed" : "permanent_failed", error instanceof Error ? error.message : String(error), Date.now(), eventId);
+  }
+
+  pruneRetainedData(now = Date.now()): void {
+    const day = 24 * 60 * 60 * 1_000;
+    this.db.prepare("DELETE FROM task_queue WHERE status IN ('completed','cancelled','interrupted') AND updated_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM turn_runs WHERE state IN ('completed','failed','interrupted') AND updated_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM turn_items WHERE turn_id NOT IN (SELECT turn_id FROM turn_runs)").run();
+    this.db.prepare("DELETE FROM server_requests WHERE status IN ('resolved','declined','expired') AND updated_at_ms<?").run(now - 7 * day);
+    this.db.prepare("DELETE FROM task_root_grants WHERE status NOT IN ('pending','approved') AND updated_at_ms<?").run(now - 7 * day);
+    this.db.prepare("DELETE FROM inbound_events WHERE status IN ('completed','retryable_failed') AND updated_at_ms<?").run(now - 7 * day);
+    this.db.prepare("DELETE FROM inbound_events WHERE status='permanent_failed' AND updated_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM failures WHERE resolved=1 AND updated_at < datetime('now','-30 days')").run();
+  }
 
   hasMessage(messageId: string): boolean {
     return Boolean(this.db.prepare("SELECT 1 FROM messages WHERE message_id=?").get(messageId));

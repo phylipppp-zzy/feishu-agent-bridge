@@ -163,6 +163,7 @@ export class SyncService {
         void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "服务重启时任务尚未完成；请重新发送该消息。", false);
       }
     }
+    this.db.pruneRetainedData();
     await this.cleanupStaleTempFiles();
     await mkdir(this.sessionsDir, { recursive: true });
     this.watcher = watch(this.sessionsDir, { ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 } });
@@ -274,7 +275,12 @@ export class SyncService {
     if (this.syncing) return this.syncing;
     this.syncing = (async () => {
       if (!this.boundChatId() || this.paused()) return;
-      for (const path of await jsonlFiles(this.sessionsDir)) await this.enqueueFile(path);
+      for (const path of await jsonlFiles(this.sessionsDir)) {
+        const info = await stat(path);
+        const cursor = this.db.getCursor(path);
+        if (cursor.parsedOffset >= info.size && cursor.size === info.size && cursor.mtimeMs >= info.mtimeMs) continue;
+        await this.enqueueFile(path);
+      }
     })().catch((error) => {
       this.db.recordFailure("sync_all", {}, error);
       throw error;
@@ -935,8 +941,11 @@ export class SyncService {
     return content ? this.feishu.replyCard(state.rootMessageId, assistantMarkdownCard(content)) : null;
   }
 
-  private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number } {
-    return { paused: this.paused(), sessions: this.db.listSessions().length, active: this.activeTurns.size, failures: this.db.failureCount() };
+  private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number; queued: number; waiting: number; failedTasks: number } {
+    const counts = this.db.taskStateCounts();
+    return { paused: this.paused(), sessions: this.db.listSessions().length, active: counts.running ?? this.activeTurns.size,
+      queued: counts.pending ?? 0, waiting: (counts.awaiting_root_consent ?? 0) + (counts.awaiting_input ?? 0) + (counts.awaiting_approval ?? 0),
+      failedTasks: counts.failed ?? 0, failures: this.db.failureCount() };
   }
 
   private async ensureControlCard(): Promise<void> {
@@ -1369,7 +1378,24 @@ export class SyncService {
     }
   }
 
+  private retryableInbound(error: unknown): boolean {
+    return /(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|timeout|\b429\b|\b5\d{2}\b)/i.test(error instanceof Error ? error.message : String(error));
+  }
+
   async onFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
+    const eventId = "message:" + message.messageId;
+    if (!this.db.claimInboundEvent(eventId)) return;
+    try {
+      await this.handleFeishuMessage(message);
+      this.db.saveMessage(message.messageId, "_control", "inbound", message.messageId);
+      this.db.completeInboundEvent(eventId);
+    } catch (error) {
+      this.db.failInboundEvent(eventId, error, this.retryableInbound(error));
+      throw error;
+    }
+  }
+
+  private async handleFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
     const chatId = this.boundChatId();
     const openId = this.boundOpenId();
     if (!chatId) {
@@ -1390,9 +1416,6 @@ export class SyncService {
     const sessionInTopic = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const slashCommand = !sessionInTopic && command.startsWith("/");
     if (message.chatType === "group" && !message.mentionedBot && !sessionInTopic && !slashCommand) return;
-    if (this.db.hasMessage(message.messageId)) return;
-    this.db.saveMessage(message.messageId, "_control", "inbound", message.messageId);
-
     if (normalized === "/") { await this.respondCard(message, commandMenuCard()); return; }
     if (["/help", "help", "帮助", "?", "？", "/home", "控制台"].includes(normalized)) {
       await this.respondCard(message, normalized === "/help" || normalized === "help" || normalized === "帮助" || normalized === "?" || normalized === "？" ? helpCard() : homeCard(this.cardStatus()));

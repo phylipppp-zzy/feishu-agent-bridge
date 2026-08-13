@@ -110,3 +110,18 @@ test("turn persistence records hashes and stores a bounded review payload", asyn
     db.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+
+test("inbound events deduplicate completed work and allow retryable failures", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-inbound-"));
+  try {
+    const db = new BridgeDatabase(dir);
+    assert.equal(db.claimInboundEvent("event-1"), true);
+    assert.equal(db.claimInboundEvent("event-1"), false);
+    db.failInboundEvent("event-1", new Error("temporary timeout"), true);
+    assert.equal(db.claimInboundEvent("event-1"), true);
+    db.completeInboundEvent("event-1");
+    assert.equal(db.claimInboundEvent("event-1"), false);
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
