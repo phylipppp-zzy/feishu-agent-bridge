@@ -73,3 +73,24 @@ test("remote request and root grant state is scoped, atomic, and expires", async
     db.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+
+test("task transitions are terminal and session cancellation is atomic", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-state-machine-"));
+  try {
+    const db = new BridgeDatabase(dir);
+    const base = { kind: "resume" as const, sessionId: "s1", cwd: "/work", prompt: "p", imageKeys: [], chatId: "c1", rootMessageId: "r1", model: null, reasoningEffort: null, runCardMessageId: null, expectedSessionId: "s1", syncStatus: "none" as const, lastSyncOffset: null };
+    db.enqueueTask({ ...base, id: "one", sourceMessageId: "one-message", status: "pending" });
+    db.enqueueTask({ ...base, id: "two", sourceMessageId: "two-message", status: "pending" });
+    assert.equal(db.transitionTask("one", "running"), true);
+    assert.equal(db.transitionTask("one", "completed"), true);
+    assert.equal(db.transitionTask("one", "running"), false);
+    assert.equal(db.getTask("one")?.status, "completed");
+    const cancelled = db.cancelTasks("r1", "s1", "test cancellation");
+    assert.equal(cancelled.length, 1);
+    assert.equal(db.getTask("two")?.status, "cancelled");
+    assert.equal(db.taskStateCounts().completed, 1);
+    assert.equal(db.taskStateCounts().cancelled, 1);
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

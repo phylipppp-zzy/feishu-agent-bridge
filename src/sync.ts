@@ -182,6 +182,8 @@ export class SyncService {
 
   async stop(): Promise<void> {
     if (this.scanTimer) clearInterval(this.scanTimer);
+    await Promise.all([...this.activeTurns.keys()].map((sessionId) => this.cancelSessionWork(sessionId, null, "service stopping")));
+    await this.cancelSessionWork(null, null, "service stopping");
     await this.watcher?.close();
     await Promise.allSettled([...(this.syncing ? [this.syncing] : []), ...this.fileQueues.values()]);
     await this.appServer?.close();
@@ -626,11 +628,43 @@ export class SyncService {
     return null;
   }
 
+  private async cleanupTurnImages(turnId: string): Promise<void> {
+    const raw = this.db.getSetting(`turn.${turnId}.images`);
+    if (!raw) return;
+    try { await Promise.all((JSON.parse(raw) as string[]).map((path) => rm(path, { force: true }))); }
+    catch { /* malformed or already removed temporary files are harmless */ }
+    this.db.deleteSetting(`turn.${turnId}.images`);
+  }
+
+  private async cancelSessionWork(sessionId: string | null, rootMessageId: string | null, reason: string): Promise<number> {
+    const cancelled = this.db.cancelTasks(rootMessageId, sessionId, reason);
+    if (!cancelled.length) return 0;
+    const targetSessionId = sessionId ?? cancelled.find((task) => task.sessionId)?.sessionId ?? null;
+    if (targetSessionId) {
+      const active = this.activeTurns.get(targetSessionId);
+      if (active) {
+        this.activeTurns.delete(targetSessionId);
+        active.state = "interrupted"; this.db.saveTurn(active);
+        await this.cleanupTurnImages(active.turnId);
+        if (this.appServer) void this.appServer.request("turn/interrupt", { threadId: targetSessionId, turnId: active.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: targetSessionId }, error));
+      }
+      for (const request of this.db.cancelServerRequestsForSession(targetSessionId)) {
+        this.requestResolvers.get(request.nonce)?.({ action: "cancel", decision: "cancel" });
+        this.requestResolvers.delete(request.nonce);
+      }
+    }
+    return cancelled.length;
+  }
+
   private async handleAppServerExit(epoch: number, error?: Error): Promise<void> {
     const interrupted = this.db.markRunningTasksInterrupted();
-    this.activeTurns.clear(); this.requestResolvers.clear();
+    for (const turn of this.activeTurns.values()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
+    this.activeTurns.clear();
+    for (const resolver of this.requestResolvers.values()) resolver({ action: "cancel", decision: "cancel" });
+    this.requestResolvers.clear();
     for (const task of interrupted) {
       if (task.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已中断", "Codex app-server 已退出；该任务不会自动重放。")).catch(() => undefined);
+      if (task.rootMessageId && task.sessionId) void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "Codex app-server 已退出；该任务不会自动重放。", false).catch(() => undefined);
     }
     if (error) this.db.recordFailure("app_server_exit", { epoch }, error);
   }
@@ -707,7 +741,11 @@ export class SyncService {
       cardMessageId: null, payload: this.redactRequestPayload(params), status: "pending", expiresAt: expiry,
     };
     const state = this.activeTurns.get(scopedSessionId);
-    if (state) { state.state = type === "user_input" ? "awaiting_input" : "awaiting_approval"; this.db.saveTurn(state); }
+    if (state) {
+      state.state = type === "user_input" ? "awaiting_input" : "awaiting_approval"; this.db.saveTurn(state);
+      const task = turnId ? this.db.taskForTurn(turnId) : null;
+      if (task) this.db.transitionTask(task.id, state.state);
+    }
     const detail = this.remoteRequestDetail(type, params);
     const decisions = Array.isArray(params.availableDecisions) ? params.availableDecisions.flatMap((item) => typeof item === "string" ? [item] : []) : undefined;
     const secret = type === "user_input" && this.requestContainsSecret(params);
@@ -764,6 +802,7 @@ export class SyncService {
     }
     this.requestResolvers.delete(request.nonce);
     this.db.setServerRequestStatus(request.nonce, decision === "decline" ? "declined" : "resolved");
+    if (request.turnId) { const task = this.db.taskForTurn(request.turnId); if (task) this.db.transitionTask(task.id, "running"); }
     resolver(result);
     if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", decision === "accept" || decision === "acceptForSession" ? "已批准。" : "已拒绝或取消。", decision === "accept" || decision === "acceptForSession"));
   }
@@ -826,17 +865,16 @@ export class SyncService {
       const turn = this.asRecord(params.turn);
       const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
       state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed";
+      // Commit local terminal state and release resources before any Feishu I/O.
       this.db.saveTurn(state);
-      await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : `Codex ${state.state}`);
       this.activeTurns.delete(sessionId);
       const task = this.db.taskForTurn(turnId);
-      if (task) this.db.updateTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed");
-      const rawImages = this.db.getSetting(`turn.${turnId}.images`);
-      if (rawImages) {
-        try { await Promise.all((JSON.parse(rawImages) as string[]).map((path) => rm(path, { force: true }))); } catch { /* cleanup is best effort */ }
-        this.db.deleteSetting(`turn.${turnId}.images`);
-      }
-      await this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false);
+      if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: `turn ${state.state}` });
+      await this.cleanupTurnImages(turnId);
+      try { await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : `Codex ${state.state}`); }
+      catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
+      void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false)
+        .catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
       void this.drainTaskQueue(sessionId);
     }
   }
@@ -1218,12 +1256,10 @@ export class SyncService {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
           const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("当前会话没有可取消的桥接任务。");
-          const cancelled = this.db.cancelPendingTasks(session.rootMessageId, session.sessionId);
+          const cancelled = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
           if (!this.activeTurns.has(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
-                    const activeTurn = this.activeTurns.get(session.sessionId);
-          if (activeTurn && this.appServer) void this.appServer.request("turn/interrupt", { threadId: session.sessionId, turnId: activeTurn.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: session.sessionId }, error));
           if (session.rootMessageId) void this.updateRunCard(session.sessionId, session.rootMessageId, "正在取消", "已向 Codex 发送取消信号。", false);
-          const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), "运行中") : runStatusCard("正在取消", "已向 Codex 发送取消信号。");
+          const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), "可继续") : runStatusCard("正在取消", "已向 Codex 发送取消信号。");
           return rootCardSession && event.openMessageId === rootCardSession.rootMessageId
             ? { delivery: "replace", card }
             : session.rootMessageId ? { delivery: "reply", rootMessageId: session.rootMessageId, card } : { delivery: "send", card };
@@ -1854,13 +1890,11 @@ export class SyncService {
   private async cancel(message: IncomingFeishuMessage): Promise<void> {
     const session = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const key = session?.sessionId;
-    const cancelled = this.db.cancelPendingTasks(message.rootId ?? null, key ?? null);
+    const cancelled = await this.cancelSessionWork(key ?? null, message.rootId ?? null, "cancelled by user");
     if (!key || (!this.activeTurns.has(key) && !cancelled)) {
       await this.respond(message, "当前话题没有由桥接服务启动的活动任务。");
       return;
     }
-    const active = key ? this.activeTurns.get(key) : null;
-    if (active && this.appServer && key) void this.appServer.request("turn/interrupt", { threadId: key, turnId: active.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: key }, error));
     await this.respond(message, cancelled ? "已取消排队任务；正在运行的任务也会停止。" : "已发送取消信号。");
   }
 }

@@ -25,6 +25,7 @@ export class CodexAppServer {
   private notificationHandler: ServerNotificationHandler | null = null;
   private starting: Promise<void> | null = null;
   private healthy = false;
+  private writeTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly bin: string, private readonly codexHome: string, private readonly stateDir?: string) {}
 
@@ -62,10 +63,14 @@ export class CodexAppServer {
       this.healthy = false;
       this.failPending(error instanceof Error ? error : new Error(String(error)));
     });
+    this.child.stdin.on("error", (error) => {
+      this.healthy = false;
+      this.failPending(error instanceof Error ? error : new Error(String(error)));
+    });
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.lines.on("line", (line) => this.consume(line));
     await this.request("initialize", { clientInfo: { name: "feishu-codex-bridge", title: "Feishu Codex Bridge", version: "0.2.0" }, capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true } });
-    this.write({ method: "initialized", params: {} });
+    await this.write({ method: "initialized", params: {} });
     this.healthy = true;
   }
 
@@ -122,19 +127,32 @@ export class CodexAppServer {
       const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`Codex app-server RPC timed out: ${method}`)); }, timeoutMs);
       timer.unref();
       this.pending.set(id, { resolve, reject, timer });
-      try { this.write({ jsonrpc: "2.0", id, method, params }); }
-      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error instanceof Error ? error : new Error(String(error))); }
+      void this.write({ jsonrpc: "2.0", id, method, params }).catch((error) => {
+        clearTimeout(timer); this.pending.delete(id); reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
   }
 
-  respond(id: JsonRpcId, result: unknown): void { this.write({ jsonrpc: "2.0", id, result }); }
-  reject(id: JsonRpcId, error: { code: number; message: string; data?: unknown }): void { this.write({ jsonrpc: "2.0", id, error }); }
+  respond(id: JsonRpcId, result: unknown): void { void this.write({ jsonrpc: "2.0", id, result }).catch((error) => this.failPending(error)); }
+  reject(id: JsonRpcId, error: { code: number; message: string; data?: unknown }): void { void this.write({ jsonrpc: "2.0", id, error }).catch((cause) => this.failPending(cause)); }
 
   private async startIfNeeded(): Promise<void> { if (!this.child) await this.start(); }
-  private write(message: JsonRpcMessage): void {
-    const stdin = this.child?.stdin as Writable | undefined;
-    if (!stdin || stdin.destroyed) throw new Error("Codex app-server is not running");
-    stdin.write(`${JSON.stringify(message)}\n`);
+  private write(message: JsonRpcMessage): Promise<void> {
+    const payload = JSON.stringify(message) + "\n";
+    this.writeTail = this.writeTail.catch(() => undefined).then(() => new Promise<void>((resolve, reject) => {
+      const stdin = this.child?.stdin as Writable | undefined;
+      if (!stdin || stdin.destroyed) { reject(new Error("Codex app-server is not running")); return; }
+      let settled = false;
+      const onError = (error: Error) => done(error);
+      const done = (error?: Error | null) => {
+        if (settled) return; settled = true; stdin.removeListener("error", onError);
+        if (error) reject(error); else resolve();
+      };
+      const accepted = stdin.write(payload, (error) => done(error));
+      if (!accepted) stdin.once("drain", () => done());
+      stdin.once("error", onError);
+    }));
+    return this.writeTail;
   }
   private consume(line: string): void {
     if (!line.trim()) return;

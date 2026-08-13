@@ -461,6 +461,12 @@ export class BridgeDatabase {
   }
 
   /** Old session-wide grants are deliberately invalid after every restart. */
+  cancelServerRequestsForSession(sessionId: string): PendingServerRequest[] {
+    const rows = this.db.prepare("SELECT nonce FROM server_requests WHERE session_id=? AND status IN ('pending','submitting')").all(sessionId) as Array<{ nonce: string }>;
+    this.db.prepare("UPDATE server_requests SET status='declined',updated_at_ms=? WHERE session_id=? AND status IN ('pending','submitting')").run(Date.now(), sessionId);
+    return rows.flatMap(({ nonce }) => this.getServerRequest(nonce) ? [this.getServerRequest(nonce)!] : []);
+  }
+
   revokeLegacyRootGrants(): void { this.db.prepare("DELETE FROM root_grants").run(); }
 
   private taskRootGrantFromRow(row: Record<string, unknown>): TaskRootGrant {
@@ -569,12 +575,31 @@ export class BridgeDatabase {
 
   updateTask(id: string, status: QueuedTask["status"], details: {
     error?: string | null; runCardMessageId?: string | null; expectedSessionId?: string | null;
-    syncStatus?: QueuedTask["syncStatus"]; lastSyncOffset?: number | null; turnId?: string | null; sessionId?: string | null;
+    syncStatus?: QueuedTask["syncStatus"]; lastSyncOffset?: number | null; turnId?: string | null; sessionId?: string | null; terminalReason?: string | null;
   } = {}): void {
-    this.db.prepare(`UPDATE task_queue SET status=?,error=COALESCE(?,error),run_card_message_id=COALESCE(?,run_card_message_id),
+    const current = this.getTask(id);
+    if (current && ["completed", "failed", "cancelled", "interrupted"].includes(current.status) && current.status !== status) return;
+    this.db.prepare(`UPDATE task_queue SET status=?,error=COALESCE(?,error),terminal_reason=COALESCE(?,terminal_reason),run_card_message_id=COALESCE(?,run_card_message_id),
       session_id=COALESCE(?,session_id),expected_session_id=COALESCE(?,expected_session_id),sync_status=COALESCE(?,sync_status),last_sync_offset=COALESCE(?,last_sync_offset),turn_id=COALESCE(?,turn_id),updated_at_ms=? WHERE id=?`)
-      .run(status, details.error ?? null, details.runCardMessageId ?? null, details.sessionId ?? null, details.expectedSessionId ?? null,
+      .run(status, details.error ?? null, details.terminalReason ?? null, details.runCardMessageId ?? null, details.sessionId ?? null, details.expectedSessionId ?? null,
         details.syncStatus ?? null, details.lastSyncOffset ?? null, details.turnId ?? null, Date.now(), id);
+  }
+
+  transitionTask(id: string, status: QueuedTask["status"], details: Parameters<BridgeDatabase["updateTask"]>[2] = {}): boolean {
+    const current = this.getTask(id);
+    if (!current || ["completed", "failed", "cancelled", "interrupted"].includes(current.status)) return false;
+    const allowed: Record<QueuedTask["status"], readonly QueuedTask["status"][]> = {
+      pending: ["running", "cancelled", "failed", "interrupted"],
+      running: ["awaiting_root_consent", "awaiting_input", "awaiting_approval", "awaiting_sync", "completed", "failed", "cancelled", "interrupted"],
+      awaiting_root_consent: ["pending", "cancelled", "interrupted"],
+      awaiting_input: ["running", "cancelled", "failed", "interrupted"],
+      awaiting_approval: ["running", "cancelled", "failed", "interrupted"],
+      awaiting_sync: ["completed", "failed", "cancelled", "interrupted"],
+      completed: [], failed: [], cancelled: [], interrupted: [],
+    };
+    if (!allowed[current.status].includes(status)) return false;
+    this.updateTask(id, status, details);
+    return true;
   }
 
   pendingTaskSessionIds(): Array<string | null> {
@@ -587,11 +612,25 @@ export class BridgeDatabase {
       .map((row) => this.taskFromRow(row));
   }
 
-  cancelPendingTasks(rootMessageId: string | null, sessionId: string | null): number {
-    const result = sessionId
-      ? this.db.prepare("UPDATE task_queue SET status='cancelled',updated_at_ms=? WHERE session_id=? AND status='pending'").run(Date.now(), sessionId)
-      : this.db.prepare("UPDATE task_queue SET status='cancelled',updated_at_ms=? WHERE root_message_id=? AND status='pending'").run(Date.now(), rootMessageId);
-    return Number(result.changes);
+  cancelTasks(rootMessageId: string | null, sessionId: string | null, reason: string): QueuedTask[] {
+    const query = sessionId
+      ? "SELECT * FROM task_queue WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')"
+      : rootMessageId
+        ? "SELECT * FROM task_queue WHERE root_message_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')"
+        : "SELECT * FROM task_queue WHERE status NOT IN ('completed','failed','cancelled','interrupted')";
+    const value = sessionId ?? rootMessageId;
+    const rows = value === null ? this.db.prepare(query).all() as Record<string, unknown>[] : this.db.prepare(query).all(value) as Record<string, unknown>[];
+    if (!rows.length) return [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const ids = rows.map((row) => String(row.id));
+      for (const id of ids) {
+        this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason=?,updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted')").run(reason, Date.now(), id);
+        this.db.prepare("UPDATE task_root_grants SET status='cancelled',updated_at_ms=? WHERE task_id=? AND status IN ('pending','approved')").run(Date.now(), id);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return rows.map((row) => this.taskFromRow(row));
   }
 
   runningTaskForRoot(rootMessageId: string): QueuedTask | null {
@@ -609,9 +648,14 @@ export class BridgeDatabase {
   }
 
   markRunningTasksInterrupted(): QueuedTask[] {
-    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status='running'").all() as Record<string, unknown>[];
-    this.db.prepare("UPDATE task_queue SET status='interrupted',updated_at_ms=? WHERE status='running'").run(Date.now());
+    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status IN ('running','awaiting_input','awaiting_approval')").all() as Record<string, unknown>[];
+    this.db.prepare("UPDATE task_queue SET status='interrupted',terminal_reason='app-server lifecycle ended',updated_at_ms=? WHERE status IN ('running','awaiting_input','awaiting_approval')").run(Date.now());
     return rows.map((row) => this.taskFromRow(row));
+  }
+
+  taskStateCounts(): Record<string, number> {
+    const rows = this.db.prepare("SELECT status,COUNT(*) AS count FROM task_queue GROUP BY status").all() as Array<{ status: string; count: number }>;
+    return Object.fromEntries(rows.map((row) => [row.status, Number(row.count)]));
   }
 
   cancelTask(id: string): void { this.updateTask(id, "cancelled"); }
