@@ -94,3 +94,19 @@ test("task transitions are terminal and session cancellation is atomic", async (
     db.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+
+test("turn persistence records hashes and stores a bounded review payload", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-turn-audit-"));
+  try {
+    const db = new BridgeDatabase(dir);
+    db.saveTurn({ sessionId: "s1", turnId: "t1", epoch: 1, mode: "default", state: "completed", text: "answer", plan: "", rootMessageId: "r1", startedAtMs: 10, endedAtMs: 20, inputHash: "input", finalOutputHash: "output" });
+    assert.equal(db.getTurn("t1")?.finalOutputHash, "output");
+    db.saveTurnItem("t1", "i1", "commandExecution", "completed", { command: "pwd", aggregatedOutput: "x".repeat(3_000), password: "do-not-store" });
+    const payload = db.listTurnItems("t1")[0]?.payload ?? {};
+    assert.equal(typeof payload.command, "string");
+    assert.equal(typeof payload.password, "undefined");
+    assert.equal((payload.aggregatedOutput as string).length, 2_000);
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

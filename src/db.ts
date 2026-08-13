@@ -150,6 +150,10 @@ export class BridgeDatabase {
       session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, open_id TEXT NOT NULL, epoch INTEGER NOT NULL,
       expires_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );`);
+    this.ensureColumn("turn_runs", "started_at_ms", "INTEGER");
+    this.ensureColumn("turn_runs", "ended_at_ms", "INTEGER");
+    this.ensureColumn("turn_runs", "input_hash", "TEXT");
+    this.ensureColumn("turn_runs", "final_output_hash", "TEXT");
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -370,9 +374,9 @@ export class BridgeDatabase {
 
   saveTurn(turn: TurnState): void {
     const stream = turn.stream ? JSON.stringify(turn.stream) : null;
-    this.db.prepare(`INSERT INTO turn_runs(turn_id,session_id,epoch,mode,state,root_message_id,text,plan,stream_json,created_at_ms,updated_at_ms)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET state=excluded.state,text=excluded.text,plan=excluded.plan,stream_json=excluded.stream_json,updated_at_ms=excluded.updated_at_ms`)
-      .run(turn.turnId, turn.sessionId, turn.epoch, turn.mode, turn.state, turn.rootMessageId, turn.text, turn.plan, stream, Date.now(), Date.now());
+    this.db.prepare(`INSERT INTO turn_runs(turn_id,session_id,epoch,mode,state,root_message_id,text,plan,stream_json,started_at_ms,ended_at_ms,input_hash,final_output_hash,created_at_ms,updated_at_ms)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(turn_id) DO UPDATE SET state=excluded.state,text=excluded.text,plan=excluded.plan,stream_json=excluded.stream_json,ended_at_ms=COALESCE(excluded.ended_at_ms,turn_runs.ended_at_ms),final_output_hash=COALESCE(excluded.final_output_hash,turn_runs.final_output_hash),updated_at_ms=excluded.updated_at_ms`)
+      .run(turn.turnId, turn.sessionId, turn.epoch, turn.mode, turn.state, turn.rootMessageId, turn.text, turn.plan, stream, turn.startedAtMs ?? Date.now(), turn.endedAtMs ?? null, turn.inputHash ?? null, turn.finalOutputHash ?? null, Date.now(), Date.now());
   }
 
   getTurn(turnId: string): TurnState | null {
@@ -382,7 +386,9 @@ export class BridgeDatabase {
     try { stream = row.stream_json ? JSON.parse(String(row.stream_json)) as TurnState["stream"] : undefined; } catch { stream = undefined; }
     return { sessionId: String(row.session_id), turnId: String(row.turn_id), epoch: Number(row.epoch),
       mode: row.mode === "plan" ? "plan" : "default", state: String(row.state) as TurnState["state"],
-      rootMessageId: String(row.root_message_id), text: String(row.text ?? ""), plan: String(row.plan ?? ""), ...(stream ? { stream } : {}) };
+      rootMessageId: String(row.root_message_id), text: String(row.text ?? ""), plan: String(row.plan ?? ""),
+      ...(typeof row.started_at_ms === "number" ? { startedAtMs: Number(row.started_at_ms) } : {}), ...(typeof row.ended_at_ms === "number" ? { endedAtMs: Number(row.ended_at_ms) } : {}),
+      ...(row.input_hash ? { inputHash: String(row.input_hash) } : {}), ...(row.final_output_hash ? { finalOutputHash: String(row.final_output_hash) } : {}), ...(stream ? { stream } : {}) };
   }
 
   activeTurn(sessionId: string): TurnState | null {
@@ -390,10 +396,20 @@ export class BridgeDatabase {
     return row?.turn_id ? this.getTurn(row.turn_id) : null;
   }
 
+  private reviewPayload(payload: Record<string, unknown>): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+    for (const key of ["type", "command", "reason", "summary", "status"]) {
+      if (typeof payload[key] === "string") result[key] = payload[key].slice(0, key === "command" ? 500 : 2_000);
+    }
+    if (Array.isArray(payload.changes)) result.changes = payload.changes.filter((item): item is string => typeof item === "string").slice(0, 100).map((item) => item.slice(0, 500));
+    if (typeof payload.aggregatedOutput === "string") result.aggregatedOutput = payload.aggregatedOutput.slice(0, 2_000);
+    return result;
+  }
+
   saveTurnItem(turnId: string, itemId: string, kind: string, status: string, payload: Record<string, unknown>, feishuMessageId: string | null = null): void {
     this.db.prepare(`INSERT INTO turn_items(turn_id,item_id,kind,status,payload,feishu_message_id,updated_at_ms) VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(turn_id,item_id) DO UPDATE SET kind=excluded.kind,status=excluded.status,payload=excluded.payload,feishu_message_id=COALESCE(excluded.feishu_message_id,turn_items.feishu_message_id),updated_at_ms=excluded.updated_at_ms`)
-      .run(turnId, itemId, kind, status, JSON.stringify(payload), feishuMessageId, Date.now());
+      .run(turnId, itemId, kind, status, JSON.stringify(this.reviewPayload(payload)), feishuMessageId, Date.now());
   }
 
   listTurnItems(turnId: string): Array<{ itemId: string; kind: string; status: string; payload: Record<string, unknown> }> {

@@ -100,6 +100,10 @@ export interface TurnState {
   text: string;
   plan: string;
   rootMessageId: string;
+  startedAtMs?: number;
+  endedAtMs?: number;
+  inputHash?: string;
+  finalOutputHash?: string;
   stream?: { cardId: string; messageId: string; elementId: string; sequence: number; lastSentAt: number };
 }
 

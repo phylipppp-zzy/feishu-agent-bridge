@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
-import { basename, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { watch, type FSWatcher } from "chokidar";
 import { assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { CodexAppServer, type JsonRpcMessage } from "./app-server.js";
@@ -18,7 +18,11 @@ const PENDING_PROMPT_TTL_MS = 10 * 60_000;
 const MODEL_CATALOG_KEY = "codex.model_catalog.v1";
 const LOG_SYNC_ATTEMPTS = 10;
 const LOG_SYNC_RETRY_MS = 500;
-const STREAM_INTERVAL_MS = 200;
+const STREAM_INTERVAL_MS = 500;
+const MAX_IMAGES_PER_TASK = 5;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES = 25 * 1024 * 1024;
+const TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 
 interface PendingChoiceState {
   request: ChoiceRequest;
@@ -103,6 +107,7 @@ export class SyncService {
   private readonly fileQueues = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, TurnState>();
   private readonly requestResolvers = new Map<string, (value: unknown) => void>();
+  private readonly notificationQueues = new Map<string, Promise<void>>();
   private readonly taskWorkers = new Set<string>();
   private syncing: Promise<void> | null = null;
   private scanTimer: NodeJS.Timeout | null = null;
@@ -130,7 +135,7 @@ export class SyncService {
       else this.db.resolveFailure("root_preflight");
     }
     if (this.appServer) {
-      this.appServer.onNotification((event) => this.onAppServerNotification(event));
+      this.appServer.onNotification((event) => this.enqueueAppServerNotification(event));
       this.appServer.onExit((event) => { void this.handleAppServerExit(event.epoch, event.error); });
       this.appServer.onServerRequest((request) => this.onAppServerRequest(request));
       await this.appServer.start();
@@ -158,6 +163,7 @@ export class SyncService {
         void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "服务重启时任务尚未完成；请重新发送该消息。", false);
       }
     }
+    await this.cleanupStaleTempFiles();
     await mkdir(this.sessionsDir, { recursive: true });
     this.watcher = watch(this.sessionsDir, { ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 } });
     this.watcher.on("add", (path) => this.queueFile(path));
@@ -558,6 +564,13 @@ export class SyncService {
       }
       if (message.role === "progress" && !this.activeTurns.has(session.sessionId)) continue;
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Codex" : "进度";
+      const deliveryKey = message.role === "assistant" ? `app_delivery.${session.sessionId}.${textHash(message.text)}` : null;
+      const appDelivered = deliveryKey ? this.db.getSetting(deliveryKey) : null;
+      if (deliveryKey && appDelivered) {
+        this.db.deleteSetting(deliveryKey);
+        this.db.saveMessage(message.id, session.sessionId, "app_server_delivery", appDelivered, { path, kind: "primary" });
+        continue;
+      }
       let feishuId: string;
       if (Buffer.byteLength(message.text, "utf8") > MAX_INLINE_MESSAGE_BYTES) {
         const preview = shortText(message.text, 1_000);
@@ -631,8 +644,10 @@ export class SyncService {
   private async cleanupTurnImages(turnId: string): Promise<void> {
     const raw = this.db.getSetting(`turn.${turnId}.images`);
     if (!raw) return;
-    try { await Promise.all((JSON.parse(raw) as string[]).map((path) => rm(path, { force: true }))); }
-    catch { /* malformed or already removed temporary files are harmless */ }
+    try {
+      const paths = JSON.parse(raw) as string[];
+      await Promise.all([...new Set(paths.map((path) => dirname(path)))].map((path) => rm(path, { recursive: true, force: true })));
+    } catch { /* malformed or already removed temporary files are harmless */ }
     this.db.deleteSetting(`turn.${turnId}.images`);
   }
 
@@ -807,6 +822,18 @@ export class SyncService {
     if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", decision === "accept" || decision === "acceptForSession" ? "已批准。" : "已拒绝或取消。", decision === "accept" || decision === "acceptForSession"));
   }
 
+  private enqueueAppServerNotification(message: JsonRpcMessage): Promise<void> {
+    const params = this.asRecord(message.params);
+    const sessionId = this.stringAt(params, "threadId", "thread_id") ?? "unscoped";
+    const turnId = this.stringAt(params, "turnId", "turn_id") ?? "none";
+    const key = sessionId + ":" + turnId;
+    const previous = this.notificationQueues.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.onAppServerNotification(message));
+    this.notificationQueues.set(key, next);
+    void next.finally(() => { if (this.notificationQueues.get(key) === next) this.notificationQueues.delete(key); });
+    return next;
+  }
+
   private async onAppServerNotification(message: JsonRpcMessage): Promise<void> {
     const params = this.asRecord(message.params);
     const method = message.method ?? "";
@@ -838,7 +865,7 @@ export class SyncService {
       const delta = this.stringAt(params, "delta", "text") ?? "";
       if (!delta) return;
       if (method.includes("plan")) state.plan += delta; else state.text += delta;
-      this.db.saveTurn(state); await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex");
+      await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex");
       return;
     }
     if (method === "item/started" || method === "item/completed") {
@@ -865,14 +892,18 @@ export class SyncService {
       const turn = this.asRecord(params.turn);
       const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
       state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed";
+      state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text);
       // Commit local terminal state and release resources before any Feishu I/O.
       this.db.saveTurn(state);
       this.activeTurns.delete(sessionId);
       const task = this.db.taskForTurn(turnId);
       if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: `turn ${state.state}` });
       await this.cleanupTurnImages(turnId);
-      try { await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : `Codex ${state.state}`); }
-      catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
+      try {
+        const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : `Codex ${state.state}`);
+        const content = state.plan || state.text;
+        if (state.state === "completed" && content && feishuMessageId) this.db.setSetting(`app_delivery.${sessionId}.${textHash(content)}`, feishuMessageId);
+      } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
       void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false)
         .catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
       void this.drainTaskQueue(sessionId);
@@ -894,14 +925,14 @@ export class SyncService {
     }
   }
 
-  private async finishTurnStream(state: TurnState, summary: string): Promise<void> {
+  private async finishTurnStream(state: TurnState, summary: string): Promise<string | null> {
     const content = state.plan || state.text;
     if (state.stream && this.feishu.updateStreamingReply && this.feishu.finishStreamingReply) {
       if (content) state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, content);
       await this.feishu.finishStreamingReply(state.stream, summary);
-      return;
+      return state.stream.messageId;
     }
-    if (content) await this.feishu.replyCard(state.rootMessageId, assistantMarkdownCard(content));
+    return content ? this.feishu.replyCard(state.rootMessageId, assistantMarkdownCard(content)) : null;
   }
 
   private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number } {
@@ -1567,15 +1598,33 @@ export class SyncService {
 
   private async downloadImages(message: IncomingFeishuMessage, imageKeys: string[]): Promise<string[]> {
     const imagePaths: string[] = [];
-    const tempDir = join(this.config.stateDir, "tmp");
+    if (imageKeys.length > MAX_IMAGES_PER_TASK) throw new Error(`At most ${MAX_IMAGES_PER_TASK} images are allowed per task`);
+    const tempDir = join(this.config.stateDir, "tmp", randomUUID());
     await mkdir(tempDir, { recursive: true, mode: 0o700 });
-    for (const imageKey of imageKeys) {
-      const data = await this.feishu.downloadImage(message.messageId, imageKey);
-      const path = join(tempDir, `${randomUUID()}${imageExtension(data)}`);
-      await writeFile(path, data, { mode: 0o600 });
-      imagePaths.push(path);
-    }
-    return imagePaths;
+    let total = 0;
+    try {
+      for (const imageKey of imageKeys) {
+        const data = await this.feishu.downloadImage(message.messageId, imageKey);
+        if (data.length > MAX_IMAGE_BYTES) throw new Error("An image exceeds the 10 MiB limit");
+        total += data.length;
+        if (total > MAX_TOTAL_IMAGE_BYTES) throw new Error("Images exceed the 25 MiB total limit");
+        const path = join(tempDir, randomUUID() + imageExtension(data));
+        await writeFile(path, data, { mode: 0o600 });
+        imagePaths.push(path);
+      }
+      return imagePaths;
+    } catch (error) { await rm(tempDir, { recursive: true, force: true }); throw error; }
+  }
+
+  private async cleanupStaleTempFiles(): Promise<void> {
+    const tempRoot = join(this.config.stateDir, "tmp");
+    let entries: Array<{ name: string }>;
+    try { entries = await readdir(tempRoot, { withFileTypes: true }); } catch { return; }
+    await Promise.all(entries.map(async (entry) => {
+      const path = join(tempRoot, entry.name);
+      try { if (Date.now() - (await stat(path)).mtimeMs > TEMP_FILE_MAX_AGE_MS) await rm(path, { recursive: true, force: true }); }
+      catch { /* best-effort startup hygiene */ }
+    }));
   }
 
   private async runNewSession(
@@ -1777,6 +1826,13 @@ export class SyncService {
     }
   }
 
+  private rememberTurnImages(turnId: string, paths: string[]): void {
+    if (!paths.length) return;
+    let existing: string[] = [];
+    try { existing = JSON.parse(this.db.getSetting(`turn.${turnId}.images`) ?? "[]") as string[]; } catch { /* replace malformed state */ }
+    this.db.setSetting(`turn.${turnId}.images`, JSON.stringify([...existing, ...paths]));
+  }
+
   private async executeAppServerTurn(task: QueuedTask): Promise<void> {
     if (!this.appServer || !task.sessionId) return;
     const session = this.db.getSession(task.sessionId);
@@ -1812,7 +1868,7 @@ export class SyncService {
     const turn = this.asRecord(response.turn);
     const turnId = this.stringAt(turn, "id") ?? this.stringAt(response, "turnId", "turn_id");
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
-    const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId };
+    const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt) };
     this.activeTurns.set(session.sessionId, state); this.db.saveTurn(state);
     this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId });
     this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
@@ -1854,6 +1910,7 @@ export class SyncService {
       try {
         await this.appServer.request("turn/steer", { threadId: session.sessionId, expectedTurnId: active.turnId,
           input: [{ type: "text", text: userPrompt }, ...paths.map((path) => ({ type: "localImage", path }))] });
+        this.rememberTurnImages(active.turnId, paths);
         await this.respond(message, "已发送给当前 Codex 回合。");
         return;
       } catch (error) {
