@@ -1,8 +1,9 @@
 import { BridgeDatabase } from "./db.js";
-import { CodexRunner } from "./codex.js";
+import { CodexCliProbe } from "./codex.js";
 import { loadConfig } from "./config.js";
 import { FeishuClient } from "./feishu.js";
 import { SyncService } from "./sync.js";
+import { CodexAppServer } from "./app-server.js";
 import { configureCardUi } from "./cards.js";
 
 async function main(): Promise<void> {
@@ -10,8 +11,9 @@ async function main(): Promise<void> {
   configureCardUi(config.cardUiVersion ?? 1);
   const db = new BridgeDatabase(config.stateDir);
   const feishu = new FeishuClient(config.appId, config.appSecret);
-  const codex = new CodexRunner(config.codexBin, config.codexHome);
-  const sync = new SyncService(config, db, feishu, codex);
+  const codex = new CodexCliProbe(config.codexBin, config.codexHome);
+  const appServer = new CodexAppServer(config.codexBin, config.codexHome, config.stateDir);
+  const sync = new SyncService(config, db, feishu, codex, appServer);
   console.log(`Starting feishu-codex-bridge with ${await codex.version()}`);
   console.log(`Session source: ${config.codexHome}/sessions; allowed root: ${config.allowedRoot}`);
   if (!db.getSetting("feishu.chat_id")) console.log("Binding is required. Send /bind <FEISHU_BIND_TOKEN> in the new private group.");

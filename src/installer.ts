@@ -9,6 +9,11 @@ export const FEISHU_SCOPES = [
   "im:message",
   "im:message.group_msg",
   "im:resource",
+  "application:application:patch",
+  // CardKit is used only for ephemeral per-turn streaming output.
+  "cardkit:card:write",
+  // Allows doctor to read this app's own online version/configuration.
+  "application:application:self_manage",
 ] as const;
 
 export const FEISHU_EVENTS = ["im.message.receive_v1", "application.bot.menu_v6"] as const;
@@ -88,15 +93,6 @@ export async function configureFeishuApp(appId: string, appSecret: string, owner
       bot: {
         enable: true,
         i18ns: [{ i18n_key: "zh_cn", get_started_desc: "发送 / 打开 Codex 操作面板" }],
-        bot_menu_enable: true,
-        bot_menu_display_strategy: 3,
-        bot_menus: FEISHU_MENUS.map((menu, index) => ({
-          menu_id: `codex_menu_${index + 1}`,
-          sort: index + 1,
-          default_name: menu.name,
-          event_key: menu.eventKey,
-          menu_content_type: 2,
-        })),
       },
     },
   });

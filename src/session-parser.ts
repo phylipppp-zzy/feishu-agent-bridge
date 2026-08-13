@@ -70,6 +70,18 @@ function stableMessageId(sessionId: string, timestamp: string, role: string, tex
   return createHash("sha256").update(`${sessionId}\0${timestamp}\0${role}\0${text}`).digest("hex");
 }
 
+// These envelopes are injected by Codex/the host, not authored by the user.
+// Filter only the complete synthetic record; arbitrary user XML must remain visible.
+function isSyntheticHostMessage(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const remaining = trimmed
+    .replace(/<recommended_plugins>[\s\S]*?<\/recommended_plugins>/gi, "")
+    .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, "")
+    .trim();
+  return remaining === "";
+}
+
 export function parseJsonlChunk(input: string, previousCarry = "", knownSessionId = "", expectedSessionId = ""): ParsedBatch {
   const joined = previousCarry + input;
   const endsWithNewline = joined.endsWith("\n");
@@ -157,7 +169,7 @@ export function parseJsonlChunk(input: string, previousCarry = "", knownSessionI
       if (role !== "user" && role !== "assistant") continue;
       let text = textFromContent(payload.content);
       if (!text) continue;
-      if (role === "user" && text.trimStart().startsWith("<environment_context>")) continue;
+      if (role === "user" && isSyntheticHostMessage(text)) continue;
       if (role === "assistant") {
         const embedded = embeddedChoice(sessionId, timestamp, text);
         if (embedded) {

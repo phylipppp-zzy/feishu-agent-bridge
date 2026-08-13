@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { choiceCard, configureCardUi, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, sessionCard, wizardReadyCard } from "../src/cards.js";
+import { choiceCard, configureCardUi, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, rootGrantCard, sessionCard, wizardReadyCard } from "../src/cards.js";
 import type { ModelCapability } from "../src/types.js";
 
 function actions(card: Record<string, unknown>): string[] {
@@ -99,4 +99,15 @@ test("large choices use a dropdown in Card 2.0", () => {
     assert.match(json, /"tag":"select_static"/);
     assert.match(json, /"action":"choice_answer"/);
   } finally { configureCardUi(1); }
+});
+
+test("remote root and approval cards keep only opaque callback state", () => {
+  const root = JSON.stringify(rootGrantCard("opaque-root-nonce", "/work", "修复部署脚本", Date.now() + 60_000));
+  assert.match(root, /root_grant_confirm/);
+  assert.match(root, /opaque-root-nonce/);
+  assert.doesNotMatch(root, /sessionId/);
+  const approval = JSON.stringify(remoteRequestCard({ nonce: "opaque-nonce", type: "command_approval", title: "批准", detail: "command", decisions: ["accept", "decline"] }));
+  assert.match(approval, /opaque-nonce/);
+  assert.match(approval, /remote_approve/);
+  assert.doesNotMatch(approval, /acceptForSession/);
 });

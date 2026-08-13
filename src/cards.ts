@@ -155,7 +155,7 @@ export function recentSessionsCard(sessions: SessionView[], search = "", page = 
     `**${safeMarkdown(basename(cwd) || "home")}**  \`${safeMarkdown(cwd)}\``,
     ...items.map((session) => {
       itemIndex += 1;
-      const title = safeMarkdown(shorten(session.firstUserText, 55) || "Codex 会话");
+      const title = safeMarkdown(shorten(session.title || session.firstUserText, 55) || "Codex 会话");
       const time = safeMarkdown(session.startedAt.slice(0, 16).replace("T", " "));
       const config = safeMarkdown([session.model, session.reasoningEffort].filter(Boolean).join(" / ") || "继承全局配置");
       return session.rootAppLink ? `${itemIndex}. [${title}](${session.rootAppLink}) · ${time} · ${config}`
@@ -175,10 +175,17 @@ export function recentSessionsCard(sessions: SessionView[], search = "", page = 
   ]);
 }
 
-export function sessionCard(session: { cwd: string; firstUserText: string; sessionId: string; model?: string | null; reasoningEffort?: string | null }, status = "可继续"): CardDefinition {
-  return card("Codex 会话", status === "运行中" ? "orange" : "green", [
-    markdown(`**${safeMarkdown(shorten(session.firstUserText) || "Codex 会话")}**\n项目：\`${safeMarkdown(session.cwd)}\`\n模型：\`${safeMarkdown(session.model ?? "继承全局配置")}\`　强度：\`${safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认")}\`\n状态：**${safeMarkdown(status)}**　ID：\`${session.sessionId.slice(0, 8)}\``),
-    actionRow([button("修改模型", "session_model", "primary"), button("刷新状态", "session_status")]),
+export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null }, status = "可继续"): CardDefinition {
+  const title = shorten(session.title || session.firstUserText) || "Codex 会话";
+  const mode = (session as { collaborationMode?: string | null }).collaborationMode === "plan" ? "Plan（只规划）" : "Default（执行）";
+  const grant = (session as { rootGrantExpiresAt?: number | null }).rootGrantExpiresAt;
+  const grantText = grant && grant > Date.now() ? `Root 授权至：**${new Date(grant).toLocaleString("zh-CN", { hour12: false })}**` : "Root 授权：**未确认**";
+  return card(title, status === "运行中" ? "orange" : "green", [
+    markdown(`项目：\`${safeMarkdown(session.cwd)}\`\n模型：\`${safeMarkdown(session.model ?? "继承全局配置")}\`　强度：\`${safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认")}\`\n模式：**${safeMarkdown(mode)}**\n状态：**${safeMarkdown(status)}**　ID：\`${session.sessionId.slice(0, 8)}\``),
+    markdown(grantText),
+    actionRow([button("修改模型", "session_model", "primary"), button(mode.startsWith("Plan") ? "切换 Default" : "切换 Plan", "session_toggle_mode"), ...(mode.startsWith("Plan") ? [button("按计划执行", "execute_plan", "primary")] : [])]),
+    actionRow([button("确认 Root 授权", "root_grant", "danger"), button("撤销 Root 授权", "root_revoke"), button("查看本轮审阅", "turn_review")]),
+    note(mode.startsWith("Plan") ? "Plan 完成后不会自动执行；点击“按计划执行”会启动新的 Default 回合。" : "Root 无沙箱：Codex 可读写整个容器、访问网络并启动进程。每会话授权有效期受限，且重启后失效。"),
   ]);
 }
 
@@ -214,3 +221,41 @@ export function choiceCard(request: ChoiceRequest, questionIndex: number): CardD
 }
 export function choiceCancelledCard(): CardDefinition { return card("选择已取消", "grey", [note("本次问题已关闭；Codex 不会继续执行。")]); }
 export function choiceAcceptedCard(answer: string, complete: boolean): CardDefinition { return card(complete ? "选择已提交" : "选择已记录", "green", [markdown(`你的回答：**${safeMarkdown(answer)}**`), note(complete ? "Codex 正在继续处理。" : "请继续回答下一项。")]); }
+
+export function rootGrantCard(nonce: string, cwd: string, taskSummary: string, expiresAt: number): CardDefinition {
+  return card("确认本任务的 Root 无沙箱授权", "red", [
+    markdown("本次任务将在 `" + safeMarkdown(cwd) + "` 中以 **root、无 Codex 沙箱**执行。容器级风险：可读写容器中的可访问文件、启动进程；网络按容器策略提供。\n\n任务摘要：" + safeMarkdown(taskSummary) + "\n\n此授权仅能使用一次，且于 " + new Date(expiresAt).toLocaleString("zh-CN", { hour12: false }) + " 失效。"),
+    actionRow([button("仅批准本任务", "root_grant_confirm", "danger", { nonce }), button("拒绝本任务", "root_grant_cancel", "default", { nonce })]),
+  ]);
+}
+
+export function remoteRequestCard(request: { nonce: string; type: string; title: string; detail: string; decisions?: string[]; secret?: boolean }): CardDefinition {
+  const decisions = request.decisions ?? [];
+  const allowed = (value: string) => !decisions.length || decisions.includes(value);
+  const buttons = [
+    ...(allowed("accept") ? [button("批准一次", "remote_approve", "primary", { nonce: request.nonce, decision: "accept" })] : []),
+    button("拒绝", "remote_approve", "danger", { nonce: request.nonce, decision: "decline" }),
+    button("取消回合", "remote_approve", "default", { nonce: request.nonce, decision: "cancel" }),
+  ];
+  return card(request.title, "orange", [
+    markdown(safeMarkdown(request.detail)),
+    ...(request.secret ? [note("敏感内容会经过飞书平台；提交值不会被桥接器写入数据库、日志或回复。 ")] : []),
+    actionRow(buttons),
+    ...(request.type === "command_approval" ? [actionRow([button("告诉 Codex 怎么做", "remote_guidance", "default", { nonce: request.nonce })])] : []),
+  ]);
+}
+
+export function remoteRequestResolvedCard(title: string, detail: string, success = true): CardDefinition {
+  return card(title, success ? "green" : "grey", [markdown(safeMarkdown(detail))]);
+}
+
+export function reviewCard(items: Array<{ kind: string; status: string; payload: Record<string, unknown> }>): CardDefinition {
+  if (!items.length) return card("本轮审阅", "grey", [markdown("Codex 未提供结构化变更、命令或测试数据。")]);
+  const lines = items.slice(-24).map((item) => {
+    const command = typeof item.payload.command === "string" ? `\n\`${safeMarkdown(item.payload.command)}\`` : "";
+    const changes = Array.isArray(item.payload.changes) ? `\n${safeMarkdown(item.payload.changes.map(String).join("\n"))}` : "";
+    const output = typeof item.payload.aggregatedOutput === "string" ? `\n${safeMarkdown(item.payload.aggregatedOutput.slice(0, 2000))}` : "";
+    return `**${safeMarkdown(item.kind)}** · ${safeMarkdown(item.status)}${command}${changes}${output}`;
+  });
+  return card("本轮审阅", "blue", [markdown(lines.join("\n\n"))]);
+}

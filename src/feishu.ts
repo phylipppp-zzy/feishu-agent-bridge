@@ -144,12 +144,17 @@ export class FeishuClient implements FeishuPort {
         const fields = Object.entries(action.formValues).map(([key, value]) =>
           `${diagnosticAction(key)}:${typeof value === "string" ? [...value].length : Array.isArray(value) ? value.length : 1}`).join(",");
         const metadata = `action=${diagnosticAction(action.action)} message=${diagnosticId(action.openMessageId)} operator=${diagnosticId(action.openId)} form=${fields || "none"}`;
-        console.info(`Feishu card callback received: ${metadata}`);
+          console.info(`Feishu card callback received: ${metadata}`);
         try {
           const outcome = await onCardAction(action);
-          void this.deliverCardActionOutcome(action, outcome);
+          // A replace callback must be acknowledged with the Card 2.0 raw-card
+          // envelope. Updating the same message asynchronously as well causes
+          // duplicate races and can exceed Feishu's three-second callback SLA.
+          if (outcome.delivery !== "replace") void this.deliverCardActionOutcome(action, outcome);
           console.info(`Feishu card callback completed: ${metadata}`);
-          return outcome.delivery === "replace" ? (outcome.card ?? outcome) : undefined;
+          return outcome.delivery === "replace"
+            ? ({ card: { type: "raw", data: outcome.card ?? outcome } } as unknown as CardDefinition)
+            : undefined;
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           console.error(`Feishu card callback failed: ${metadata}; error=${detail}`);
@@ -285,6 +290,44 @@ export class FeishuClient implements FeishuPort {
       });
       if (response.code && response.code !== 0) throw new Error(`Feishu API ${response.code}: ${response.msg ?? "unknown error"}`);
     });
+  }
+
+  async createStreamingReply(rootMessageId: string, title: string): Promise<{ cardId: string; messageId: string; elementId: string; sequence: number }> {
+    const elementId = "stream_md";
+    const card = {
+      schema: "2.0",
+      config: { update_multi: true, streaming_mode: true, summary: { content: title } },
+      header: { template: "blue", title: { tag: "plain_text", content: title } },
+      body: { elements: [{ tag: "markdown", element_id: elementId, content: "正在生成…" }] },
+    };
+    const created = await this.limited(() => this.client.cardkit.v1.card.create({
+      data: { type: "card_json", data: JSON.stringify(card) },
+    }));
+    const cardId = created.data?.card_id;
+    if (!cardId) throw new Error("CardKit create returned no card_id");
+    const sent = await this.limited(() => this.client.im.message.reply({
+      path: { message_id: rootMessageId },
+      data: { msg_type: "interactive", content: JSON.stringify({ type: "card", data: { card_id: cardId } }), reply_in_thread: true },
+    }));
+    const messageId = this.ensureResponse(sent);
+    return { cardId, messageId, elementId, sequence: 0 };
+  }
+
+  async updateStreamingReply(stream: { cardId: string; elementId: string; sequence: number }, content: string): Promise<number> {
+    const sequence = stream.sequence + 1;
+    await this.limited(() => this.client.cardkit.v1.cardElement.content({
+      path: { card_id: stream.cardId, element_id: stream.elementId },
+      data: { content, sequence, uuid: `c_${stream.cardId}_${sequence}` },
+    }));
+    return sequence;
+  }
+
+  async finishStreamingReply(stream: { cardId: string; elementId: string; sequence: number }, summary: string): Promise<void> {
+    const sequence = stream.sequence + 1;
+    await this.limited(() => this.client.cardkit.v1.card.settings({
+      path: { card_id: stream.cardId },
+      data: { settings: JSON.stringify({ config: { streaming_mode: false, summary: { content: summary } } }), sequence, uuid: `s_${stream.cardId}_${sequence}` },
+    }));
   }
 
   async deleteMessage(messageId: string): Promise<void> {

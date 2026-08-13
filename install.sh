@@ -6,16 +6,22 @@ cd "$PROJECT_DIR"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-Usage: ./install.sh [--existing-app <cli_xxx> | --from-env]
+Usage: ./install.sh [--container] [--existing-app <cli_xxx> | --from-env]
 
   no option                 Create a new self-built Feishu app by QR code.
   --existing-app <cli_xxx>  QR-authorize and configure an existing self-built app.
   --from-env                Use a manually configured ~/.config/feishu-codex-bridge/env.
+  --container               Allow root and skip user-systemd installation.
 EOF
   exit 0
 fi
 
-if [[ "${EUID}" -eq 0 ]]; then
+CONTAINER_MODE=0
+for argument in "$@"; do
+  if [[ "$argument" == "--container" ]]; then CONTAINER_MODE=1; fi
+done
+
+if [[ "${EUID}" -eq 0 && "$CONTAINER_MODE" -ne 1 ]]; then
   echo "请以实际运行 Codex 的普通用户执行安装器，不要使用 sudo。" >&2
   exit 1
 fi
@@ -56,7 +62,7 @@ codex login
 EOF
   exit 1
 fi
-if ! command -v systemctl >/dev/null 2>&1; then
+if [[ "$CONTAINER_MODE" -ne 1 ]] && ! command -v systemctl >/dev/null 2>&1; then
   echo "当前安装器仅支持带 systemd 的 Linux。" >&2
   exit 1
 fi
@@ -68,5 +74,9 @@ npm run check
 echo "[3/4] 运行测试并构建"
 npm test
 npm run build
-echo "[4/4] 创建飞书应用并安装用户服务"
+if [[ "$CONTAINER_MODE" -eq 1 ]]; then
+  echo "[4/4] 配置飞书应用和容器运行环境"
+else
+  echo "[4/4] 创建飞书应用并安装用户服务"
+fi
 exec node scripts/install.mjs "$@"

@@ -2,13 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { watch, type FSWatcher } from "chokidar";
-import { assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
-import { CodexRunner } from "./codex.js";
+import { assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
+import { CodexAppServer, type JsonRpcMessage } from "./app-server.js";
+import { CodexCliProbe } from "./codex.js";
 import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
 import { resolveAllowedPath } from "./path-policy.js";
+import { remoteApprovalAllowed, rootExecutionPreflight } from "./execution-policy.js";
 import { parseJsonlChunk } from "./session-parser.js";
-import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, QueuedTask, SessionMetadata } from "./types.js";
+import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
 const MAX_INLINE_MESSAGE_BYTES = 45_000;
@@ -16,6 +18,7 @@ const PENDING_PROMPT_TTL_MS = 10 * 60_000;
 const MODEL_CATALOG_KEY = "codex.model_catalog.v1";
 const LOG_SYNC_ATTEMPTS = 10;
 const LOG_SYNC_RETRY_MS = 500;
+const STREAM_INTERVAL_MS = 200;
 
 interface PendingChoiceState {
   request: ChoiceRequest;
@@ -43,6 +46,11 @@ interface WizardState {
 
 function feishuPrompt(prompt: string): string {
   return `<feishu_bridge>\nWhen user input is required, do not call interactive tools and do not guess. End the turn with exactly one block in this form:\n<feishu_input>{"questions":[{"id":"choice","header":"short header","question":"question","options":[{"label":"option","description":"description"}]}]}</feishu_input>\nUse an empty options array for free-text input. You may ask through this block for bounded business decisions, including public web or repository research, dependency or implementation choices, and whether to modify files inside the already-authorized workspace. Never ask for system-level approval or authentication: sudo or privilege escalation, bypassing the sandbox, passwords, secrets, API keys, tokens, verification codes, CAPTCHA, login/browser authentication, writing outside the authorized workspace, or uploading private local data to an external service. State that those actions are unavailable instead. A Feishu answer is only user intent; it does not bypass approval=never, workspace-write, path validation, or network sandbox restrictions.\n</feishu_bridge>\n<user_message>\n${prompt}\n</user_message>`;
+}
+
+function collaborationPrompt(prompt: string, mode: "default" | "plan" = "default"): string {
+  if (mode !== "plan") return feishuPrompt(prompt);
+  return `${feishuPrompt(prompt)}\n\n<feishu_plan_mode>Plan mode is active. Inspect and reason only: do not edit files, run mutating commands, install dependencies, or change external state. Return a concrete implementation plan and wait for an explicit user request to execute it.</feishu_plan_mode>`;
 }
 
 function textHash(text: string): string { return createHash("sha256").update(text).digest("hex"); }
@@ -93,23 +101,51 @@ export class SyncService {
   private readonly sessionsDir: string;
   private watcher: FSWatcher | null = null;
   private readonly fileQueues = new Map<string, Promise<void>>();
-  private readonly activeRuns = new Map<string, AbortController>();
+  private readonly activeTurns = new Map<string, TurnState>();
+  private readonly requestResolvers = new Map<string, (value: unknown) => void>();
   private readonly taskWorkers = new Set<string>();
   private syncing: Promise<void> | null = null;
   private scanTimer: NodeJS.Timeout | null = null;
   private messageLinkPermissionDenied = false;
   private models: ModelCapability[] = [];
+  private titleIndex: Map<string, string> | null = null;
+  private rootExecutionReady = false;
 
   constructor(
     private readonly config: BridgeConfig,
     private readonly db: BridgeDatabase,
     private readonly feishu: FeishuPort,
-    private readonly codex: CodexRunner,
+    private readonly codex: CodexCliProbe,
+    private readonly appServer?: CodexAppServer,
   ) {
     this.sessionsDir = join(config.codexHome, "sessions");
   }
 
   async start(): Promise<void> {
+    if (this.config.executionMode === "root-danger-full-access") {
+      const preflight = await rootExecutionPreflight(this.config);
+      this.rootExecutionReady = preflight.ok;
+      this.db.setSetting("codex.root_preflight", JSON.stringify(preflight));
+      if (!preflight.ok) this.db.recordFailure("root_preflight", { reasons: preflight.reasons }, new Error("Root execution disabled: " + preflight.reasons.join("; ")));
+      else this.db.resolveFailure("root_preflight");
+    }
+    if (this.appServer) {
+      this.appServer.onNotification((event) => this.onAppServerNotification(event));
+      this.appServer.onExit((event) => { void this.handleAppServerExit(event.epoch, event.error); });
+      this.appServer.onServerRequest((request) => this.onAppServerRequest(request));
+      await this.appServer.start();
+      await this.expireRemoteState();
+      await this.refreshThreadsFromAppServer();
+    }
+    const sandboxAvailable = await this.codex.sandboxSmokeTest();
+    this.db.setSetting("codex.sandbox_available", sandboxAvailable ? "1" : "0");
+    if (!sandboxAvailable && this.config.executionMode !== "root-danger-full-access") {
+      this.db.recordFailure("codex_sandbox", {}, new Error("Codex bwrap sandbox unavailable; remote command/file/permission approvals disabled"));
+      console.warn("Codex sandbox unavailable: remote command, file-change, and permission approvals are fail-closed.");
+    } else if (!sandboxAvailable) {
+      console.warn("Codex bwrap sandbox unavailable; explicit Root danger-full-access mode is active.");
+      this.db.resolveFailure("codex_sandbox", {});
+    } else this.db.resolveFailure("codex_sandbox", {});
     await this.refreshModels();
     await this.backfillHistoricalModels();
     for (const task of this.db.markRunningTasksInterrupted()) {
@@ -145,14 +181,10 @@ export class SyncService {
   }
 
   async stop(): Promise<void> {
-    for (const controller of this.activeRuns.values()) controller.abort();
     if (this.scanTimer) clearInterval(this.scanTimer);
     await this.watcher?.close();
     await Promise.allSettled([...(this.syncing ? [this.syncing] : []), ...this.fileQueues.values()]);
-    const deadline = Date.now() + 10_000;
-    while (this.activeRuns.size && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    await this.appServer?.close();
   }
 
   private boundChatId(): string | null { return this.db.getSetting("feishu.chat_id"); }
@@ -244,9 +276,76 @@ export class SyncService {
 
   private async reconcileExistingState(): Promise<void> {
     await this.reconcileSessionFiles();
+    await this.migrateTitlesAndSyntheticMessages();
     await this.clearStaleActiveSessions();
     await this.purgeSubagentMessages();
     await this.restoreRootCards();
+  }
+
+  private async loadTitleIndex(): Promise<Map<string, string>> {
+    if (this.titleIndex) return this.titleIndex;
+    const index = new Map<string, string>();
+    try {
+      const content = await readFile(join(this.config.codexHome, "session_index.jsonl"), "utf8");
+      for (const line of content.split("\n")) {
+        try {
+          const row = JSON.parse(line) as { id?: unknown; thread_name?: unknown };
+          if (typeof row.id === "string" && typeof row.thread_name === "string" && row.thread_name.trim()) index.set(row.id, row.thread_name.trim());
+        } catch { /* ignore an incomplete index line */ }
+      }
+    } catch { /* index is optional; app-server provides the same metadata for new runs */ }
+    this.titleIndex = index;
+    return index;
+  }
+
+  private syntheticMessageId(sessionId: string, timestamp: string, text: string): string {
+    return createHash("sha256").update(`${sessionId}\0${timestamp}\0user\0${text}`).digest("hex");
+  }
+
+  private async migrateTitlesAndSyntheticMessages(): Promise<void> {
+    const titles = await this.loadTitleIndex();
+    for (const session of this.db.listSessions()) {
+      try {
+        const raw = await readFile(session.path, "utf8");
+        const batch = parseJsonlChunk(raw, "", session.sessionId, session.sessionId);
+        const preview = batch.messages.find((message) => message.role === "user")?.text ?? session.firstUserText;
+        const title = titles.get(session.sessionId) ?? session.title ?? preview;
+        this.db.setSessionTitle(session.sessionId, title, preview);
+        for (const line of raw.split("\n")) {
+          let record: Record<string, unknown>;
+          try { record = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+          if (record.type !== "response_item") continue;
+          const payload = record.payload as Record<string, unknown> | undefined;
+          if (payload?.type !== "message" || payload.role !== "user") continue;
+          const content = payload.content;
+          if (!Array.isArray(content)) continue;
+          const text = content.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+            .filter((item) => item.type === "input_text" && typeof item.text === "string")
+            .map((item) => String(item.text)).join("\n");
+          const trimmed = text.trim();
+          const remaining = trimmed.replace(/<recommended_plugins>[\s\S]*?<\/recommended_plugins>/gi, "")
+            .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, "").trim();
+          const synthetic = Boolean(trimmed) && remaining === "";
+          if (!synthetic) continue;
+          const timestamp = typeof record.timestamp === "string" ? record.timestamp : new Date(0).toISOString();
+          const id = this.syntheticMessageId(session.sessionId, timestamp, text);
+          const message = this.db.getMessage(id);
+          if (!message?.feishuMessageId || message.recallState === "recalled") continue;
+          try {
+            await this.feishu.deleteMessage(message.feishuMessageId);
+            this.db.markMessageRecalled(id);
+          } catch (error) {
+            this.db.recordFailure("recall_synthetic_message", { sessionId: session.sessionId, id }, error);
+          }
+        }
+        const refreshed = this.db.getSession(session.sessionId);
+        if (refreshed?.rootMessageId) {
+          await this.feishu.updateCard(refreshed.rootMessageId, sessionCard(this.sessionView(refreshed), this.activeTurns.has(session.sessionId) ? "运行中" : "可继续"));
+        }
+      } catch (error) {
+        this.db.recordFailure("migrate_session_title", { sessionId: session.sessionId }, error);
+      }
+    }
   }
 
   private async reconcileSessionFiles(): Promise<void> {
@@ -268,7 +367,7 @@ export class SyncService {
   private async clearStaleActiveSessions(): Promise<void> {
     const cutoff = Date.now() - this.config.activeSessionQuietMs;
     for (const sessionId of this.db.listActiveSessionIds()) {
-      if (this.activeRuns.has(sessionId)) continue;
+      if (this.activeTurns.has(sessionId)) continue;
       const session = this.db.getSession(sessionId);
       if (!session) { this.db.setSetting(`session.${sessionId}.active`, "0"); continue; }
       try {
@@ -353,7 +452,7 @@ export class SyncService {
     for (const session of this.db.listSessions()) {
       if (!session.rootMessageId) continue;
       try {
-        await this.feishu.updateCard(session.rootMessageId, sessionCard(session, this.activeRuns.has(session.sessionId) ? "运行中" : "可继续"));
+        await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.activeTurns.has(session.sessionId) ? "运行中" : "可继续"));
         this.db.setSessionCardMessage(session.sessionId, session.rootMessageId);
       } catch (error) {
         this.db.recordFailure("restore_root_card", { sessionId: session.sessionId }, error);
@@ -401,7 +500,8 @@ export class SyncService {
 
     if (batch?.metadata) {
       const firstUser = batch.messages.find((message) => message.role === "user")?.text ?? "";
-      const metadata: SessionMetadata = { ...batch.metadata, path, firstUserText: firstUser };
+      const title = (await this.loadTitleIndex()).get(batch.metadata.sessionId) ?? firstUser;
+      const metadata: SessionMetadata = { ...batch.metadata, path, firstUserText: firstUser, title, collaborationMode: "default" };
       if (isSubagentSource(metadata.source)) {
         cursor.sessionId = null;
         cursor.parsedOffset = parsedEnd;
@@ -454,7 +554,7 @@ export class SyncService {
           continue;
         }
       }
-      if (message.role === "progress" && !this.activeRuns.has(session.sessionId)) continue;
+      if (message.role === "progress" && !this.activeTurns.has(session.sessionId)) continue;
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Codex" : "进度";
       let feishuId: string;
       if (Buffer.byteLength(message.text, "utf8") > MAX_INLINE_MESSAGE_BYTES) {
@@ -462,7 +562,7 @@ export class SyncService {
         await this.feishu.replyText(rootId, `${label}（正文过长，完整内容见附件）\n${preview}`);
         feishuId = await this.feishu.replyFile(rootId, `${session.sessionId.slice(0, 8)}-${message.id.slice(0, 12)}.md`, Buffer.from(message.text));
       } else if (message.role === "assistant") {
-        feishuId = await this.feishu.replyCard(rootId, assistantMarkdownCard(message.text));
+        feishuId = await this.replyAssistant(rootId, session, message.text);
       } else {
         feishuId = await this.feishu.replyText(rootId, `${label}\n${message.text}`);
       }
@@ -494,18 +594,280 @@ export class SyncService {
     }
   }
 
+  private async replyAssistant(rootId: string, session: SessionMetadata, text: string): Promise<string> {
+    const streaming = this.feishu.createStreamingReply && process.env.FEISHU_CARDKIT_STREAMING !== "0";
+    if (streaming) {
+      try {
+        const stream = await this.feishu.createStreamingReply!(rootId, session.title || "Codex");
+        stream.sequence = await this.feishu.updateStreamingReply!(stream, text);
+        await this.feishu.finishStreamingReply!(stream, "Codex 已完成");
+        return stream.messageId;
+      } catch (error) {
+        this.db.recordFailure("cardkit_stream", { sessionId: session.sessionId }, error);
+        console.warn("CardKit streaming failed; falling back to inline card", error);
+      }
+    }
+    return this.feishu.replyCard(rootId, assistantMarkdownCard(text));
+  }
+
   private async ensureRoot(chatId: string, session: SessionMetadata & { rootMessageId: string | null; rootAppLink: string | null; chatId: string | null; threadId: string | null; sessionCardMessageId: string | null }): Promise<string> {
     if (session.rootMessageId) return session.rootMessageId;
-    const title = `[${basename(session.cwd) || "home"}] ${shortText(session.firstUserText || "Codex 会话")} · ${session.sessionId.slice(0, 8)}`;
+    const title = session.title || shortText(session.firstUserText || "Codex 会话");
     const detail = `开始：${session.startedAt}\n目录：${session.cwd}\n来源：${session.source}\n原始日志仅保存在本机。`;
-    const root = await this.feishu.createSessionRoot(chatId, title, detail, sessionCard(session));
+    const root = await this.feishu.createSessionRoot(chatId, title, detail, sessionCard(this.sessionView(session)));
     this.db.setSessionRoot(session.sessionId, root.messageId, root.appLink, root.chatId, root.threadId);
     this.db.setSessionCardMessage(session.sessionId, root.messageId);
     return root.messageId;
   }
 
+  private asRecord(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
+  private stringAt(value: Record<string, unknown>, ...keys: string[]): string | null {
+    for (const key of keys) if (typeof value[key] === "string" && String(value[key]).trim()) return String(value[key]);
+    return null;
+  }
+
+  private async handleAppServerExit(epoch: number, error?: Error): Promise<void> {
+    const interrupted = this.db.markRunningTasksInterrupted();
+    this.activeTurns.clear(); this.requestResolvers.clear();
+    for (const task of interrupted) {
+      if (task.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已中断", "Codex app-server 已退出；该任务不会自动重放。")).catch(() => undefined);
+    }
+    if (error) this.db.recordFailure("app_server_exit", { epoch }, error);
+  }
+
+  private async expireRemoteState(): Promise<void> {
+    for (const request of this.db.expireServerRequests()) {
+      if (request.cardMessageId) void this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("请求已失效", "Codex 服务已重启；请在话题中重新提交。", false)).catch(() => undefined);
+    }
+    this.db.revokeLegacyRootGrants();
+    this.db.expireTaskRootGrants(this.appServer?.appServerEpoch);
+  }
+
+  private async refreshThreadsFromAppServer(): Promise<void> {
+    if (!this.appServer) return;
+    let cursor: string | null = null;
+    do {
+      const result = this.asRecord(await this.appServer.request("thread/list", {
+        sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"], ...(cursor ? { cursor } : {}),
+      }));
+      const threads = Array.isArray(result.threads) ? result.threads : Array.isArray(result.data) ? result.data : [];
+      for (const item of threads) {
+        const thread = this.asRecord(item);
+        const sessionId = this.stringAt(thread, "id");
+        if (!sessionId) continue;
+        const existing = this.db.getSession(sessionId);
+        if (!existing) continue;
+        const title = this.stringAt(thread, "name") ?? this.stringAt(thread, "preview") ?? existing.title;
+        if (title) this.db.setSessionTitle(sessionId, title);
+      }
+      cursor = this.stringAt(result, "nextCursor", "next_cursor");
+    } while (cursor);
+  }
+
+  private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { rootGrantExpiresAt: number | null } {
+    // Root authorization is task-scoped; no session retains authorization state.
+    return { ...session, rootGrantExpiresAt: null };
+  }
+
+  private requestKind(method: string): RemoteRequestType | null {
+    if (method === "item/tool/requestUserInput" || method === "tool/requestUserInput") return "user_input";
+    if (method === "item/commandExecution/requestApproval") return "command_approval";
+    if (method === "item/fileChange/requestApproval") return "file_approval";
+    if (method === "item/permissions/requestApproval") return "permissions";
+    if (method === "mcpServer/elicitation/request") return "mcp_elicitation";
+    return null;
+  }
+
+  private redactRequestPayload(value: Record<string, unknown>): Record<string, unknown> {
+    const copy = { ...value };
+    delete copy.answers; delete copy.answer; delete copy.content; delete copy.secret;
+    return copy;
+  }
+
+  private async onAppServerRequest(request: JsonRpcMessage): Promise<unknown> {
+    const type = this.requestKind(request.method ?? "");
+    const params = this.asRecord(request.params);
+    const sessionId = this.stringAt(params, "threadId", "thread_id");
+    const turnId = this.stringAt(params, "turnId", "turn_id");
+    const itemId = this.stringAt(params, "itemId", "item_id");
+    const session = sessionId ? this.db.getSession(sessionId) : null;
+    const openId = this.boundOpenId();
+    if (!type || !session?.rootMessageId || !openId || !this.appServer || request.id === undefined) {
+      throw new Error(`Unsupported or unscoped Codex server request ${request.method ?? "unknown"}`);
+    }
+    const policy = remoteApprovalAllowed(type, params, this.config.allowedMcpServers ?? []);
+    if (!policy.allowed) throw new Error(policy.reason);
+    const scopedSessionId = session.sessionId;
+    const rootMessageId = session.rootMessageId;
+    const nonce = randomUUID();
+    const expiry = Number.isFinite(Number(params.autoResolutionMs)) ? Date.now() + Number(params.autoResolutionMs) : Date.now() + 30 * 60_000;
+    const pending: PendingServerRequest = {
+      nonce, rpcId: request.id, epoch: this.appServer.appServerEpoch, type, sessionId: scopedSessionId, turnId, itemId,
+      openId, chatId: session.chatId ?? this.boundChatId() ?? "", rootMessageId,
+      cardMessageId: null, payload: this.redactRequestPayload(params), status: "pending", expiresAt: expiry,
+    };
+    const state = this.activeTurns.get(scopedSessionId);
+    if (state) { state.state = type === "user_input" ? "awaiting_input" : "awaiting_approval"; this.db.saveTurn(state); }
+    const detail = this.remoteRequestDetail(type, params);
+    const decisions = Array.isArray(params.availableDecisions) ? params.availableDecisions.flatMap((item) => typeof item === "string" ? [item] : []) : undefined;
+    const secret = type === "user_input" && this.requestContainsSecret(params);
+    if (secret) throw new Error("Secret input is never accepted through Feishu");
+    const card = remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(decisions ? { decisions } : {}), secret });
+    const cardMessageId = await this.feishu.replyCard(rootMessageId, card);
+    pending.cardMessageId = cardMessageId; this.db.saveServerRequest(pending);
+    await this.updateRunCard(scopedSessionId, rootMessageId, type === "user_input" ? "等待输入" : "等待批准", "Codex 正在等待你的选择。", true);
+    const timeout = setTimeout(() => {
+      const live = this.db.claimServerRequest(nonce, openId, pending.chatId, this.appServer?.appServerEpoch ?? -1);
+      if (!live) return;
+      void this.resolveRemoteRequest(live, "decline").catch((error) => this.db.recordFailure("remote_request_timeout", { nonce }, error));
+    }, Math.max(1, expiry - Date.now()));
+    timeout.unref();
+    return new Promise((resolve) => this.requestResolvers.set(nonce, resolve));
+  }
+
+  private requestContainsSecret(params: Record<string, unknown>): boolean {
+    const questions = Array.isArray(params.questions) ? params.questions : [];
+    return questions.some((question) => this.asRecord(question).isSecret === true);
+  }
+
+  private remoteRequestTitle(type: RemoteRequestType): string {
+    return ({ user_input: "Codex 等待你的输入", command_approval: "Codex 请求执行命令", file_approval: "Codex 请求修改文件", permissions: "Codex 请求额外权限", mcp_elicitation: "MCP 请求你的确认" } as const)[type];
+  }
+
+  private remoteRequestDetail(type: RemoteRequestType, params: Record<string, unknown>): string {
+    if (type === "command_approval") return `命令：${this.stringAt(params, "command") ?? "未提供"}\n目录：${this.stringAt(params, "cwd") ?? "未提供"}\n原因：${this.stringAt(params, "reason") ?? "未提供"}`;
+    if (type === "file_approval") return `原因：${this.stringAt(params, "reason") ?? "未提供"}\n影响根目录：${this.stringAt(params, "grantRoot", "grant_root") ?? "未提供"}`;
+    if (type === "permissions") return `目录：${this.stringAt(params, "cwd") ?? "未提供"}\n原因：${this.stringAt(params, "reason") ?? "未提供"}\n请求：${JSON.stringify(params.permissions ?? params)}`;
+    if (type === "mcp_elicitation") return `${this.stringAt(params, "serverName") ?? "MCP"}\n${this.stringAt(params, "message", "url") ?? "需要确认"}`;
+    const questions = Array.isArray(params.questions) ? params.questions.map((q) => this.asRecord(q)).map((q) => `${this.stringAt(q, "header") ?? "问题"}：${this.stringAt(q, "question") ?? ""}`).join("\n") : "需要输入";
+    return questions;
+  }
+
+  private async resolveRemoteRequest(request: PendingServerRequest, decision: string, answer?: string): Promise<void> {
+    const resolver = this.requestResolvers.get(request.nonce);
+    if (!resolver) { this.db.setServerRequestStatus(request.nonce, "expired"); return; }
+    const params = request.payload;
+    let result: unknown;
+    if (request.type === "user_input") {
+      const questions = Array.isArray(params.questions) ? params.questions.map((item) => this.asRecord(item)) : [];
+      const first = questions[0];
+      if (decision === "accept" && first) result = { answers: { [this.stringAt(first, "id") ?? "answer"]: { answers: [answer ?? "已确认"] } } };
+      else result = { answers: {} };
+    } else if (request.type === "permissions") {
+      result = decision === "accept" || decision === "acceptForSession"
+        ? { permissions: params.permissions ?? [], scope: decision === "acceptForSession" ? "session" : "turn" }
+        : { permissions: [], scope: "turn" };
+    } else if (request.type === "mcp_elicitation") {
+      result = { action: decision === "accept" ? "accept" : decision === "cancel" ? "cancel" : "decline", content: null, _meta: null };
+    } else {
+      result = { decision: decision === "accept" || decision === "acceptForSession" || decision === "cancel" ? decision : "decline" };
+    }
+    this.requestResolvers.delete(request.nonce);
+    this.db.setServerRequestStatus(request.nonce, decision === "decline" ? "declined" : "resolved");
+    resolver(result);
+    if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", decision === "accept" || decision === "acceptForSession" ? "已批准。" : "已拒绝或取消。", decision === "accept" || decision === "acceptForSession"));
+  }
+
+  private async onAppServerNotification(message: JsonRpcMessage): Promise<void> {
+    const params = this.asRecord(message.params);
+    const method = message.method ?? "";
+    const sessionId = this.stringAt(params, "threadId", "thread_id");
+    const turnId = this.stringAt(params, "turnId", "turn_id");
+    if (method === "thread/name/updated" && sessionId) {
+      const title = this.stringAt(params, "threadName", "thread_name", "name");
+      if (title) {
+        this.db.setSessionTitle(sessionId, title);
+        const session = this.db.getSession(sessionId);
+        if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.activeTurns.has(sessionId) ? "运行中" : "可继续"));
+      }
+      return;
+    }
+    if (method === "turn/started" && sessionId && turnId) {
+      const session = this.db.getSession(sessionId);
+      if (!session?.rootMessageId) return;
+      const current = this.activeTurns.get(sessionId) ?? { sessionId, turnId, epoch: this.appServer?.appServerEpoch ?? 0,
+        mode: session.collaborationMode === "plan" ? "plan" : "default", state: "running" as const, text: "", plan: "", rootMessageId: session.rootMessageId };
+      current.turnId = turnId;
+      this.activeTurns.set(sessionId, current); this.db.saveTurn(current);
+      await this.updateRunCard(sessionId, session.rootMessageId, "运行中", "Codex 正在处理。", true);
+      return;
+    }
+    if (method === "item/agentMessage/delta" || method === "item/plan/delta") {
+      if (!sessionId || !turnId) return;
+      const state = this.activeTurns.get(sessionId);
+      if (!state || state.turnId !== turnId) return;
+      const delta = this.stringAt(params, "delta", "text") ?? "";
+      if (!delta) return;
+      if (method.includes("plan")) state.plan += delta; else state.text += delta;
+      this.db.saveTurn(state); await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex");
+      return;
+    }
+    if (method === "item/started" || method === "item/completed") {
+      if (!sessionId || !turnId) return;
+      const item = this.asRecord(params.item);
+      const itemId = this.stringAt(item, "id") ?? this.stringAt(params, "itemId") ?? `${turnId}:${method}`;
+      const kind = this.stringAt(item, "type") ?? "unknown";
+      const status = this.stringAt(item, "status") ?? (method === "item/completed" ? "completed" : "inProgress");
+      this.db.saveTurnItem(turnId, itemId, kind, status, item);
+      return;
+    }
+    if (method === "serverRequest/resolved") {
+      const requestId = this.stringAt(params, "requestId", "request_id");
+      if (!requestId) return;
+      for (const request of this.db.resolveServerRequestsByRpcId(requestId, this.appServer?.appServerEpoch ?? -1)) {
+        if (!request.cardMessageId) continue;
+        await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已处理", "该请求已完成或已由 Codex 清理。"));
+      }
+      return;
+    }
+    if (method === "turn/completed" && sessionId && turnId) {
+      const state = this.activeTurns.get(sessionId);
+      if (!state || state.turnId !== turnId) return;
+      const turn = this.asRecord(params.turn);
+      const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
+      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed";
+      this.db.saveTurn(state);
+      await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : `Codex ${state.state}`);
+      this.activeTurns.delete(sessionId);
+      const task = this.db.taskForTurn(turnId);
+      if (task) this.db.updateTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed");
+      const rawImages = this.db.getSetting(`turn.${turnId}.images`);
+      if (rawImages) {
+        try { await Promise.all((JSON.parse(rawImages) as string[]).map((path) => rm(path, { force: true }))); } catch { /* cleanup is best effort */ }
+        this.db.deleteSetting(`turn.${turnId}.images`);
+      }
+      await this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false);
+      void this.drainTaskQueue(sessionId);
+    }
+  }
+
+  private async flushTurnStream(state: TurnState, title: string): Promise<void> {
+    const content = state.plan || state.text;
+    if (!content || Date.now() - (state.stream?.lastSentAt ?? 0) < STREAM_INTERVAL_MS) return;
+    if (!state.stream && this.feishu.createStreamingReply) {
+      try {
+        const created = await this.feishu.createStreamingReply(state.rootMessageId, title);
+        state.stream = { ...created, lastSentAt: 0 };
+      } catch (error) { this.db.recordFailure("cardkit_stream", { sessionId: state.sessionId }, error); return; }
+    }
+    if (state.stream && this.feishu.updateStreamingReply) {
+      state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, content);
+      state.stream.lastSentAt = Date.now(); this.db.saveTurn(state);
+    }
+  }
+
+  private async finishTurnStream(state: TurnState, summary: string): Promise<void> {
+    const content = state.plan || state.text;
+    if (state.stream && this.feishu.updateStreamingReply && this.feishu.finishStreamingReply) {
+      if (content) state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, content);
+      await this.feishu.finishStreamingReply(state.stream, summary);
+      return;
+    }
+    if (content) await this.feishu.replyCard(state.rootMessageId, assistantMarkdownCard(content));
+  }
+
   private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number } {
-    return { paused: this.paused(), sessions: this.db.listSessions().length, active: this.activeRuns.size, failures: this.db.failureCount() };
+    return { paused: this.paused(), sessions: this.db.listSessions().length, active: this.activeTurns.size, failures: this.db.failureCount() };
   }
 
   private async ensureControlCard(): Promise<void> {
@@ -702,7 +1064,7 @@ export class SyncService {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
-      if (rootCardSession && !["session_model", "session_status", "cancel_run"].includes(event.action)) {
+      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "execute_plan", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_guidance"].includes(event.action)) {
         return { delivery: "reply", rootMessageId: rootCardSession.rootMessageId,
           card: errorCard("此会话话题默认用于继续对话；新建、搜索和服务管理请在群主消息或控制台中操作。") };
       }
@@ -799,7 +1161,7 @@ export class SyncService {
             if (!current.sessionId) return errorCard("会话模型设置已失效。");
             this.db.setSessionModel(current.sessionId, model.slug, effort);
             this.db.deleteSetting(this.wizardKey(event.openId, current.mode));
-            return sessionCard({ ...this.db.getSession(current.sessionId)! }, "可继续");
+            return sessionCard(this.sessionView({ ...this.db.getSession(current.sessionId)! }), "可继续");
           }
           if (!current.cwd) return errorCard("项目目录尚未选择，请重新开始。 ");
           if (current.prompt) {
@@ -840,21 +1202,75 @@ export class SyncService {
         case "session_status": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("请在对应会话话题内刷新状态。");
-          const card = sessionCard(session, this.activeRuns.has(session.sessionId) ? "运行中" : "可继续");
+          const card = sessionCard(this.sessionView(session), this.activeTurns.has(session.sessionId) ? "运行中" : "可继续");
           return event.openMessageId === session.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: session.rootMessageId, card };
+        }
+        case "session_toggle_mode": {
+          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          if (!session) return errorCard("请在对应会话话题内切换模式。");
+          const mode = session.collaborationMode === "plan" ? "default" : "plan";
+          this.db.setCollaborationMode(session.sessionId, mode);
+          const updated = this.db.getSession(session.sessionId)!;
+          const card = sessionCard(this.sessionView(updated), this.activeTurns.has(updated.sessionId) ? "运行中" : "可继续");
+          return event.openMessageId === updated.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: updated.rootMessageId!, card };
         }
         case "cancel_run": {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
           const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("当前会话没有可取消的桥接任务。");
           const cancelled = this.db.cancelPendingTasks(session.rootMessageId, session.sessionId);
-          if (!this.activeRuns.has(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
-          this.activeRuns.get(session.sessionId)?.abort();
+          if (!this.activeTurns.has(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
+                    const activeTurn = this.activeTurns.get(session.sessionId);
+          if (activeTurn && this.appServer) void this.appServer.request("turn/interrupt", { threadId: session.sessionId, turnId: activeTurn.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: session.sessionId }, error));
           if (session.rootMessageId) void this.updateRunCard(session.sessionId, session.rootMessageId, "正在取消", "已向 Codex 发送取消信号。", false);
-          const card = rootCardSession ? sessionCard(rootCardSession, "运行中") : runStatusCard("正在取消", "已向 Codex 发送取消信号。");
+          const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), "运行中") : runStatusCard("正在取消", "已向 Codex 发送取消信号。");
           return rootCardSession && event.openMessageId === rootCardSession.rootMessageId
             ? { delivery: "replace", card }
             : session.rootMessageId ? { delivery: "reply", rootMessageId: session.rootMessageId, card } : { delivery: "send", card };
+        }
+        case "root_grant": return errorCard("普通 workspace-write 回合不需要 Root 授权；Root 任务会单独显示一次性授权卡。");
+        case "root_grant_confirm": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const grant = this.appServer ? this.db.approveTaskRootGrant(nonce, event.openId, event.chatId, this.appServer.appServerEpoch) : null;
+          if (!grant) return errorCard("该 Root 授权已过期、已处理或不属于当前用户/会话。");
+          void this.drainTaskQueue(grant.sessionId);
+          return { delivery: "replace", card: remoteRequestResolvedCard("已批准本任务", "授权已消费为下一次启动准备；不会保留为会话权限。") };
+        }
+        case "root_grant_cancel": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const grant = this.appServer ? this.db.denyTaskRootGrant(nonce, event.openId, event.chatId, this.appServer.appServerEpoch) : null;
+          if (!grant) return errorCard("该 Root 授权已过期、已处理或不属于当前用户/会话。");
+          return { delivery: "replace", card: remoteRequestResolvedCard("Root 授权已拒绝", "该任务已取消；不会影响其他任务。", false) };
+        }
+        case "root_revoke": return errorCard("Root 授权是一次性任务授权，无会话级权限可撤销。");
+        case "execute_plan": {
+          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          if (!session) return errorCard("当前会话不可用。");
+          this.db.setCollaborationMode(session.sessionId, "default");
+          if (this.config.executionMode === "root-danger-full-access") return { delivery: "reply", rootMessageId: session.rootMessageId, card: errorCard("Root 执行仅能通过本任务的一次性授权卡启动。") };
+          return { delivery: "reply", rootMessageId: session.rootMessageId, card: runStatusCard("等待任务", "请在话题内发送明确的执行指令；计划不会自动执行。") };
+        }
+        case "turn_review": {
+          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          if (!session) return errorCard("当前会话不可用。");
+          const turn = this.db.activeTurn(session.sessionId);
+          const latest = turn ?? (this.activeTurns.get(session.sessionId) ?? null);
+          return { delivery: "reply", rootMessageId: session.rootMessageId, card: reviewCard(latest ? this.db.listTurnItems(latest.turnId) : []) };
+        }
+        case "remote_approve": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const decision = typeof event.value.decision === "string" ? event.value.decision : "decline";
+          const request = this.db.claimServerRequest(nonce, event.openId, event.chatId, this.appServer?.appServerEpoch ?? -1);
+          if (!request) return errorCard("该 Codex 请求已过期、已处理或不属于当前用户。 ");
+          void this.resolveRemoteRequest(request, decision).catch((error) => this.db.recordFailure("remote_request_response", { nonce }, error));
+          return { delivery: "replace", card: remoteRequestResolvedCard("正在提交", "已向 Codex 提交你的决定。") };
+        }
+        case "remote_guidance": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const request = this.db.getServerRequest(nonce);
+          if (!request || request.status !== "pending" || request.openId !== event.openId || request.chatId !== event.chatId || request.epoch !== this.appServer?.appServerEpoch) return errorCard("该命令请求已过期。 ");
+          this.db.setSetting(`guidance.${nonce}`, JSON.stringify({ sessionId: request.sessionId, expiresAt: request.expiresAt }));
+          return { delivery: "replace", card: remoteRequestResolvedCard("告诉 Codex 怎么做", "请直接在当前话题回复替代做法；桥接器会先拒绝原命令，再将你的说明注入当前回合。") };
         }
         case "cancel_wizard":
           const wizard = this.validWizard(event.openId, event);
@@ -1003,6 +1419,28 @@ export class SyncService {
     }
     if (message.rootId) {
       const session = this.db.getSessionByRoot(message.rootId);
+      const guidanceRequest = session ? this.db.nextServerRequest(session.sessionId, "command_approval") : null;
+      if (guidanceRequest && command && this.db.getSetting(`guidance.${guidanceRequest.nonce}`)) {
+        const claimed = this.db.claimServerRequest(guidanceRequest.nonce, message.senderOpenId, message.chatId, this.appServer?.appServerEpoch ?? -1);
+        if (claimed) {
+          this.db.deleteSetting(`guidance.${claimed.nonce}`);
+          await this.respondCard(message, remoteRequestResolvedCard("指导已提交", "已拒绝原命令，并尝试将你的说明发送给当前 Codex 回合。"));
+          void (async () => {
+            await this.resolveRemoteRequest(claimed, "decline");
+            if (claimed.turnId && this.appServer) await this.appServer.request("turn/steer", { threadId: claimed.sessionId, expectedTurnId: claimed.turnId, input: [{ type: "text", text: command }] });
+          })().catch((error) => this.db.recordFailure("remote_guidance", { nonce: claimed.nonce }, error));
+          return;
+        }
+      }
+      const remoteInput = session ? this.db.nextServerRequest(session.sessionId, "user_input") : null;
+      if (remoteInput && command) {
+        const claimed = this.db.claimServerRequest(remoteInput.nonce, message.senderOpenId, message.chatId, this.appServer?.appServerEpoch ?? -1);
+        if (claimed) {
+          await this.respondCard(message, remoteRequestResolvedCard("输入已提交", "Codex 正在继续处理。"));
+          void this.resolveRemoteRequest(claimed, "accept", command).catch((error) => this.db.recordFailure("remote_input", { nonce: claimed.nonce }, error));
+          return;
+        }
+      }
       const pending = session ? this.getPendingChoice(session.sessionId) : null;
       if (pending && command) {
         const numeric = command.match(/^([1-9]\d*)$/);
@@ -1047,7 +1485,7 @@ export class SyncService {
     return [
       `状态：${this.paused() ? "已暂停" : "运行中"}`,
       `已索引会话：${this.db.listSessions().length}`,
-      `活动 Codex 任务：${this.activeRuns.size}`,
+      `活动 Codex 任务：${this.activeTurns.size}`,
       `未解决失败：${this.db.failureCount()}`,
       `允许目录：${this.config.allowedRoot}`,
     ].join("\n");
@@ -1162,6 +1600,7 @@ export class SyncService {
     try {
       while (!this.paused()) {
         const session = sessionId ? this.db.getSession(sessionId) : null;
+        if (session && this.activeTurns.has(session.sessionId)) return;
         if (session && await this.hasLocalActiveSession(session)) return;
         const task = this.db.claimNextTask(sessionId);
         if (!task) return;
@@ -1249,74 +1688,99 @@ export class SyncService {
   }
 
   private async executeResumeTask(task: QueuedTask): Promise<void> {
-    const session = task.sessionId ? this.db.getSession(task.sessionId) : null;
-    if (!session || !session.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session unavailable" }); return; }
-    const controller = new AbortController();
-    this.activeRuns.set(session.sessionId, controller);
-    const imagePaths: string[] = [];
-    try {
-      const cwd = await resolveAllowedPath(task.cwd, this.config.allowedRoot);
-      imagePaths.push(...await this.downloadImages(this.taskMessage(task), task.imageKeys));
-      await this.updateRunCard(session.sessionId, session.rootMessageId, "运行中", "已提交 Codex，正在处理。", true);
-      this.queuePendingPrompt(session.sessionId, feishuPrompt(task.prompt), task.sourceMessageId);
-      const result = await this.codex.run({ cwd, sessionId: session.sessionId, prompt: feishuPrompt(task.prompt), imagePaths, signal: controller.signal,
-        ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}) });
-      if (result.exitCode !== 0) throw new Error(result.stderr || `Codex exited ${result.exitCode}`);
-      await this.updateRunCard(session.sessionId, session.rootMessageId, "正在同步回复", "Codex 已完成，正在确认日志和话题回复。", false);
-      if (await this.waitForTaskLog(task, session.sessionId)) {
-        await this.updateRunCard(session.sessionId, session.rootMessageId, "完成", "本轮已完成，回复已同步到话题。", false);
-      } else {
-        await this.updateRunCard(session.sessionId, session.rootMessageId, "已执行，等待日志同步", "Codex 已完成；服务会继续同步回复，不会重复执行任务。", false);
-      }
-    } catch (error) {
-      if (controller.signal.aborted) {
-        this.db.updateTask(task.id, "cancelled");
-        await this.updateRunCard(session.sessionId, session.rootMessageId, "已取消", "本轮已取消。", false);
-      } else {
-        this.db.updateTask(task.id, "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
-        this.db.recordFailure("codex_resume", { sessionId: session.sessionId, messageId: task.sourceMessageId }, error);
-        await this.updateRunCard(session.sessionId, session.rootMessageId, "失败", shortText(String(error), MAX_ERROR_CHARS), false);
-      }
-    } finally {
-      this.activeRuns.delete(session.sessionId);
-      await Promise.all(imagePaths.map((path) => rm(path, { force: true })));
+    if (!this.appServer) {
+      this.db.updateTask(task.id, "failed", { error: "Codex app-server is unavailable; legacy exec fallback is disabled" });
+      return;
     }
+    await this.executeAppServerResumeTask(task);
   }
 
   private async executeNewTask(task: QueuedTask): Promise<void> {
-    const controller = new AbortController();
-    this.activeRuns.set(task.id, controller);
-    const imagePaths: string[] = [];
-    const message = this.taskMessage(task);
-    try {
-      imagePaths.push(...await this.downloadImages(message, task.imageKeys));
-      const result = await this.codex.run({ cwd: task.cwd, prompt: task.prompt, imagePaths, signal: controller.signal,
-        ...(task.model ? { model: task.model } : {}),
-        ...(task.reasoningEffort ? { reasoningEffort: task.reasoningEffort } : {}) });
-      if (result.exitCode !== 0) throw new Error(result.stderr || `Codex exited ${result.exitCode}`);
-      this.db.setSetting(this.pendingModelKey(result.sessionId), JSON.stringify({ model: task.model, reasoningEffort: task.reasoningEffort }));
-      this.db.updateTask(task.id, "awaiting_sync", { expectedSessionId: result.sessionId, syncStatus: "awaiting" });
-      if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("正在同步回复", "Codex 已完成，正在创建话题并同步回复。"));
-      else await this.respond(message, `会话已创建：${result.sessionId}\n正在同步新话题和回复。`);
-      if (await this.waitForTaskLog(task, result.sessionId)) {
-        if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("完成", "会话已创建，回复已同步到新话题。"));
-      } else if (task.runCardMessageId) {
-        await this.feishu.updateCard(task.runCardMessageId, runStatusCard("已执行，等待日志同步", "Codex 已完成；服务会继续同步回复，不会重复执行任务。"));
-      }
-    } catch (error) {
-      if (controller.signal.aborted) {
-        this.db.updateTask(task.id, "cancelled");
-        if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("已取消", "本轮已取消。"));
-      } else {
-        this.db.updateTask(task.id, "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
-        this.db.recordFailure("codex_new", { cwd: task.cwd, messageId: task.sourceMessageId }, error);
-        if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("失败", shortText(String(error), MAX_ERROR_CHARS)));
-        else await this.respond(message, `Codex 创建失败：${shortText(String(error), MAX_ERROR_CHARS)}`);
-      }
-    } finally {
-      this.activeRuns.delete(task.id);
-      await Promise.all(imagePaths.map((path) => rm(path, { force: true })));
+    if (!this.appServer) {
+      this.db.updateTask(task.id, "failed", { error: "Codex app-server is unavailable; legacy exec fallback is disabled" });
+      return;
     }
+    await this.executeAppServerNewTask(task);
+  }
+
+  private async executeAppServerNewTask(task: QueuedTask): Promise<void> {
+    if (!this.appServer) return;
+    try {
+      const canonicalCwd = await resolveAllowedPath(task.cwd, this.config.allowedRoot);
+      const response = this.asRecord(await this.appServer.request("thread/start", { cwd: canonicalCwd,
+        ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}) }));
+      const thread = this.asRecord(response.thread);
+      const sessionId = this.stringAt(thread, "id") ?? this.stringAt(response, "threadId", "thread_id");
+      if (!sessionId) throw new Error("Codex app-server thread/start returned no thread id");
+      const metadata: SessionMetadata = { sessionId, path: join(this.sessionsDir, "app-server", `${sessionId}.jsonl`), cwd: canonicalCwd,
+        startedAt: new Date().toISOString(), source: "appServer", firstUserText: task.prompt,
+        title: this.stringAt(thread, "name") ?? shortText(task.prompt), collaborationMode: "default", model: task.model, reasoningEffort: task.reasoningEffort };
+      this.db.upsertSession(metadata);
+      const session = this.db.getSession(sessionId)!;
+      const rootId = await this.ensureRoot(task.chatId, session);
+      this.db.updateTask(task.id, "running", { sessionId, expectedSessionId: sessionId });
+      await this.updateRunCard(sessionId, rootId, "已创建", "Codex 会话已创建，正在准备执行。", true);
+      await this.executeAppServerTurn({ ...task, sessionId, rootMessageId: rootId, expectedSessionId: sessionId });
+    } catch (error) {
+      this.db.updateTask(task.id, "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
+      this.db.recordFailure("app_server_new", { taskId: task.id }, error);
+      if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("失败", shortText(String(error), MAX_ERROR_CHARS)));
+    }
+  }
+
+  private async executeAppServerResumeTask(task: QueuedTask): Promise<void> {
+    const session = task.sessionId ? this.db.getSession(task.sessionId) : null;
+    if (!session?.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session unavailable" }); return; }
+    try {
+      await this.appServer!.request("thread/resume", { threadId: session.sessionId });
+      await this.executeAppServerTurn(task);
+    } catch (error) {
+      this.db.updateTask(task.id, "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
+      this.db.recordFailure("app_server_resume", { sessionId: session.sessionId, taskId: task.id }, error);
+      await this.updateRunCard(session.sessionId, session.rootMessageId, "失败", shortText(String(error), MAX_ERROR_CHARS), false);
+    }
+  }
+
+  private async executeAppServerTurn(task: QueuedTask): Promise<void> {
+    if (!this.appServer || !task.sessionId) return;
+    const session = this.db.getSession(task.sessionId);
+    if (!session?.rootMessageId) throw new Error("session root unavailable");
+    const mode = session.collaborationMode === "plan" ? "plan" : "default";
+    const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
+    if (mode === "default" && this.config.executionMode === "root-danger-full-access") {
+      if (!this.rootExecutionReady) throw new Error("Root execution is disabled because container preflight failed");
+      const existing = this.db.getTaskRootGrantForTask(task.id);
+      const canRun = existing?.status === "approved" && this.db.consumeTaskRootGrant(task.id, session.sessionId, canonicalCwd, this.appServer.appServerEpoch);
+      if (!canRun) {
+        const grant = existing?.status === "pending" ? existing : this.db.createTaskRootGrant({
+          nonce: randomUUID(), taskId: task.id, sessionId: session.sessionId, canonicalCwd,
+          openId: this.boundOpenId() ?? "", chatId: task.chatId, epoch: this.appServer.appServerEpoch,
+          expiresAt: Date.now() + (this.config.rootGrantTtlMs ?? 600_000),
+        });
+        this.db.updateTask(task.id, "awaiting_root_consent", { sessionId: session.sessionId });
+        await this.updateRunCard(session.sessionId, session.rootMessageId, "等待 Root 授权", "Root 模式需要本任务的一次性授权。", false);
+        await this.feishu.replyCard(session.rootMessageId, rootGrantCard(grant.nonce, canonicalCwd, shortText(task.prompt, 500), grant.expiresAt));
+        return;
+      }
+    }
+    const imagePaths = await this.downloadImages(this.taskMessage(task), task.imageKeys);
+    const input: Array<Record<string, unknown>> = [{ type: "text", text: task.prompt }, ...imagePaths.map((path) => ({ type: "localImage", path }))];
+    const params: Record<string, unknown> = {
+      threadId: session.sessionId, input, cwd: canonicalCwd,
+      approvalPolicy: "on-request", approvalsReviewer: "user",
+      sandboxPolicy: this.config.executionMode === "root-danger-full-access" ? { type: "dangerFullAccess" } : { type: "workspaceWrite", writableRoots: [canonicalCwd], networkAccess: false },
+      ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}),
+      collaborationMode: { mode, settings: { model: task.model ?? null, reasoning_effort: task.reasoningEffort ?? null, developer_instructions: null } },
+    };
+    const response = this.asRecord(await this.appServer.request("turn/start", params));
+    const turn = this.asRecord(response.turn);
+    const turnId = this.stringAt(turn, "id") ?? this.stringAt(response, "turnId", "turn_id");
+    if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
+    const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId };
+    this.activeTurns.set(session.sessionId, state); this.db.saveTurn(state);
+    this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId });
+    this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
+    await this.updateRunCard(session.sessionId, session.rootMessageId, "运行中", mode === "plan" ? "Codex 正在只读规划。" : this.config.executionMode === "root-danger-full-access" ? "Codex 正在专用 Root 容器中执行。" : "Codex 正在受限工作区中执行。", true);
   }
 
   private async hasLocalActiveSession(session: SessionMetadata & { path: string }): Promise<boolean> {
@@ -1348,6 +1812,19 @@ export class SyncService {
     if (!userPrompt) { await this.respond(message, "消息中没有可提交的文本或图片。"); return; }
     try { await resolveAllowedPath(session.cwd, this.config.allowedRoot); }
     catch (error) { await this.respond(message, `会话目录被拒绝：${String(error)}`); return; }
+    const active = this.activeTurns.get(session.sessionId);
+    if (active && this.appServer) {
+      const paths = await this.downloadImages(message, message.imageKeys);
+      try {
+        await this.appServer.request("turn/steer", { threadId: session.sessionId, expectedTurnId: active.turnId,
+          input: [{ type: "text", text: userPrompt }, ...paths.map((path) => ({ type: "localImage", path }))] });
+        await this.respond(message, "已发送给当前 Codex 回合。");
+        return;
+      } catch (error) {
+        await Promise.all(paths.map((path) => rm(path, { force: true })));
+        console.warn("turn/steer unavailable; queueing next turn", error);
+      }
+    }
     await this.enqueueResumeTask(session, message, userPrompt);
   }
 
@@ -1378,11 +1855,12 @@ export class SyncService {
     const session = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const key = session?.sessionId;
     const cancelled = this.db.cancelPendingTasks(message.rootId ?? null, key ?? null);
-    if (!key || (!this.activeRuns.has(key) && !cancelled)) {
+    if (!key || (!this.activeTurns.has(key) && !cancelled)) {
       await this.respond(message, "当前话题没有由桥接服务启动的活动任务。");
       return;
     }
-    this.activeRuns.get(key)?.abort();
+    const active = key ? this.activeTurns.get(key) : null;
+    if (active && this.appServer && key) void this.appServer.request("turn/interrupt", { threadId: key, turnId: active.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: key }, error));
     await this.respond(message, cancelled ? "已取消排队任务；正在运行的任务也会停止。" : "已发送取消信号。");
   }
 }

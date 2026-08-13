@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CodexRunner } from "../src/codex.js";
+import { CodexCliProbe } from "../src/codex.js";
 import { BridgeDatabase } from "../src/db.js";
 import { parseJsonlChunk } from "../src/session-parser.js";
 import { forbiddenRemoteQuestion, SyncService } from "../src/sync.js";
@@ -93,7 +93,7 @@ test("full sync creates one topic, visible messages, and exact archive without d
     const db = new BridgeDatabase(stateDir);
     db.setSetting("feishu.chat_id", "chat-1"); db.setSetting("feishu.open_id", "user-1");
     const feishu = new FakeFeishu();
-    const service = new SyncService(config, db, feishu, new CodexRunner("/bin/false", codexHome));
+    const service = new SyncService(config, db, feishu, new CodexCliProbe("/bin/false", codexHome));
     (service as unknown as { models: ModelCapability[] }).models = catalog;
     await service.syncAll();
     assert.equal(feishu.roots.length, 1);
@@ -198,7 +198,7 @@ test("an appended assistant reply is delivered once after the initial user-only 
     const db = new BridgeDatabase(config.stateDir);
     db.setSetting("feishu.chat_id", "chat-1"); db.setSetting("feishu.open_id", "user-1");
     const feishu = new FakeFeishu();
-    const service = new SyncService(config, db, feishu, new CodexRunner("/bin/false", codexHome));
+    const service = new SyncService(config, db, feishu, new CodexCliProbe("/bin/false", codexHome));
     await service.syncAll();
     const appended = [
       { timestamp: "2026-08-04T00:00:03Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "world" }] } },
@@ -228,7 +228,7 @@ test("removes previously mirrored subagent messages and clears stale local activ
     const config: BridgeConfig = { appId: "app", appSecret: "secret", allowedRoot: home, codexHome, codexBin: "/bin/false", stateDir, bindToken: "token", scanIntervalMs: 1_000, activeSessionQuietMs: 1 };
     const db = new BridgeDatabase(stateDir);
     const feishu = new FakeFeishu();
-    const service = new SyncService(config, db, feishu, new CodexRunner("/bin/false", codexHome));
+    const service = new SyncService(config, db, feishu, new CodexCliProbe("/bin/false", codexHome));
     const childMessage = parseJsonlChunk(content, "", parentId).messages[0]!;
     db.saveMessage(childMessage.id, parentId, "outbound", "feishu-subagent-message");
     const mixedPath = join(sessions, `rollout-2026-08-04T00-00-02-${parentId}.jsonl`);
@@ -260,7 +260,7 @@ test("uses the most recent cached model catalog when the CLI refresh fails", asy
     };
     const db = new BridgeDatabase(config.stateDir);
     db.setSetting("codex.model_catalog.v1", JSON.stringify(catalog));
-    const unavailableCodex = { listModels: async () => { throw new Error("offline"); } } as unknown as CodexRunner;
+    const unavailableCodex = { listModels: async () => { throw new Error("offline"); } } as unknown as CodexCliProbe;
     const service = new SyncService(config, db, new FakeFeishu(), unavailableCodex);
     await (service as unknown as { refreshModels: () => Promise<boolean> }).refreshModels();
     assert.deepEqual((service as unknown as { models: ModelCapability[] }).models, catalog);
@@ -277,7 +277,7 @@ test("binding sends one control card immediately", async () => {
     };
     const db = new BridgeDatabase(config.stateDir);
     const feishu = new FakeFeishu();
-    const service = new SyncService(config, db, feishu, new CodexRunner("/bin/false", config.codexHome));
+    const service = new SyncService(config, db, feishu, new CodexCliProbe("/bin/false", config.codexHome));
     await service.onFeishuMessage(inbound({ text: "/bind token" }));
     assert.equal(db.getSetting("feishu.chat_id"), "chat-1");
     assert.equal(feishu.cards.length, 1);

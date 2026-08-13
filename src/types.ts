@@ -9,6 +9,12 @@ export interface BridgeConfig {
   scanIntervalMs: number;
   activeSessionQuietMs: number;
   cardUiVersion?: 1 | 2;
+  /** Explicitly opt in to the intentionally unsandboxed Root execution mode. */
+  executionMode?: "workspace-write" | "root-danger-full-access";
+  rootGrantTtlMs?: number;
+  rootFullAccessAck?: boolean;
+  /** Explicitly allowed MCP server identifiers. Empty means no MCP escalation. */
+  allowedMcpServers?: string[];
 }
 
 export interface SessionMetadata {
@@ -18,6 +24,9 @@ export interface SessionMetadata {
   startedAt: string;
   source: string;
   firstUserText: string;
+  /** Canonical user-facing title from Codex thread metadata. */
+  title?: string | null;
+  collaborationMode?: "default" | "plan" | null;
   model?: string | null;
   reasoningEffort?: string | null;
 }
@@ -46,6 +55,52 @@ export interface ChoiceRequest {
   timestamp: string;
   questions: ChoiceQuestion[];
   expiresAt: number;
+}
+
+export type RemoteRequestType = "user_input" | "command_approval" | "file_approval" | "permissions" | "mcp_elicitation";
+export type RemoteRequestStatus = "pending" | "submitting" | "resolved" | "expired" | "declined";
+
+/** Persisted metadata deliberately excludes answers to secret questions. */
+export interface PendingServerRequest {
+  nonce: string;
+  rpcId: string | number;
+  epoch: number;
+  type: RemoteRequestType;
+  sessionId: string;
+  turnId: string | null;
+  itemId: string | null;
+  openId: string;
+  chatId: string;
+  rootMessageId: string;
+  cardMessageId: string | null;
+  payload: Record<string, unknown>;
+  status: RemoteRequestStatus;
+  expiresAt: number;
+}
+
+/** A one-time Root authorization bound to exactly one queued task. */
+export interface TaskRootGrant {
+  nonce: string;
+  taskId: string;
+  sessionId: string;
+  canonicalCwd: string;
+  openId: string;
+  chatId: string;
+  epoch: number;
+  expiresAt: number;
+  status: "pending" | "approved" | "denied" | "expired" | "consumed" | "cancelled";
+}
+
+export interface TurnState {
+  sessionId: string;
+  turnId: string;
+  epoch: number;
+  mode: "default" | "plan";
+  state: "running" | "awaiting_input" | "awaiting_approval" | "completed" | "failed" | "interrupted";
+  text: string;
+  plan: string;
+  rootMessageId: string;
+  stream?: { cardId: string; messageId: string; elementId: string; sequence: number; lastSentAt: number };
 }
 
 export interface FileCursor {
@@ -125,23 +180,9 @@ export interface FeishuPort {
   updateCard(messageId: string, card: CardDefinition): Promise<void>;
   deleteMessage(messageId: string): Promise<void>;
   getMessageMetadata(messageId: string): Promise<FeishuMessageMetadata | null>;
-}
-
-export interface CodexRunRequest {
-  cwd: string;
-  prompt: string;
-  sessionId?: string;
-  imagePaths?: string[];
-  signal?: AbortSignal;
-  model?: string;
-  reasoningEffort?: string;
-}
-
-export interface CodexRunResult {
-  sessionId: string;
-  exitCode: number;
-  assistantMessages: string[];
-  stderr: string;
+  createStreamingReply?(rootMessageId: string, title: string): Promise<{ cardId: string; messageId: string; elementId: string; sequence: number }>;
+  updateStreamingReply?(stream: { cardId: string; elementId: string; sequence: number }, content: string): Promise<number>;
+  finishStreamingReply?(stream: { cardId: string; elementId: string; sequence: number }, summary: string): Promise<void>;
 }
 
 export interface QueuedTask {
@@ -156,9 +197,14 @@ export interface QueuedTask {
   rootMessageId: string | null;
   model: string | null;
   reasoningEffort: string | null;
-  status: "pending" | "running" | "awaiting_sync" | "completed" | "failed" | "cancelled" | "interrupted";
+  status: "pending" | "running" | "awaiting_root_consent" | "awaiting_input" | "awaiting_approval" | "awaiting_sync" | "completed" | "failed" | "cancelled" | "interrupted";
   runCardMessageId: string | null;
   expectedSessionId: string | null;
   syncStatus: "none" | "awaiting" | "synced";
   lastSyncOffset: number | null;
+  turnId?: string | null;
+  /** Reason the task reached a terminal state, suitable for a concise user card. */
+  terminalReason?: string | null;
+  /** Authorization nonce while awaiting a Root-only execution. */
+  rootGrantNonce?: string | null;
 }

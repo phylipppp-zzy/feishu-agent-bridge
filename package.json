@@ -11,8 +11,10 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/index.js",
+    "start:container": "node scripts/container-start.mjs",
     "dev": "tsx src/index.ts",
     "doctor": "node scripts/doctor.mjs",
+    "doctor:container": "node scripts/doctor.mjs --container",
     "install:local": "node scripts/install.mjs",
     "rebind": "node scripts/rebind.mjs",
     "test": "node --import tsx --test test/*.test.ts"

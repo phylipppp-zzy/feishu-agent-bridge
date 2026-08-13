@@ -11,10 +11,13 @@
 - 扫描并持续监听 `~/.codex/sessions/**/*.jsonl`；每个 Codex `session_id` 映射到一个飞书根消息，话题回复构成可读对话。
 - 飞书可读视图包含用户消息、Codex 正文和进度更新。飞书发起的消息会抑制本地 JSONL 回声，避免重复显示“用户”消息。
 - 支持 JSON 2.0 控制台卡片、项目目录 -> 模型 -> 思考强度 -> 任务的新建流程、会话搜索、话题内续聊、图片输入、暂停、重试和取消任务。
+- 会话根卡标题使用 Codex 的真实 thread title；历史会话会自动迁移并过滤宿主注入的插件/环境上下文。
+- 飞书交互会话使用长驻 `codex app-server --stdio`：支持实时流、同回合引导、原生问答、取消、Plan 和结构化命令/文件审阅；JSONL 仍用于历史导入和本地 CLI 会话同步。
+- 会话根卡可切换 Default/Plan；Plan 使用 Codex 原生模式且不自动执行。每轮正文优先使用 CardKit 流式实体，权限或客户端不支持时自动回退普通 JSON 2.0 卡片。
 - 超过 50,000 字符的正文以 Markdown 附件发送。图片下载到权限为 `0600` 的受控临时目录，传给 Codex 后删除。
 - SQLite 位于 `~/.local/state/feishu-codex-bridge/bridge.sqlite`，保存会话话题映射、解析游标、去重键和失败记录。
 - 原始 Codex JSONL 永远只保留在本机 `~/.codex/sessions`，桥接服务不提供原始日志上传功能。
-- 远程执行固定使用 `workspace-write`、`approval=never` 和 `--skip-git-repo-check`。因此当前用户主目录下经 `realpath` 校验的非 Git 目录也能新建和续聊。
+- Default 以 app-server 权限策略运行；容器 Root 模式必须通过显式环境确认，并在每个会话中确认 8 小时授权。没有任何静默 `codex exec` 回退。
 - 服务启动时通过 `codex debug models` 读取可见模型与支持的思考强度，缓存到 SQLite。CLI 暂时不可用时使用最近一次有效缓存；没有有效目录时会阻止新建，并提示使用 `/retry`。
 
 ## 一键安装
@@ -49,6 +52,19 @@
 - 若显示“安装完成”和 `/bind` 命令：服务已经在运行。创建一个私密话题群，加入新机器人后，在群中发送该命令。
 - 若提示“等待管理员审核”：服务已经安装，但机器人尚不能使用。先在飞书后台批准应用版本；随后在仓库目录运行 `npm run doctor` 重新检查。检查通过后，再运行一次 `./install.sh` 显示原来的 `/bind` 命令；它会复用同一个应用和绑定码，不会新建应用。此时才创建群并绑定。
 - 若显示其他失败信息：按安装器输出的修复命令处理后，重新运行 `./install.sh`。不需要手动创建或启动 systemd 服务。
+
+### root 或无 systemd 的容器
+
+当容器中的 Codex 以 root 运行，或 PID 1 不是 systemd 时，可使用容器模式：
+
+```bash
+./install.sh --container --existing-app <cli_xxx>
+npm run start:container
+```
+
+该模式会生成同样的 `0600` 环境文件、配置飞书应用并运行无 systemd 自检，但不创建用户服务。`start:container` 在前台运行，会在桥接子进程异常退出 5 秒后重启，并转发 `SIGINT`/`SIGTERM` 用于优雅停止。
+
+应将 `npm run start:container` 设为容器入口或交由外部平台启动。容器自身被删除或重启后，容器内进程无法自行恢复；必须由容器外部的启动策略重新执行该命令。
 
 成功时终端会显示类似下面的绑定命令：
 
@@ -91,6 +107,9 @@ $EDITOR ~/.config/feishu-codex-bridge/env
    - `im:message`：读取机器人根消息，并在点击卡片后显式更新原卡片。
    - `im:message.group_msg`：以应用身份读取绑定私密群中的根消息，用于回填会话话题元数据。该权限可读取群消息，仅应授予专用私密群。
    - `im:resource`：下载用户图片，以及发送超长正文的附件。
+   - `cardkit:card:write`：创建和流式更新每轮临时输出卡片实体。
+   - `application:application:patch`：受管安装自动维护本应用配置并发布版本。
+   - `application:application:self_manage`：doctor 只读核验本应用线上版本、事件和回调配置。
 3. 在“事件与回调”选择“使用长连接接收事件/回调”，订阅 `im.message.receive_v1`、`application.bot.menu_v6` 和回调 `card.action.trigger`。
 4. 可选配置机器人自定义菜单，事件键分别使用 `codex.home`、`codex.new`、`codex.sessions`、`codex.search` 和 `codex.service`。菜单项类型必须为“事件”，不是跳转链接。
 5. 创建并发布新版本；创建私密话题群，只加入授权用户和机器人。
@@ -158,7 +177,7 @@ systemctl --user start feishu-codex-bridge.service
 
 该设置原子更新并用于之后的续聊。群主消息中的 `/model` 不会修改任何会话。群主消息发送单独的 `/` 后会返回操作面板；飞书长连接只能处理已经发送的消息，因此这不是输入框内的实时命令补全。
 
-本版本不实现 `/plan`、服务等级或速度档位；它们不与会话模型设置混用。
+Plan 通过会话根卡切换；新会话默认 Default。服务等级和速度档位不与会话模型设置混用。
 
 “最近会话”按项目分组，每页显示 8 条。搜索只查询 SQLite 中的工作目录、首条用户消息和短会话 ID，不读取完整 JSONL；多关键词使用 AND 匹配。会话标题使用飞书消息链接定位根消息。
 
@@ -202,7 +221,7 @@ systemctl --user start feishu-codex-bridge.service
 - 依赖、研究、实现和方案选择。
 - 是否修改已授权工作目录内的文件。
 
-卡片只传达用户的业务意图，不会绕过 `approval=never`、`workspace-write`、路径校验或网络沙箱。以下事项不会生成远程批准按钮：sudo、提权、密码、密钥、令牌、验证码、CAPTCHA、登录认证、绕过沙箱、目录外写入，以及向外部服务上传私密本地数据。
+原生 Codex 请求会以卡片展示命令、文件、网络或 MCP 影响范围，并使用一次性 nonce 防止重复或跨用户提交。若启用 `ALLOW_GROUP_SECRET_INPUT=1`，secret 值会经过飞书平台但不会被桥接器写入 SQLite、日志或回复；不启用时此类请求会拒绝。
 
 ## 同步内容与隐私
 
@@ -215,8 +234,9 @@ systemctl --user start feishu-codex-bridge.service
 ## Codex 执行边界
 
 - 工作目录必须经 `realpath` 校验并位于安装器写入的 `ALLOWED_ROOT`，默认为当前用户主目录；符号链接逃逸和目录外路径会被拒绝。
-- 新会话和续聊均使用 `--skip-git-repo-check`，仅跳过 Git 仓库要求，不放宽路径限制或沙箱。
-- 固定使用 `workspace-write` 与 `approval=never`；不会使用 `danger-full-access`、sudo 或自动提权。
+- 飞书交互回合不使用 `codex exec`；新建和续聊均通过 app-server 的 `thread/*` 与 `turn/*` 生命周期执行。
+- 默认 `workspace-write` 环境在 sandbox smoke test 失败时 fail-closed。只有 `CODEX_EXECUTION_MODE=root-danger-full-access`、`ROOT_FULL_ACCESS_ACK=I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER` 同时存在时，才允许无沙箱 Root 模式。
+- Root 模式可读写整个容器、访问网络并启动进程；飞书会话卡须确认后才开始 Default 回合，授权最长八小时，并在 app-server 重启、目录变化、用户重绑或撤销时失效。
 - 每个续聊会话都受活动任务与 JSONL 活动状态保护，避免桥接器与本地 Codex 同时写入同一会话。
 - 每次新建和续聊都传入会话保存的 `-m <model>` 与 `-c model_reasoning_effort="<effort>"`；没有保存设置的历史会话不传覆盖项，继续使用本机 Codex 默认值。
 

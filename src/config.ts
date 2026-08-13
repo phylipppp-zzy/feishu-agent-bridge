@@ -19,13 +19,24 @@ function positiveInteger(name: string, fallback: number): number {
 }
 
 function cardUiVersion(): 1 | 2 {
-  const value = process.env.FEISHU_CARD_UI_VERSION ?? "1";
+  const value = process.env.FEISHU_CARD_UI_VERSION ?? "2";
   if (value === "1" || value === "2") return Number(value) as 1 | 2;
   throw new Error("FEISHU_CARD_UI_VERSION must be 1 or 2");
 }
 
+function executionMode(): "workspace-write" | "root-danger-full-access" {
+  const value = process.env.CODEX_EXECUTION_MODE ?? "workspace-write";
+  if (value === "workspace-write" || value === "root-danger-full-access") return value;
+  throw new Error("CODEX_EXECUTION_MODE must be workspace-write or root-danger-full-access");
+}
+
 export function loadConfig(): BridgeConfig {
   const home = homedir();
+  const mode = executionMode();
+  const ack = process.env.ROOT_FULL_ACCESS_ACK === "I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER";
+  if (mode === "root-danger-full-access" && !ack) {
+    throw new Error("Root mode requires ROOT_FULL_ACCESS_ACK=I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER");
+  }
   return {
     appId: required("FEISHU_APP_ID"),
     appSecret: required("FEISHU_APP_SECRET"),
@@ -37,5 +48,9 @@ export function loadConfig(): BridgeConfig {
     scanIntervalMs: positiveInteger("SCAN_INTERVAL_MS", 10_000),
     activeSessionQuietMs: positiveInteger("ACTIVE_SESSION_QUIET_MS", 5_000),
     cardUiVersion: cardUiVersion(),
+    executionMode: mode,
+    rootGrantTtlMs: positiveInteger("ROOT_GRANT_TTL_SECONDS", 600) * 1_000,
+    rootFullAccessAck: ack,
+    allowedMcpServers: (process.env.CODEX_ALLOWED_MCP_SERVERS ?? "").split(",").map((value) => value.trim()).filter(Boolean),
   };
 }

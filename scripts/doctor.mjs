@@ -9,6 +9,7 @@ import { parseEnvironment } from "../dist/src/installer.js";
 
 const execFileAsync = promisify(execFile);
 const envPath = join(homedir(), ".config/feishu-codex-bridge/env");
+const containerArgument = process.argv.includes("--container");
 let failures = 0;
 function result(ok, text) { console.log(`${ok ? "OK" : "FAIL"}  ${text}`); if (!ok) failures += 1; }
 
@@ -43,16 +44,51 @@ if (values.FEISHU_APP_ID && values.FEISHU_APP_SECRET) {
     });
     const response = await client.request({ url: "/open-apis/bot/v3/info", method: "GET" });
     result(Boolean(response?.bot?.open_id), "Feishu credentials and bot capability are available");
+    try {
+      const scopes = await client.request({ url: "/open-apis/application/v6/scopes?page_size=100", method: "GET" });
+      const rows = scopes?.data?.scopes ?? scopes?.data?.items ?? [];
+      const granted = new Map(rows.filter((row) => row && typeof row === "object")
+        .map((row) => [row.scope_name ?? row.name, row.grant_status]));
+      for (const required of ["im:message", "im:message:send_as_bot", "im:message.group_msg", "im:resource", "cardkit:card:write"]) {
+        result(granted.get(required) === 1 || granted.get(required) === "1", `Feishu scope ${required} is granted`);
+      }
+      if (granted.get("application:application:self_manage") !== 1 && granted.get("application:application:self_manage") !== "1") {
+        console.log("WARN  application:application:self_manage is not granted; online event/callback configuration cannot be audited by doctor");
+      }
+    } catch (error) {
+      console.log(`WARN  Feishu scope audit unavailable: ${error instanceof Error ? error.message : error}`);
+    }
   } catch (error) { result(false, `Feishu bot API unavailable (the app may await administrator approval): ${error instanceof Error ? error.message : error}`); }
 }
 
 const codexBin = values.CODEX_BIN || "codex";
+const rootMode = values.CODEX_EXECUTION_MODE === "root-danger-full-access";
+const rootAck = values.ROOT_FULL_ACCESS_ACK === "I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER";
+if (rootMode) {
+  result(rootAck, "Root danger-full-access acknowledgement is configured");
+  result(values.ALLOW_GROUP_SECRET_INPUT === "1", "Group secret-input acknowledgement is configured");
+}
 try {
   const { stdout } = await execFileAsync(codexBin, ["--version"]);
   result(true, `Codex available: ${stdout.trim()}`);
   await execFileAsync(codexBin, ["login", "status"]);
   result(true, "Codex login is available");
 } catch (error) { result(false, `Codex unavailable: ${error}`); }
+
+try {
+  await execFileAsync(codexBin, ["sandbox", "--", "/usr/bin/true"]);
+  result(true, "Codex sandbox smoke test passed; command/file approvals can be enabled");
+} catch (error) {
+  if (rootMode && rootAck) console.log("WARN  Codex sandbox smoke test failed; explicit Root danger-full-access mode is active and can modify the entire container");
+  else result(false, "Codex sandbox smoke test failed; remote command/file/permission approvals are fail-closed in this container");
+  console.log(`INFO  sandbox diagnostic: ${error instanceof Error ? error.message : error}`);
+}
+
+try {
+  const { stdout } = await execFileAsync(codexBin, ["app-server", "generate-json-schema", "--experimental", "--out", "/tmp/feishu-codex-bridge-doctor-schema"], { maxBuffer: 1_000_000 });
+  void stdout;
+  result(true, "Codex app-server experimental schema is available");
+} catch (error) { result(false, `Codex app-server schema generation failed: ${error instanceof Error ? error.message : error}`); }
 
 try {
   const sessions = values.CODEX_HOME ? join(values.CODEX_HOME, "sessions") : join(homedir(), ".codex/sessions");
@@ -72,9 +108,13 @@ try {
   console.log(`INFO  systemd linger: ${stdout.trim() || "unknown"}; service is login-session-only when disabled`);
 } catch { console.log("INFO  unable to query systemd linger"); }
 
-try {
-  await execFileAsync("systemctl", ["--user", "is-active", "--quiet", "feishu-codex-bridge.service"]);
-  result(true, "feishu-codex-bridge user service is active");
-} catch { result(false, "feishu-codex-bridge user service is not active; run systemctl --user restart feishu-codex-bridge.service"); }
+if (containerArgument || values.FEISHU_RUNTIME === "container") {
+  console.log("INFO  container runtime selected; start the bridge with npm run start:container");
+} else {
+  try {
+    await execFileAsync("systemctl", ["--user", "is-active", "--quiet", "feishu-codex-bridge.service"]);
+    result(true, "feishu-codex-bridge user service is active");
+  } catch { result(false, "feishu-codex-bridge user service is not active; run systemctl --user restart feishu-codex-bridge.service"); }
+}
 
 process.exitCode = failures ? 1 : 0;

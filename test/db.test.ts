@@ -51,3 +51,25 @@ test("persistent task queue claims FIFO work and preserves Codex failures for ma
     db.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("remote request and root grant state is scoped, atomic, and expires", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-remote-db-"));
+  try {
+    const db = new BridgeDatabase(dir);
+    db.enqueueTask({ id: "root-task", kind: "resume", sessionId: "s1", cwd: "/work", prompt: "p", imageKeys: [], sourceMessageId: "root-message", chatId: "c1", rootMessageId: "r1", model: null, reasoningEffort: null, status: "awaiting_root_consent", runCardMessageId: null, expectedSessionId: "s1", syncStatus: "none", lastSyncOffset: null });
+    db.createTaskRootGrant({ nonce: "root-nonce", taskId: "root-task", sessionId: "s1", canonicalCwd: "/work", openId: "u1", chatId: "c1", epoch: 7, expiresAt: Date.now() + 60_000 });
+    assert.equal(db.approveTaskRootGrant("root-nonce", "u2", "c1", 7), null);
+    assert.equal(db.approveTaskRootGrant("root-nonce", "u1", "c1", 7)?.status, "approved");
+    assert.equal(db.consumeTaskRootGrant("root-task", "s1", "/work", 7), true);
+    assert.equal(db.consumeTaskRootGrant("root-task", "s1", "/work", 7), false);
+    db.saveServerRequest({ nonce: "n1", rpcId: 42, epoch: 7, type: "command_approval", sessionId: "s1", turnId: "t1", itemId: "i1", openId: "u1", chatId: "c1", rootMessageId: "r1", cardMessageId: null, payload: { command: "pwd" }, status: "pending", expiresAt: Date.now() + 60_000 });
+    assert.equal(db.claimServerRequest("n1", "u2", "c1", 7), null);
+    assert.equal(db.claimServerRequest("n1", "u1", "c1", 7)?.status, "submitting");
+    assert.equal(db.claimServerRequest("n1", "u1", "c1", 7), null);
+    db.saveTurn({ sessionId: "s1", turnId: "t1", epoch: 7, mode: "plan", state: "running", text: "", plan: "plan", rootMessageId: "r1" });
+    assert.equal(db.activeTurn("s1")?.plan, "plan");
+    db.expireTaskRootGrants(8);
+    assert.equal(db.getTaskRootGrant("root-nonce")?.status, "consumed");
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
