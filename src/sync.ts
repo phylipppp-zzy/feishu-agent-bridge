@@ -12,6 +12,8 @@ import { isRetryableTransportError } from "./inbound-events.js";
 import { parseJsonlChunk } from "./session-parser.js";
 import type { FeishuRouterPort } from "./bridge-contracts.js";
 import { jsonlFiles, SessionImporter } from "./session-importer.js";
+import { TaskScheduler } from "./task-scheduler.js";
+import { ApprovalService } from "./approval-service.js";
 import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
@@ -108,9 +110,9 @@ export class SyncService implements FeishuRouterPort {
   private readonly sessionsDir: string;
   private readonly sessionImporter: SessionImporter;
   private readonly activeTurns = new Map<string, TurnState>();
-  private readonly requestResolvers = new Map<string, (value: unknown) => void>();
+  private readonly approvalService: ApprovalService;
   private readonly notificationQueues = new Map<string, Promise<void>>();
-  private readonly taskWorkers = new Set<string>();
+  private readonly taskScheduler: TaskScheduler;
   private scanTimer: NodeJS.Timeout | null = null;
   private messageLinkPermissionDenied = false;
   private models: ModelCapability[] = [];
@@ -138,6 +140,25 @@ export class SyncService implements FeishuRouterPort {
         console.error(`Session importer ${operation} failed for ${path}`, error);
       },
     });
+    this.taskScheduler = new TaskScheduler({
+      db,
+      executor: { execute: async (task) => task.kind === "resume" ? this.executeResumeTask(task) : this.executeNewTask(task) },
+      isPaused: () => this.paused(),
+      hasActiveTurn: (sessionId) => this.activeTurns.has(sessionId),
+      hasLocalActiveSession: async (sessionId) => {
+        const session = this.db.getSession(sessionId);
+        return session ? this.hasLocalActiveSession(session) : false;
+      },
+      onError: (operation, task, error) => this.db.recordFailure(operation, task ? { taskId: task.id } : {}, error),
+    });
+    this.approvalService = new ApprovalService({
+      db,
+      onServerRequest: (request) => this.onAppServerRequest(request),
+      onResolveAction: (request, decision, answer) => this.resolveRemoteRequest(request, decision, answer),
+      onRootConsent: (task) => this.createRootGrant(task),
+      onConsumeRootGrant: (task) => this.consumeRootGrant(task),
+      onExpire: () => this.expireRemoteState(),
+    });
   }
 
   async start(): Promise<void> {
@@ -152,7 +173,7 @@ export class SyncService implements FeishuRouterPort {
       this.appServer.onNotification((event) => this.enqueueAppServerNotification(event));
       this.appServer.onLifecycle((event) => { if (event.kind === "started") this.appServerRestartAttempts = 0; });
       this.appServer.onExit((event) => { void this.handleAppServerExit(event.epoch, event.error); });
-      this.appServer.onServerRequest((request) => this.onAppServerRequest(request));
+      this.appServer.onServerRequest((request) => this.approvalService.handleServerRequest(request));
       await this.appServer.start();
       await this.expireRemoteState();
       await this.refreshThreadsFromAppServer();
@@ -659,10 +680,7 @@ export class SyncService implements FeishuRouterPort {
         await this.cleanupTurnImages(active.turnId);
         if (this.appServer) void this.appServer.request("turn/interrupt", { threadId: targetSessionId, turnId: active.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: targetSessionId }, error));
       }
-      for (const request of this.db.cancelServerRequestsForSession(targetSessionId)) {
-        this.requestResolvers.get(request.nonce)?.({ action: "cancel", decision: "cancel" });
-        this.requestResolvers.delete(request.nonce);
-      }
+      await this.approvalService.cancelForSession(targetSessionId);
     }
     return cancelled.length;
   }
@@ -678,8 +696,7 @@ export class SyncService implements FeishuRouterPort {
     const interrupted = this.db.markRunningTasksInterrupted();
     for (const turn of this.activeTurns.values()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
     this.activeTurns.clear();
-    for (const resolver of this.requestResolvers.values()) resolver({ action: "cancel", decision: "cancel" });
-    this.requestResolvers.clear();
+    this.approvalService.clear();
     for (const task of interrupted) {
       if (task.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已中断", "Codex app-server 已退出；该任务不会自动重放。")).catch(() => undefined);
       if (task.rootMessageId && task.sessionId) void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "Codex app-server 已退出；该任务不会自动重放。", false).catch(() => undefined);
@@ -840,11 +857,11 @@ export class SyncService implements FeishuRouterPort {
       void this.resolveRemoteRequest(live, "decline").catch((error) => this.db.recordFailure("remote_request_timeout", { nonce }, error));
     }, Math.max(1, expiry - Date.now()));
     timeout.unref();
-    return new Promise((resolve) => this.requestResolvers.set(nonce, resolve));
+    return this.approvalService.waitFor(nonce);
   }
 
   private async resolveRemoteRequest(request: PendingServerRequest, decision: string, answer?: string): Promise<void> {
-    const resolver = this.requestResolvers.get(request.nonce);
+    const resolver = this.approvalService.take(request.nonce);
     if (!resolver) { this.db.setServerRequestStatus(request.nonce, "expired"); return; }
     const params = request.payload;
     let result: unknown;
@@ -862,7 +879,6 @@ export class SyncService implements FeishuRouterPort {
     } else {
       result = { decision: decision === "accept" || decision === "acceptForSession" || decision === "cancel" ? decision : "decline" };
     }
-    this.requestResolvers.delete(request.nonce);
     this.db.setServerRequestStatus(request.nonce, decision === "decline" ? "declined" : "resolved");
     if (request.turnId) { const task = this.db.taskForTurn(request.turnId); if (task) this.db.transitionTask(task.id, "running"); }
     resolver(result);
@@ -1720,26 +1736,11 @@ export class SyncService implements FeishuRouterPort {
   }
 
   private async drainPendingTasks(): Promise<void> {
-    for (const sessionId of this.db.pendingTaskSessionIds()) void this.drainTaskQueue(sessionId);
+    for (const sessionId of this.db.pendingTaskSessionIds()) void this.taskScheduler.drain(sessionId);
   }
 
   private async drainTaskQueue(sessionId: string | null): Promise<void> {
-    const workerKey = sessionId ?? "__new__";
-    if (this.taskWorkers.has(workerKey) || this.paused()) return;
-    this.taskWorkers.add(workerKey);
-    try {
-      while (!this.paused()) {
-        const session = sessionId ? this.db.getSession(sessionId) : null;
-        if (session && this.activeTurns.has(session.sessionId)) return;
-        if (session && await this.hasLocalActiveSession(session)) return;
-        const task = this.db.claimNextTask(sessionId);
-        if (!task) return;
-        if (task.kind === "resume") await this.executeResumeTask(task);
-        else await this.executeNewTask(task);
-      }
-    } finally {
-      this.taskWorkers.delete(workerKey);
-    }
+    return this.taskScheduler.drain(sessionId);
   }
 
   private async syncTaskLog(task: QueuedTask, sessionId: string): Promise<boolean> {
@@ -1843,6 +1844,29 @@ export class SyncService implements FeishuRouterPort {
       : { mode, rootMode, approvalPolicy: "on-request", sandboxPolicy: { type: "workspaceWrite", writableRoots: [canonicalCwd], networkAccess: false } };
   }
 
+  private async createRootGrant(task: QueuedTask): Promise<import("./types.js").TaskRootGrant | null> {
+    if (!task.sessionId || !this.appServer || !this.rootExecutionReady) return null;
+    const session = this.db.getSession(task.sessionId);
+    if (!session) return null;
+    const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
+    const existing = this.db.getTaskRootGrantForTask(task.id);
+    if (existing) return existing;
+    return this.db.createTaskRootGrant({
+      nonce: randomUUID(), taskId: task.id, sessionId: session.sessionId, canonicalCwd,
+      openId: this.boundOpenId() ?? "", chatId: task.chatId, epoch: this.appServer.appServerEpoch,
+      expiresAt: Date.now() + (this.config.rootGrantTtlMs ?? 600_000),
+    });
+  }
+
+  private async consumeRootGrant(task: QueuedTask): Promise<boolean> {
+    if (!task.sessionId || !this.appServer) return false;
+    const session = this.db.getSession(task.sessionId);
+    if (!session) return false;
+    const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
+    const grant = this.db.getTaskRootGrantForTask(task.id);
+    return grant?.status === "approved" && this.db.consumeTaskRootGrant(task.id, session.sessionId, canonicalCwd, this.appServer.appServerEpoch);
+  }
+
   private async executeAppServerNewTask(task: QueuedTask): Promise<void> {
     if (!this.appServer) return;
     try {
@@ -1905,14 +1929,11 @@ export class SyncService implements FeishuRouterPort {
     if (rootModeRequested) {
       if (!this.rootExecutionReady) throw new Error("Root execution is disabled because container preflight failed");
       const existing = this.db.getTaskRootGrantForTask(task.id);
-      const canRun = existing?.status === "approved" && this.db.consumeTaskRootGrant(task.id, session.sessionId, canonicalCwd, this.appServer.appServerEpoch);
+      const canRun = await this.approvalService.consumeRootGrant(task);
       rootAuthorized = canRun;
       if (!canRun) {
-        const grant = existing?.status === "pending" ? existing : this.db.createTaskRootGrant({
-          nonce: randomUUID(), taskId: task.id, sessionId: session.sessionId, canonicalCwd,
-          openId: this.boundOpenId() ?? "", chatId: task.chatId, epoch: this.appServer.appServerEpoch,
-          expiresAt: Date.now() + (this.config.rootGrantTtlMs ?? 600_000),
-        });
+        const grant = existing?.status === "pending" ? existing : await this.approvalService.requestRootConsent(task);
+        if (!grant) throw new Error("Unable to create Root authorization for task");
         this.db.updateTask(task.id, "awaiting_root_consent", { sessionId: session.sessionId });
         await this.updateRunCard(session.sessionId, session.rootMessageId, "等待 Root 授权", "Root 模式需要本任务的一次性授权。", false);
         await this.feishu.replyCard(session.rootMessageId, rootGrantCard(grant.nonce, canonicalCwd, shortText(task.prompt, 500), grant.expiresAt));
