@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { watch, type FSWatcher } from "chokidar";
 import { assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { CodexAppServer, type JsonRpcMessage } from "./app-server.js";
 import { CodexCliProbe } from "./codex.js";
@@ -12,6 +11,7 @@ import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight } 
 import { isRetryableTransportError } from "./inbound-events.js";
 import { parseJsonlChunk } from "./session-parser.js";
 import type { FeishuRouterPort } from "./bridge-contracts.js";
+import { jsonlFiles, SessionImporter } from "./session-importer.js";
 import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
@@ -96,21 +96,6 @@ function imageExtension(data: Buffer): string {
   return ".image";
 }
 
-async function jsonlFiles(root: string): Promise<string[]> {
-  const result: string[] = [];
-  async function visit(dir: string): Promise<void> {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) await visit(path);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) result.push(path);
-    }
-  }
-  await visit(root);
-  return result.sort();
-}
-
 function sessionIdFromPath(path: string): string | null {
   return basename(path).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1] ?? null;
 }
@@ -121,13 +106,11 @@ function isSubagentSource(source: string): boolean {
 
 export class SyncService implements FeishuRouterPort {
   private readonly sessionsDir: string;
-  private watcher: FSWatcher | null = null;
-  private readonly fileQueues = new Map<string, Promise<void>>();
+  private readonly sessionImporter: SessionImporter;
   private readonly activeTurns = new Map<string, TurnState>();
   private readonly requestResolvers = new Map<string, (value: unknown) => void>();
   private readonly notificationQueues = new Map<string, Promise<void>>();
   private readonly taskWorkers = new Set<string>();
-  private syncing: Promise<void> | null = null;
   private scanTimer: NodeJS.Timeout | null = null;
   private messageLinkPermissionDenied = false;
   private models: ModelCapability[] = [];
@@ -144,6 +127,17 @@ export class SyncService implements FeishuRouterPort {
     private readonly appServer?: CodexAppServer,
   ) {
     this.sessionsDir = join(config.codexHome, "sessions");
+    this.sessionImporter = new SessionImporter({
+      sessionsDir: this.sessionsDir,
+      db,
+      isEnabled: () => Boolean(this.boundChatId()) && !this.paused(),
+      processFile: (path) => this.processFile(path),
+      reconcileHistory: () => this.reconcileExistingState(),
+      onError: (operation, path, error) => {
+        this.db.recordFailure(operation, { path }, error);
+        console.error(`Session importer ${operation} failed for ${path}`, error);
+      },
+    });
   }
 
   async start(): Promise<void> {
@@ -188,10 +182,7 @@ export class SyncService implements FeishuRouterPort {
     this.db.pruneRetainedData();
     await this.cleanupStaleTempFiles();
     await mkdir(this.sessionsDir, { recursive: true });
-    this.watcher = watch(this.sessionsDir, { ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 } });
-    this.watcher.on("add", (path) => this.queueFile(path));
-    this.watcher.on("change", (path) => this.queueFile(path));
-    this.watcher.on("error", (error) => console.error("Session watcher error", error));
+    await this.sessionImporter.startWatching();
     this.scanTimer = setInterval(() => {
       if (!this.boundChatId() || this.paused()) return;
       void this.syncAll();
@@ -201,7 +192,7 @@ export class SyncService implements FeishuRouterPort {
     }, this.config.scanIntervalMs);
     this.scanTimer.unref();
     if (this.boundChatId()) {
-      void this.reconcileExistingState().then(() => this.syncAll()).catch((error) => {
+      void this.sessionImporter.reconcileHistory().then(() => this.syncAll()).catch((error) => {
         this.db.recordFailure("reconcile_existing_state", {}, error);
       });
       void this.reconcileAwaitingSyncTasks();
@@ -215,8 +206,7 @@ export class SyncService implements FeishuRouterPort {
     if (this.appServerRestartTimer) clearTimeout(this.appServerRestartTimer);
     await Promise.all([...this.activeTurns.keys()].map((sessionId) => this.cancelSessionWork(sessionId, null, "service stopping")));
     await this.cancelAllWork("service stopping");
-    await this.watcher?.close();
-    await Promise.allSettled([...(this.syncing ? [this.syncing] : []), ...this.fileQueues.values()]);
+    await this.sessionImporter.stopWatching();
     await this.appServer?.close();
   }
 
@@ -280,45 +270,8 @@ export class SyncService implements FeishuRouterPort {
     this.db.setSetting(MODEL_BACKFILL_MIGRATION_KEY, "1");
   }
 
-  private queueFile(path: string): void {
-    void this.enqueueFile(path);
-  }
-
-  private enqueueFile(path: string): Promise<void> {
-    if (!path.endsWith(".jsonl") || !this.boundChatId() || this.paused()) return Promise.resolve();
-    const previous = this.fileQueues.get(path) ?? Promise.resolve();
-    const next = previous.then(() => this.processFile(path)).catch((error) => {
-      this.db.recordFailure("process_file", { path }, error);
-      console.error(`Failed to process ${path}`, error);
-    }).finally(() => {
-      if (this.fileQueues.get(path) === next) this.fileQueues.delete(path);
-    });
-    this.fileQueues.set(path, next);
-    return next;
-  }
-
   async syncAll(): Promise<void> {
-    if (this.syncing) return this.syncing;
-    this.syncing = (async () => {
-      if (!this.boundChatId() || this.paused()) return;
-      const paths = await jsonlFiles(this.sessionsDir);
-      const changed: string[] = [];
-      for (const path of paths) {
-        const info = await stat(path);
-        const cursor = this.db.getCursor(path);
-        if (cursor.parsedOffset >= info.size && cursor.size === info.size && cursor.mtimeMs >= info.mtimeMs) continue;
-        changed.push(path);
-      }
-      let cursor = 0;
-      const workers = Array.from({ length: Math.min(4, changed.length) }, async () => {
-        while (cursor < changed.length) { const path = changed[cursor++]; if (path) await this.enqueueFile(path); }
-      });
-      await Promise.all(workers);
-    })().catch((error) => {
-      this.db.recordFailure("sync_all", {}, error);
-      throw error;
-    }).finally(() => { this.syncing = null; });
-    return this.syncing;
+    return this.sessionImporter.syncChangedFiles();
   }
 
   private async reconcileExistingState(): Promise<void> {
@@ -647,7 +600,7 @@ export class SyncService implements FeishuRouterPort {
     this.db.saveCursor(cursor);
     if (latestStat.size > fileStat.size || latestStat.mtimeMs > fileStat.mtimeMs) {
       console.info(`Session log changed during scan; scheduling another pass path=${basename(path)} offset=${cursor.parsedOffset}`);
-      const timer = setTimeout(() => this.queueFile(path), 300);
+      const timer = setTimeout(() => this.sessionImporter.enqueue(path), 300);
       timer.unref();
     }
   }
@@ -1801,7 +1754,7 @@ export class SyncService implements FeishuRouterPort {
       console.info(`Codex log is not available yet task=${task.id.slice(0, 8)} session=${sessionId.slice(0, 8)}`);
       return false;
     }
-    await this.enqueueFile(path);
+    await this.sessionImporter.enqueueAndWait(path);
     const cursor = this.db.getCursor(path);
     const fileStat = await stat(path);
     const active = this.db.getSetting(`session.${sessionId}.active`) === "1";
