@@ -11,6 +11,7 @@ import { resolveAllowedPath } from "./path-policy.js";
 import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { parseJsonlChunk } from "./session-parser.js";
+import type { FeishuRouterPort } from "./bridge-contracts.js";
 import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
@@ -118,7 +119,7 @@ function isSubagentSource(source: string): boolean {
   return /(?:^|[._:-])subagent(?:$|[._:-])|delegated?_agent/i.test(source);
 }
 
-export class SyncService {
+export class SyncService implements FeishuRouterPort {
   private readonly sessionsDir: string;
   private watcher: FSWatcher | null = null;
   private readonly fileQueues = new Map<string, Promise<void>>();
@@ -1203,7 +1204,7 @@ export class SyncService {
     catch (error) { this.db.failInboundEvent(eventId, error, isRetryableTransportError(error), claimToken); throw error; }
   }
 
-  private async handleCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
+  async handleCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
@@ -1458,6 +1459,8 @@ export class SyncService {
     }
   }
 
+  async handleMessage(message: IncomingFeishuMessage): Promise<void> { return this.onFeishuMessage(message); }
+
   private async handleFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
     const chatId = this.boundChatId();
     const openId = this.boundOpenId();
@@ -1634,6 +1637,8 @@ export class SyncService {
       this.db.completeInboundEvent(eventId, claimToken);
     } catch (error) { this.db.failInboundEvent(eventId, error, isRetryableTransportError(error), claimToken); throw error; }
   }
+
+  async handleMenuAction(action: IncomingBotMenuAction): Promise<void> { return this.onBotMenuAction(action); }
   private statusText(): string {
     return [
       `状态：${this.paused() ? "已暂停" : "运行中"}`,

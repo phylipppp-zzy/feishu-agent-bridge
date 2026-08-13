@@ -14,6 +14,8 @@ export type AppServerHealthState = "stopped" | "starting" | "healthy" | "unhealt
 export interface AppServerHealth { state: AppServerHealthState; epoch: number; sinceMs: number; lastError?: string; }
 export interface AppServerLifecycleEvent { kind: "started" | "exited" | "stopped"; epoch: number; error?: Error; }
 export interface AppServerPort {
+  readonly appServerEpoch: number;
+  readonly isHealthy: boolean;
   getHealth(): AppServerHealth;
   ensureStarted(): Promise<void>;
   request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T>;
