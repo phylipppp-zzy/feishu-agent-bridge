@@ -52,10 +52,17 @@ function postContent(body: Record<string, unknown>): { text: string; imageKeys: 
   return { text: text.join("\n"), imageKeys };
 }
 
-async function streamToBuffer(stream: Readable): Promise<Buffer> {
-  const pieces: Buffer[] = [];
-  for await (const piece of stream) pieces.push(Buffer.isBuffer(piece) ? piece : Buffer.from(piece));
-  return Buffer.concat(pieces);
+async function streamToBuffer(stream: Readable, maxBytes = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
+  const pieces: Buffer[] = []; let total = 0;
+  try {
+    for await (const piece of stream) {
+      const chunk = Buffer.isBuffer(piece) ? piece : Buffer.from(piece);
+      total += chunk.length;
+      if (total > maxBytes) { stream.destroy(new Error(`download exceeds ${maxBytes} bytes`)); throw new Error(`download exceeds ${maxBytes} bytes`); }
+      pieces.push(chunk);
+    }
+    return Buffer.concat(pieces);
+  } finally { if (!stream.destroyed) stream.destroy(); }
 }
 
 export function parseIncoming(
@@ -98,7 +105,9 @@ export function parseCardAction(data: Lark.RawCardActionEvent): IncomingCardActi
   const rawAction = (source as unknown as { action?: Record<string, unknown> }).action ?? {};
   const rawForm = rawAction.form_value ?? rawAction.formValue;
   const formValues = rawForm && typeof rawForm === "object" ? rawForm as Record<string, unknown> : {};
-  return {
+  const rawEventId = typeof raw.event_id === "string" ? raw.event_id : typeof raw.uuid === "string" ? raw.uuid : "";
+  const eventId = rawEventId || `card:${diagnosticId(JSON.stringify({ messageId: event.messageId, chatId: event.chatId, operator: event.operator.openId, action: value.action, value, formValues }))}`;
+  const parsed = {
     openId: event.operator.openId,
     chatId: event.chatId,
     openMessageId: event.messageId,
@@ -107,6 +116,8 @@ export function parseCardAction(data: Lark.RawCardActionEvent): IncomingCardActi
     formValues,
     ...(event.action.option ? { option: event.action.option } : {}),
   };
+  Object.defineProperty(parsed, "eventId", { value: eventId, enumerable: false });
+  return parsed;
 }
 
 export class FeishuClient implements FeishuPort {
@@ -376,10 +387,10 @@ export class FeishuClient implements FeishuPort {
     })));
   }
 
-  async downloadImage(messageId: string, imageKey: string): Promise<Buffer> {
+  async downloadImage(messageId: string, imageKey: string, maxBytes = 10 * 1024 * 1024): Promise<Buffer> {
     const response = await this.client.im.messageResource.get({
       params: { type: "image" }, path: { message_id: messageId, file_key: imageKey },
     });
-    return streamToBuffer(response.getReadableStream());
+    return streamToBuffer(response.getReadableStream(), maxBytes);
   }
 }

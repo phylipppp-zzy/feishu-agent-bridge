@@ -67,20 +67,20 @@ function summary(cwd?: string, model?: string, effort?: string): string {
   return `项目：${cwd ? `\`${safeMarkdown(cwd)}\`` : "未选择"}　模型：${model ? `\`${safeMarkdown(model)}\`` : "未选择"}　强度：${effort ? `\`${safeMarkdown(effortLabel(effort))}\`` : "未选择"}`;
 }
 
-export function homeCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number }, notice = ""): CardDefinition {
+export function homeCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number; appServer?: string }, notice = ""): CardDefinition {
   return card("Codex 控制台", status.paused ? "orange" : "blue", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
-    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　会话：**${status.sessions}**　运行中：**${status.active}**　排队：**${status.queued ?? 0}**　等待用户：**${status.waiting ?? 0}**　失败任务：**${status.failedTasks ?? 0}**　失败类别：**${status.failures}**`),
+    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　会话：**${status.sessions}**　运行中：**${status.active}**　排队：**${status.queued ?? 0}**　等待用户：**${status.waiting ?? 0}**　失败任务：**${status.failedTasks ?? 0}**　失败类别：**${status.failures}**${status.appServer ? `　app-server：**${safeMarkdown(status.appServer)}**` : ""}`),
     actionRow([button("新建会话", "new", "primary"), button("继续最近", "recent"), button("项目", "projects")]),
     actionRow([button("服务管理", "service")]),
     note("会话话题内直接回复或使用 /model 均无需 @ 机器人；优先使用会话根卡的“修改模型”。"),
   ]);
 }
 
-export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number }): CardDefinition {
+export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number; appServer?: string }): CardDefinition {
   return card("服务管理", status.paused ? "orange" : "blue", [
-    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**\n会话：${status.sessions}　运行中：${status.active}　排队：${status.queued ?? 0}　等待用户：${status.waiting ?? 0}　失败任务：${status.failedTasks ?? 0}　未解决失败类别：${status.failures}`),
-    actionRow([button("立即同步", "sync", "primary"), status.paused ? button("恢复同步", "resume", "primary") : button("暂停同步", "pause")]),
+    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**\n会话：${status.sessions}　运行中：${status.active}　排队：${status.queued ?? 0}　等待用户：${status.waiting ?? 0}　失败任务：${status.failedTasks ?? 0}　未解决失败类别：${status.failures}${status.appServer ? `\napp-server：${safeMarkdown(status.appServer)}` : ""}`),
+    actionRow([button("立即同步", "sync", "primary"), status.paused ? button("恢复 Bridge", "resume", "primary") : button("暂停 Bridge", "pause")]),
     actionRow([button("重试失败", "retry"), button("使用帮助", "help"), button("返回控制台", "home")]),
   ]);
 }
@@ -175,20 +175,29 @@ export function recentSessionsCard(sessions: SessionView[], search = "", page = 
   ]);
 }
 
-export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null }, status = "可继续"): CardDefinition {
-  const title = shorten(session.title || session.firstUserText) || "Codex 会话";
-  const mode = (session as { collaborationMode?: string | null }).collaborationMode === "plan" ? "Plan（只规划）" : "Default（执行）";
-  const grant = (session as { rootGrantExpiresAt?: number | null }).rootGrantExpiresAt;
-  const grantText = grant && grant > Date.now() ? `Root 授权至：**${new Date(grant).toLocaleString("zh-CN", { hour12: false })}**` : "Root 授权：**未确认**";
-  return card(title, status === "运行中" ? "orange" : "green", [
-    markdown(`项目：\`${safeMarkdown(session.cwd)}\`\n模型：\`${safeMarkdown(session.model ?? "继承全局配置")}\`　强度：\`${safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认")}\`\n模式：**${safeMarkdown(mode)}**\n状态：**${safeMarkdown(status)}**　ID：\`${session.sessionId.slice(0, 8)}\``),
-    markdown(grantText),
-    actionRow([button("修改模型", "session_model", "primary"), button(mode.startsWith("Plan") ? "切换 Default" : "切换 Plan", "session_toggle_mode"), ...(mode.startsWith("Plan") ? [button("按计划执行", "execute_plan", "primary")] : [])]),
-    actionRow([button("确认 Root 授权", "root_grant", "danger"), button("撤销 Root 授权", "root_revoke"), button("查看本轮审阅", "turn_review")]),
-    note(mode.startsWith("Plan") ? "Plan 完成后不会自动执行；点击“按计划执行”会启动新的 Default 回合。" : "Root 无沙箱：Codex 可读写整个容器、访问网络并启动进程。每会话授权有效期受限，且重启后失效。"),
-  ]);
+export interface SessionCardPresentation {
+  executionMode?: "workspace-write" | "root-danger-full-access";
+  rootExecutionReady?: boolean;
+  rootPreflightReasons?: string[];
+  hasActiveWork?: boolean;
 }
 
+export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null; collaborationMode?: string | null }, status = "可继续", presentation: SessionCardPresentation = {}): CardDefinition {
+  const title = shorten(session.title || session.firstUserText) || "Codex 会话";
+  const plan = session.collaborationMode === "plan";
+  const mode = plan ? "Plan（只读规划）" : "Default（执行）";
+  const root = presentation.executionMode === "root-danger-full-access";
+  const risk = root
+    ? (presentation.rootExecutionReady === false ? "Root 容器预检失败：" + ((presentation.rootPreflightReasons ?? []).join("；") || "执行已禁用") : "专用容器 Root 模式：本任务可读写容器、访问网络并启动进程；每次任务单独授权。")
+    : plan ? "Plan：只读沙箱、禁止网络，不会请求 Root。" : "Default：仅允许 canonical 工作目录写入，禁止网络。";
+  const controls = [button("修改模型", "session_model", "primary"), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode"), button("查看本轮审阅", "turn_review")];
+  const tick = "\\x60";
+  return card(title, status === "运行中" ? "orange" : "green", [
+    markdown("项目：" + tick + safeMarkdown(session.cwd) + tick + "\\n模型：" + tick + safeMarkdown(session.model ?? "继承全局配置") + tick + "　强度：" + tick + safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认") + tick + "\\n模式：**" + safeMarkdown(mode) + "**\\n状态：**" + safeMarkdown(status) + "**　ID：" + tick + session.sessionId.slice(0, 8) + tick),
+    actionRow(controls),
+    note(risk + (presentation.hasActiveWork ? " 当前有任务运行中，设置只在下一轮生效。" : "")),
+  ]);
+}
 export function runStatusCard(state: string, detail: string, cancellable = false, sessionId?: string): CardDefinition {
   return card("Codex 运行状态", state === "失败" ? "red" : state === "完成" ? "green" : "orange", [
     markdown(`状态：**${safeMarkdown(state)}**\n${safeMarkdown(detail || "等待 Codex 输出")}`),

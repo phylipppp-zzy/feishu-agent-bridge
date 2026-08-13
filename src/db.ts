@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FileCursor, PendingServerRequest, QueuedTask, SessionMetadata, TaskRootGrant, TurnState } from "./types.js";
@@ -6,6 +7,7 @@ import type { FileCursor, PendingServerRequest, QueuedTask, SessionMetadata, Tas
 
 export class BridgeDatabase {
   readonly db: DatabaseSync;
+  readonly serviceEpoch = randomUUID();
 
   constructor(stateDir: string) {
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
@@ -127,6 +129,8 @@ export class BridgeDatabase {
       stream_json TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS turn_runs_session_state ON turn_runs(session_id,state);
+    CREATE TABLE IF NOT EXISTS app_server_deliveries (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, role TEXT NOT NULL, started_at_ms INTEGER, ended_at_ms INTEGER, content_hash TEXT NOT NULL, content_bytes INTEGER NOT NULL DEFAULT 0, feishu_message_id TEXT, source_message_id TEXT, source_path TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY(session_id,turn_id,role));
+    CREATE INDEX IF NOT EXISTS app_server_deliveries_hash ON app_server_deliveries(session_id,role,content_hash);
     CREATE TABLE IF NOT EXISTS turn_items (
       turn_id TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
       payload TEXT NOT NULL DEFAULT '{}', feishu_message_id TEXT, updated_at_ms INTEGER NOT NULL,
@@ -155,6 +159,11 @@ export class BridgeDatabase {
       session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, open_id TEXT NOT NULL, epoch INTEGER NOT NULL,
       expires_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );`);
+    this.ensureColumn("inbound_events", "claim_token", "TEXT");
+    this.ensureColumn("inbound_events", "service_epoch", "TEXT");
+    this.ensureColumn("inbound_events", "lease_until_ms", "INTEGER");
+    this.ensureColumn("inbound_events", "attempt_count", "INTEGER NOT NULL DEFAULT 0");
+    this.db.prepare("UPDATE inbound_events SET status='retryable_failed',error='service restarted during event processing',updated_at_ms=? WHERE status='processing' AND (service_epoch IS NULL OR service_epoch<>?)").run(Date.now(), this.serviceEpoch);
     this.ensureColumn("turn_runs", "started_at_ms", "INTEGER");
     this.ensureColumn("turn_runs", "ended_at_ms", "INTEGER");
     this.ensureColumn("turn_runs", "input_hash", "TEXT");
@@ -372,6 +381,14 @@ export class BridgeDatabase {
       .run(sessionId, messageId, state, detail, Date.now());
   }
 
+  upsertAppServerDelivery(delivery: { sessionId: string; turnId: string; role: string; startedAtMs?: number | null; endedAtMs?: number | null; contentHash: string; contentBytes: number; feishuMessageId?: string | null; sourceMessageId?: string | null; sourcePath?: string | null }): void {
+    this.db.prepare("INSERT INTO app_server_deliveries(session_id,turn_id,role,started_at_ms,ended_at_ms,content_hash,content_bytes,feishu_message_id,source_message_id,source_path,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,turn_id,role) DO UPDATE SET started_at_ms=COALESCE(excluded.started_at_ms,app_server_deliveries.started_at_ms),ended_at_ms=COALESCE(excluded.ended_at_ms,app_server_deliveries.ended_at_ms),content_hash=excluded.content_hash,content_bytes=excluded.content_bytes,feishu_message_id=COALESCE(excluded.feishu_message_id,app_server_deliveries.feishu_message_id),source_message_id=COALESCE(excluded.source_message_id,app_server_deliveries.source_message_id),source_path=COALESCE(excluded.source_path,app_server_deliveries.source_path),updated_at_ms=excluded.updated_at_ms").run(delivery.sessionId, delivery.turnId, delivery.role, delivery.startedAtMs ?? null, delivery.endedAtMs ?? null, delivery.contentHash, delivery.contentBytes, delivery.feishuMessageId ?? null, delivery.sourceMessageId ?? null, delivery.sourcePath ?? null, Date.now(), Date.now());
+  }
+  findAppServerDelivery(sessionId: string, role: string, contentHash: string): { turnId: string; feishuMessageId: string | null } | null {
+    const row = this.db.prepare("SELECT turn_id,feishu_message_id FROM app_server_deliveries WHERE session_id=? AND role=? AND content_hash=? ORDER BY updated_at_ms DESC LIMIT 1").get(sessionId, role, contentHash) as { turn_id?: string; feishu_message_id?: string } | undefined;
+    return row?.turn_id ? { turnId: row.turn_id, feishuMessageId: row.feishu_message_id ? String(row.feishu_message_id) : null } : null;
+  }
+
   getRunStatus(sessionId: string): { messageId: string | null; state: string; detail: string; updatedAtMs: number } | null {
     const row = this.db.prepare("SELECT message_id,state,detail,updated_at_ms FROM run_status WHERE session_id=?").get(sessionId) as Record<string, unknown> | undefined;
     return row ? { messageId: row.message_id ? String(row.message_id) : null, state: String(row.state), detail: String(row.detail), updatedAtMs: Number(row.updated_at_ms) } : null;
@@ -401,16 +418,24 @@ export class BridgeDatabase {
     return row?.turn_id ? this.getTurn(row.turn_id) : null;
   }
 
-  private reviewPayload(payload: Record<string, unknown>): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
-    for (const key of ["type", "command", "reason", "summary", "status"]) {
-      if (typeof payload[key] === "string") result[key] = payload[key].slice(0, key === "command" ? 500 : 2_000);
-    }
-    if (Array.isArray(payload.changes)) result.changes = payload.changes.filter((item): item is string => typeof item === "string").slice(0, 100).map((item) => item.slice(0, 500));
-    if (typeof payload.aggregatedOutput === "string") result.aggregatedOutput = payload.aggregatedOutput.slice(0, 2_000);
-    return result;
+  latestTurn(sessionId: string): TurnState | null {
+    const row = this.db.prepare("SELECT turn_id FROM turn_runs WHERE session_id=? ORDER BY COALESCE(ended_at_ms,updated_at_ms) DESC LIMIT 1").get(sessionId) as { turn_id?: string } | undefined;
+    return row?.turn_id ? this.getTurn(row.turn_id) : null;
   }
 
+  private reviewPayload(payload: Record<string, unknown>): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+    if (typeof payload.type === "string") result.type = payload.type.slice(0, 120);
+    if (typeof payload.status === "string") result.status = payload.status.slice(0, 80);
+    if (typeof payload.command === "string") result.command = payload.command.replace(/(?:authorization|cookie|token|password|secret|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[REDACTED]").slice(0, 200);
+    if (typeof payload.reason === "string") result.reason = payload.reason.replace(/\s+/g, " ").slice(0, 300);
+    if (typeof payload.summary === "string") result.summary = payload.summary.replace(/(?:authorization|cookie|token|password|secret|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[REDACTED]").slice(0, 500);
+    if (typeof payload.aggregatedOutput === "string") result.aggregatedOutput = payload.aggregatedOutput.replace(/(?:authorization|cookie|token|password|secret|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[REDACTED]").slice(0, 2_000);
+    if (Array.isArray(payload.changes)) result.changes = payload.changes.filter((item): item is string => typeof item === "string").slice(0, 50).map((item) => item.split(/[\\/]/).pop()!.slice(0, 160));
+    if (Array.isArray(payload.permissionKinds)) result.permissionKinds = payload.permissionKinds.filter((item): item is string => typeof item === "string").slice(0, 20);
+    if (typeof payload.mcpServer === "string") result.mcpServer = payload.mcpServer.slice(0, 120);
+    return result;
+  }
   saveTurnItem(turnId: string, itemId: string, kind: string, status: string, payload: Record<string, unknown>, feishuMessageId: string | null = null): void {
     this.db.prepare(`INSERT INTO turn_items(turn_id,item_id,kind,status,payload,feishu_message_id,updated_at_ms) VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(turn_id,item_id) DO UPDATE SET kind=excluded.kind,status=excluded.status,payload=excluded.payload,feishu_message_id=COALESCE(excluded.feishu_message_id,turn_items.feishu_message_id),updated_at_ms=excluded.updated_at_ms`)
@@ -638,7 +663,7 @@ export class BridgeDatabase {
       ? "SELECT * FROM task_queue WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')"
       : rootMessageId
         ? "SELECT * FROM task_queue WHERE root_message_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')"
-        : "SELECT * FROM task_queue WHERE status NOT IN ('completed','failed','cancelled','interrupted')";
+        : "SELECT * FROM task_queue WHERE 1=0";
     const value = sessionId ?? rootMessageId;
     const rows = value === null ? this.db.prepare(query).all() as Record<string, unknown>[] : this.db.prepare(query).all(value) as Record<string, unknown>[];
     if (!rows.length) return [];
@@ -651,6 +676,16 @@ export class BridgeDatabase {
       }
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return rows.map((row) => this.taskFromRow(row));
+  }
+
+  cancelTasksBySession(sessionId: string, reason: string): QueuedTask[] { return this.cancelTasks(null, sessionId, reason); }
+  cancelTasksByRoot(rootMessageId: string, reason: string): QueuedTask[] { return this.cancelTasks(rootMessageId, null, reason); }
+  cancelAllTasks(reason: string): QueuedTask[] {
+    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status NOT IN ('completed','failed','cancelled','interrupted')").all() as Record<string, unknown>[];
+    if (!rows.length) return [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try { for (const row of rows) { const id = String(row.id); this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason=?,updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted')").run(reason, Date.now(), id); this.db.prepare("UPDATE task_root_grants SET status='cancelled',updated_at_ms=? WHERE task_id=? AND status IN ('pending','approved')").run(Date.now(), id); } this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return rows.map((row) => this.taskFromRow(row));
   }
 
@@ -693,27 +728,41 @@ export class BridgeDatabase {
 
   deleteChoice(requestId: string): void { this.db.prepare("DELETE FROM choice_queue WHERE request_id=?").run(requestId); }
 
-  claimInboundEvent(eventId: string): boolean {
+  claimInboundEvent(eventId: string, leaseMs = 5 * 60_000): boolean {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.db.prepare("SELECT status FROM inbound_events WHERE event_id=?").get(eventId) as { status?: string } | undefined;
-      if (row && row.status !== "retryable_failed") { this.db.exec("COMMIT"); return false; }
-      if (row) this.db.prepare("UPDATE inbound_events SET status='processing',error=NULL,updated_at_ms=? WHERE event_id=? AND status='retryable_failed'").run(Date.now(), eventId);
-      else this.db.prepare("INSERT INTO inbound_events(event_id,status,created_at_ms,updated_at_ms) VALUES(?,'processing',?,?)").run(eventId, Date.now(), Date.now());
+      const now = Date.now(); const token = randomUUID();
+      const row = this.db.prepare("SELECT status,service_epoch,lease_until_ms FROM inbound_events WHERE event_id=?").get(eventId) as { status?: string; service_epoch?: string; lease_until_ms?: number } | undefined;
+      if (row && row.status === "completed" || row?.status === "permanent_failed") { this.db.exec("COMMIT"); return false; }
+      const reclaim = !row || row.status === "retryable_failed" || row.status === "processing" && (row.service_epoch !== this.serviceEpoch || Number(row.lease_until_ms ?? 0) <= now);
+      if (!reclaim) { this.db.exec("COMMIT"); return false; }
+      if (row) this.db.prepare("UPDATE inbound_events SET status='processing',error=NULL,claim_token=?,service_epoch=?,lease_until_ms=?,attempt_count=COALESCE(attempt_count,0)+1,updated_at_ms=? WHERE event_id=?").run(token, this.serviceEpoch, now + leaseMs, now, eventId);
+      else this.db.prepare("INSERT INTO inbound_events(event_id,status,claim_token,service_epoch,lease_until_ms,attempt_count,created_at_ms,updated_at_ms) VALUES(?,'processing',?,?,?,1,?,?)").run(eventId, token, this.serviceEpoch, now + leaseMs, now, now);
       this.db.exec("COMMIT"); return true;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
-  completeInboundEvent(eventId: string): void { this.db.prepare("UPDATE inbound_events SET status='completed',updated_at_ms=? WHERE event_id=? AND status='processing'").run(Date.now(), eventId); }
-  failInboundEvent(eventId: string, error: unknown, retryable: boolean): void {
-    this.db.prepare("UPDATE inbound_events SET status=?,error=?,updated_at_ms=? WHERE event_id=? AND status='processing'")
-      .run(retryable ? "retryable_failed" : "permanent_failed", error instanceof Error ? error.message : String(error), Date.now(), eventId);
+  inboundClaimToken(eventId: string): string | null {
+    const row = this.db.prepare("SELECT claim_token FROM inbound_events WHERE event_id=? AND status=\'processing\' AND service_epoch=?").get(eventId, this.serviceEpoch) as { claim_token?: string } | undefined;
+    return row?.claim_token ? String(row.claim_token) : null;
+  }
+
+  recoverStaleInboundEvents(now = Date.now()): number {
+    const result = this.db.prepare("UPDATE inbound_events SET status='retryable_failed',error='processing lease expired',updated_at_ms=? WHERE status='processing' AND (lease_until_ms IS NULL OR lease_until_ms<=?)").run(now, now);
+    return Number(result.changes);
+  }
+
+  completeInboundEvent(eventId: string, claimToken?: string | null): void { this.db.prepare("UPDATE inbound_events SET status='completed',claim_token=NULL,lease_until_ms=NULL,updated_at_ms=? WHERE event_id=? AND status='processing' AND service_epoch=? AND (? IS NULL OR claim_token=? )").run(Date.now(), eventId, this.serviceEpoch, claimToken ?? null, claimToken ?? null); }
+  failInboundEvent(eventId: string, error: unknown, retryable: boolean, claimToken?: string | null): void {
+    this.db.prepare("UPDATE inbound_events SET status=?,error=?,claim_token=NULL,lease_until_ms=NULL,updated_at_ms=? WHERE event_id=? AND status='processing' AND service_epoch=? AND (? IS NULL OR claim_token=? )")
+      .run(retryable ? "retryable_failed" : "permanent_failed", error instanceof Error ? error.message : String(error), Date.now(), eventId, this.serviceEpoch, claimToken ?? null, claimToken ?? null);
   }
 
   pruneRetainedData(now = Date.now()): void {
     const day = 24 * 60 * 60 * 1_000;
-    this.db.prepare("DELETE FROM task_queue WHERE status IN ('completed','cancelled','interrupted') AND updated_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM task_queue WHERE status IN ('completed','failed','cancelled','interrupted') AND updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM turn_runs WHERE state IN ('completed','failed','interrupted') AND updated_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM app_server_deliveries WHERE updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM turn_items WHERE turn_id NOT IN (SELECT turn_id FROM turn_runs)").run();
     this.db.prepare("DELETE FROM server_requests WHERE status IN ('resolved','declined','expired') AND updated_at_ms<?").run(now - 7 * day);
     this.db.prepare("DELETE FROM task_root_grants WHERE status NOT IN ('pending','approved') AND updated_at_ms<?").run(now - 7 * day);

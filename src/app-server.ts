@@ -10,6 +10,19 @@ export interface JsonRpcMessage { jsonrpc?: "2.0"; id?: JsonRpcId; method?: stri
 export type ServerRequestHandler = (request: JsonRpcMessage) => Promise<unknown>;
 export type ServerNotificationHandler = (notification: JsonRpcMessage) => Promise<void> | void;
 export type AppServerExitHandler = (event: { epoch: number; code: number | null; error?: Error }) => void;
+export type AppServerHealthState = "stopped" | "starting" | "healthy" | "unhealthy" | "restarting";
+export interface AppServerHealth { state: AppServerHealthState; epoch: number; sinceMs: number; lastError?: string; }
+export interface AppServerLifecycleEvent { kind: "started" | "exited" | "stopped"; epoch: number; error?: Error; }
+export interface AppServerPort {
+  getHealth(): AppServerHealth;
+  ensureStarted(): Promise<void>;
+  request<T = unknown>(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<T>;
+  respond(id: JsonRpcId, result: unknown): Promise<void>;
+  reject(id: JsonRpcId, error: { code: number; message: string; data?: unknown }): Promise<void>;
+  interrupt(threadId: string, turnId: string): Promise<void>;
+  restart(reason?: string): Promise<void>;
+  close(): Promise<void>;
+}
 const execFileAsync = promisify(execFile);
 const REQUIRED_PROTOCOL_TOKENS = ["thread/start", "thread/resume", "thread/list", "turn/start", "turn/steer", "turn/interrupt", "item/tool/requestUserInput", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "turn/completed"];
 
@@ -26,18 +39,32 @@ export class CodexAppServer {
   private starting: Promise<void> | null = null;
   private healthy = false;
   private writeTail: Promise<void> = Promise.resolve();
+  private healthState: AppServerHealthState = "stopped";
+  private healthSinceMs = Date.now();
+  private lastHealthError: string | undefined;
+  private expectedClose = false;
+  private notifiedExitEpoch = -1;
+  private readonly lifecycleHandlers = new Set<(event: AppServerLifecycleEvent) => void>();
 
   constructor(private readonly bin: string, private readonly codexHome: string, private readonly stateDir?: string) {}
 
   get appServerEpoch(): number { return this.epoch; }
   get isHealthy(): boolean { return this.healthy; }
+  getHealth(): AppServerHealth { return { state: this.healthState, epoch: this.epoch, sinceMs: this.healthSinceMs, ...(this.lastHealthError ? { lastError: this.lastHealthError } : {}) }; }
+  onLifecycle(handler: (event: AppServerLifecycleEvent) => void): () => void { this.lifecycleHandlers.add(handler); return () => this.lifecycleHandlers.delete(handler); }
+  private setHealth(state: AppServerHealthState, error?: Error): void { this.healthState = state; this.healthSinceMs = Date.now(); this.lastHealthError = error?.message; }
+  private emitLifecycle(event: AppServerLifecycleEvent): void { for (const handler of this.lifecycleHandlers) handler(event); }
+  private notifyExit(code: number | null, error: Error): void { if (this.notifiedExitEpoch === this.epoch) return; this.notifiedExitEpoch = this.epoch; this.healthy = false; this.setHealth(this.expectedClose ? "stopped" : "unhealthy", error); this.failPending(error); if (!this.expectedClose) for (const handler of this.exitHandlers) handler({ epoch: this.epoch, code, error }); this.emitLifecycle({ kind: this.expectedClose ? "stopped" : "exited", epoch: this.epoch, error }); }
   onServerRequest(handler: ServerRequestHandler): void { this.handler = handler; }
   onNotification(handler: ServerNotificationHandler): void { this.notificationHandler = handler; }
   onExit(handler: AppServerExitHandler): () => void { this.exitHandlers.add(handler); return () => this.exitHandlers.delete(handler); }
-  async restart(): Promise<void> { await this.close(); await this.start(); }
+  async ensureStarted(): Promise<void> { await this.start(); }
+  async restart(reason = "manual restart"): Promise<void> { this.setHealth("restarting", new Error(reason)); await this.close(); await this.start(); }
+  async interrupt(threadId: string, turnId: string): Promise<void> { await this.request("turn/interrupt", { threadId, turnId }, 10_000); }
 
   async start(): Promise<void> {
     if (this.child && this.healthy) return;
+    this.setHealth("starting");
     if (this.starting) return this.starting;
     this.starting = this.startImpl().finally(() => { this.starting = null; });
     return this.starting;
@@ -47,31 +74,23 @@ export class CodexAppServer {
     if (this.child) await this.close();
     const enabled = await this.detectFeatureFlags();
     await this.cacheAndVerifySchema();
+    this.expectedClose = false;
     this.child = spawn(this.bin, ["app-server", "--stdio", ...enabled.flatMap((name) => ["--enable", name])], {
       env: { ...process.env, CODEX_HOME: this.codexHome }, stdio: ["pipe", "pipe", "pipe"],
     });
     this.epoch += 1;
     this.child.stderr.setEncoding("utf8").on("data", (chunk: string) => console.warn(`[codex app-server] ${chunk.trimEnd()}`));
-    this.child.on("close", (code) => {
-      this.healthy = false;
-      this.child = null;
-      const error = new Error(`Codex app-server exited (${code ?? "unknown"})`);
-      this.failPending(error);
-      for (const handler of this.exitHandlers) handler({ epoch: this.epoch, code, error });
-    });
-    this.child.on("error", (error) => {
-      this.healthy = false;
-      this.failPending(error instanceof Error ? error : new Error(String(error)));
-    });
-    this.child.stdin.on("error", (error) => {
-      this.healthy = false;
-      this.failPending(error instanceof Error ? error : new Error(String(error)));
-    });
+    this.notifiedExitEpoch = -1;
+    this.child.on("close", (code) => { const error = new Error("Codex app-server exited (" + (code ?? "unknown") + ")"); this.child = null; this.notifyExit(code, error); });
+    this.child.on("error", (error) => this.notifyExit(null, error instanceof Error ? error : new Error(String(error))));
+    this.child.stdin.on("error", (error) => this.notifyExit(null, error instanceof Error ? error : new Error(String(error))));
     this.lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     this.lines.on("line", (line) => this.consume(line));
     await this.request("initialize", { clientInfo: { name: "feishu-codex-bridge", title: "Feishu Codex Bridge", version: "0.2.0" }, capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true } });
     await this.write({ method: "initialized", params: {} });
     this.healthy = true;
+    this.setHealth("healthy");
+    this.emitLifecycle({ kind: "started", epoch: this.epoch });
   }
 
   private async detectFeatureFlags(): Promise<string[]> {
@@ -106,12 +125,14 @@ export class CodexAppServer {
   }
 
   async close(): Promise<void> {
+    this.expectedClose = true;
     this.lines?.close();
     this.lines = null;
     const child = this.child;
     this.child = null;
     this.failPending(new Error("Codex app-server closed"));
     this.healthy = false;
+    this.setHealth("stopped");
     if (!child) return;
     child.kill("SIGTERM");
     await new Promise<void>((resolve) => {
@@ -133,10 +154,20 @@ export class CodexAppServer {
     });
   }
 
-  respond(id: JsonRpcId, result: unknown): void { void this.write({ jsonrpc: "2.0", id, result }).catch((error) => this.failPending(error)); }
-  reject(id: JsonRpcId, error: { code: number; message: string; data?: unknown }): void { void this.write({ jsonrpc: "2.0", id, error }).catch((cause) => this.failPending(cause)); }
+  async respond(id: JsonRpcId, result: unknown): Promise<void> { await this.writeWithTimeout({ jsonrpc: "2.0", id, result }, 10_000); }
+  async reject(id: JsonRpcId, error: { code: number; message: string; data?: unknown }): Promise<void> { await this.writeWithTimeout({ jsonrpc: "2.0", id, error }, 10_000); }
 
-  private async startIfNeeded(): Promise<void> { if (!this.child) await this.start(); }
+  private async startIfNeeded(): Promise<void> {
+    if (this.child) {
+      if (this.healthState === "unhealthy") throw new Error("Codex app-server is unhealthy");
+      return;
+    }
+    await this.start();
+  }
+  private async writeWithTimeout(message: JsonRpcMessage, timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try { await Promise.race([this.write(message), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Codex app-server write timed out")), timeoutMs); timer.unref(); })]); } finally { if (timer) clearTimeout(timer); }
+  }
   private write(message: JsonRpcMessage): Promise<void> {
     const payload = JSON.stringify(message) + "\n";
     this.writeTail = this.writeTail.catch(() => undefined).then(() => new Promise<void>((resolve, reject) => {

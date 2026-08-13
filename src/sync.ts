@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { watch, type FSWatcher } from "chokidar";
 import { assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { CodexAppServer, type JsonRpcMessage } from "./app-server.js";
@@ -8,15 +8,17 @@ import { CodexCliProbe } from "./codex.js";
 import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
 import { resolveAllowedPath } from "./path-policy.js";
-import { remoteApprovalAllowed, rootExecutionPreflight } from "./execution-policy.js";
+import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { parseJsonlChunk } from "./session-parser.js";
 import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
 const MAX_INLINE_MESSAGE_BYTES = 45_000;
+const MAX_LIVE_TEXT_BYTES = 200_000;
 const PENDING_PROMPT_TTL_MS = 10 * 60_000;
 const MODEL_CATALOG_KEY = "codex.model_catalog.v1";
+const MODEL_BACKFILL_MIGRATION_KEY = "migration.session_model_backfill.v1";
 const LOG_SYNC_ATTEMPTS = 10;
 const LOG_SYNC_RETRY_MS = 500;
 const STREAM_INTERVAL_MS = 500;
@@ -71,6 +73,20 @@ function shortText(text: string, max = 80): string {
   return [...compact].slice(0, max).join("");
 }
 
+function appendBoundedText(current: string, delta: string, maxBytes: number): string {
+  const combined = current + delta;
+  if (Buffer.byteLength(combined, "utf8") <= maxBytes) return combined;
+  const head = combined.slice(0, Math.floor(maxBytes * 0.75));
+  const tail = combined.slice(-Math.floor(maxBytes * 0.2));
+  return head + "\n\n[…正文过长，已截断；完整内容见同步日志…]\n\n" + tail;
+}
+
+function inlinePreview(text: string): string {
+  if (Buffer.byteLength(text, "utf8") <= MAX_INLINE_MESSAGE_BYTES) return text;
+  const head = text.slice(0, 30_000); const tail = text.slice(-10_000);
+  return head + "\n\n[…正文超过飞书卡片上限，完整内容见 Markdown 附件…]\n\n" + tail;
+}
+
 function imageExtension(data: Buffer): string {
   if (data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return ".png";
   if (data[0] === 0xff && data[1] === 0xd8) return ".jpg";
@@ -116,6 +132,8 @@ export class SyncService {
   private models: ModelCapability[] = [];
   private titleIndex: Map<string, string> | null = null;
   private rootExecutionReady = false;
+  private appServerRestartAttempts = 0;
+  private appServerRestartTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -137,6 +155,7 @@ export class SyncService {
     }
     if (this.appServer) {
       this.appServer.onNotification((event) => this.enqueueAppServerNotification(event));
+      this.appServer.onLifecycle((event) => { if (event.kind === "started") this.appServerRestartAttempts = 0; });
       this.appServer.onExit((event) => { void this.handleAppServerExit(event.epoch, event.error); });
       this.appServer.onServerRequest((request) => this.onAppServerRequest(request));
       await this.appServer.start();
@@ -164,6 +183,7 @@ export class SyncService {
         void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "服务重启时任务尚未完成；请重新发送该消息。", false);
       }
     }
+    this.db.recoverStaleInboundEvents();
     this.db.pruneRetainedData();
     await this.cleanupStaleTempFiles();
     await mkdir(this.sessionsDir, { recursive: true });
@@ -176,6 +196,7 @@ export class SyncService {
       void this.syncAll();
       void this.drainPendingTasks();
       void this.reconcileAwaitingSyncTasks();
+      void this.expireRootGrants();
     }, this.config.scanIntervalMs);
     this.scanTimer.unref();
     if (this.boundChatId()) {
@@ -190,8 +211,9 @@ export class SyncService {
 
   async stop(): Promise<void> {
     if (this.scanTimer) clearInterval(this.scanTimer);
+    if (this.appServerRestartTimer) clearTimeout(this.appServerRestartTimer);
     await Promise.all([...this.activeTurns.keys()].map((sessionId) => this.cancelSessionWork(sessionId, null, "service stopping")));
-    await this.cancelSessionWork(null, null, "service stopping");
+    await this.cancelAllWork("service stopping");
     await this.watcher?.close();
     await Promise.allSettled([...(this.syncing ? [this.syncing] : []), ...this.fileQueues.values()]);
     await this.appServer?.close();
@@ -242,6 +264,7 @@ export class SyncService {
   }
 
   private async backfillHistoricalModels(): Promise<void> {
+    if (this.db.getSetting(MODEL_BACKFILL_MIGRATION_KEY) === "1") return;
     for (const session of this.db.listSessions()) {
       if (session.model && session.reasoningEffort) continue;
       try {
@@ -253,6 +276,7 @@ export class SyncService {
         this.db.recordFailure("backfill_session_model", { sessionId: session.sessionId, path: session.path }, error);
       }
     }
+    this.db.setSetting(MODEL_BACKFILL_MIGRATION_KEY, "1");
   }
 
   private queueFile(path: string): void {
@@ -276,12 +300,19 @@ export class SyncService {
     if (this.syncing) return this.syncing;
     this.syncing = (async () => {
       if (!this.boundChatId() || this.paused()) return;
-      for (const path of await jsonlFiles(this.sessionsDir)) {
+      const paths = await jsonlFiles(this.sessionsDir);
+      const changed: string[] = [];
+      for (const path of paths) {
         const info = await stat(path);
         const cursor = this.db.getCursor(path);
         if (cursor.parsedOffset >= info.size && cursor.size === info.size && cursor.mtimeMs >= info.mtimeMs) continue;
-        await this.enqueueFile(path);
+        changed.push(path);
       }
+      let cursor = 0;
+      const workers = Array.from({ length: Math.min(4, changed.length) }, async () => {
+        while (cursor < changed.length) { const path = changed[cursor++]; if (path) await this.enqueueFile(path); }
+      });
+      await Promise.all(workers);
     })().catch((error) => {
       this.db.recordFailure("sync_all", {}, error);
       throw error;
@@ -577,11 +608,9 @@ export class SyncService {
       }
       if (message.role === "progress" && !this.activeTurns.has(session.sessionId)) continue;
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Codex" : "进度";
-      const deliveryKey = message.role === "assistant" ? `app_delivery.${session.sessionId}.${textHash(message.text)}` : null;
-      const appDelivered = deliveryKey ? this.db.getSetting(deliveryKey) : null;
-      if (deliveryKey && appDelivered) {
-        this.db.deleteSetting(deliveryKey);
-        this.db.saveMessage(message.id, session.sessionId, "app_server_delivery", appDelivered, { path, kind: "primary" });
+      const mapped = message.role === "assistant" ? this.db.findAppServerDelivery(session.sessionId, "assistant", textHash(message.text)) : null;
+      if (mapped?.feishuMessageId) {
+        this.db.saveMessage(message.id, session.sessionId, "app_server_delivery", mapped.feishuMessageId, { path, kind: "primary" });
         continue;
       }
       let feishuId: string;
@@ -665,10 +694,10 @@ export class SyncService {
   }
 
   private async cancelSessionWork(sessionId: string | null, rootMessageId: string | null, reason: string): Promise<number> {
-    const cancelled = this.db.cancelTasks(rootMessageId, sessionId, reason);
-    if (!cancelled.length) return 0;
-    const targetSessionId = sessionId ?? cancelled.find((task) => task.sessionId)?.sessionId ?? null;
-    if (targetSessionId) {
+    const cancelled = sessionId ? this.db.cancelTasksBySession(sessionId, reason) : rootMessageId ? this.db.cancelTasksByRoot(rootMessageId, reason) : [];
+    const targetIds = new Set<string>(cancelled.flatMap((task) => task.sessionId ? [task.sessionId] : []));
+    if (sessionId) targetIds.add(sessionId);
+    for (const targetSessionId of targetIds) {
       const active = this.activeTurns.get(targetSessionId);
       if (active) {
         this.activeTurns.delete(targetSessionId);
@@ -684,6 +713,13 @@ export class SyncService {
     return cancelled.length;
   }
 
+  private async cancelAllWork(reason: string): Promise<number> {
+    const cancelled = this.db.cancelAllTasks(reason);
+    const ids = new Set<string>(cancelled.flatMap((task) => task.sessionId ? [task.sessionId] : []));
+    for (const sessionId of this.activeTurns.keys()) ids.add(sessionId);
+    for (const sessionId of ids) await this.cancelSessionWork(sessionId, null, reason);
+    return cancelled.length;
+  }
   private async handleAppServerExit(epoch: number, error?: Error): Promise<void> {
     const interrupted = this.db.markRunningTasksInterrupted();
     for (const turn of this.activeTurns.values()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
@@ -695,6 +731,21 @@ export class SyncService {
       if (task.rootMessageId && task.sessionId) void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "Codex app-server 已退出；该任务不会自动重放。", false).catch(() => undefined);
     }
     if (error) this.db.recordFailure("app_server_exit", { epoch }, error);
+    this.scheduleAppServerRestart();
+  }
+
+  private scheduleAppServerRestart(): void {
+    if (!this.appServer || this.appServerRestartTimer || this.appServerRestartAttempts >= 5) return;
+    const delays = [1_000, 2_000, 5_000, 10_000, 30_000];
+    const delay = delays[this.appServerRestartAttempts++] ?? 30_000;
+    this.appServerRestartTimer = setTimeout(() => {
+      this.appServerRestartTimer = null;
+      void this.appServer!.restart("recover after unexpected app-server exit").then(() => this.drainPendingTasks()).catch((error) => {
+        this.db.recordFailure("app_server_restart", { attempt: this.appServerRestartAttempts }, error);
+        this.scheduleAppServerRestart();
+      });
+    }, delay);
+    this.appServerRestartTimer.unref();
   }
 
   private async expireRemoteState(): Promise<void> {
@@ -703,6 +754,15 @@ export class SyncService {
     }
     this.db.revokeLegacyRootGrants();
     this.db.expireTaskRootGrants(this.appServer?.appServerEpoch);
+  }
+
+  private async expireRootGrants(): Promise<void> {
+    const expired = this.db.expireTaskRootGrants(this.appServer?.appServerEpoch);
+    for (const grant of expired) {
+      await this.cancelSessionWork(grant.sessionId, null, "Root authorization expired");
+      const session = this.db.getSession(grant.sessionId);
+      if (session?.rootMessageId) void this.updateRunCard(grant.sessionId, session.rootMessageId, "已取消", "Root 授权已过期，任务未执行。", false).catch(() => undefined);
+    }
   }
 
   private async refreshThreadsFromAppServer(): Promise<void> {
@@ -726,9 +786,10 @@ export class SyncService {
     } while (cursor);
   }
 
-  private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { rootGrantExpiresAt: number | null } {
-    // Root authorization is task-scoped; no session retains authorization state.
-    return { ...session, rootGrantExpiresAt: null };
+  private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { executionMode: BridgeConfig["executionMode"]; rootExecutionReady: boolean; rootPreflightReasons: string[]; hasActiveWork: boolean } {
+    let reasons: string[] = [];
+    try { reasons = JSON.parse(this.db.getSetting("codex.root_preflight") ?? "{}").reasons ?? []; } catch { /* invalid diagnostics are ignored */ }
+    return { ...session, executionMode: this.config.executionMode, rootExecutionReady: this.rootExecutionReady, rootPreflightReasons: reasons, hasActiveWork: this.activeTurns.has(session.sessionId) };
   }
 
   private requestKind(method: string): RemoteRequestType | null {
@@ -740,10 +801,30 @@ export class SyncService {
     return null;
   }
 
-  private redactRequestPayload(value: Record<string, unknown>): Record<string, unknown> {
-    const copy = { ...value };
-    delete copy.answers; delete copy.answer; delete copy.content; delete copy.secret;
-    return copy;
+  private safeRequestPayload(type: RemoteRequestType, value: Record<string, unknown>, canonicalCwd?: string): Record<string, unknown> {
+    const summary = remoteApprovalSummary(type, value, canonicalCwd ? { taskId: "", sessionId: "", collaborationMode: "default", executionMode: this.config.executionMode ?? "workspace-write", canonicalCwd, allowedMcpServers: new Set(this.config.allowedMcpServers ?? []) } : undefined);
+    if (type === "permissions") {
+      const permissions = Array.isArray(value.permissions) ? value.permissions.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const permission = item as Record<string, unknown>;
+        if (permission.type !== "fs_read" && permission.type !== "fs_write") return [];
+        const path = typeof permission.path === "string" && canonicalCwd ? relative(canonicalCwd, resolve(canonicalCwd, permission.path)) : undefined;
+        return [{ type: permission.type, ...(path ? { path: path.slice(0, 240) } : {}) }];
+      }).slice(0, 20) : [];
+      return { ...summary, permissions };
+    }
+    if (type !== "user_input") return summary as unknown as Record<string, unknown>;
+    const questions = Array.isArray(value.questions) ? value.questions.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const q = item as Record<string, unknown>;
+      if (q.isSecret === true) return [];
+      const options = Array.isArray(q.options) ? q.options.flatMap((option) => {
+        if (!option || typeof option !== "object") return []; const o = option as Record<string, unknown>;
+        return typeof o.label === "string" ? [{ label: o.label.slice(0, 200), description: typeof o.description === "string" ? o.description.slice(0, 300) : "" }] : [];
+      }).slice(0, 20) : [];
+      return [{ id: typeof q.id === "string" ? q.id.slice(0, 100) : "question", header: typeof q.header === "string" ? q.header.slice(0, 200) : "问题", question: typeof q.question === "string" ? q.question.slice(0, 500) : "", options }];
+    }).slice(0, 10) : [];
+    return { type, questions };
   }
 
   private async onAppServerRequest(request: JsonRpcMessage): Promise<unknown> {
@@ -757,7 +838,24 @@ export class SyncService {
     if (!type || !session?.rootMessageId || !openId || !this.appServer || request.id === undefined) {
       throw new Error(`Unsupported or unscoped Codex server request ${request.method ?? "unknown"}`);
     }
-    const policy = remoteApprovalAllowed(type, params, this.config.allowedMcpServers ?? []);
+    const task = turnId ? this.db.taskForTurn(turnId) : null;
+    if (!task) throw new Error("Codex request is not attached to an active task");
+    const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
+    if (type === "file_approval") {
+      const grantRoot = typeof params.grantRoot === "string" ? params.grantRoot : typeof params.grant_root === "string" ? params.grant_root : canonicalCwd;
+      await resolveAllowedPath(grantRoot, canonicalCwd);
+      const paths = Array.isArray(params.changes) ? params.changes : Array.isArray(params.paths) ? params.paths : [];
+      for (const path of paths) if (typeof path === "string") await resolveAllowedPath(path, canonicalCwd);
+    }
+    if (type === "permissions" && Array.isArray(params.permissions)) {
+      for (const item of params.permissions) {
+        if (!item || typeof item !== "object") continue;
+        const path = (item as Record<string, unknown>).path;
+        if (typeof path === "string") await resolveAllowedPath(path, canonicalCwd);
+      }
+    }
+    const mode = session.collaborationMode === "plan" ? "plan" : "default";
+    const policy = remoteApprovalAllowed(type, params, this.config.allowedMcpServers ?? [], { taskId: task.id, sessionId: session.sessionId, collaborationMode: mode, executionMode: this.config.executionMode ?? "workspace-write", canonicalCwd, allowedMcpServers: new Set(this.config.allowedMcpServers ?? []) });
     if (!policy.allowed) throw new Error(policy.reason);
     const scopedSessionId = session.sessionId;
     const rootMessageId = session.rootMessageId;
@@ -766,7 +864,7 @@ export class SyncService {
     const pending: PendingServerRequest = {
       nonce, rpcId: request.id, epoch: this.appServer.appServerEpoch, type, sessionId: scopedSessionId, turnId, itemId,
       openId, chatId: session.chatId ?? this.boundChatId() ?? "", rootMessageId,
-      cardMessageId: null, payload: this.redactRequestPayload(params), status: "pending", expiresAt: expiry,
+      cardMessageId: null, payload: this.safeRequestPayload(type, params, canonicalCwd), status: "pending", expiresAt: expiry,
     };
     const state = this.activeTurns.get(scopedSessionId);
     if (state) {
@@ -774,7 +872,7 @@ export class SyncService {
       const task = turnId ? this.db.taskForTurn(turnId) : null;
       if (task) this.db.transitionTask(task.id, state.state);
     }
-    const detail = this.remoteRequestDetail(type, params);
+    const detail = this.remoteRequestDetail(type, pending.payload);
     const decisions = Array.isArray(params.availableDecisions) ? params.availableDecisions.flatMap((item) => typeof item === "string" ? [item] : []) : undefined;
     const secret = type === "user_input" && this.requestContainsSecret(params);
     if (secret) throw new Error("Secret input is never accepted through Feishu");
@@ -791,24 +889,6 @@ export class SyncService {
     return new Promise((resolve) => this.requestResolvers.set(nonce, resolve));
   }
 
-  private requestContainsSecret(params: Record<string, unknown>): boolean {
-    const questions = Array.isArray(params.questions) ? params.questions : [];
-    return questions.some((question) => this.asRecord(question).isSecret === true);
-  }
-
-  private remoteRequestTitle(type: RemoteRequestType): string {
-    return ({ user_input: "Codex 等待你的输入", command_approval: "Codex 请求执行命令", file_approval: "Codex 请求修改文件", permissions: "Codex 请求额外权限", mcp_elicitation: "MCP 请求你的确认" } as const)[type];
-  }
-
-  private remoteRequestDetail(type: RemoteRequestType, params: Record<string, unknown>): string {
-    if (type === "command_approval") return `命令：${this.stringAt(params, "command") ?? "未提供"}\n目录：${this.stringAt(params, "cwd") ?? "未提供"}\n原因：${this.stringAt(params, "reason") ?? "未提供"}`;
-    if (type === "file_approval") return `原因：${this.stringAt(params, "reason") ?? "未提供"}\n影响根目录：${this.stringAt(params, "grantRoot", "grant_root") ?? "未提供"}`;
-    if (type === "permissions") return `目录：${this.stringAt(params, "cwd") ?? "未提供"}\n原因：${this.stringAt(params, "reason") ?? "未提供"}\n请求：${JSON.stringify(params.permissions ?? params)}`;
-    if (type === "mcp_elicitation") return `${this.stringAt(params, "serverName") ?? "MCP"}\n${this.stringAt(params, "message", "url") ?? "需要确认"}`;
-    const questions = Array.isArray(params.questions) ? params.questions.map((q) => this.asRecord(q)).map((q) => `${this.stringAt(q, "header") ?? "问题"}：${this.stringAt(q, "question") ?? ""}`).join("\n") : "需要输入";
-    return questions;
-  }
-
   private async resolveRemoteRequest(request: PendingServerRequest, decision: string, answer?: string): Promise<void> {
     const resolver = this.requestResolvers.get(request.nonce);
     if (!resolver) { this.db.setServerRequestStatus(request.nonce, "expired"); return; }
@@ -821,7 +901,7 @@ export class SyncService {
       else result = { answers: {} };
     } else if (request.type === "permissions") {
       result = decision === "accept" || decision === "acceptForSession"
-        ? { permissions: params.permissions ?? [], scope: decision === "acceptForSession" ? "session" : "turn" }
+        ? { permissions: Array.isArray(params.permissions) ? params.permissions : [], scope: decision === "acceptForSession" ? "session" : "turn" }
         : { permissions: [], scope: "turn" };
     } else if (request.type === "mcp_elicitation") {
       result = { action: decision === "accept" ? "accept" : decision === "cancel" ? "cancel" : "decline", content: null, _meta: null };
@@ -848,111 +928,62 @@ export class SyncService {
   }
 
   private async onAppServerNotification(message: JsonRpcMessage): Promise<void> {
-    const params = this.asRecord(message.params);
-    const method = message.method ?? "";
-    const sessionId = this.stringAt(params, "threadId", "thread_id");
-    const turnId = this.stringAt(params, "turnId", "turn_id");
+    const params = this.asRecord(message.params); const method = message.method ?? "";
+    const sessionId = this.stringAt(params, "threadId", "thread_id"); const turnId = this.stringAt(params, "turnId", "turn_id");
     if (method === "thread/name/updated" && sessionId) {
       const title = this.stringAt(params, "threadName", "thread_name", "name");
-      if (title) {
-        this.db.setSessionTitle(sessionId, title);
-        const session = this.db.getSession(sessionId);
-        if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.activeTurns.has(sessionId) ? "运行中" : "可继续"));
-      }
+      if (title) { this.db.setSessionTitle(sessionId, title); const session = this.db.getSession(sessionId); if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.activeTurns.has(sessionId) ? "运行中" : "可继续")); }
       return;
     }
     if (method === "turn/started" && sessionId && turnId) {
-      const session = this.db.getSession(sessionId);
-      if (!session?.rootMessageId) return;
-      const current = this.activeTurns.get(sessionId) ?? { sessionId, turnId, epoch: this.appServer?.appServerEpoch ?? 0,
-        mode: session.collaborationMode === "plan" ? "plan" : "default", state: "running" as const, text: "", plan: "", rootMessageId: session.rootMessageId };
-      current.turnId = turnId;
-      this.activeTurns.set(sessionId, current); this.db.saveTurn(current);
-      await this.updateRunCard(sessionId, session.rootMessageId, "运行中", "Codex 正在处理。", true);
-      return;
+      const session = this.db.getSession(sessionId); if (!session?.rootMessageId) return;
+      const current = this.activeTurns.get(sessionId) ?? { sessionId, turnId, epoch: this.appServer?.appServerEpoch ?? 0, mode: session.collaborationMode === "plan" ? "plan" : "default", state: "running" as const, text: "", plan: "", rootMessageId: session.rootMessageId };
+      current.turnId = turnId; this.activeTurns.set(sessionId, current); this.db.saveTurn(current); await this.updateRunCard(sessionId, session.rootMessageId, "运行中", "Codex 正在处理。", true); return;
     }
-    if (method === "item/agentMessage/delta" || method === "item/plan/delta") {
-      if (!sessionId || !turnId) return;
-      const state = this.activeTurns.get(sessionId);
-      if (!state || state.turnId !== turnId) return;
-      const delta = this.stringAt(params, "delta", "text") ?? "";
-      if (!delta) return;
-      if (method.includes("plan")) state.plan += delta; else state.text += delta;
-      await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex");
-      return;
+    if ((method === "item/agentMessage/delta" || method === "item/plan/delta") && sessionId && turnId) {
+      const state = this.activeTurns.get(sessionId); if (!state || state.turnId !== turnId) return;
+      const delta = this.stringAt(params, "delta", "text") ?? ""; if (!delta) return;
+      if (method.includes("plan")) state.plan = appendBoundedText(state.plan, delta, MAX_LIVE_TEXT_BYTES); else state.text = appendBoundedText(state.text, delta, MAX_LIVE_TEXT_BYTES);
+      await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex"); return;
     }
-    if (method === "item/started" || method === "item/completed") {
-      if (!sessionId || !turnId) return;
-      const item = this.asRecord(params.item);
-      const itemId = this.stringAt(item, "id") ?? this.stringAt(params, "itemId") ?? `${turnId}:${method}`;
-      const kind = this.stringAt(item, "type") ?? "unknown";
-      const status = this.stringAt(item, "status") ?? (method === "item/completed" ? "completed" : "inProgress");
-      this.db.saveTurnItem(turnId, itemId, kind, status, item);
-      return;
+    if ((method === "item/started" || method === "item/completed") && sessionId && turnId) {
+      const item = this.asRecord(params.item); const itemId = this.stringAt(item, "id") ?? this.stringAt(params, "itemId") ?? turnId + ":" + method; const kind = this.stringAt(item, "type") ?? "unknown"; const status = this.stringAt(item, "status") ?? (method === "item/completed" ? "completed" : "inProgress"); this.db.saveTurnItem(turnId, itemId, kind, status, item); return;
     }
     if (method === "serverRequest/resolved") {
-      const requestId = this.stringAt(params, "requestId", "request_id");
-      if (!requestId) return;
-      for (const request of this.db.resolveServerRequestsByRpcId(requestId, this.appServer?.appServerEpoch ?? -1)) {
-        if (!request.cardMessageId) continue;
-        await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已处理", "该请求已完成或已由 Codex 清理。"));
-      }
+      const requestId = this.stringAt(params, "requestId", "request_id"); if (!requestId) return;
+      for (const request of this.db.resolveServerRequestsByRpcId(requestId, this.appServer?.appServerEpoch ?? -1)) if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已处理", "该请求已完成或已由 Codex 清理。"));
       return;
     }
     if (method === "turn/completed" && sessionId && turnId) {
-      const state = this.activeTurns.get(sessionId);
-      if (!state || state.turnId !== turnId) return;
-      const turn = this.asRecord(params.turn);
-      const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
-      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed";
-      state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text);
-      // Commit local terminal state and release resources before any Feishu I/O.
-      this.db.saveTurn(state);
-      this.activeTurns.delete(sessionId);
-      const task = this.db.taskForTurn(turnId);
-      if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: `turn ${state.state}` });
-      await this.cleanupTurnImages(turnId);
-      try {
-        const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : `Codex ${state.state}`);
-        const content = state.plan || state.text;
-        if (state.state === "completed" && content && feishuMessageId) this.db.setSetting(`app_delivery.${sessionId}.${textHash(content)}`, feishuMessageId);
-      } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
-      void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false)
-        .catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
-      void this.drainTaskQueue(sessionId);
+      const state = this.activeTurns.get(sessionId); if (!state || state.turnId !== turnId) return; const turn = this.asRecord(params.turn); const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
+      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed"; state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text); this.db.saveTurn(state); this.activeTurns.delete(sessionId);
+      const task = this.db.taskForTurn(turnId); if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: "turn " + state.state }); await this.cleanupTurnImages(turnId);
+      try { const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : "Codex " + state.state); const content = state.plan || state.text; if (content && feishuMessageId) this.db.upsertAppServerDelivery({ sessionId, turnId, role: "assistant", startedAtMs: state.startedAtMs ?? null, endedAtMs: state.endedAtMs ?? null, contentHash: textHash(content), contentBytes: Buffer.byteLength(content, "utf8"), feishuMessageId }); } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
+      void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error)); void this.drainTaskQueue(sessionId);
     }
   }
 
   private async flushTurnStream(state: TurnState, title: string): Promise<void> {
     const content = state.plan || state.text;
     if (!content || Date.now() - (state.stream?.lastSentAt ?? 0) < STREAM_INTERVAL_MS) return;
-    if (!state.stream && this.feishu.createStreamingReply) {
-      try {
-        const created = await this.feishu.createStreamingReply(state.rootMessageId, title);
-        state.stream = { ...created, lastSentAt: 0 };
-      } catch (error) { this.db.recordFailure("cardkit_stream", { sessionId: state.sessionId }, error); return; }
-    }
-    if (state.stream && this.feishu.updateStreamingReply) {
-      state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, content);
-      state.stream.lastSentAt = Date.now(); this.db.saveTurn(state);
-    }
+    const preview = inlinePreview(content);
+    if (!state.stream && this.feishu.createStreamingReply) { try { const created = await this.feishu.createStreamingReply(state.rootMessageId, title); state.stream = { ...created, lastSentAt: 0 }; } catch (error) { this.db.recordFailure("cardkit_stream", { sessionId: state.sessionId }, error); return; } }
+    if (state.stream && this.feishu.updateStreamingReply) { state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, preview); state.stream.lastSentAt = Date.now(); this.db.saveTurn(state); }
   }
 
   private async finishTurnStream(state: TurnState, summary: string): Promise<string | null> {
-    const content = state.plan || state.text;
-    if (state.stream && this.feishu.updateStreamingReply && this.feishu.finishStreamingReply) {
-      if (content) state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, content);
-      await this.feishu.finishStreamingReply(state.stream, summary);
-      return state.stream.messageId;
-    }
-    return content ? this.feishu.replyCard(state.rootMessageId, assistantMarkdownCard(content)) : null;
+    const content = state.plan || state.text; const preview = inlinePreview(content); let messageId: string | null = null;
+    if (state.stream && this.feishu.updateStreamingReply && this.feishu.finishStreamingReply) { if (preview) state.stream.sequence = await this.feishu.updateStreamingReply(state.stream, preview); await this.feishu.finishStreamingReply(state.stream, summary); messageId = state.stream.messageId; } else if (preview) messageId = await this.feishu.replyCard(state.rootMessageId, assistantMarkdownCard(preview));
+    if (content && Buffer.byteLength(content, "utf8") > MAX_INLINE_MESSAGE_BYTES) await this.feishu.replyFile(state.rootMessageId, state.sessionId.slice(0, 8) + "-" + state.turnId.slice(0, 12) + ".md", Buffer.from(content));
+    return messageId;
   }
 
-  private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number; queued: number; waiting: number; failedTasks: number } {
+  private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number; queued: number; waiting: number; failedTasks: number; appServer?: string } {
     const counts = this.db.taskStateCounts();
+    const health = this.appServer?.getHealth();
     return { paused: this.paused(), sessions: this.db.listSessions().length, active: counts.running ?? this.activeTurns.size,
       queued: counts.pending ?? 0, waiting: (counts.awaiting_root_consent ?? 0) + (counts.awaiting_input ?? 0) + (counts.awaiting_approval ?? 0),
-      failedTasks: counts.failed ?? 0, failures: this.db.failureCount() };
+      failedTasks: counts.failed ?? 0, failures: this.db.failureCount(), appServer: health ? `${health.state} / epoch ${health.epoch}` : "未启用" };
   }
 
   private async ensureControlCard(): Promise<void> {
@@ -1100,6 +1131,25 @@ export class SyncService {
       ? question.options[index]!.label : null;
   }
 
+  private requestContainsSecret(params: Record<string, unknown>): boolean {
+    const questions = Array.isArray(params.questions) ? params.questions : [];
+    return questions.some((question) => this.asRecord(question).isSecret === true);
+  }
+
+  private remoteRequestTitle(type: RemoteRequestType): string {
+    return ({ user_input: "Codex 等待你的输入", command_approval: "Codex 请求执行命令", file_approval: "Codex 请求修改文件", permissions: "Codex 请求额外权限", mcp_elicitation: "MCP 请求你的确认" } as const)[type];
+  }
+
+  private remoteRequestDetail(type: RemoteRequestType, params: Record<string, unknown>): string {
+    if (type === "command_approval") return "命令：" + (this.stringAt(params, "commandSummary") ?? "未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    if (type === "file_approval") return "原因：" + (this.stringAt(params, "reason") ?? "未提供") + "\n影响路径：" + (Array.isArray(params.relativePaths) ? params.relativePaths.join(", ") : "未提供");
+    if (type === "permissions") return "权限类型：" + (Array.isArray(params.permissionKinds) ? params.permissionKinds.join(", ") : "未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    if (type === "mcp_elicitation") return (this.stringAt(params, "mcpServer") ?? "MCP") + "\n需要确认";
+    const questions = Array.isArray(params.questions) ? params.questions.map((q) => this.asRecord(q)).map((q) => (this.stringAt(q, "header") ?? "问题") + "：" + (this.stringAt(q, "question") ?? "")).join("\n") : "需要输入";
+    return questions;
+  }
+
+
   private getWizard(openId: string, mode: "new" | "session" = "new"): WizardState | null {
     const raw = this.db.getSetting(this.wizardKey(openId, mode));
     if (!raw) return null;
@@ -1146,10 +1196,18 @@ export class SyncService {
   }
 
   async onCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
+    const eventId = "card:" + (event.eventId ?? createHash("sha256").update(JSON.stringify({ action: event.action, value: event.value, formValues: event.formValues, chat: event.chatId, message: event.openMessageId, operator: event.openId })).digest("hex"));
+    if (!this.db.claimInboundEvent(eventId)) return { delivery: "replace", card: errorCard("该操作已处理、过期或正在处理中。") };
+    const claimToken = this.db.inboundClaimToken(eventId);
+    try { const outcome = await this.handleCardAction(event); this.db.completeInboundEvent(eventId, claimToken); return outcome; }
+    catch (error) { this.db.failInboundEvent(eventId, error, isRetryableTransportError(error), claimToken); throw error; }
+  }
+
+  private async handleCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
-      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "execute_plan", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_guidance"].includes(event.action)) {
+      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_guidance"].includes(event.action)) {
         return { delivery: "reply", rootMessageId: rootCardSession.rootMessageId,
           card: errorCard("此会话话题默认用于继续对话；新建、搜索和服务管理请在群主消息或控制台中操作。") };
       }
@@ -1293,6 +1351,7 @@ export class SyncService {
         case "session_toggle_mode": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("请在对应会话话题内切换模式。");
+          if (this.activeTurns.has(session.sessionId) || (session.rootMessageId && this.db.runningTaskForRoot(session.rootMessageId))) return errorCard("当前回合正在运行；请完成或取消后再切换模式。");
           const mode = session.collaborationMode === "plan" ? "default" : "plan";
           this.db.setCollaborationMode(session.sessionId, mode);
           const updated = this.db.getSession(session.sessionId)!;
@@ -1323,21 +1382,16 @@ export class SyncService {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const grant = this.appServer ? this.db.denyTaskRootGrant(nonce, event.openId, event.chatId, this.appServer.appServerEpoch) : null;
           if (!grant) return errorCard("该 Root 授权已过期、已处理或不属于当前用户/会话。");
+          await this.cancelSessionWork(grant.sessionId, null, "Root authorization was declined");
           return { delivery: "replace", card: remoteRequestResolvedCard("Root 授权已拒绝", "该任务已取消；不会影响其他任务。", false) };
         }
         case "root_revoke": return errorCard("Root 授权是一次性任务授权，无会话级权限可撤销。");
-        case "execute_plan": {
-          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
-          if (!session) return errorCard("当前会话不可用。");
-          this.db.setCollaborationMode(session.sessionId, "default");
-          if (this.config.executionMode === "root-danger-full-access") return { delivery: "reply", rootMessageId: session.rootMessageId, card: errorCard("Root 执行仅能通过本任务的一次性授权卡启动。") };
-          return { delivery: "reply", rootMessageId: session.rootMessageId, card: runStatusCard("等待任务", "请在话题内发送明确的执行指令；计划不会自动执行。") };
-        }
+
         case "turn_review": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("当前会话不可用。");
           const turn = this.db.activeTurn(session.sessionId);
-          const latest = turn ?? (this.activeTurns.get(session.sessionId) ?? null);
+          const latest = turn ?? this.db.latestTurn(session.sessionId) ?? (this.activeTurns.get(session.sessionId) ?? null);
           return { delivery: "reply", rootMessageId: session.rootMessageId, card: reviewCard(latest ? this.db.listTurnItems(latest.turnId) : []) };
         }
         case "remote_approve": {
@@ -1370,13 +1424,18 @@ export class SyncService {
           this.db.setSetting("sync.paused", "0");
           void this.syncAll();
           return homeCard(this.cardStatus(), "同步已恢复");
-        case "retry":
-          this.db.resolveInfrastructureFailures();
+        case "retry": {
           this.messageLinkPermissionDenied = false;
-          await this.refreshModels();
+          const modelsReady = await this.refreshModels();
+          let appServerReady = true;
+          if (this.appServer && this.appServer.getHealth().state === "unhealthy") {
+            try { await this.appServer.restart("manual retry"); } catch (error) { appServerReady = false; this.db.recordFailure("app_server_retry", {}, error); }
+          }
+          if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
           void this.syncAll();
           void this.backfillSessionLinks();
-          return homeCard(this.cardStatus(), this.models.length ? "正在重试未完成任务，模型目录已刷新" : "模型目录仍不可用；请稍后再次 /retry");
+          return homeCard(this.cardStatus(), modelsReady && appServerReady ? "正在重试未完成任务，模型目录和 app-server 已恢复" : "基础设施仍不可用；请稍后再次 /retry");
+        }
         default: return errorCard(`未知卡片操作：${event.action}`);
       }
     } catch (error) {
@@ -1388,12 +1447,13 @@ export class SyncService {
   async onFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
     const eventId = "message:" + message.messageId;
     if (!this.db.claimInboundEvent(eventId)) return;
+    const claimToken = this.db.inboundClaimToken(eventId);
     try {
       await this.handleFeishuMessage(message);
       this.db.saveMessage(message.messageId, "_control", "inbound", message.messageId);
-      this.db.completeInboundEvent(eventId);
+      this.db.completeInboundEvent(eventId, claimToken);
     } catch (error) {
-      this.db.failInboundEvent(eventId, error, isRetryableTransportError(error));
+      this.db.failInboundEvent(eventId, error, isRetryableTransportError(error), claimToken);
       throw error;
     }
   }
@@ -1456,10 +1516,14 @@ export class SyncService {
       return;
     }
     if (["重试", "/retry"].includes(normalized)) {
-      this.db.resolveInfrastructureFailures();
       this.messageLinkPermissionDenied = false;
-      await this.refreshModels();
-      await this.respondCard(message, homeCard(this.cardStatus(), this.models.length ? "正在重试未完成任务，模型目录已刷新" : "模型目录仍不可用；请稍后再次 /retry"));
+      const modelsReady = await this.refreshModels();
+      let appServerReady = true;
+      if (this.appServer && this.appServer.getHealth().state === "unhealthy") {
+        try { await this.appServer.restart("manual retry"); } catch (error) { appServerReady = false; this.db.recordFailure("app_server_retry", {}, error); }
+      }
+      if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
+      await this.respondCard(message, homeCard(this.cardStatus(), modelsReady && appServerReady ? "正在重试未完成任务，模型目录和 app-server 已恢复" : "基础设施仍不可用；请稍后再次 /retry"));
       void this.syncAll();
       void this.backfillSessionLinks();
       return;
@@ -1557,23 +1621,19 @@ export class SyncService {
   }
 
   async onBotMenuAction(action: IncomingBotMenuAction): Promise<void> {
-    const chatId = this.boundChatId();
-    if (!chatId || action.openId !== this.boundOpenId()) return;
-    const dedupeId = `bot-menu:${action.eventId}`;
-    if (this.db.hasMessage(dedupeId)) return;
-    this.db.saveMessage(dedupeId, "_control", "inbound_menu", null);
-    const cards: Record<string, () => CardDefinition> = {
-      "codex.home": () => homeCard(this.cardStatus()),
-      "codex.new": () => this.models.length ? this.projectCard(this.beginNewWizard(action.openId, chatId)) : errorCard("模型目录暂不可用。请使用 /retry 刷新。"),
-      "codex.sessions": () => this.recentCard(),
-      "codex.search": () => this.recentCard(),
-      "codex.service": () => serviceCard(this.cardStatus()),
-    };
-    const build = cards[action.eventKey];
-    if (build) await this.feishu.sendCard(chatId, build());
-    else console.warn(`Ignored unknown Feishu bot menu event key: ${action.eventKey}`);
+    const eventId = "menu:" + action.eventId; if (!this.db.claimInboundEvent(eventId)) return;
+    const claimToken = this.db.inboundClaimToken(eventId);
+    try {
+      const chatId = this.boundChatId(); if (!chatId || action.openId !== this.boundOpenId()) { this.db.completeInboundEvent(eventId, claimToken); return; }
+      const cards: Record<string, () => CardDefinition> = {
+        "codex.home": () => homeCard(this.cardStatus()),
+        "codex.new": () => this.models.length ? this.projectCard(this.beginNewWizard(action.openId, chatId)) : errorCard("模型目录暂不可用。请使用 /retry 刷新。"),
+        "codex.sessions": () => this.recentCard(), "codex.search": () => this.recentCard(), "codex.service": () => serviceCard(this.cardStatus()),
+      };
+      const build = cards[action.eventKey]; if (build) await this.feishu.sendCard(chatId, build()); else console.warn("Ignored unknown Feishu bot menu event key: " + action.eventKey);
+      this.db.completeInboundEvent(eventId, claimToken);
+    } catch (error) { this.db.failInboundEvent(eventId, error, isRetryableTransportError(error), claimToken); throw error; }
   }
-
   private statusText(): string {
     return [
       `状态：${this.paused() ? "已暂停" : "运行中"}`,
@@ -1624,13 +1684,14 @@ export class SyncService {
 
   private async downloadImages(message: IncomingFeishuMessage, imageKeys: string[]): Promise<string[]> {
     const imagePaths: string[] = [];
-    if (imageKeys.length > MAX_IMAGES_PER_TASK) throw new Error(`At most ${MAX_IMAGES_PER_TASK} images are allowed per task`);
+    const uniqueKeys = [...new Set(imageKeys)];
+    if (uniqueKeys.length > MAX_IMAGES_PER_TASK) throw new Error(`At most ${MAX_IMAGES_PER_TASK} images are allowed per task`);
     const tempDir = join(this.config.stateDir, "tmp", randomUUID());
     await mkdir(tempDir, { recursive: true, mode: 0o700 });
     let total = 0;
     try {
-      for (const imageKey of imageKeys) {
-        const data = await this.feishu.downloadImage(message.messageId, imageKey);
+      for (const imageKey of uniqueKeys) {
+        const data = await this.feishu.downloadImage(message.messageId, imageKey, MAX_IMAGE_BYTES);
         if (data.length > MAX_IMAGE_BYTES) throw new Error("An image exceeds the 10 MiB limit");
         total += data.length;
         if (total > MAX_TOTAL_IMAGE_BYTES) throw new Error("Images exceed the 25 MiB total limit");
@@ -1814,11 +1875,23 @@ export class SyncService {
     await this.executeAppServerNewTask(task);
   }
 
+  private appServerOutcomeUncertain(error: unknown): boolean { const text = error instanceof Error ? error.message : String(error); return /timed out|exited|not running|closed|stdin|write/i.test(text); }
+
+  private resolveTurnExecutionPolicy(mode: "plan" | "default", canonicalCwd: string, rootAuthorized = false): { mode: "plan" | "default"; rootMode: boolean; approvalPolicy: "never" | "on-request"; sandboxPolicy: Record<string, unknown> } {
+    if (mode === "plan") return { mode, rootMode: false, approvalPolicy: "never", sandboxPolicy: { type: "readOnly", networkAccess: false } };
+    const rootMode = this.config.executionMode === "root-danger-full-access" && rootAuthorized;
+    return rootMode
+      ? { mode, rootMode, approvalPolicy: "on-request", sandboxPolicy: { type: "dangerFullAccess" } }
+      : { mode, rootMode, approvalPolicy: "on-request", sandboxPolicy: { type: "workspaceWrite", writableRoots: [canonicalCwd], networkAccess: false } };
+  }
+
   private async executeAppServerNewTask(task: QueuedTask): Promise<void> {
     if (!this.appServer) return;
     try {
       const canonicalCwd = await resolveAllowedPath(task.cwd, this.config.allowedRoot);
+      const execution = this.resolveTurnExecutionPolicy("default", canonicalCwd, false);
       const response = this.asRecord(await this.appServer.request("thread/start", { cwd: canonicalCwd,
+        approvalPolicy: execution.approvalPolicy, sandboxPolicy: execution.sandboxPolicy,
         ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}) }));
       const thread = this.asRecord(response.thread);
       const sessionId = this.stringAt(thread, "id") ?? this.stringAt(response, "threadId", "thread_id");
@@ -1833,9 +1906,10 @@ export class SyncService {
       await this.updateRunCard(sessionId, rootId, "已创建", "Codex 会话已创建，正在准备执行。", true);
       await this.executeAppServerTurn({ ...task, sessionId, rootMessageId: rootId, expectedSessionId: sessionId });
     } catch (error) {
-      this.db.updateTask(task.id, "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
+      const uncertain = this.appServerOutcomeUncertain(error);
+      this.db.updateTask(task.id, uncertain ? "interrupted" : "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
       this.db.recordFailure("app_server_new", { taskId: task.id }, error);
-      if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("失败", shortText(String(error), MAX_ERROR_CHARS)));
+      if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard(uncertain ? "已中断" : "失败", uncertain ? "app-server 结果不确定，任务不会自动重放。" : shortText(String(error), MAX_ERROR_CHARS)));
     }
   }
 
@@ -1843,12 +1917,15 @@ export class SyncService {
     const session = task.sessionId ? this.db.getSession(task.sessionId) : null;
     if (!session?.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session unavailable" }); return; }
     try {
-      await this.appServer!.request("thread/resume", { threadId: session.sessionId });
+      const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
+      const execution = this.resolveTurnExecutionPolicy(session.collaborationMode === "plan" ? "plan" : "default", canonicalCwd, false);
+      await this.appServer!.request("thread/resume", { threadId: session.sessionId, cwd: canonicalCwd, approvalPolicy: execution.approvalPolicy, sandboxPolicy: execution.sandboxPolicy });
       await this.executeAppServerTurn(task);
     } catch (error) {
-      this.db.updateTask(task.id, "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
+      const uncertain = this.appServerOutcomeUncertain(error);
+      this.db.updateTask(task.id, uncertain ? "interrupted" : "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
       this.db.recordFailure("app_server_resume", { sessionId: session.sessionId, taskId: task.id }, error);
-      await this.updateRunCard(session.sessionId, session.rootMessageId, "失败", shortText(String(error), MAX_ERROR_CHARS), false);
+      await this.updateRunCard(session.sessionId, session.rootMessageId, uncertain ? "已中断" : "失败", uncertain ? "app-server 结果不确定，任务不会自动重放。" : shortText(String(error), MAX_ERROR_CHARS), false);
     }
   }
 
@@ -1865,10 +1942,13 @@ export class SyncService {
     if (!session?.rootMessageId) throw new Error("session root unavailable");
     const mode = session.collaborationMode === "plan" ? "plan" : "default";
     const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
-    if (mode === "default" && this.config.executionMode === "root-danger-full-access") {
+    let rootAuthorized = false;
+    const rootModeRequested = mode === "default" && this.config.executionMode === "root-danger-full-access";
+    if (rootModeRequested) {
       if (!this.rootExecutionReady) throw new Error("Root execution is disabled because container preflight failed");
       const existing = this.db.getTaskRootGrantForTask(task.id);
       const canRun = existing?.status === "approved" && this.db.consumeTaskRootGrant(task.id, session.sessionId, canonicalCwd, this.appServer.appServerEpoch);
+      rootAuthorized = canRun;
       if (!canRun) {
         const grant = existing?.status === "pending" ? existing : this.db.createTaskRootGrant({
           nonce: randomUUID(), taskId: task.id, sessionId: session.sessionId, canonicalCwd,
@@ -1883,10 +1963,11 @@ export class SyncService {
     }
     const imagePaths = await this.downloadImages(this.taskMessage(task), task.imageKeys);
     const input: Array<Record<string, unknown>> = [{ type: "text", text: task.prompt }, ...imagePaths.map((path) => ({ type: "localImage", path }))];
+    const execution = this.resolveTurnExecutionPolicy(mode, canonicalCwd, rootAuthorized);
     const params: Record<string, unknown> = {
       threadId: session.sessionId, input, cwd: canonicalCwd,
-      approvalPolicy: "on-request", approvalsReviewer: "user",
-      sandboxPolicy: this.config.executionMode === "root-danger-full-access" ? { type: "dangerFullAccess" } : { type: "workspaceWrite", writableRoots: [canonicalCwd], networkAccess: false },
+      approvalPolicy: execution.approvalPolicy, approvalsReviewer: "user",
+      sandboxPolicy: execution.sandboxPolicy,
       ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}),
       collaborationMode: { mode, settings: { model: task.model ?? null, reasoning_effort: task.reasoningEffort ?? null, developer_instructions: null } },
     };
@@ -1896,9 +1977,10 @@ export class SyncService {
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
     const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt) };
     this.activeTurns.set(session.sessionId, state); this.db.saveTurn(state);
+    this.db.upsertAppServerDelivery({ sessionId: session.sessionId, turnId, role: "user", startedAtMs: state.startedAtMs ?? null, contentHash: textHash(task.prompt), contentBytes: Buffer.byteLength(task.prompt, "utf8"), sourceMessageId: task.sourceMessageId });
     this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId });
     this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
-    await this.updateRunCard(session.sessionId, session.rootMessageId, "运行中", mode === "plan" ? "Codex 正在只读规划。" : this.config.executionMode === "root-danger-full-access" ? "Codex 正在专用 Root 容器中执行。" : "Codex 正在受限工作区中执行。", true);
+    await this.updateRunCard(session.sessionId, session.rootMessageId, "运行中", mode === "plan" ? "Codex 正在只读规划。" : execution.rootMode ? "Codex 正在专用 Root 容器中执行。" : "Codex 正在受限工作区中执行。", true);
   }
 
   private async hasLocalActiveSession(session: SessionMetadata & { path: string }): Promise<boolean> {

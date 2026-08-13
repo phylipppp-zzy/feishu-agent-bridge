@@ -60,6 +60,24 @@ export interface ChoiceRequest {
 export type RemoteRequestType = "user_input" | "command_approval" | "file_approval" | "permissions" | "mcp_elicitation";
 export type RemoteRequestStatus = "pending" | "submitting" | "resolved" | "expired" | "declined";
 
+export interface ApprovalContext {
+  taskId: string;
+  sessionId: string;
+  collaborationMode: "default" | "plan";
+  executionMode: "workspace-write" | "root-danger-full-access";
+  canonicalCwd: string;
+  allowedMcpServers: ReadonlySet<string>;
+}
+
+export interface SafeApprovalSummary {
+  type: RemoteRequestType;
+  commandSummary?: string;
+  relativePaths?: string[];
+  permissionKinds?: string[];
+  mcpServer?: string;
+  reason?: string;
+}
+
 /** Persisted metadata deliberately excludes answers to secret questions. */
 export interface PendingServerRequest {
   nonce: string;
@@ -140,6 +158,7 @@ export type CardActionOutcome = CardDefinition & {
 };
 
 export interface IncomingCardAction {
+  eventId?: string;
   openId: string;
   chatId: string;
   openMessageId: string;
@@ -177,7 +196,7 @@ export interface FeishuPort {
   createSessionRoot(chatId: string, title: string, detail: string, card?: CardDefinition): Promise<SentRootMessage>;
   replyText(rootMessageId: string, text: string): Promise<string>;
   replyFile(rootMessageId: string, fileName: string, data: Buffer): Promise<string>;
-  downloadImage(messageId: string, imageKey: string): Promise<Buffer>;
+  downloadImage(messageId: string, imageKey: string, maxBytes?: number): Promise<Buffer>;
   sendText(chatId: string, text: string): Promise<string>;
   sendCard(chatId: string, card: CardDefinition): Promise<string>;
   replyCard(rootMessageId: string, card: CardDefinition): Promise<string>;
