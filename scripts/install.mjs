@@ -140,9 +140,10 @@ const environmentValues = {
   CODEX_BIN: codexBin,
   STATE_DIR: stateDir,
   CODEX_EXECUTION_MODE: saved.CODEX_EXECUTION_MODE ?? "workspace-write",
-  ROOT_GRANT_TTL_SECONDS: saved.ROOT_GRANT_TTL_SECONDS ?? "28800",
+  ROOT_GRANT_TTL_SECONDS: saved.ROOT_GRANT_TTL_SECONDS ?? "600",
 };
 delete environmentValues.UPLOAD_RAW_ARCHIVES;
+delete environmentValues.ALLOW_GROUP_SECRET_INPUT;
 if (needsFeishuConfiguration) {
   await writeFile(pendingEnvFile, renderEnvironment({ ...environmentValues, FEISHU_SETUP_VERSION: "0" }), { mode: 0o600 });
   await chmod(pendingEnvFile, 0o600);

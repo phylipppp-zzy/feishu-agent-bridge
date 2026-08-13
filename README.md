@@ -17,7 +17,7 @@
 - 超过 50,000 字符的正文以 Markdown 附件发送。图片下载到权限为 `0600` 的受控临时目录，传给 Codex 后删除。
 - SQLite 位于 `~/.local/state/feishu-codex-bridge/bridge.sqlite`，保存会话话题映射、解析游标、去重键和失败记录。
 - 原始 Codex JSONL 永远只保留在本机 `~/.codex/sessions`，桥接服务不提供原始日志上传功能。
-- Default 以 app-server 权限策略运行；容器 Root 模式必须通过显式环境确认，并在每个会话中确认 8 小时授权。没有任何静默 `codex exec` 回退。
+- Default 使用 app-server 的受限 `workspace-write` 策略；Plan 永远只读且禁用网络。Root 仅在通过预检的专用容器中启用，并且每项任务都需要一次性授权；没有任何 `codex exec` 回退。
 - 服务启动时通过 `codex debug models` 读取可见模型与支持的思考强度，缓存到 SQLite。CLI 暂时不可用时使用最近一次有效缓存；没有有效目录时会阻止新建，并提示使用 `/retry`。
 
 ## 一键安装
@@ -165,7 +165,7 @@ systemctl --user start feishu-codex-bridge.service
 <消息>
 ```
 
-服务使用对应的 `session_id` 执行 `codex exec resume`。同一会话正在本地 Codex CLI 或桥接服务中运行时，飞书续聊会暂缓，避免两个前端并发修改同一线程。
+服务通过 app-server 的 `thread/resume` 和 `turn/start` 继续对应的 `session_id`。同一会话正在本地 Codex CLI 或桥接服务中运行时，飞书续聊会暂缓，避免两个前端并发修改同一线程。
 
 新建时选定的模型和思考强度会随 `session_id` 保存，之后的续聊会继续传入同一配置。历史会话会从本机 JSONL 最近的 `turn_context.payload.model` 与 `payload.effort` 回填；没有这些字段的历史会话继续继承本机 Codex 全局配置。若保存的模型从当前目录中消失，桥接器会停止该话题续聊，要求重新选择，而不会静默切换。
 
@@ -221,7 +221,7 @@ Plan 通过会话根卡切换；新会话默认 Default。服务等级和速度�
 - 依赖、研究、实现和方案选择。
 - 是否修改已授权工作目录内的文件。
 
-原生 Codex 请求会以卡片展示命令、文件、网络或 MCP 影响范围，并使用一次性 nonce 防止重复或跨用户提交。若启用 `ALLOW_GROUP_SECRET_INPUT=1`，secret 值会经过飞书平台但不会被桥接器写入 SQLite、日志或回复；不启用时此类请求会拒绝。
+原生 Codex 请求会以卡片展示经过字段白名单筛选的命令、文件、网络或 MCP 影响范围，并使用一次性 nonce 防止重复或跨用户提交。飞书不接受 secret、密码、令牌、验证码或其他认证信息；此类请求会直接拒绝。
 
 ## 同步内容与隐私
 
@@ -235,10 +235,11 @@ Plan 通过会话根卡切换；新会话默认 Default。服务等级和速度�
 
 - 工作目录必须经 `realpath` 校验并位于安装器写入的 `ALLOWED_ROOT`，默认为当前用户主目录；符号链接逃逸和目录外路径会被拒绝。
 - 飞书交互回合不使用 `codex exec`；新建和续聊均通过 app-server 的 `thread/*` 与 `turn/*` 生命周期执行。
-- 默认 `workspace-write` 环境在 sandbox smoke test 失败时 fail-closed。只有 `CODEX_EXECUTION_MODE=root-danger-full-access`、`ROOT_FULL_ACCESS_ACK=I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER` 同时存在时，才允许无沙箱 Root 模式。
-- Root 模式可读写整个容器、访问网络并启动进程；飞书会话卡须确认后才开始 Default 回合，授权最长八小时，并在 app-server 重启、目录变化、用户重绑或撤销时失效。
+- Plan 使用只读沙箱、禁用网络，且不会要求 Root 授权；普通 Default 回合使用 `workspace-write`，可写范围仅为本次经校验的工作目录，禁用网络。
+- 只有 `CODEX_EXECUTION_MODE=root-danger-full-access` 与 `ROOT_FULL_ACCESS_ACK=I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER` 同时存在、进程为 UID 0、位于容器、无 `CAP_SYS_ADMIN/CAP_SYS_MODULE` 且无法访问容器运行时 socket 时，才允许 Root 模式；否则 fail-closed。
+- Root 模式可读写整个专用容器、访问网络并启动进程。每项 Root 任务都必须通过独立的一次性授权卡；批准、拒绝、超时、重启或 epoch 变化都会使该授权失效，绝不形成会话级长期权限。
 - 每个续聊会话都受活动任务与 JSONL 活动状态保护，避免桥接器与本地 Codex 同时写入同一会话。
-- 每次新建和续聊都传入会话保存的 `-m <model>` 与 `-c model_reasoning_effort="<effort>"`；没有保存设置的历史会话不传覆盖项，继续使用本机 Codex 默认值。
+- 每次新建和续聊都向 app-server 传入会话保存的模型与思考强度；没有保存设置的历史会话不传覆盖项，继续使用本机 Codex 默认值。
 
 ## 服务生命周期与运维
 

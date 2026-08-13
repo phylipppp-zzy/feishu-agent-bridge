@@ -2,8 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { messageAppLink, parseCardAction, parseIncoming, utf8Chunks } from "../src/feishu.js";
+import { isRetryableTransportError } from "../src/inbound-events.js";
 
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles["im.message.receive_v1"]>>[0];
+
+test("classifies only transient Feishu transport failures as retryable", () => {
+  assert.equal(isRetryableTransportError(new Error("Feishu API 429: rate limited")), true);
+  assert.equal(isRetryableTransportError(new Error("ETIMEDOUT")), true);
+  assert.equal(isRetryableTransportError(new Error("Feishu API 400: invalid request")), false);
+});
 
 test("normalizes a rich post and recognizes the configured bot mention", () => {
   const event = {

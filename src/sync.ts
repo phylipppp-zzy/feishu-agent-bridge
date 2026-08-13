@@ -9,6 +9,7 @@ import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
 import { resolveAllowedPath } from "./path-policy.js";
 import { remoteApprovalAllowed, rootExecutionPreflight } from "./execution-policy.js";
+import { isRetryableTransportError } from "./inbound-events.js";
 import { parseJsonlChunk } from "./session-parser.js";
 import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
@@ -317,6 +318,7 @@ export class SyncService {
   }
 
   private async migrateTitlesAndSyntheticMessages(): Promise<void> {
+    if (this.db.getSetting("migration.history_cleanup_v1") === "1") return;
     const titles = await this.loadTitleIndex();
     for (const session of this.db.listSessions()) {
       try {
@@ -360,9 +362,11 @@ export class SyncService {
         this.db.recordFailure("migrate_session_title", { sessionId: session.sessionId }, error);
       }
     }
+    this.db.setSetting("migration.history_cleanup_v1", "1");
   }
 
   private async reconcileSessionFiles(): Promise<void> {
+    if (this.db.getSetting("migration.session_path_index_v1") === "1") return;
     for (const path of await jsonlFiles(this.sessionsDir)) {
       const ownerSessionId = sessionIdFromPath(path);
       if (!ownerSessionId) continue;
@@ -376,6 +380,7 @@ export class SyncService {
         this.db.recordFailure("reconcile_session_path", { path }, error);
       }
     }
+    this.db.setSetting("migration.session_path_index_v1", "1");
   }
 
   private async clearStaleActiveSessions(): Promise<void> {
@@ -415,6 +420,7 @@ export class SyncService {
   }
 
   private async purgeSubagentMessages(): Promise<void> {
+    if (this.db.getSetting("migration.subagent_cleanup_v1") === "1") return;
     for (const path of await jsonlFiles(this.sessionsDir)) {
       const ownerSessionId = sessionIdFromPath(path);
       if (!ownerSessionId) continue;
@@ -460,6 +466,7 @@ export class SyncService {
         this.db.recordFailure("purge_subagent_message", { path }, error);
       }
     }
+    this.db.setSetting("migration.subagent_cleanup_v1", "1");
   }
 
   private async restoreRootCards(): Promise<void> {
@@ -1378,10 +1385,6 @@ export class SyncService {
     }
   }
 
-  private retryableInbound(error: unknown): boolean {
-    return /(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|timeout|\b429\b|\b5\d{2}\b)/i.test(error instanceof Error ? error.message : String(error));
-  }
-
   async onFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
     const eventId = "message:" + message.messageId;
     if (!this.db.claimInboundEvent(eventId)) return;
@@ -1390,7 +1393,7 @@ export class SyncService {
       this.db.saveMessage(message.messageId, "_control", "inbound", message.messageId);
       this.db.completeInboundEvent(eventId);
     } catch (error) {
-      this.db.failInboundEvent(eventId, error, this.retryableInbound(error));
+      this.db.failInboundEvent(eventId, error, isRetryableTransportError(error));
       throw error;
     }
   }
@@ -1720,16 +1723,16 @@ export class SyncService {
     }
   }
 
-  private async findSessionLog(sessionId: string): Promise<string | null> {
-    const suffix = `${sessionId}.jsonl`;
-    return (await jsonlFiles(this.sessionsDir)).find((path) => path.endsWith(suffix)) ?? null;
-  }
-
   private async syncTaskLog(task: QueuedTask, sessionId: string): Promise<boolean> {
-    const path = (this.db.getSession(sessionId)?.path) ?? await this.findSessionLog(sessionId);
+    const path = this.db.getSession(sessionId)?.path ?? null;
     if (!path) {
       this.db.updateTask(task.id, "awaiting_sync", { expectedSessionId: sessionId, syncStatus: "awaiting" });
-      console.info(`Codex log not available yet task=${task.id.slice(0, 8)} session=${sessionId.slice(0, 8)}`);
+      console.info(`Codex log path is not indexed yet task=${task.id.slice(0, 8)} session=${sessionId.slice(0, 8)}`);
+      return false;
+    }
+    try { await stat(path); } catch {
+      this.db.updateTask(task.id, "awaiting_sync", { expectedSessionId: sessionId, syncStatus: "awaiting" });
+      console.info(`Codex log is not available yet task=${task.id.slice(0, 8)} session=${sessionId.slice(0, 8)}`);
       return false;
     }
     await this.enqueueFile(path);

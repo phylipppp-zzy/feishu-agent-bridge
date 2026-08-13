@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { parseEnvironment } from "../dist/src/installer.js";
+import { rootExecutionPreflight } from "../dist/src/execution-policy.js";
 
 const execFileAsync = promisify(execFile);
 const envPath = join(homedir(), ".config/feishu-codex-bridge/env");
@@ -66,7 +67,9 @@ const rootMode = values.CODEX_EXECUTION_MODE === "root-danger-full-access";
 const rootAck = values.ROOT_FULL_ACCESS_ACK === "I_UNDERSTAND_CODEX_CAN_MODIFY_THE_ENTIRE_CONTAINER";
 if (rootMode) {
   result(rootAck, "Root danger-full-access acknowledgement is configured");
-  result(values.ALLOW_GROUP_SECRET_INPUT === "1", "Group secret-input acknowledgement is configured");
+  const preflight = await rootExecutionPreflight({ executionMode: "root-danger-full-access" });
+  result(preflight.ok, "Root dedicated-container preflight passed");
+  if (!preflight.ok) console.log(`INFO  Root preflight: ${preflight.reasons.join("; ")}`);
 }
 try {
   const { stdout } = await execFileAsync(codexBin, ["--version"]);

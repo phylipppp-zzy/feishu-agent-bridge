@@ -14,7 +14,8 @@ This service mirrors local Codex conversations from `~/.codex/sessions` into a p
 - Sends bodies over 50,000 characters as Markdown attachments. Downloaded images are stored in a controlled `0600` temporary directory and removed after Codex receives them.
 - Stores mappings, parsing offsets, deduplication keys, and failures in `~/.local/state/feishu-codex-bridge/bridge.sqlite`.
 - Keeps raw Codex JSONL on the local machine only. The bridge does not upload raw archives.
-- Runs remotely requested Codex work with `workspace-write`, `approval=never`, and `--skip-git-repo-check`. A non-Git directory is allowed only after `realpath` validation under the allowed root.
+- Runs Feishu turns through the persistent `codex app-server --stdio`; JSONL is retained for history import, external CLI sessions, and recovery only.
+- Plan turns are read-only with networking disabled. Default turns use `workspace-write` for the canonical task directory with networking disabled. Root is an explicit, one-task authorization for a preflight-checked dedicated container only; there is no `codex exec` fallback.
 - Loads visible models and supported reasoning efforts from `codex debug models` at startup and caches them in SQLite. If no valid model directory is available, new sessions are blocked and `/retry` can refresh it.
 
 ## One-Command Installation
@@ -146,7 +147,7 @@ You can also send:
 
 `/new` saves the prompt and image references, then shows model and reasoning cards. It executes automatically after selection. The directory must exist, resolve under the install user's home directory, and cannot escape through traversal or symlinks.
 
-To continue an existing session, reply directly in that session's topic. No `@bot` is needed there. The bridge runs `codex exec resume` with its mapped `session_id`. A continuation waits if the same session is active in local Codex or in the bridge, preventing concurrent writes.
+To continue an existing session, reply directly in that session's topic. No `@bot` is needed there. The bridge resumes the mapped `session_id` through app-server `thread/resume` and `turn/start`. A continuation waits if the same session is active in local Codex or in the bridge, preventing concurrent writes.
 
 Selected model and reasoning effort persist with the `session_id`. For a mapped topic, use the root card's **Change model** action or send `/model` to open the same selection flow. The text fallback is:
 
@@ -190,7 +191,7 @@ Cards may ask for confirmation to:
 - Choose dependencies, research direction, implementation, or a plan.
 - Modify files within an already authorized working directory.
 
-Cards only express business intent. They never bypass `approval=never`, `workspace-write`, path validation, or the network sandbox. The bridge never offers remote approval for sudo, privilege escalation, passwords, keys, tokens, verification codes, CAPTCHA, authentication, sandbox bypass, writes outside the allowed root, or private-data export to external services.
+Cards only express business intent. They never bypass path validation or the sandbox policy. The bridge never offers remote approval for sudo, privilege escalation, passwords, keys, tokens, verification codes, CAPTCHA, authentication, sandbox bypass, runtime sockets, writes outside the allowed root, or private-data export to external services. Secret input in Feishu is always rejected.
 
 ## Synchronization and Privacy
 
@@ -203,10 +204,11 @@ At a group root, a normal prompt must mention the current bot and the bridge ver
 ## Codex Execution Boundary
 
 - Working directories must pass `realpath` and remain under installer-written `ALLOWED_ROOT`, which defaults to the install user's home directory. Traversal and symlink escape are rejected.
-- New and resumed sessions use `--skip-git-repo-check`; this bypasses only the Git-repository requirement, not the path policy or sandbox.
-- The bridge always uses `workspace-write` and `approval=never`, never `danger-full-access`, sudo, or automatic privilege elevation.
+- Feishu turns do not use `codex exec`; new and resumed sessions use app-server `thread/*` and `turn/*` requests.
+- Plan uses a read-only sandbox with networking disabled. Normal Default uses `workspace-write` for the canonical cwd with networking disabled.
+- `root-danger-full-access` is available only when its explicit acknowledgement is configured and the process is UID 0 inside a dedicated container with neither `CAP_SYS_ADMIN` nor `CAP_SYS_MODULE` nor an accessible Docker, Podman, or containerd socket. Each Root task needs a separate one-time authorization; restart and epoch changes revoke all outstanding authorizations.
 - Active-task and JSONL-activity protection prevents the bridge and local Codex from writing the same session concurrently.
-- New and resumed sessions pass stored `-m <model>` and `-c model_reasoning_effort="<effort>"`. Historical sessions without saved settings retain local Codex defaults.
+- New and resumed sessions pass stored model and reasoning-effort settings to app-server. Historical sessions without saved settings retain local Codex defaults.
 
 ## Service Lifecycle and Operations
 
