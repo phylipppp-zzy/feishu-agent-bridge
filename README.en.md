@@ -17,6 +17,7 @@ This service mirrors local Codex conversations from `~/.codex/sessions` into a p
 - Runs Feishu turns through the persistent `codex app-server --stdio`; JSONL is retained for history import, external CLI sessions, and recovery only.
 - Plan turns are read-only with networking disabled. Default turns use `workspace-write` for the canonical task directory with networking disabled. Root is an explicit, one-task authorization for a preflight-checked dedicated container only; there is no `codex exec` fallback.
 - Loads visible models and supported reasoning efforts from `codex debug models` at startup and caches them in SQLite. If no valid model directory is available, new sessions are blocked and `/retry` can refresh it.
+- Internally, JSONL import, durable scheduling, app-server turns, approvals, and Feishu routing are split across `SessionImporter`, `TaskScheduler`, `TurnCoordinator`, `ApprovalService`, and `FeishuRouter`. `SyncService` remains only as a compatibility facade and owns no cross-module queues or active state.
 
 ## One-Command Installation
 

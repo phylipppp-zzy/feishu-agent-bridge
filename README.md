@@ -19,6 +19,7 @@
 - 原始 Codex JSONL 永远只保留在本机 `~/.codex/sessions`，桥接服务不提供原始日志上传功能。
 - Default 使用 app-server 的受限 `workspace-write` 策略；Plan 永远只读且禁用网络。Root 仅在通过预检的专用容器中启用，并且每项任务都需要一次性授权；没有任何 `codex exec` 回退。
 - 服务启动时通过 `codex debug models` 读取可见模型与支持的思考强度，缓存到 SQLite。CLI 暂时不可用时使用最近一次有效缓存；没有有效目录时会阻止新建，并提示使用 `/retry`。
+- 内部职责按 `SessionImporter`、`TaskScheduler`、`TurnCoordinator`、`ApprovalService` 和 `FeishuRouter` 拆分；`SyncService` 仅保留兼容门面，不持有跨模块队列或活动状态。
 
 ## 一键安装
 

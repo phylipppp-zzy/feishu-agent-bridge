@@ -11,14 +11,14 @@ does not expose an HTTP server or public callback endpoint.
 
 | Boundary | Rule | Enforcement |
 | --- | --- | --- |
-| Execution backend | Feishu work uses `codex app-server --stdio` only. Never add `codex exec` or a fallback. | `src/app-server.ts`, `src/sync.ts` |
-| Working directory | Resolve with `realpath` before both thread and turn creation; it must remain under `ALLOWED_ROOT`. | `src/path-policy.ts`, `src/sync.ts` |
-| Plan | Read-only sandbox, no network, never needs Root authorization. | turn construction in `src/sync.ts` |
-| Normal Default | `workspaceWrite` for the canonical cwd only, no network. | turn construction in `src/sync.ts` |
+| Execution backend | Feishu work uses `codex app-server --stdio` only. Never add `codex exec` or a fallback. | `src/app-server.ts`, `src/turn-coordinator.ts` |
+| Working directory | Resolve with `realpath` before both thread and turn creation; it must remain under `ALLOWED_ROOT`. | `src/path-policy.ts`, `src/turn-coordinator.ts` |
+| Plan | Read-only sandbox, no network, never needs Root authorization. | turn construction in `src/sync-runtime.ts` |
+| Normal Default | `workspaceWrite` for the canonical cwd only, no network. | turn construction in `src/sync-runtime.ts` |
 | Root Default | `dangerFullAccess` only in a preflight-approved dedicated container and only after one task-scoped authorization. | `src/execution-policy.ts`, `src/db.ts` |
 | Remote approval | Never authorize credentials, privilege escalation, sandbox bypass, runtime sockets, out-of-root writes, sensitive-data export, or non-allowlisted MCP. | `src/execution-policy.ts` |
-| Secrets | Never solicit secret input in Feishu or persist it. | request policy in `src/sync.ts` |
-| Display | App-server notifications own live display. JSONL imports history/external sessions and must not echo an app-server delivery. | `src/sync.ts`, `src/session-parser.ts` |
+| Secrets | Never solicit secret input in Feishu or persist it. | request policy in `src/sync-runtime.ts` |
+| Display | App-server notifications own live display. JSONL imports history/external sessions and must not echo an app-server delivery. | `src/turn-coordinator.ts`, `src/session-importer.ts` |
 
 ## Runtime components
 
@@ -35,7 +35,12 @@ is deliberately separated even where a coordinator invokes the components:
 | `db` | Schema migrations, SQLite transactions, task/turn/grant/event persistence and retention. | Feishu API calls. |
 | `feishu` | SDK/WebSocket normalization, serialized rate-limited API calls, files and CardKit transport. | Authorization decisions. |
 | `cards` | Pure v2 card construction (with explicit v1 rollback configuration). | Side effects or trust decisions. |
-| `sync` | Composition: session import, durable task scheduling, app-server turn coordination, approval handling, and Feishu command/card routing. | SDK protocol encoding and raw SQL. |
+| `session-importer` | Watches and incrementally imports JSONL, reconciles history, and suppresses live-delivery duplicates. | Task execution, approvals, or Feishu routing. |
+| `task-scheduler` | Owns the durable FIFO task queue, workers, terminal-state protection, and explicit cancellation scopes. | App-server protocol, Feishu APIs, or approval resolver state. |
+| `turn-coordinator` | Owns app-server turns, serialized notifications, bounded streaming, images, and active-turn state. | Feishu command routing or durable queue policy. |
+| `approval-service` | Owns one-time Root grants, remote approvals, user choices, resolvers, and expiry. | Raw protocol payload persistence or app-server execution. |
+| `feishu-router` | Routes message, menu, and card entry points through claim/authorization boundaries and delegates work asynchronously. | Direct app-server RPC or private module maps. |
+| `sync` | Compatibility facade that composes the runtime and preserves the existing public entry points. | Business workflow ownership; concrete state lives in the modules above. |
 
 Do not create a second mutable in-memory queue as an optimization. Durable
 SQLite state is the authority; local maps only serialize short-lived delivery

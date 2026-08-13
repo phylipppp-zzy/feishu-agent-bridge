@@ -9,7 +9,7 @@ authenticated Feishu WebSocket connection.
                                |
              message / card / menu event router
                                |
-              SQLite state + one-time authorization
+SQLite state + one-time authorization
                     |                         |
   JSONL history <-- import and deduplicate --> app-server turns
        |                                         |
@@ -17,6 +17,15 @@ authenticated Feishu WebSocket connection.
        |                                         |
   imported Feishu topic <--- bounded, serialized stream updates
 ```
+
+The public `SyncService` remains a compatibility facade for `index.ts` and
+existing integrations. Its runtime is composed from five narrow services:
+`SessionImporter` owns JSONL files and cursors, `TaskScheduler` owns durable
+FIFO work and cancellation scopes, `TurnCoordinator` owns app-server turns and
+live output, `ApprovalService` owns one-time grants and request resolvers, and
+`FeishuRouter` owns the message/menu/card entry points. Each service owns its
+short-lived maps; modules exchange immutable DTOs and never reach into another
+service's private state.
 
 `codex app-server --stdio` is the only execution backend for Feishu-initiated
 work. New sessions use `thread/start`; existing sessions use `thread/resume`;
