@@ -14,6 +14,7 @@ import type { FeishuRouterPort } from "./bridge-contracts.js";
 import { jsonlFiles, SessionImporter } from "./session-importer.js";
 import { TaskScheduler } from "./task-scheduler.js";
 import { ApprovalService } from "./approval-service.js";
+import { TurnCoordinator } from "./turn-coordinator.js";
 import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
@@ -109,9 +110,8 @@ function isSubagentSource(source: string): boolean {
 export class SyncService implements FeishuRouterPort {
   private readonly sessionsDir: string;
   private readonly sessionImporter: SessionImporter;
-  private readonly activeTurns = new Map<string, TurnState>();
+  private readonly turnCoordinator: TurnCoordinator;
   private readonly approvalService: ApprovalService;
-  private readonly notificationQueues = new Map<string, Promise<void>>();
   private readonly taskScheduler: TaskScheduler;
   private scanTimer: NodeJS.Timeout | null = null;
   private messageLinkPermissionDenied = false;
@@ -140,11 +140,19 @@ export class SyncService implements FeishuRouterPort {
         console.error(`Session importer ${operation} failed for ${path}`, error);
       },
     });
+    this.turnCoordinator = new TurnCoordinator({
+      executeTask: async (task) => task.kind === "resume" ? this.executeResumeTask(task) : this.executeNewTask(task),
+      interruptTurn: async (sessionId, turnId) => {
+        if (this.appServer) await this.appServer.interrupt(sessionId, turnId);
+      },
+      onNotification: (event) => this.onAppServerNotification(event),
+      onLifecycle: async (event) => { if (event.kind === "exited") await this.handleAppServerExit(event.epoch, event.error); },
+    });
     this.taskScheduler = new TaskScheduler({
       db,
-      executor: { execute: async (task) => task.kind === "resume" ? this.executeResumeTask(task) : this.executeNewTask(task) },
+      executor: this.turnCoordinator,
       isPaused: () => this.paused(),
-      hasActiveTurn: (sessionId) => this.activeTurns.has(sessionId),
+      hasActiveTurn: (sessionId) => this.turnCoordinator.hasActiveTurn(sessionId),
       hasLocalActiveSession: async (sessionId) => {
         const session = this.db.getSession(sessionId);
         return session ? this.hasLocalActiveSession(session) : false;
@@ -170,7 +178,7 @@ export class SyncService implements FeishuRouterPort {
       else this.db.resolveFailure("root_preflight");
     }
     if (this.appServer) {
-      this.appServer.onNotification((event) => this.enqueueAppServerNotification(event));
+      this.appServer.onNotification((event) => this.turnCoordinator.handleNotification(event));
       this.appServer.onLifecycle((event) => { if (event.kind === "started") this.appServerRestartAttempts = 0; });
       this.appServer.onExit((event) => { void this.handleAppServerExit(event.epoch, event.error); });
       this.appServer.onServerRequest((request) => this.approvalService.handleServerRequest(request));
@@ -225,7 +233,7 @@ export class SyncService implements FeishuRouterPort {
   async stop(): Promise<void> {
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.appServerRestartTimer) clearTimeout(this.appServerRestartTimer);
-    await Promise.all([...this.activeTurns.keys()].map((sessionId) => this.cancelSessionWork(sessionId, null, "service stopping")));
+    await Promise.all(this.turnCoordinator.sessionIds().map((sessionId) => this.cancelSessionWork(sessionId, null, "service stopping")));
     await this.cancelAllWork("service stopping");
     await this.sessionImporter.stopWatching();
     await this.appServer?.close();
@@ -362,7 +370,7 @@ export class SyncService implements FeishuRouterPort {
         }
         const refreshed = this.db.getSession(session.sessionId);
         if (refreshed?.rootMessageId) {
-          await this.feishu.updateCard(refreshed.rootMessageId, sessionCard(this.sessionView(refreshed), this.activeTurns.has(session.sessionId) ? "运行中" : "可继续"));
+          await this.feishu.updateCard(refreshed.rootMessageId, sessionCard(this.sessionView(refreshed), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续"));
         }
       } catch (error) {
         this.db.recordFailure("migrate_session_title", { sessionId: session.sessionId }, error);
@@ -392,7 +400,7 @@ export class SyncService implements FeishuRouterPort {
   private async clearStaleActiveSessions(): Promise<void> {
     const cutoff = Date.now() - this.config.activeSessionQuietMs;
     for (const sessionId of this.db.listActiveSessionIds()) {
-      if (this.activeTurns.has(sessionId)) continue;
+      if (this.turnCoordinator.hasActiveTurn(sessionId)) continue;
       const session = this.db.getSession(sessionId);
       if (!session) { this.db.setSetting(`session.${sessionId}.active`, "0"); continue; }
       try {
@@ -479,7 +487,7 @@ export class SyncService implements FeishuRouterPort {
     for (const session of this.db.listSessions()) {
       if (!session.rootMessageId) continue;
       try {
-        await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.activeTurns.has(session.sessionId) ? "运行中" : "可继续"));
+        await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续"));
         this.db.setSessionCardMessage(session.sessionId, session.rootMessageId);
       } catch (error) {
         this.db.recordFailure("restore_root_card", { sessionId: session.sessionId }, error);
@@ -581,7 +589,7 @@ export class SyncService implements FeishuRouterPort {
           continue;
         }
       }
-      if (message.role === "progress" && !this.activeTurns.has(session.sessionId)) continue;
+      if (message.role === "progress" && !this.turnCoordinator.hasActiveTurn(session.sessionId)) continue;
       const label = message.role === "user" ? "用户" : message.role === "assistant" ? "Codex" : "进度";
       const mapped = message.role === "assistant" ? this.db.findAppServerDelivery(session.sessionId, "assistant", textHash(message.text)) : null;
       if (mapped?.feishuMessageId) {
@@ -673,9 +681,9 @@ export class SyncService implements FeishuRouterPort {
     const targetIds = new Set<string>(cancelled.flatMap((task) => task.sessionId ? [task.sessionId] : []));
     if (sessionId) targetIds.add(sessionId);
     for (const targetSessionId of targetIds) {
-      const active = this.activeTurns.get(targetSessionId);
+      const active = this.turnCoordinator.mutableTurn(targetSessionId);
       if (active) {
-        this.activeTurns.delete(targetSessionId);
+        this.turnCoordinator.deleteTurn(targetSessionId);
         active.state = "interrupted"; this.db.saveTurn(active);
         await this.cleanupTurnImages(active.turnId);
         if (this.appServer) void this.appServer.request("turn/interrupt", { threadId: targetSessionId, turnId: active.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: targetSessionId }, error));
@@ -688,14 +696,14 @@ export class SyncService implements FeishuRouterPort {
   private async cancelAllWork(reason: string): Promise<number> {
     const cancelled = this.db.cancelAllTasks(reason);
     const ids = new Set<string>(cancelled.flatMap((task) => task.sessionId ? [task.sessionId] : []));
-    for (const sessionId of this.activeTurns.keys()) ids.add(sessionId);
+    for (const sessionId of this.turnCoordinator.sessionIds()) ids.add(sessionId);
     for (const sessionId of ids) await this.cancelSessionWork(sessionId, null, reason);
     return cancelled.length;
   }
   private async handleAppServerExit(epoch: number, error?: Error): Promise<void> {
     const interrupted = this.db.markRunningTasksInterrupted();
-    for (const turn of this.activeTurns.values()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
-    this.activeTurns.clear();
+    for (const turn of this.turnCoordinator.states()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
+    this.turnCoordinator.clearTurns();
     this.approvalService.clear();
     for (const task of interrupted) {
       if (task.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已中断", "Codex app-server 已退出；该任务不会自动重放。")).catch(() => undefined);
@@ -760,7 +768,7 @@ export class SyncService implements FeishuRouterPort {
   private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { executionMode: BridgeConfig["executionMode"]; rootExecutionReady: boolean; rootPreflightReasons: string[]; hasActiveWork: boolean } {
     let reasons: string[] = [];
     try { reasons = JSON.parse(this.db.getSetting("codex.root_preflight") ?? "{}").reasons ?? []; } catch { /* invalid diagnostics are ignored */ }
-    return { ...session, executionMode: this.config.executionMode, rootExecutionReady: this.rootExecutionReady, rootPreflightReasons: reasons, hasActiveWork: this.activeTurns.has(session.sessionId) };
+    return { ...session, executionMode: this.config.executionMode, rootExecutionReady: this.rootExecutionReady, rootPreflightReasons: reasons, hasActiveWork: this.turnCoordinator.hasActiveTurn(session.sessionId) };
   }
 
   private requestKind(method: string): RemoteRequestType | null {
@@ -837,7 +845,7 @@ export class SyncService implements FeishuRouterPort {
       openId, chatId: session.chatId ?? this.boundChatId() ?? "", rootMessageId,
       cardMessageId: null, payload: this.safeRequestPayload(type, params, canonicalCwd), status: "pending", expiresAt: expiry,
     };
-    const state = this.activeTurns.get(scopedSessionId);
+    const state = this.turnCoordinator.mutableTurn(scopedSessionId);
     if (state) {
       state.state = type === "user_input" ? "awaiting_input" : "awaiting_approval"; this.db.saveTurn(state);
       const task = turnId ? this.db.taskForTurn(turnId) : null;
@@ -885,33 +893,21 @@ export class SyncService implements FeishuRouterPort {
     if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", decision === "accept" || decision === "acceptForSession" ? "已批准。" : "已拒绝或取消。", decision === "accept" || decision === "acceptForSession"));
   }
 
-  private enqueueAppServerNotification(message: JsonRpcMessage): Promise<void> {
-    const params = this.asRecord(message.params);
-    const sessionId = this.stringAt(params, "threadId", "thread_id") ?? "unscoped";
-    const turnId = this.stringAt(params, "turnId", "turn_id") ?? "none";
-    const key = sessionId + ":" + turnId;
-    const previous = this.notificationQueues.get(key) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(() => this.onAppServerNotification(message));
-    this.notificationQueues.set(key, next);
-    void next.finally(() => { if (this.notificationQueues.get(key) === next) this.notificationQueues.delete(key); });
-    return next;
-  }
-
   private async onAppServerNotification(message: JsonRpcMessage): Promise<void> {
     const params = this.asRecord(message.params); const method = message.method ?? "";
     const sessionId = this.stringAt(params, "threadId", "thread_id"); const turnId = this.stringAt(params, "turnId", "turn_id");
     if (method === "thread/name/updated" && sessionId) {
       const title = this.stringAt(params, "threadName", "thread_name", "name");
-      if (title) { this.db.setSessionTitle(sessionId, title); const session = this.db.getSession(sessionId); if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.activeTurns.has(sessionId) ? "运行中" : "可继续")); }
+      if (title) { this.db.setSessionTitle(sessionId, title); const session = this.db.getSession(sessionId); if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(sessionId) ? "运行中" : "可继续")); }
       return;
     }
     if (method === "turn/started" && sessionId && turnId) {
       const session = this.db.getSession(sessionId); if (!session?.rootMessageId) return;
-      const current = this.activeTurns.get(sessionId) ?? { sessionId, turnId, epoch: this.appServer?.appServerEpoch ?? 0, mode: session.collaborationMode === "plan" ? "plan" : "default", state: "running" as const, text: "", plan: "", rootMessageId: session.rootMessageId };
-      current.turnId = turnId; this.activeTurns.set(sessionId, current); this.db.saveTurn(current); await this.updateRunCard(sessionId, session.rootMessageId, "运行中", "Codex 正在处理。", true); return;
+      const current = this.turnCoordinator.mutableTurn(sessionId) ?? { sessionId, turnId, epoch: this.appServer?.appServerEpoch ?? 0, mode: session.collaborationMode === "plan" ? "plan" : "default", state: "running" as const, text: "", plan: "", rootMessageId: session.rootMessageId };
+      current.turnId = turnId; this.turnCoordinator.setTurn(current); this.db.saveTurn(current); await this.updateRunCard(sessionId, session.rootMessageId, "运行中", "Codex 正在处理。", true); return;
     }
     if ((method === "item/agentMessage/delta" || method === "item/plan/delta") && sessionId && turnId) {
-      const state = this.activeTurns.get(sessionId); if (!state || state.turnId !== turnId) return;
+      const state = this.turnCoordinator.mutableTurn(sessionId); if (!state || state.turnId !== turnId) return;
       const delta = this.stringAt(params, "delta", "text") ?? ""; if (!delta) return;
       if (method.includes("plan")) state.plan = appendBoundedText(state.plan, delta, MAX_LIVE_TEXT_BYTES); else state.text = appendBoundedText(state.text, delta, MAX_LIVE_TEXT_BYTES);
       await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex"); return;
@@ -925,8 +921,8 @@ export class SyncService implements FeishuRouterPort {
       return;
     }
     if (method === "turn/completed" && sessionId && turnId) {
-      const state = this.activeTurns.get(sessionId); if (!state || state.turnId !== turnId) return; const turn = this.asRecord(params.turn); const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
-      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed"; state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text); this.db.saveTurn(state); this.activeTurns.delete(sessionId);
+      const state = this.turnCoordinator.mutableTurn(sessionId); if (!state || state.turnId !== turnId) return; const turn = this.asRecord(params.turn); const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
+      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed"; state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text); this.db.saveTurn(state); this.turnCoordinator.deleteTurn(sessionId);
       const task = this.db.taskForTurn(turnId); if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: "turn " + state.state }); await this.cleanupTurnImages(turnId);
       try { const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : "Codex " + state.state); const content = state.plan || state.text; if (content && feishuMessageId) this.db.upsertAppServerDelivery({ sessionId, turnId, role: "assistant", startedAtMs: state.startedAtMs ?? null, endedAtMs: state.endedAtMs ?? null, contentHash: textHash(content), contentBytes: Buffer.byteLength(content, "utf8"), feishuMessageId }); } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
       void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error)); void this.drainTaskQueue(sessionId);
@@ -951,7 +947,7 @@ export class SyncService implements FeishuRouterPort {
   private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number; queued: number; waiting: number; failedTasks: number; appServer?: string } {
     const counts = this.db.taskStateCounts();
     const health = this.appServer?.getHealth();
-    return { paused: this.paused(), sessions: this.db.listSessions().length, active: counts.running ?? this.activeTurns.size,
+    return { paused: this.paused(), sessions: this.db.listSessions().length, active: counts.running ?? this.turnCoordinator.activeCount(),
       queued: counts.pending ?? 0, waiting: (counts.awaiting_root_consent ?? 0) + (counts.awaiting_input ?? 0) + (counts.awaiting_approval ?? 0),
       failedTasks: counts.failed ?? 0, failures: this.db.failureCount(), appServer: health ? `${health.state} / epoch ${health.epoch}` : "未启用" };
   }
@@ -1315,17 +1311,17 @@ export class SyncService implements FeishuRouterPort {
         case "session_status": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("请在对应会话话题内刷新状态。");
-          const card = sessionCard(this.sessionView(session), this.activeTurns.has(session.sessionId) ? "运行中" : "可继续");
+          const card = sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续");
           return event.openMessageId === session.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: session.rootMessageId, card };
         }
         case "session_toggle_mode": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("请在对应会话话题内切换模式。");
-          if (this.activeTurns.has(session.sessionId) || (session.rootMessageId && this.db.runningTaskForRoot(session.rootMessageId))) return errorCard("当前回合正在运行；请完成或取消后再切换模式。");
+          if (this.turnCoordinator.hasActiveTurn(session.sessionId) || (session.rootMessageId && this.db.runningTaskForRoot(session.rootMessageId))) return errorCard("当前回合正在运行；请完成或取消后再切换模式。");
           const mode = session.collaborationMode === "plan" ? "default" : "plan";
           this.db.setCollaborationMode(session.sessionId, mode);
           const updated = this.db.getSession(session.sessionId)!;
-          const card = sessionCard(this.sessionView(updated), this.activeTurns.has(updated.sessionId) ? "运行中" : "可继续");
+          const card = sessionCard(this.sessionView(updated), this.turnCoordinator.hasActiveTurn(updated.sessionId) ? "运行中" : "可继续");
           return event.openMessageId === updated.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: updated.rootMessageId!, card };
         }
         case "cancel_run": {
@@ -1333,7 +1329,7 @@ export class SyncService implements FeishuRouterPort {
           const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("当前会话没有可取消的桥接任务。");
           const cancelled = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
-          if (!this.activeTurns.has(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
+          if (!this.turnCoordinator.hasActiveTurn(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
           if (session.rootMessageId) void this.updateRunCard(session.sessionId, session.rootMessageId, "正在取消", "已向 Codex 发送取消信号。", false);
           const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), "可继续") : runStatusCard("正在取消", "已向 Codex 发送取消信号。");
           return rootCardSession && event.openMessageId === rootCardSession.rootMessageId
@@ -1361,7 +1357,7 @@ export class SyncService implements FeishuRouterPort {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
           if (!session) return errorCard("当前会话不可用。");
           const turn = this.db.activeTurn(session.sessionId);
-          const latest = turn ?? this.db.latestTurn(session.sessionId) ?? (this.activeTurns.get(session.sessionId) ?? null);
+          const latest = turn ?? this.db.latestTurn(session.sessionId) ?? (this.turnCoordinator.mutableTurn(session.sessionId) ?? null);
           return { delivery: "reply", rootMessageId: session.rootMessageId, card: reviewCard(latest ? this.db.listTurnItems(latest.turnId) : []) };
         }
         case "remote_approve": {
@@ -1612,7 +1608,7 @@ export class SyncService implements FeishuRouterPort {
     return [
       `状态：${this.paused() ? "已暂停" : "运行中"}`,
       `已索引会话：${this.db.listSessions().length}`,
-      `活动 Codex 任务：${this.activeTurns.size}`,
+      `活动 Codex 任务：${this.turnCoordinator.activeCount()}`,
       `未解决失败：${this.db.failureCount()}`,
       `允许目录：${this.config.allowedRoot}`,
     ].join("\n");
@@ -1955,7 +1951,7 @@ export class SyncService implements FeishuRouterPort {
     const turnId = this.stringAt(turn, "id") ?? this.stringAt(response, "turnId", "turn_id");
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
     const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt) };
-    this.activeTurns.set(session.sessionId, state); this.db.saveTurn(state);
+    this.turnCoordinator.setTurn(state); this.db.saveTurn(state);
     this.db.upsertAppServerDelivery({ sessionId: session.sessionId, turnId, role: "user", startedAtMs: state.startedAtMs ?? null, contentHash: textHash(task.prompt), contentBytes: Buffer.byteLength(task.prompt, "utf8"), sourceMessageId: task.sourceMessageId });
     this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId });
     this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
@@ -1991,7 +1987,7 @@ export class SyncService implements FeishuRouterPort {
     if (!userPrompt) { await this.respond(message, "消息中没有可提交的文本或图片。"); return; }
     try { await resolveAllowedPath(session.cwd, this.config.allowedRoot); }
     catch (error) { await this.respond(message, `会话目录被拒绝：${String(error)}`); return; }
-    const active = this.activeTurns.get(session.sessionId);
+    const active = this.turnCoordinator.mutableTurn(session.sessionId);
     if (active && this.appServer) {
       const paths = await this.downloadImages(message, message.imageKeys);
       try {
@@ -2035,7 +2031,7 @@ export class SyncService implements FeishuRouterPort {
     const session = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const key = session?.sessionId;
     const cancelled = await this.cancelSessionWork(key ?? null, message.rootId ?? null, "cancelled by user");
-    if (!key || (!this.activeTurns.has(key) && !cancelled)) {
+    if (!key || (!this.turnCoordinator.hasActiveTurn(key) && !cancelled)) {
       await this.respond(message, "当前话题没有由桥接服务启动的活动任务。");
       return;
     }
