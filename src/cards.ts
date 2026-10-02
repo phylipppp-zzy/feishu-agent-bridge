@@ -1,63 +1,10 @@
 import { basename, relative } from "node:path";
+import { actionRow, button, card, cardUiVersion, inputForm, markdown, nextElementId, note, plain, safeMarkdown, shorten } from "./card-kit.js";
 import type { CardDefinition, ChoiceOption, ChoiceQuestion, ChoiceRequest, ModelCapability, SessionMetadata } from "./types.js";
 
+export { configureCardUi } from "./card-kit.js";
+
 type SessionView = SessionMetadata & { rootMessageId: string | null; rootAppLink: string | null; chatId: string | null; threadId: string | null; sessionCardMessageId: string | null };
-
-let cardUiVersion: 1 | 2 = 1;
-let elementSequence = 0;
-
-export function configureCardUi(version: 1 | 2): void { cardUiVersion = version; }
-
-function plain(content: string): Record<string, string> { return { tag: "plain_text", content }; }
-function markdown(content: string): Record<string, string> { return { tag: "markdown", content }; }
-function note(content: string): Record<string, unknown> {
-  return cardUiVersion === 2 ? markdown(content) : { tag: "note", elements: [plain(content)] };
-}
-function button(label: string, action: string, type: "default" | "primary" | "danger" = "default", extra: Record<string, unknown> = {}): Record<string, unknown> {
-  const value = { action, ...extra };
-  return cardUiVersion === 2
-    ? { tag: "button", element_id: `btn_${++elementSequence}`, text: plain(label), type, behaviors: [{ type: "callback", value }] }
-    : { tag: "button", text: plain(label), type, value };
-}
-function actionRow(actions: Record<string, unknown>[]): Record<string, unknown> {
-  if (cardUiVersion === 1) return { tag: "action", layout: "flow", actions };
-  return {
-    tag: "column_set", horizontal_spacing: "8px", horizontal_align: "left",
-    columns: actions.map((action) => ({ tag: "column", width: "auto", elements: [action] })),
-  };
-}
-function card(title: string, template: string, elements: Record<string, unknown>[]): CardDefinition {
-  const common = { config: { wide_screen_mode: true, enable_forward: false, update_multi: true }, header: { template, title: plain(title) } };
-  return cardUiVersion === 2 ? { schema: "2.0", ...common, body: { elements } } : { ...common, elements };
-}
-
-interface FormButton { label: string; action: string; type?: "default" | "primary" | "danger"; extra?: Record<string, unknown>; }
-function inputForm(options: {
-  formName: string; inputName: string; elementId: string; placeholder: string; maxLength: number;
-  required?: boolean; multiline?: boolean; rows?: number; buttons: FormButton[];
-}): Record<string, unknown>[] {
-  const input: Record<string, unknown> = cardUiVersion === 2 ? {
-    tag: "input", element_id: options.elementId, name: options.inputName, required: options.required ?? false,
-    placeholder: plain(options.placeholder), max_length: options.maxLength, width: "fill",
-    ...(options.multiline ? { input_type: "multiline_text", rows: options.rows ?? 4, auto_resize: true, max_rows: 8 } : {}),
-  } : {
-    tag: "input", name: options.inputName, required: options.required ?? false, placeholder: plain(options.placeholder),
-    max_length: options.maxLength, ...(options.multiline ? { input_type: "multiline_text", multiline: true, rows: options.rows ?? 4 } : {}),
-  };
-  const submitButtons = options.buttons.map((item, index) => {
-    const built = button(item.label, item.action, item.type ?? "default", item.extra ?? {});
-    return cardUiVersion === 2
-      ? { ...built, name: `${options.formName}_b${index + 1}`, form_action_type: "submit" }
-      : { ...built, name: `${options.formName}_b${index + 1}`, action_type: "form_submit" };
-  });
-  if (cardUiVersion === 1) return [input, actionRow(submitButtons)];
-  return [{
-    tag: "form", element_id: `${options.formName}_id`, name: options.formName, direction: "vertical", vertical_spacing: "8px",
-    elements: [input, actionRow(submitButtons)],
-  }];
-}
-function safeMarkdown(value: string): string { return value.replace(/[\\`*_{}\[\]()#+.!|>-]/g, "\\$&"); }
-function shorten(value: string, limit = 100): string { return [...value.replace(/\s+/g, " ").trim()].slice(0, limit).join(""); }
 
 export const EFFORT_LABELS: Record<string, string> = {
   low: "快速", medium: "平衡", high: "深入", xhigh: "超高", max: "最大", ultra: "极限",
@@ -226,7 +173,7 @@ function optionControls(options: ChoiceOption[], action: string, value: Record<s
     return [actionRow(options.map((option, optionIndex) =>
       button(`${optionIndex + 1}. ${option.label}`, action, optionIndex === 0 ? "primary" : "default", { ...value, optionIndex })))];
   }
-  if (cardUiVersion === 2) {
+  if (cardUiVersion() === 2) {
     return [{ tag: "select_static", element_id: selectId, name: selectName,
       placeholder: plain("选择一个选项"), options: options.map((option, optionIndex) => ({ text: plain(`${optionIndex + 1}. ${option.label}`), value: String(optionIndex) })),
       behaviors: [{ type: "callback", value: { action, ...value } }] }];
@@ -260,7 +207,7 @@ export function remoteQuestionCard(nonce: string, questions: ChoiceQuestion[], q
   const question = questions[questionIndex];
   if (!question) return card("Codex 等待你的输入", "orange", [markdown("Codex 请求输入，但没有可以显示的问题。"), decline]);
   return card(`Codex 等待你的回答 ${questionIndex + 1}/${questions.length}`, "orange", [...questionDetails(question),
-    ...(question.options.length ? optionControls(question.options, "remote_answer", { nonce, questionIndex }, `answer_${++elementSequence}`, `answer_${questionIndex}`) : []),
+    ...(question.options.length ? optionControls(question.options, "remote_answer", { nonce, questionIndex }, nextElementId("answer"), `answer_${questionIndex}`) : []),
     decline,
     note((question.options.length ? "也可以在本话题回复选项编号，或直接回复自定义答案。" : "请直接在本话题回复你的答案。") + "回答会在 Codex 当前这一轮内生效。")]);
 }
