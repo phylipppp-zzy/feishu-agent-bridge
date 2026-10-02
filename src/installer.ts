@@ -50,14 +50,43 @@ function ensureApiSuccess(operation: string, response: { code?: number | undefin
   if (response.code && response.code !== 0) throw new Error(`${operation} failed: ${response.msg ?? `code ${response.code}`}`);
 }
 
+/** App identity and wording that differ between the Codex and Claude bridges. */
+export interface FeishuAppProfile {
+  source: string;
+  presetName: string;
+  presetDesc: string;
+  botDescription: string;
+  releaseRemark: string;
+  releaseChangelog: string;
+}
+
+export const CODEX_APP_PROFILE: FeishuAppProfile = {
+  source: "feishu-codex-bridge",
+  presetName: "Codex Bridge - {user}",
+  presetDesc: "在飞书话题中同步和继续本机 Codex 会话",
+  botDescription: "发送 / 打开 Codex 操作面板",
+  releaseRemark: "Initial installation by feishu-codex-bridge",
+  releaseChangelog: "Enable the Codex bridge bot, WebSocket events, cards and menus.",
+};
+
+export const CLAUDE_APP_PROFILE: FeishuAppProfile = {
+  source: "feishu-claude-bridge",
+  presetName: "Claude Bridge - {user}",
+  presetDesc: "在飞书话题中查看和继续本机 Claude Code 会话",
+  botDescription: "发送 / 打开 Claude 操作面板",
+  releaseRemark: "Initial installation by feishu-claude-bridge",
+  releaseChangelog: "Enable the Claude bridge bot, WebSocket events and cards.",
+};
+
 export async function registerFeishuApp(
   onVerificationUrl: (url: string, expireIn: number) => void,
   existingAppId?: string,
+  profile: FeishuAppProfile = CODEX_APP_PROFILE,
 ): Promise<RegisteredApp> {
   const registered = await Lark.registerApp({
-    source: "feishu-codex-bridge",
+    source: profile.source,
     ...(existingAppId ? { appId: existingAppId } : { createOnly: true }),
-    appPreset: { name: "Codex Bridge - {user}", desc: "在飞书话题中同步和继续本机 Codex 会话" },
+    appPreset: { name: profile.presetName, desc: profile.presetDesc },
     addons: {
       preset: false,
       scopes: { tenant: [...FEISHU_SCOPES] },
@@ -73,7 +102,7 @@ export async function registerFeishuApp(
   };
 }
 
-export async function configureFeishuApp(appId: string, appSecret: string, ownerOpenId: string): Promise<{ publishVersion?: string }> {
+export async function configureFeishuApp(appId: string, appSecret: string, ownerOpenId: string, profile: FeishuAppProfile = CODEX_APP_PROFILE): Promise<{ publishVersion?: string }> {
   const client = new Lark.Client({
     appId,
     appSecret,
@@ -92,7 +121,7 @@ export async function configureFeishuApp(appId: string, appSecret: string, owner
     data: {
       bot: {
         enable: true,
-        i18ns: [{ i18n_key: "zh_cn", get_started_desc: "发送 / 打开 Codex 操作面板" }],
+        i18ns: [{ i18n_key: "zh_cn", get_started_desc: profile.botDescription }],
       },
     },
   });
@@ -103,18 +132,18 @@ export async function configureFeishuApp(appId: string, appSecret: string, owner
     data: {
       mobile_default_ability: "bot",
       pc_default_ability: "bot",
-      remark: "Initial installation by feishu-codex-bridge",
-      changelog: "Enable the Codex bridge bot, WebSocket events, cards and menus.",
+      remark: profile.releaseRemark,
+      changelog: profile.releaseChangelog,
     },
   });
   ensureApiSuccess("submit Feishu application release", published);
   return published.data?.version ? { publishVersion: published.data.version } : {};
 }
 
-export async function provisionFeishuApp(onVerificationUrl: (url: string, expireIn: number) => void): Promise<ProvisionedApp> {
-  const registered = await registerFeishuApp(onVerificationUrl);
+export async function provisionFeishuApp(onVerificationUrl: (url: string, expireIn: number) => void, profile: FeishuAppProfile = CODEX_APP_PROFILE): Promise<ProvisionedApp> {
+  const registered = await registerFeishuApp(onVerificationUrl, undefined, profile);
   if (!registered.ownerOpenId) throw new Error("Feishu registration did not return the installing user's open_id");
-  return { ...registered, ...await configureFeishuApp(registered.appId, registered.appSecret, registered.ownerOpenId) };
+  return { ...registered, ...await configureFeishuApp(registered.appId, registered.appSecret, registered.ownerOpenId, profile) };
 }
 
 function quoted(value: string): string {
@@ -123,6 +152,17 @@ function quoted(value: string): string {
 }
 
 function systemdQuoted(value: string): string { return quoted(value.replaceAll("%", "%%")); }
+
+/**
+ * A path for settings such as WorkingDirectory= and EnvironmentFile=. systemd takes their whole
+ * value literally (only Exec lines support quoting), so quotes would become part of the path.
+ */
+function systemdPath(value: string): string {
+  if (!value.startsWith("/") || value !== value.trim() || /[\r\n"\\]/.test(value)) {
+    throw new Error(`systemd path must be absolute and free of quotes, backslashes and line breaks: ${value}`);
+  }
+  return value.replaceAll("%", "%%");
+}
 
 export function generateBindToken(): string { return randomBytes(24).toString("base64url"); }
 
@@ -151,27 +191,30 @@ export function parseEnvironment(content: string): Record<string, string> {
   return values;
 }
 
-export function renderSystemdUnit(input: { projectDir: string; nodeBin: string; environmentFile: string }): string {
+/**
+ * `sessionUmask` is set for a service that runs the person's own Claude Code sessions: their
+ * commands then see the same /tmp and create files with the same permissions as in a terminal,
+ * so the service keeps the shared /tmp and uses the installing shell's umask.
+ */
+export function renderSystemdUnit(input: { projectDir: string; nodeBin: string; environmentFile: string; description?: string; entry?: string; sessionUmask?: number }): string {
+  const isolation = input.sessionUmask === undefined ? "UMask=0077\nNoNewPrivileges=true\nRestrictSUIDSGID=true\nPrivateTmp=true\nProtectSystem=full"
+    : `UMask=${(input.sessionUmask & 0o777).toString(8).padStart(4, "0")}\nNoNewPrivileges=true\nRestrictSUIDSGID=true\nProtectSystem=full`;
   return `[Unit]
-Description=Feishu to Codex session bridge
+Description=${input.description ?? "Feishu to Codex session bridge"}
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${systemdQuoted(input.projectDir)}
+WorkingDirectory=${systemdPath(input.projectDir)}
 Environment=NODE_ENV=production
-EnvironmentFile=${systemdQuoted(input.environmentFile)}
-ExecStart=${systemdQuoted(input.nodeBin)} ${systemdQuoted(`${input.projectDir}/dist/src/index.js`)}
+EnvironmentFile=${systemdPath(input.environmentFile)}
+ExecStart=${systemdQuoted(input.nodeBin)} ${systemdQuoted(`${input.projectDir}/${input.entry ?? "dist/src/index.js"}`)}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 KillMode=mixed
-UMask=0077
-NoNewPrivileges=true
-RestrictSUIDSGID=true
-PrivateTmp=true
-ProtectSystem=full
+${isolation}
 
 [Install]
 WantedBy=default.target

@@ -61,6 +61,10 @@ test("JSON 2.0 cards use body elements and real form submit controls", () => {
     assert.match(projects, /"name":"project_path"/);
     assert.match(projects, /"action":"submit_project_path"/);
     assert.match(projects, /"action":"search_projects"/);
+    // Full project paths are listed as text; buttons carry a number and a short name, which phones do not cut off.
+    const listed = JSON.stringify(projectsCard([{ cwd: "/home/tester/a-very-long-project-directory/code/main", count: 3 }], "/home/tester", "wizard-1"));
+    assert.match(listed, /1\. \/home\/tester\/a\\\\-very\\\\-long\\\\-project\\\\-directory\/code\/main（3 个会话）/);
+    assert.match(listed, /"content":"1 · main"/);
     const search = JSON.stringify(recentSessionsCard([]));
     assert.match(search, /"name":"session_search"/);
     assert.match(search, /"action":"search_sessions"/);

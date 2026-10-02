@@ -367,6 +367,14 @@ test("plain words in a session topic go to Codex while slash commands still reac
     }
     assert.deepEqual(continued, words);
     assert.notEqual(db.getSetting("sync.paused"), "1");
+    // A lone / in a topic posts the session's root card again at the bottom; its buttons work there too.
+    await service.onFeishuMessage(inbound({ messageId: "topic-menu", rootId: "root-1", mentionedBot: false, text: "/" }));
+    const copy = JSON.stringify(feishu.cards.at(-1));
+    assert.match(copy, /"action":"session_model"/);
+    const sessionId = /"sessionId":"([^"]+)"/.exec(copy)?.[1] ?? "";
+    assert.ok(sessionId);
+    const status = await service.onCardAction({ ...cardAction("session_status", { sessionId }), openMessageId: "copy-of-root" });
+    assert.doesNotMatch(JSON.stringify(status), /请在对应会话话题内/);
     await service.onFeishuMessage(inbound({ messageId: "topic-slash-pause", rootId: "root-1", mentionedBot: false, text: "/pause" }));
     assert.equal(db.getSetting("sync.paused"), "1");
     await service.onFeishuMessage(inbound({ messageId: "root-status", text: "状态" }));
