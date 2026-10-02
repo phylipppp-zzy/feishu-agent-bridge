@@ -30,3 +30,19 @@ test("a session is in scope when its working directory is a sync directory or be
   assert.equal(inSyncScope("/x/y", ["/a/b", "/x"]), true);
   assert.equal(inSyncScope("/x/y", ["/"]), true);
 });
+
+test("the binding status is read from the bridge database without disturbing it", async () => {
+  const { ClaudeBridgeDatabase } = await import("../src/claude/db.js");
+  const { readBinding } = await import("../src/claude/binding-status.js");
+  const dir = await mkdtemp(join(tmpdir(), "claude-binding-"));
+  try {
+    assert.equal(await readBinding(join(dir, "missing")), null);
+    const db = new ClaudeBridgeDatabase(dir);
+    assert.equal(await readBinding(dir), null);
+    db.setSetting("feishu.chat_id", "oc_1");
+    db.setSetting("feishu.bound_at", "2026-10-02T15:39:58.268Z");
+    assert.deepEqual(await readBinding(dir), { boundAt: "2026-10-02T15:39:58.268Z" });
+    db.setSetting("feishu.open_id", "ou_1");
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

@@ -210,7 +210,9 @@ test("opening an indexed session creates its topic with the latest turn", async 
   } finally { await env.cleanup(); }
 });
 
-test("a stalled turn is shown as unfinished, and a rejected tool panel falls back to plain lines", async () => {
+test("a stalled turn is shown as unfinished, and a rejected tool panel falls back to plain lines", async (t) => {
+  // The simulated rejection is logged as a failure; keep it out of the test output.
+  t.mock.method(console, "error", () => undefined);
   const env = await setup("claude-stale-");
   try {
     const now = Date.now();

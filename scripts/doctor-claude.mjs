@@ -10,6 +10,7 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import { parseEnvironment } from "../dist/src/installer.js";
 import { bridgeHookCommand, bridgeHooksStatus, parseBridgeHookCommand } from "../dist/src/claude/hooks-config.js";
 import { readClaudeSettings } from "../dist/src/claude/settings-file.js";
+import { readBinding } from "../dist/src/claude/binding-status.js";
 import { installSafeLogging } from "../dist/src/safe-log.js";
 
 const execFileAsync = promisify(execFile);
@@ -116,6 +117,11 @@ else {
     }
   } catch (error) { result(false, `无法检查 ${settingsFile} 中的 hook：${message(error)}`); }
 }
+
+const binding = await readBinding(stateDir);
+console.log(binding
+  ? `INFO  已绑定到飞书群${binding.boundAt ? `（绑定于 ${new Date(binding.boundAt).toLocaleString("zh-CN", { hour12: false })}）` : ""}`
+  : "INFO  尚未绑定：在私密话题群中发送 @机器人 /bind <绑定码>（绑定码即环境文件中的 FEISHU_BIND_TOKEN）");
 
 const presenceDir = join(stateDir, "presence");
 try {

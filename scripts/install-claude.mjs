@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { CLAUDE_APP_PROFILE, configureFeishuApp, generateBindToken, parseEnvironment, registerFeishuApp, renderEnvironment, renderSystemdUnit } from "../dist/src/installer.js";
 import { BRIDGE_HOOK_EVENTS, bridgeHookCommand, mergeBridgeHooks } from "../dist/src/claude/hooks-config.js";
 import { readClaudeSettings, writeClaudeSettings } from "../dist/src/claude/settings-file.js";
+import { readBinding } from "../dist/src/claude/binding-status.js";
 
 const args = process.argv.slice(2);
 const usage = `Usage: ./install-claude.sh [--existing-app <cli_xxx> | --from-env] [--no-hooks] [--sync-dir <dir>... | --sync-all]
@@ -255,7 +256,12 @@ try {
 }
 
 if (!process.exitCode) {
-  console.log(`\n安装完成。下一步：
+  // A rerun (for example to change SYNC_DIRS) keeps the binding; the bind code is already spent then.
+  const binding = await readBinding(stateDir);
+  const boundAt = binding?.boundAt ? `（绑定于 ${new Date(binding.boundAt).toLocaleString("zh-CN", { hour12: false })}）` : "";
+  console.log(binding ? `\n安装完成，服务已按新的配置重启。机器人已经绑定到飞书群${boundAt}，无需再次绑定。
+
+提示：` : `\n安装完成。下一步：
 1. 在飞书中创建一个私密话题群，并把新机器人加入群。
 2. 在群中发送：@机器人 /bind ${bindToken}
 3. 绑定后，本机的 Claude Code 会话会以只读方式同步到群内话题。
