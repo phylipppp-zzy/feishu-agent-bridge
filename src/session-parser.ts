@@ -74,33 +74,46 @@ function stableMessageId(sessionId: string, timestamp: string, role: string, tex
 
 // Context Codex and its host add to a user message (plugin lists, environment, AGENTS.md and
 // user instructions). The person did not type it, so it is not shown as their message.
-const HOST_BLOCKS = [
-  /^<recommended_plugins>[\s\S]*?<\/recommended_plugins>/i,
-  /^<environment_context>[\s\S]*?<\/environment_context>/i,
-  /^<user_instructions>[\s\S]*?<\/user_instructions>/i,
-  /^# AGENTS\.md instructions[^\n]*\n+<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/i,
+const HOST_BLOCKS: ReadonlyArray<{ open: string; block: RegExp }> = [
+  { open: "<recommended_plugins>", block: /^<recommended_plugins>[\s\S]*?<\/recommended_plugins>/i },
+  { open: "<environment_context>", block: /^<environment_context>[\s\S]*?<\/environment_context>/i },
+  { open: "<user_instructions>", block: /^<user_instructions>[\s\S]*?<\/user_instructions>/i },
+  { open: "# AGENTS.md instructions", block: /^# AGENTS\.md instructions[^\n]*\n+<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/i },
 ];
 
+/** The text without a host block at its start, or null when it does not start with one. */
+function withoutLeadingBlock(text: string): string | null {
+  for (const { block } of HOST_BLOCKS) {
+    const match = text.match(block);
+    if (match) return text.slice(match[0].length).trim();
+  }
+  return null;
+}
+
+/** The text without a host block that makes up its last lines exactly, or null. */
+function withoutTrailingBlock(text: string): string | null {
+  for (const { open, block } of HOST_BLOCKS) {
+    const lower = text.toLowerCase();
+    let index = lower.lastIndexOf(open.toLowerCase());
+    while (index > 0 && text[index - 1] !== "\n") index = lower.lastIndexOf(open.toLowerCase(), index - 1);
+    if (index < 0) continue;
+    const match = text.slice(index).match(block);
+    if (match && match[0].length === text.length - index) return text.slice(0, index).trim();
+  }
+  return null;
+}
+
 /**
- * A user text without the host context around it. Only whole blocks at the start or the end of
- * the text count as context, as Codex places them; the same tags quoted inside a question, a
- * quotation or a code example stay visible.
+ * A user text without the host context around it. Codex puts context at the start of the text,
+ * sometimes with more context after the person's words; so blocks are removed from the start, and
+ * from the end only when the text began with context. Tags quoted inside a question, a quotation
+ * or a code example, or pasted at the end of the person's own text, stay visible.
  */
 export function stripHostContext(text: string): string {
   let rest = text.trim();
-  for (let changed = true; changed && rest;) {
-    changed = false;
-    for (const block of HOST_BLOCKS) {
-      const match = rest.match(block);
-      if (match) { rest = rest.slice(match[0].length).trim(); changed = true; }
-    }
-    for (const block of HOST_BLOCKS) {
-      const end = new RegExp(`${block.source.slice(1)}$`, block.flags);
-      // Only a block that starts on its own line can end the text as context.
-      const match = rest.match(end);
-      if (match && (match.index === 0 || rest[match.index! - 1] === "\n")) { rest = rest.slice(0, match.index).trim(); changed = true; }
-    }
-  }
+  let injected = false;
+  for (let next = withoutLeadingBlock(rest); next !== null; next = withoutLeadingBlock(rest)) { rest = next; injected = true; }
+  if (injected) for (let next = withoutTrailingBlock(rest); next !== null && rest; next = withoutTrailingBlock(rest)) rest = next;
   return rest;
 }
 

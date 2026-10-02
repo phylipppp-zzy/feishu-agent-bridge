@@ -2049,7 +2049,8 @@ export class SyncRuntime implements FeishuRouterPort {
     const sessionInTopic = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const slashCommand = !sessionInTopic && command.startsWith("/");
     // The new-session wizard asked for the task in the main timeline; that message needs no @.
-    const pendingWizard = !sessionInTopic && !slashCommand && command ? this.getWizard(message.senderOpenId, "new") : null;
+    // Only the main timeline: a reply inside any topic (also one that is not a session) is never taken as the task.
+    const pendingWizard = !message.rootId && !slashCommand && command ? this.getWizard(message.senderOpenId, "new") : null;
     const wizardTask = pendingWizard?.awaitingChatTask === true && pendingWizard.chatId === message.chatId;
     if (wizardTask && !message.mentionedBot) return this.submitWizardTask(message, pendingWizard!, command);
     if (message.chatType === "group" && !message.mentionedBot && !sessionInTopic && !slashCommand) return;

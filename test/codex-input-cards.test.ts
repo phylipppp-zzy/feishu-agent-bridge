@@ -34,6 +34,14 @@ test("F01: host context is not shown as the person's message, while real request
   assert.deepEqual(visible([userRecord(1, quoted)]), [quoted]);
   const code = "```xml\n<recommended_plugins>a</recommended_plugins>\n```";
   assert.equal(stripHostContext(code), code);
+  // Text the person wrote is never cut, even with host-like blocks after it.
+  const pasted = "这个块是什么意思？\n<environment_context>x</environment_context>";
+  assert.equal(stripHostContext(pasted), pasted);
+  const several = "我的问题\n<recommended_plugins>x</recommended_plugins>\n中间\n<recommended_plugins>y</recommended_plugins>";
+  assert.equal(stripHostContext(several), several);
+  // Context around the person's words is removed when the text starts with context.
+  assert.equal(stripHostContext(`${plugins}\n帮我修复\n${environment}`), "帮我修复");
+  assert.equal(stripHostContext(`${plugins}\n问题\n<recommended_plugins>x</recommended_plugins>\n中间\n${environment}`), "问题\n<recommended_plugins>x</recommended_plugins>\n中间");
   // Message ids still come from the recorded text, so messages imported earlier are not imported again.
   const raw = `${plugins}\n帮我看看`;
   const parsed = parseJsonlChunk(jsonl([{ timestamp: at(0), type: "session_meta", payload: { session_id: SESSION_ID, cwd: "/w", timestamp: at(0) } }, userRecord(5, raw)]));
@@ -124,6 +132,9 @@ test("F10: the wizard takes the task from the next main-timeline message without
   (env.service as unknown as { continueSession: (message: { text: string }) => Promise<void> }).continueSession = async (message) => { continued.push(message.text); };
   await env.service.onFeishuMessage(inbound({ messageId: "w-topic", text: "话题里的回复" }));
   assert.deepEqual(continued, ["话题里的回复"]);
+  // Nor is a reply in a topic that is not a session (for example under another bot card).
+  await env.service.onFeishuMessage(inbound({ messageId: "w-other-topic", rootId: "card-root-9", text: "卡片话题里的回复" }));
+  assert.deepEqual(started, []);
   const message = inbound({ messageId: "w-task", text: "整理 README" });
   delete (message as { rootId?: string }).rootId;
   await env.service.onFeishuMessage(message);
