@@ -80,6 +80,15 @@ export interface PresenceUpdate {
   message: string | null;
 }
 
+/** SQL condition limiting sessions to those whose cwd is one of `dirs` or below them; empty means all. */
+function scopeCondition(dirs: readonly string[]): { sql: string; params: string[] } {
+  if (!dirs.length) return { sql: "", params: [] };
+  return {
+    sql: ` AND (${dirs.map(() => "(cwd=? OR instr(cwd,?)=1)").join(" OR ")})`,
+    params: dirs.flatMap((dir) => [dir, dir.endsWith("/") ? dir : `${dir}/`]),
+  };
+}
+
 /** Durable state of the Claude bridge: session index, cursors, rendered turns and Feishu event claims. */
 export class ClaudeBridgeDatabase {
   readonly db: DatabaseSync;
@@ -228,16 +237,19 @@ export class ClaudeBridgeDatabase {
       .map((row) => this.sessionFromRow(row));
   }
 
-  listRecentSessions(limit: number, offset = 0, search = ""): ClaudeSession[] {
+  listRecentSessions(limit: number, offset = 0, search = "", syncDirs: readonly string[] = []): ClaudeSession[] {
     const words = search.split(/\s+/).map((word) => word.trim()).filter(Boolean).slice(0, 6);
     const where = words.map(() => "(LOWER(COALESCE(custom_title,'')||' '||COALESCE(ai_title,'')||' '||COALESCE(first_prompt,'')||' '||COALESCE(cwd,'')||' '||session_id) LIKE ?)");
-    const sql = `SELECT * FROM sessions WHERE last_activity_ms>0${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY last_activity_ms DESC LIMIT ? OFFSET ?`;
-    const params = [...words.map((word) => `%${word.toLowerCase().replace(/[%_]/g, "")}%`), limit, offset];
+    const scope = scopeCondition(syncDirs);
+    const sql = `SELECT * FROM sessions WHERE last_activity_ms>0${scope.sql}${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY last_activity_ms DESC LIMIT ? OFFSET ?`;
+    const params = [...scope.params, ...words.map((word) => `%${word.toLowerCase().replace(/[%_]/g, "")}%`), limit, offset];
     return (this.db.prepare(sql).all(...params) as Record<string, unknown>[]).map((row) => this.sessionFromRow(row));
   }
-  sessionCounts(): { indexed: number; topics: number; open: number } {
+  sessionCounts(syncDirs: readonly string[] = []): { indexed: number; topics: number; open: number } {
+    const scope = scopeCondition(syncDirs);
     const row = this.db.prepare(`SELECT COUNT(*) AS indexed, COUNT(root_message_id) AS topics,
-      SUM(CASE WHEN presence_state IN ('idle','running','waiting') THEN 1 ELSE 0 END) AS open FROM sessions WHERE last_activity_ms>0`).get() as Record<string, unknown>;
+      SUM(CASE WHEN presence_state IN ('idle','running','waiting') THEN 1 ELSE 0 END) AS open FROM sessions WHERE last_activity_ms>0${scope.sql}`)
+      .get(...scope.params) as Record<string, unknown>;
     return { indexed: Number(row.indexed ?? 0), topics: Number(row.topics ?? 0), open: Number(row.open ?? 0) };
   }
 

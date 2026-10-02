@@ -42,6 +42,11 @@ function displayPath(path: string | null): string {
   return path === home ? "~" : path.startsWith(`${home}/`) ? `~/${path.slice(home.length + 1)}` : path;
 }
 
+/** The directories whose sessions are mirrored (SYNC_DIRS), for status cards. */
+export function scopeLabel(syncDirs: readonly string[]): string {
+  return syncDirs.length ? syncDirs.map(displayPath).join("、") : "全部目录";
+}
+
 /** Where the session is open right now, as reported by the Claude Code hooks. */
 export function presenceLabel(session: Pick<ClaudeSession, "presenceState" | "entrypoint">): string {
   const where = sourceLabel(session.entrypoint);
@@ -146,10 +151,10 @@ export function claudeRootCard(session: ClaudeSession): CardDefinition {
   ]);
 }
 
-export function claudeHomeCard(status: { paused: boolean; indexed: number; topics: number; open: number; failures: number }, notice = ""): CardDefinition {
+export function claudeHomeCard(status: { paused: boolean; indexed: number; topics: number; open: number; failures: number; scope: string }, notice = ""): CardDefinition {
   return card("Claude 控制台", status.paused ? "orange" : "blue", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
-    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　已索引会话：**${status.indexed}**　已建话题：**${status.topics}**　本机打开中：**${status.open}**　未解决失败：**${status.failures}**`),
+    markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　已索引会话：**${status.indexed}**　已建话题：**${status.topics}**　本机打开中：**${status.open}**　未解决失败：**${status.failures}**\n同步范围：${safeMarkdown(status.scope)}`),
     actionRow([
       button("最近会话", "recent", "primary"),
       button("立即同步", "sync"),
@@ -165,6 +170,7 @@ export function claudeHelpCard(): CardDefinition {
       "**当前是只读镜像阶段**：本机 Claude Code（VS Code 或终端）的会话会同步到这个群，每个会话一个话题，每一轮对话一张卡片，执行记录折叠在卡片里。",
       "最近几天有活动的会话会自动建话题，并显示最后一轮；更早的内容可以在话题里点“导出完整记录”。更早的会话可以在“最近会话”中搜索后打开。",
       "会话在 VS Code 或终端里等待你确认权限时，话题里会收到提醒。",
+      "只想同步部分目录时，在环境文件中设置 `SYNC_DIRS`（多个目录用英文逗号分隔），重启服务后生效；控制台会显示当前的同步范围。",
       "",
       "**群主消息中的命令**：`/` 命令菜单、`/help` 帮助、`/status` 控制台、`/sessions` 最近会话、`/search <关键词>` 搜索、`/sync` 立即同步、`/pause` 与 `/resume-sync` 暂停或恢复同步。",
       "**会话话题中的命令**：`/export` 导出完整记录。其它消息暂不会发给 Claude。",

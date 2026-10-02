@@ -63,22 +63,27 @@ const toolUse = (sessionId: string, uuid: string, at: number, id: string, comman
 const toolResult = (sessionId: string, uuid: string, at: number, id: string) => ({ ...common(sessionId), type: "user", uuid, timestamp: iso(at), message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] } });
 const jsonl = (records: unknown[]) => `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
 
-async function setup(prefix: string) {
+const atCwd = (records: Array<Record<string, unknown>>, cwd: string) => records.map((record) => "cwd" in record ? { ...record, cwd } : record);
+
+async function setup(prefix: string, syncDirs: string[] = []) {
   const home = await mkdtemp(join(tmpdir(), prefix));
   const projects = join(home, ".claude", "projects", "-home-tester-project");
   await mkdir(projects, { recursive: true });
   const config: ClaudeBridgeConfig = { appId: "app", appSecret: "secret", bindToken: "token", claudeHome: join(home, ".claude"), stateDir: join(home, "state"),
-    allowedRoot: home, historyDays: 3, scanIntervalMs: 60_000, livenessIntervalMs: 60_000 };
+    allowedRoot: home, historyDays: 3, syncDirs, scanIntervalMs: 60_000, livenessIntervalMs: 60_000 };
   const db = new ClaudeBridgeDatabase(config.stateDir);
   const feishu = new FakeFeishu();
   const runtime = new ClaudeRuntime(config, db, feishu);
   const path = (sessionId: string) => join(projects, `${sessionId}.jsonl`);
-  const internals = runtime as unknown as { presence: { scan(): Promise<void> }; checkLiveness(): Promise<void>; bootstrapping: Promise<void> | null };
+  type Internals = { presence: { scan(): Promise<void> }; checkLiveness(): Promise<void>; bootstrap(): Promise<void>; bootstrapping: Promise<void> | null };
+  const internals = runtime as unknown as Internals;
   const message = (overrides: Partial<IncomingFeishuMessage>): IncomingFeishuMessage => ({
     messageId: `m-${Math.random()}`, chatId: "chat-1", chatType: "group", senderOpenId: "user-1", mentionedBot: true, text: "", imageKeys: [], ...overrides,
   });
   const bind = async () => { await runtime.onFeishuMessage(message({ text: "/bind token" })); await internals.bootstrapping; };
-  return { home, config, db, feishu, runtime, path, internals, message, bind, cleanup: async () => { db.close(); await rm(home, { recursive: true, force: true }); } };
+  /** A restarted service over the same state, for example with a different SYNC_DIRS. */
+  const restart = (overrides: Partial<ClaudeBridgeConfig>) => new ClaudeRuntime({ ...config, ...overrides }, db, feishu) as unknown as Internals;
+  return { home, config, db, feishu, runtime, path, internals, message, bind, restart, cleanup: async () => { db.close(); await rm(home, { recursive: true, force: true }); } };
 }
 
 test("binding shows the latest turn of recent sessions, every turn of new ones, and only indexes old ones", async () => {
@@ -218,5 +223,36 @@ test("a stalled turn is shown as unfinished, and a rejected tool panel falls bac
     assert.match(JSON.stringify(cards[0]?.card), /执行记录（1 项）/);
     assert.doesNotMatch(JSON.stringify(cards[0]?.card), /collapsible_panel/);
     assert.equal(env.db.getSetting("cards.simple_tools"), "1");
+  } finally { await env.cleanup(); }
+});
+
+test("SYNC_DIRS limits topics, lists and notices to sessions working in those directories", async () => {
+  const env = await setup("claude-scope-", ["/home/tester/project"]);
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "r-p1", now - HOUR, "项目内的问题"), reply(RECENT, "r-a1", now - HOUR + MINUTE, "项目内的回答")], "/home/tester/project/app")));
+    await writeFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p1", now - 2 * HOUR, "别处的问题"), reply(OLD, "o-a1", now - 2 * HOUR + MINUTE, "别处的回答")], "/home/tester/project-other")));
+    await env.bind();
+    assert.deepEqual(env.feishu.roots.map((root) => title(root.card)), ["项目内的问题"]);
+    assert.equal(env.db.getSession(OLD)?.rootMessageId, null);
+    const recent = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "recent", value: {}, formValues: {} });
+    assert.match(JSON.stringify(recent.card), /项目内的问题/);
+    assert.doesNotMatch(JSON.stringify(recent.card), /别处的问题/);
+    const home = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "home", value: {}, formValues: {} });
+    assert.match(JSON.stringify(home.card), /同步范围：\/home\/tester\/project/);
+    assert.match(JSON.stringify(home.card), /已索引会话：\*\*1\*\*/);
+
+    // Activity outside the scope stays local.
+    await appendFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p2", now, "别处的新问题")], "/home/tester/project-other")));
+    await env.runtime.syncAll();
+    assert.equal(env.feishu.roots.length, 1);
+
+    // After a restart with every directory in scope, the recent session that was left out gets its topic.
+    const widened = env.restart({ syncDirs: [] });
+    await widened.bootstrap();
+    const other = env.db.getSession(OLD)!;
+    assert.ok(other.rootMessageId);
+    assert.deepEqual(env.feishu.repliesTo(other.rootMessageId!).map((item) => item.kind === "text" ? item.text : title(item.card)),
+      ["VS Code：别处的新问题", "Claude · 进行中"]);
   } finally { await env.cleanup(); }
 });

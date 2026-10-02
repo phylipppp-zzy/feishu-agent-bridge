@@ -6,12 +6,15 @@ cd "$PROJECT_DIR"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-Usage: ./install-claude.sh [--existing-app <cli_xxx> | --from-env] [--no-hooks]
+Usage: ./install-claude.sh [--existing-app <cli_xxx> | --from-env] [--no-hooks] [--sync-dir <dir>... | --sync-all]
 
   no option                 Create a new self-built Feishu app by QR code.
   --existing-app <cli_xxx>  QR-authorize and configure an existing self-built app.
   --from-env                Use a manually configured ~/.config/feishu-claude-bridge/env.
   --no-hooks                Do not register the session-state hooks in Claude Code settings.json.
+  --sync-dir <dir>          Mirror only sessions working in <dir> or below it (absolute or ~/ path; repeatable).
+  --sync-all                Mirror sessions of every directory again (the default).
+  Without --sync-dir or --sync-all, the SYNC_DIRS already saved in the environment file is kept.
 EOF
   exit 0
 fi

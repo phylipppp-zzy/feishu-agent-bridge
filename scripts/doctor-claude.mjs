@@ -34,6 +34,13 @@ try {
     result(Boolean(values[key]), `${key} 已配置`);
   }
   if (values.HISTORY_DAYS !== undefined) result(/^[1-9][0-9]*$/.test(values.HISTORY_DAYS), `HISTORY_DAYS=${values.HISTORY_DAYS} 是正整数`);
+  const syncDirs = (values.SYNC_DIRS ?? "").split(",").map((dir) => dir.trim()).filter(Boolean);
+  if (!syncDirs.length) console.log("INFO  同步范围：全部目录（SYNC_DIRS 未设置）");
+  for (const dir of syncDirs) {
+    const expanded = dir === "~" ? homedir() : dir.startsWith("~/") ? join(homedir(), dir.slice(2)) : dir;
+    const exists = expanded.startsWith("/") && await stat(expanded).then((info) => info.isDirectory(), () => false);
+    result(exists, `同步目录 ${dir} ${exists ? "存在" : "不存在或不是绝对路径；只同步工作目录在 SYNC_DIRS 内的会话"}`);
+  }
   if (values.FEISHU_SETUP_VERSION === "manual") console.log("INFO  飞书应用为手工配置；请在开发者后台确认可见范围、权限和长连接设置");
   else result(Boolean(values.FEISHU_OWNER_OPEN_ID), "飞书应用的可见范围已限制为安装者本人");
   console.log("INFO  卡片回调走飞书长连接，不需要公网回调地址");

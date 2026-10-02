@@ -22,6 +22,26 @@ Claude 桥接和 Codex 桥接互不影响：各用一个飞书应用、一个私
 - 绑定后新开始的会话，从第一轮开始完整显示。
 - 已有话题的会话出现新活动时，只追加新的轮次。
 
+## 只同步部分目录（可选）
+
+默认同步所有目录下的会话。只想同步某个文件夹及其子目录下的对话时，设置 `SYNC_DIRS`：
+
+```bash
+# 方式一：通过安装器（可写多个 --sync-dir；会复用已有的飞书应用和 hook）
+./install-claude.sh --sync-dir ~/usr/zhangzy/workspace --sync-dir /data/projects
+# 恢复同步全部目录
+./install-claude.sh --sync-all
+
+# 方式二：直接编辑环境文件，然后重启服务
+#   ~/.config/feishu-claude-bridge/env 中写：SYNC_DIRS="/home/sar/usr/zhangzy/workspace,/data/projects"
+systemctl --user restart feishu-claude-bridge.service
+```
+
+- 判断依据是会话的工作目录（Claude Code 日志里记录的 `cwd`，即在 VS Code 中打开的文件夹或启动 `claude` 时所在的目录），不是 `~/.claude/projects` 下的文件夹名。路径支持 `~/` 开头，符号链接会解析成真实路径。
+- 范围外的会话不建话题、不发卡片、不发提醒，也不出现在“最近会话”和搜索结果里。桥接仍会在本机读取它们的日志，只为了判断工作目录。
+- 范围扩大后重启服务：新纳入范围、最近 `HISTORY_DAYS` 天内有活动的会话会补建话题并显示最后一轮。范围缩小后，已有话题保留在群里，但不再更新。
+- 控制台（`/status`）会显示当前的同步范围。
+
 ## 安装
 
 前提：带 systemd 的 Linux（WSL2 可以，需要启用 systemd）、Node.js 22 及以上、能在终端运行的 `claude` 命令。
@@ -36,6 +56,7 @@ Claude 桥接和 Codex 桥接互不影响：各用一个飞书应用、一个私
 
 - `--existing-app <cli_xxx>`：复用已有的飞书应用（用应用所有者账号扫码）。
 - `--from-env`：使用手工填写的 `~/.config/feishu-claude-bridge/env`（参照 `deploy/env.claude.example`），不修改飞书后台。
+- `--sync-dir <目录>`、`--sync-all`：设置或清除同步范围，见上一节。
 - `--no-hooks`：不修改 `~/.claude/settings.json`。这时根卡片上没有实时状态，也收不到“等待你处理”的提醒，对话内容照常同步。
 
 安装完成后，在飞书创建一个私密话题群，把新机器人加进群，发送：

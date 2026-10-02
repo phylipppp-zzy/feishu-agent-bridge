@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { isRetryableTransportError } from "../inbound-events.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage } from "../types.js";
 import { CARD_TEXT_LIMIT, claudeCommandMenuCard, claudeHelpCard, claudeHomeCard, claudeNoticeCard, claudeRecentCard, claudeRootCard, claudeTurnCard,
-  promptLine, sessionTitle, sourceLabel, transcriptMarkdown, turnMarkdown, turnText } from "./cards.js";
-import type { ClaudeBridgeConfig } from "./config.js";
+  promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown, turnMarkdown, turnText } from "./cards.js";
+import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
 import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
 import { isTranscriptPath, readTranscriptEvents, TranscriptImporter, transcriptSessionId } from "./importer.js";
@@ -89,6 +89,8 @@ export class ClaudeRuntime {
   private boundChatId(): string | null { return this.db.getSetting("feishu.chat_id"); }
   private boundOpenId(): string | null { return this.db.getSetting("feishu.open_id"); }
   private paused(): boolean { return this.stopping || this.db.getSetting("sync.paused") === "1"; }
+  /** Sessions outside SYNC_DIRS are read for their working directory only and never shown in Feishu. */
+  private inScope(cwd: string | null): boolean { return inSyncScope(cwd, this.config.syncDirs); }
 
   private fail(operation: string, detail: Record<string, unknown>, error: unknown): void {
     this.db.recordFailure(operation, detail, error);
@@ -99,10 +101,35 @@ export class ClaudeRuntime {
   private bootstrap(): Promise<void> {
     this.bootstrapping ??= (async () => {
       await this.syncAll();
+      await this.applyScopeChange();
       await this.presence.scan();
       await this.checkLiveness();
     })().catch((error) => this.fail("bootstrap", {}, error)).finally(() => { this.bootstrapping = null; });
     return this.bootstrapping;
+  }
+
+  /**
+   * After SYNC_DIRS changes, sessions that came into scope are treated as at binding:
+   * those active within HISTORY_DAYS get a topic with their latest turn.
+   */
+  private async applyScopeChange(): Promise<void> {
+    const scope = JSON.stringify(this.config.syncDirs);
+    const previous = this.db.getSetting("sync.scope");
+    if (previous === scope) return;
+    this.db.setSetting("sync.scope", scope);
+    if (previous === null) return;
+    const activeSince = Date.now() - this.config.historyDays * DAY_MS;
+    for (let offset = 0; ; offset += 200) {
+      const sessions = this.db.listRecentSessions(200, offset, "", this.config.syncDirs);
+      for (const session of sessions) {
+        if (session.lastActivityMs < activeSince) return;
+        const turn = !session.rootMessageId && session.currentTurnId ? this.db.getTurn(session.currentTurnId) : null;
+        if (!turn) continue;
+        this.db.saveTurn(session.sessionId, turn.view, "pending");
+        await this.renderSession(session.sessionId);
+      }
+      if (sessions.length < 200) return;
+    }
   }
 
   private async periodicSync(): Promise<void> {
@@ -134,7 +161,11 @@ export class ClaudeRuntime {
     // turn of recently active sessions, everything of sessions that just started.
     const visible = new Set<string>();
     const saved = new Map<string, TurnView>();
-    if (!fromStart) {
+    const scoped = this.inScope(result.meta.cwd ?? session?.cwd ?? null);
+    if (!scoped) {
+      // Out of scope: keep only the latest turn, so the session can still be shown if SYNC_DIRS changes.
+      if (result.current) saved.set(result.current.turnId, result.current);
+    } else if (!fromStart) {
       for (const turn of result.touched) { visible.add(turn.turnId); saved.set(turn.turnId, turn); }
     } else {
       const recent = (lastActivityMs ?? info.mtimeMs) >= Date.now() - this.config.historyDays * DAY_MS;
@@ -159,7 +190,7 @@ export class ClaudeRuntime {
           pid: session.presencePid, pidStart: session.presencePidStart, message: null });
       }
     });
-    if (visible.size || session?.rootMessageId) await this.renderSession(sessionId);
+    if (scoped && (visible.size || session?.rootMessageId)) await this.renderSession(sessionId);
   }
 
   /** Renders one session at a time so its cards keep their order and are never edited concurrently. */
@@ -213,7 +244,7 @@ export class ClaudeRuntime {
     const chatId = this.boundChatId();
     if (!chatId || this.stopping) return;
     let session = this.db.getSession(sessionId);
-    if (!session) return;
+    if (!session || !this.inScope(session.cwd)) return;
     const turns = this.db.turnsToRender(sessionId);
     if (!session.rootMessageId) {
       if (!turns.length) return;
@@ -262,7 +293,7 @@ export class ClaudeRuntime {
     if (!before && !path) return;
     const session = this.db.updatePresence({ sessionId: record.sessionId, path, cwd: record.cwd, state: record.state, atMs: record.at,
       pid: record.pid, pidStart: record.pidStartTime, message: record.message });
-    if (!session?.rootMessageId) return;
+    if (!session?.rootMessageId || !this.inScope(session.cwd)) return;
     if (record.state === "waiting" && session.presenceAtMs === record.at && session.waitingNotifiedAtMs < record.at && record.at >= Date.now() - WAITING_NOTICE_MAX_AGE_MS) {
       this.db.setWaitingNotified(session.sessionId, record.at);
       await this.feishu.replyText(session.rootMessageId, `⏳ 这个会话在${sourceLabel(session.entrypoint)}中等待你处理${record.message ? `：${record.message}` : "。"}`)
@@ -282,11 +313,12 @@ export class ClaudeRuntime {
   }
 
   private homeCard(notice = ""): CardDefinition {
-    return claudeHomeCard({ paused: this.paused(), ...this.db.sessionCounts(), failures: this.db.failureCount() }, notice);
+    return claudeHomeCard({ paused: this.paused(), ...this.db.sessionCounts(this.config.syncDirs), failures: this.db.failureCount(),
+      scope: scopeLabel(this.config.syncDirs) }, notice);
   }
 
   private recentCard(search = "", page = 0): CardDefinition {
-    const rows = this.db.listRecentSessions(PAGE_SIZE + 1, page * PAGE_SIZE, search);
+    const rows = this.db.listRecentSessions(PAGE_SIZE + 1, page * PAGE_SIZE, search, this.config.syncDirs);
     return claudeRecentCard(rows.slice(0, PAGE_SIZE), search, page, rows.length > PAGE_SIZE);
   }
 
@@ -299,7 +331,7 @@ export class ClaudeRuntime {
   /** Creates the topic of an indexed session on demand and shows its latest turn. */
   private async openSession(sessionId: string): Promise<ClaudeSession | null> {
     const session = this.db.getSession(sessionId);
-    if (!session) return null;
+    if (!session || !this.inScope(session.cwd)) return null;
     if (!session.rootMessageId) {
       const current = session.currentTurnId ? this.db.getTurn(session.currentTurnId) : null;
       if (current) this.db.saveTurn(sessionId, current.view, "pending");
@@ -352,7 +384,7 @@ export class ClaudeRuntime {
       this.db.setSetting("feishu.open_id", message.senderOpenId);
       this.db.setSetting("feishu.bound_at", new Date().toISOString());
       this.newSessionCutoffMs = Date.now() - NEW_SESSION_GRACE_MS;
-      await this.feishu.sendText(message.chatId, `绑定成功。正在同步最近 ${this.config.historyDays} 天有活动的 Claude 会话；绑定码已失效。`);
+      await this.feishu.sendText(message.chatId, `绑定成功。正在同步最近 ${this.config.historyDays} 天有活动的 Claude 会话（同步范围：${scopeLabel(this.config.syncDirs)}）；绑定码已失效。`);
       await this.ensureControlCard();
       void this.bootstrap();
       return;

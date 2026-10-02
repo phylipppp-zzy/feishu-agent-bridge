@@ -10,25 +10,33 @@ import { BRIDGE_HOOK_EVENTS, bridgeHookCommand, mergeBridgeHooks } from "../dist
 import { readClaudeSettings, writeClaudeSettings } from "../dist/src/claude/settings-file.js";
 
 const args = process.argv.slice(2);
-const usage = `Usage: ./install-claude.sh [--existing-app <cli_xxx> | --from-env] [--no-hooks]
+const usage = `Usage: ./install-claude.sh [--existing-app <cli_xxx> | --from-env] [--no-hooks] [--sync-dir <dir>... | --sync-all]
 
   no option                 Create a new self-built Feishu app by QR code.
   --existing-app <cli_xxx>  QR-authorize and configure an existing self-built app.
   --from-env                Use a manually configured ~/.config/feishu-claude-bridge/env.
-  --no-hooks                Do not register the session-state hooks in Claude Code settings.json.`;
+  --no-hooks                Do not register the session-state hooks in Claude Code settings.json.
+  --sync-dir <dir>          Mirror only sessions working in <dir> or below it (absolute or ~/ path; repeatable).
+  --sync-all                Mirror sessions of every directory again (the default).
+  Without --sync-dir or --sync-all, the SYNC_DIRS already saved in the environment file is kept.`;
 if (args.includes("--help") || args.includes("-h")) { console.log(usage); process.exit(0); }
 if (args.includes("--container")) throw new Error("Claude Code 桥接的安装器暂不支持 --container。");
-const flags = ["--existing-app", "--from-env", "--no-hooks"];
-const existingIndex = args.indexOf("--existing-app");
-const existingAppId = existingIndex >= 0 ? args[existingIndex + 1] : null;
-const fromEnv = args.includes("--from-env");
-const installHooks = !args.includes("--no-hooks");
-if ((existingIndex >= 0 && (!existingAppId || !/^cli_[A-Za-z0-9]+$/.test(existingAppId))) ||
-  flags.some((flag) => args.filter((arg) => arg === flag).length > 1) ||
-  (fromEnv && existingIndex >= 0) ||
-  args.some((arg, index) => !flags.includes(arg) && (existingIndex < 0 || index !== existingIndex + 1))) {
-  throw new Error(usage);
+let existingAppId = null;
+let fromEnv = false;
+let installHooks = true;
+let syncAll = false;
+const syncDirArgs = [];
+for (let index = 0; index < args.length; index += 1) {
+  const arg = args[index];
+  const value = args[index + 1];
+  if (arg === "--existing-app" && existingAppId === null && /^cli_[A-Za-z0-9]+$/.test(value ?? "")) { existingAppId = value; index += 1; }
+  else if (arg === "--from-env" && !fromEnv) fromEnv = true;
+  else if (arg === "--no-hooks" && installHooks) installHooks = false;
+  else if (arg === "--sync-dir" && value && !value.startsWith("--")) { syncDirArgs.push(value); index += 1; }
+  else if (arg === "--sync-all" && !syncAll) syncAll = true;
+  else throw new Error(usage);
 }
+if ((fromEnv && existingAppId) || (syncAll && syncDirArgs.length)) throw new Error(usage);
 
 const projectDir = await realpath(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 const userHome = homedir();
@@ -114,6 +122,22 @@ if (codexAppId && claimedAppId === codexAppId) {
 }
 
 const saved = previous ?? pending ?? {};
+// --sync-dir replaces the saved scope and --sync-all clears it; otherwise the saved SYNC_DIRS is kept.
+let syncDirs = saved.SYNC_DIRS ?? "";
+if (syncAll) syncDirs = "";
+else if (syncDirArgs.length) {
+  const resolved = [];
+  for (const dir of syncDirArgs) {
+    // install-claude.sh runs from the repository, so a relative path would not mean what the user typed.
+    const expanded = dir === "~" ? userHome : dir.startsWith("~/") ? join(userHome, dir.slice(2)) : dir;
+    if (!expanded.startsWith("/")) throw new Error(`--sync-dir 需要绝对路径或以 ~/ 开头的路径：${dir}`);
+    let real;
+    try { real = await realpath(expanded); } catch { throw new Error(`--sync-dir 指定的目录不存在：${dir}`); }
+    if (real.includes(",")) throw new Error(`同步目录的路径不能包含英文逗号：${real}`);
+    resolved.push(real);
+  }
+  syncDirs = [...new Set(resolved)].join(",");
+}
 const claudeHome = resolve(saved.CLAUDE_HOME ?? defaultClaudeHome);
 const stateDir = resolve(saved.STATE_DIR ?? defaultStateDir);
 const settingsFile = join(claudeHome, "settings.json");
@@ -178,6 +202,7 @@ const environmentValues = {
   STATE_DIR: stateDir,
   ALLOWED_ROOT: allowedRoot,
   HISTORY_DAYS: saved.HISTORY_DAYS ?? "3",
+  SYNC_DIRS: syncDirs,
 };
 if (needsFeishuConfiguration) {
   await writeFile(pendingEnvFile, renderEnvironment({ ...environmentValues, FEISHU_SETUP_VERSION: "0" }), { mode: 0o600 });
@@ -191,6 +216,7 @@ if (needsFeishuConfiguration) {
   await rm(pendingEnvFile, { force: true });
 }
 await chmod(envFile, 0o600);
+console.log(`同步范围：${syncDirs ? syncDirs.split(",").map(displayPath).join("、") : "全部目录"}`);
 
 if (installHooks) {
   // Re-read: Claude Code may have changed settings.json while the Feishu steps ran.

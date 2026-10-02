@@ -1,5 +1,6 @@
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 export interface ClaudeBridgeConfig {
   appId: string;
@@ -12,6 +13,8 @@ export interface ClaudeBridgeConfig {
   allowedRoot: string;
   /** Sessions active within this many days get a topic when the bridge first sees them. */
   historyDays: number;
+  /** Only sessions working in one of these directories or below them are mirrored; empty mirrors all. */
+  syncDirs: string[];
   scanIntervalMs: number;
   livenessIntervalMs: number;
 }
@@ -30,6 +33,26 @@ function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number)
   return value;
 }
 
+/**
+ * Comma-separated absolute directories (`~/` allowed). Each is resolved through symlinks,
+ * because Claude Code records the physical working directory of a session.
+ */
+export function parseSyncDirs(raw: string | undefined, home = homedir()): string[] {
+  const dirs = (raw ?? "").split(",").map((item) => item.trim()).filter(Boolean).map((dir) => {
+    const expanded = dir === "~" ? home : dir.startsWith("~/") ? join(home, dir.slice(2)) : dir;
+    if (!expanded.startsWith("/")) throw new Error(`SYNC_DIRS entries must be absolute paths: ${dir}`);
+    try { return realpathSync(expanded); } catch { return resolve(expanded); }
+  });
+  return [...new Set(dirs)];
+}
+
+/** Whether a session whose working directory is `cwd` lies in the configured sync directories. */
+export function inSyncScope(cwd: string | null, syncDirs: readonly string[]): boolean {
+  if (!syncDirs.length) return true;
+  if (!cwd) return false;
+  return syncDirs.some((dir) => cwd === dir || cwd.startsWith(dir.endsWith("/") ? dir : `${dir}/`));
+}
+
 export function loadClaudeConfig(env: NodeJS.ProcessEnv = process.env): ClaudeBridgeConfig {
   const home = homedir();
   return {
@@ -40,6 +63,7 @@ export function loadClaudeConfig(env: NodeJS.ProcessEnv = process.env): ClaudeBr
     stateDir: resolve(env.STATE_DIR ?? `${home}/.local/state/feishu-claude-bridge`),
     allowedRoot: resolve(env.ALLOWED_ROOT ?? home),
     historyDays: positiveInteger(env, "HISTORY_DAYS", 3),
+    syncDirs: parseSyncDirs(env.SYNC_DIRS, home),
     scanIntervalMs: positiveInteger(env, "SCAN_INTERVAL_MS", 10_000),
     livenessIntervalMs: positiveInteger(env, "LIVENESS_INTERVAL_MS", 30_000),
   };
