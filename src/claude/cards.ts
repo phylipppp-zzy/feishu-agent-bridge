@@ -338,7 +338,7 @@ export function claudeNewTaskCard(cwd: string, notice = ""): CardDefinition {
   return card("新建 Claude 会话", "turquoise", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
     markdown(`目录：${safeMarkdown(displayPath(cwd))}`),
-    ...inputForm({ formName: "new_task_form", inputName: "new_task", elementId: "new_task", placeholder: "要 Claude 做什么", maxLength: 4_000, multiline: true, rows: 5,
+    ...inputForm({ formName: "new_task_form", inputName: "new_task", elementId: "new_task", placeholder: "要 Claude 做什么（更长的任务可以在新话题里接着补充）", maxLength: 1_000, multiline: true, rows: 5,
       buttons: [{ label: "开始", action: "new_submit", type: "primary", extra: { cwd } }] }),
     note("会在这个目录中启动 Claude Code（使用你本机的设置），并为它新建一个话题。"),
     actionRow([button("重新选择目录", "new_session")]),

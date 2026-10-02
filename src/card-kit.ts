@@ -33,18 +33,23 @@ export function card(title: string, template: string, elements: Record<string, u
   return uiVersion === 2 ? { schema: "2.0", ...common, body: { elements } } : { ...common, elements };
 }
 
+/** The longest text a card input may accept. */
+export const INPUT_MAX_LENGTH = 1_000;
+
 export interface FormButton { label: string; action: string; type?: "default" | "primary" | "danger"; extra?: Record<string, unknown>; }
 export function inputForm(options: {
   formName: string; inputName: string; elementId: string; placeholder: string; maxLength: number;
   required?: boolean; multiline?: boolean; rows?: number; buttons: FormButton[];
 }): Record<string, unknown>[] {
+  // Feishu rejects the whole card when an input allows more than 1000 characters (error 11310).
+  const maxLength = Math.min(options.maxLength, INPUT_MAX_LENGTH);
   const input: Record<string, unknown> = uiVersion === 2 ? {
     tag: "input", element_id: options.elementId, name: options.inputName, required: options.required ?? false,
-    placeholder: plain(options.placeholder), max_length: options.maxLength, width: "fill",
+    placeholder: plain(options.placeholder), max_length: maxLength, width: "fill",
     ...(options.multiline ? { input_type: "multiline_text", rows: options.rows ?? 4, auto_resize: true, max_rows: 8 } : {}),
   } : {
     tag: "input", name: options.inputName, required: options.required ?? false, placeholder: plain(options.placeholder),
-    max_length: options.maxLength, ...(options.multiline ? { input_type: "multiline_text", multiline: true, rows: options.rows ?? 4 } : {}),
+    max_length: maxLength, ...(options.multiline ? { input_type: "multiline_text", multiline: true, rows: options.rows ?? 4 } : {}),
   };
   const submitButtons = options.buttons.map((item, index) => {
     const built = button(item.label, item.action, item.type ?? "default", item.extra ?? {});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { configureCardUi } from "../src/card-kit.js";
-import { CARD_TEXT_LIMIT, claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeNewSessionCard, claudePermissionCard, claudePlanCard,
+import { CARD_TEXT_LIMIT, claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeNewSessionCard, claudeNewTaskCard, claudePermissionCard, claudePlanCard,
   claudeQuestionCard, claudeRootCard, claudeTurnCard, formatDuration, presenceLabel, promptLine, transcriptMarkdown } from "../src/claude/cards.js";
 import type { Interaction } from "../src/claude/interactions.js";
 import type { TurnView } from "../src/claude/conversation.js";
@@ -114,4 +114,8 @@ test("request cards show what Claude wants and every way to answer", () => {
   const picker = JSON.stringify(claudeNewSessionCard(["/srv/project"], "全部目录", { nonce: "d-1", preview: "整理 README" }));
   assert.match(picker, /任务：整理 README/);
   assert.match(picker, /"draft":"d-1"/);
+  // Feishu rejects a card whose input allows more than 1000 characters.
+  const task = JSON.stringify(claudeNewTaskCard("/srv/project"));
+  for (const match of task.matchAll(/"max_length":(\d+)/g)) assert.ok(Number(match[1]) <= 1_000);
+  assert.match(task, /"max_length":1000/);
 });
