@@ -18,6 +18,7 @@
     "doctor": "node scripts/doctor.mjs",
     "doctor:container": "node scripts/doctor.mjs --container",
     "doctor:claude": "node scripts/doctor-claude.mjs",
+    "check:claude-cards": "node scripts/check-claude-cards.mjs",
     "install:local": "node scripts/install.mjs",
     "install:claude": "node scripts/install-claude.mjs",
     "rebind": "node scripts/rebind.mjs",
