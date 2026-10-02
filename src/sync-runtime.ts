@@ -28,6 +28,11 @@ const PENDING_PROMPT_TTL_MS = 10 * 60_000;
 // long after it was sent; keep the echo marker for the lifetime of a long turn.
 const INBOUND_MIRROR_TTL_MS = 24 * 60 * 60_000;
 const MODEL_CATALOG_KEY = "codex.model_catalog.v1";
+/** When the catalog was last read, from which Codex version, and the last refresh error. */
+const MODEL_CATALOG_META_KEY = "codex.model_catalog.meta.v1";
+/** A catalog older than this is refreshed in the background, so new Codex models appear without a restart. */
+const MODEL_CATALOG_TTL_MS = 30 * 60_000;
+const MODEL_CATALOG_CHECK_MS = 5 * 60_000;
 const MODEL_BACKFILL_MIGRATION_KEY = "migration.session_model_backfill.v1";
 const LOG_SYNC_ATTEMPTS = 10;
 const LOG_SYNC_RETRY_MS = 500;
@@ -144,6 +149,8 @@ export class SyncRuntime implements FeishuRouterPort {
   private outputDelivery: Promise<void> | null = null;
   /** When an interrupt was last sent for a turn, so a repeated cancel only resends one that went unconfirmed. */
   private readonly cancelRequestedAt = new Map<string, number>();
+  private modelRefresh: Promise<boolean> | null = null;
+  private modelCatalogTimer: NodeJS.Timeout | null = null;
   private threadStateTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -225,6 +232,8 @@ export class SyncRuntime implements FeishuRouterPort {
       this.db.resolveFailure("codex_sandbox", {});
     } else this.db.resolveFailure("codex_sandbox", {});
     await this.refreshModels();
+    this.modelCatalogTimer = setInterval(() => this.refreshModelsIfStale(), MODEL_CATALOG_CHECK_MS);
+    this.modelCatalogTimer.unref();
     await this.backfillHistoricalModels();
     for (const task of this.db.markRunningTasksInterrupted()) {
       if (task.runCardMessageId) {
@@ -270,6 +279,7 @@ export class SyncRuntime implements FeishuRouterPort {
     if (this.threadStateTimer) clearInterval(this.threadStateTimer);
     for (const timer of this.cancelTimers.values()) clearTimeout(timer);
     this.cancelTimers.clear();
+    if (this.modelCatalogTimer) clearInterval(this.modelCatalogTimer);
     await this.sessionImporter.stopWatching();
     await this.appServer?.close();
     this.db.markRunningTasksInterrupted();
@@ -309,19 +319,68 @@ export class SyncRuntime implements FeishuRouterPort {
     } catch { return []; }
   }
 
-  private async refreshModels(): Promise<boolean> {
+  private catalogMeta(): { refreshedAtMs: number; attemptedAtMs: number; codexVersion: string | null; lastError: string | null } {
     try {
+      const value = JSON.parse(this.db.getSetting(MODEL_CATALOG_META_KEY) ?? "{}") as Record<string, unknown>;
+      return { refreshedAtMs: Number(value.refreshedAtMs) || 0, attemptedAtMs: Number(value.attemptedAtMs) || 0,
+        codexVersion: typeof value.codexVersion === "string" ? value.codexVersion : null, lastError: typeof value.lastError === "string" ? value.lastError : null };
+    } catch { return { refreshedAtMs: 0, attemptedAtMs: 0, codexVersion: null, lastError: null }; }
+  }
+
+  /**
+   * Reads the model catalog from the configured Codex. Concurrent callers share one read; a failed
+   * or empty read keeps the last good catalog (marked as stale) instead of replacing it.
+   */
+  private refreshModels(): Promise<boolean> {
+    this.modelRefresh ??= this.readModelCatalog().finally(() => { this.modelRefresh = null; });
+    return this.modelRefresh;
+  }
+
+  private async readModelCatalog(): Promise<boolean> {
+    const meta = this.catalogMeta();
+    const attemptedAtMs = Date.now();
+    try {
+      const codexVersion = await this.codex.version().catch(() => null);
       const models = await this.codex.listModels();
       if (!models.length) throw new Error("Codex model catalog contains no visible models");
       this.models = models;
       this.db.setSetting(MODEL_CATALOG_KEY, JSON.stringify(models));
+      this.db.setSetting(MODEL_CATALOG_META_KEY, JSON.stringify({ refreshedAtMs: Date.now(), attemptedAtMs, codexVersion, lastError: null }));
+      this.db.resolveFailure("model_catalog", {});
       return true;
     } catch (error) {
-      this.models = this.cachedModels();
+      if (!this.models.length) this.models = this.cachedModels();
+      const lastError = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+      this.db.setSetting(MODEL_CATALOG_META_KEY, JSON.stringify({ ...meta, attemptedAtMs, lastError }));
       this.db.recordFailure("model_catalog", {}, error);
       console.warn(`Unable to refresh Codex model catalog; using ${this.models.length ? "cached catalog" : "no catalog"}.`, error);
       return false;
     }
+  }
+
+  /** Starts a background refresh when the catalog is old; a failed refresh is retried after a few minutes, not on every call. */
+  private refreshModelsIfStale(): void {
+    const meta = this.catalogMeta();
+    const now = Date.now();
+    if (this.stopping || now - meta.refreshedAtMs < MODEL_CATALOG_TTL_MS || now - meta.attemptedAtMs < MODEL_CATALOG_CHECK_MS || this.modelRefresh) return;
+    // Failures are recorded by the refresh itself; a background refresh must never surface as an unhandled rejection.
+    void this.refreshModels().catch(() => undefined);
+  }
+
+  /** Where the listed models come from, shown on model cards. */
+  private catalogNote(): string {
+    const meta = this.catalogMeta();
+    const when = meta.refreshedAtMs ? new Date(meta.refreshedAtMs).toLocaleString("zh-CN", { hour12: false }) : "未知时间";
+    const source = meta.codexVersion ? `（${meta.codexVersion}）` : "";
+    return meta.lastError
+      ? `模型目录最近一次刷新失败，下面是 ${when} 读取的目录${source}。可以发送 /retry 再试。`
+      : `模型目录读取自本机 Codex${source}，更新于 ${when}。如缺少新模型，发送 /retry 刷新。`;
+  }
+
+  /** The model menu, with the catalog checked for age first. */
+  private modelChoiceCard(wizardId: string, currentModel: string | undefined, cwd: string | undefined, mode: "new" | "session"): CardDefinition {
+    this.refreshModelsIfStale();
+    return modelCard(this.models, wizardId, currentModel, cwd, mode, this.catalogNote());
   }
 
   private modelBySlug(slug: string | undefined): ModelCapability | null {
@@ -1754,7 +1813,7 @@ export class SyncRuntime implements FeishuRouterPort {
           const cwd = await resolveAllowedPath(entered, this.config.allowedRoot);
           wizard.cwd = cwd; delete wizard.model; delete wizard.reasoningEffort;
           Object.assign(wizard, this.newModelDefaults());
-          return { delivery: "replace", card: modelCard(this.models, this.saveWizard(event.openId, wizard).id, wizard.model, cwd, "new") };
+          return { delivery: "replace", card: this.modelChoiceCard(this.saveWizard(event.openId, wizard).id, wizard.model, cwd, "new") };
         }
         case "select_project": {
           const wizard = this.validWizard(event.openId, event, "new");
@@ -1766,13 +1825,13 @@ export class SyncRuntime implements FeishuRouterPort {
           Object.assign(wizard, this.newModelDefaults());
           const current = this.saveWizard(event.openId, wizard);
           if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重新开始。 ");
-          return { delivery: "replace", card: modelCard(this.models, current.id, current.model, current.cwd, "new") };
+          return { delivery: "replace", card: this.modelChoiceCard(current.id, current.model, current.cwd, "new") };
         }
         case "show_models": {
           const wizard = this.validWizard(event.openId, event);
           if (!wizard) return errorCard("该模型设置卡片已过期，请重新开始。 ");
           if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重试。");
-          return { delivery: "replace", card: modelCard(this.models, this.saveWizard(event.openId, wizard).id, wizard.model, wizard.cwd, wizard.mode) };
+          return { delivery: "replace", card: this.modelChoiceCard(this.saveWizard(event.openId, wizard).id, wizard.model, wizard.cwd, wizard.mode) };
         }
         case "select_model": {
           const wizard = this.validWizard(event.openId, event);
@@ -1830,7 +1889,7 @@ export class SyncRuntime implements FeishuRouterPort {
           if (!root) return errorCard("请在对应会话话题内使用“修改模型”。");
           if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重试。");
           const wizard = this.saveWizard(event.openId, { id: randomUUID(), mode: "session", chatId: event.chatId, rootId: root.rootMessageId, sessionId: root.sessionId, expiresAt: 0 });
-          const card = modelCard(this.models, wizard.id, root.model ?? undefined, root.cwd, "session");
+          const card = this.modelChoiceCard(wizard.id, root.model ?? undefined, root.cwd, "session");
           if (root.rootMessageId === event.openMessageId) {
             return { delivery: "reply", rootMessageId: root.rootMessageId, card };
           }
@@ -2264,7 +2323,7 @@ export class SyncRuntime implements FeishuRouterPort {
       cwd, prompt: match[2], imageKeys: message.imageKeys, sourceMessageId: message.messageId,
       ...(message.rootId ? { rootId: message.rootId } : {}),
     });
-    await this.respondCard(message, modelCard(this.models, wizard.id, undefined, cwd, "new"));
+    await this.respondCard(message, this.modelChoiceCard(wizard.id, undefined, cwd, "new"));
   }
 
   private async runNewSessionFromWizard(wizard: WizardState): Promise<void> {
@@ -2335,7 +2394,7 @@ export class SyncRuntime implements FeishuRouterPort {
     const wizard = this.saveWizard(message.senderOpenId, {
       id: randomUUID(), mode: "session", chatId: message.chatId, rootId: message.rootId, sessionId: session.sessionId, expiresAt: 0,
     });
-    await this.respondCard(message, modelCard(this.models, wizard.id, session.model ?? undefined, session.cwd, "session"));
+    await this.respondCard(message, this.modelChoiceCard(wizard.id, session.model ?? undefined, session.cwd, "session"));
   }
 
   private async setSessionModelFromText(message: IncomingFeishuMessage, command: string): Promise<void> {
