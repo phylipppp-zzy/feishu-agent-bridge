@@ -191,7 +191,7 @@ export function claudeRootCard(session: ClaudeSession, options: RootCardOptions 
       `飞书续聊：${safeMarkdown(modeLabel(options.feishuMode ?? "default"))}　${safeMarkdown(options.feishuModel ?? "默认模型")}${options.feishuEffort ? ` · ${safeMarkdown(options.feishuEffort)}` : ""}`,
       `会话 ID：\`${session.sessionId}\``,
     ].join("\n")),
-    note(`在本话题直接回复就会继续这个会话：Claude 在本机运行，执行记录和需要你确认的事项都会发到这里。发送 /stop 停止当前回合；以 >> 开头的消息排到本轮结束后再发。会话正在 VS Code 或终端中打开时，会先问你要分叉还是接管。电脑上继续：\`${resume}\`。${session.presenceState === "waiting" && session.presenceMessage && !live ? `\n等待处理：${safeMarkdown(session.presenceMessage)}` : ""}`),
+    note(`在本话题直接回复就会继续这个会话：Claude 在本机运行，执行记录和需要你确认的事项都会发到这里。发送 /stop 停止当前回合；以 >> 开头的消息排到本轮结束后再发；单独发送 / 会在话题最新处再发一张本卡片，不用翻回顶部。在手机上发消息会切换到手机侧控制（电脑上这一轮还在运行时，等它结束再发送）。电脑上继续：\`${resume}\`。${session.presenceState === "waiting" && session.presenceMessage && !live ? `\n等待处理：${safeMarkdown(session.presenceMessage)}` : ""}`),
     actionRow([
       ...(live === "running" || live === "waiting" ? [button("停止本轮", "stop_turn", "danger", id)] : []),
       button("权限模式", "mode_card", "default", id),
@@ -267,16 +267,23 @@ export function claudePlanCard(interaction: Interaction): CardDefinition {
   ]);
 }
 
-/** The session is open in VS Code or a terminal: writing from Feishu as well would interleave both. */
-export function claudeConflictCard(session: ClaudeSession, nonce: string): CardDefinition {
-  return card("这个会话正在本机打开", "orange", [
-    markdown(`会话在**${presenceLabel(session)}**。两边同时往同一个会话写入，对话会交错，本机那边也看不到飞书里的这几轮。`),
+/**
+ * The session is in the middle of a turn in VS Code or a terminal. The phone takes over as soon as
+ * that turn ends: until then both sides would write into the same session at once.
+ */
+export function claudeLocalBusyCard(session: ClaudeSession, nonce: string, messages: number): CardDefinition {
+  const waiting = session.presenceState === "waiting";
+  return card(waiting ? "电脑上正在等你确认" : "电脑上这一轮还在运行", "orange", [
+    markdown([
+      `会话在**${presenceLabel(session)}**。为避免两边同时写入同一个会话，${messages > 1 ? `你的 ${messages} 条消息` : "你的消息"}会在电脑上这一轮结束后自动发送，并切换到手机侧控制。`,
+      ...(waiting ? ["电脑上的这一轮在等待确认，只能在电脑上处理；不想等的话，可以立即切换或分叉。"] : []),
+    ].join("\n")),
     actionRow([
-      button("分叉继续（推荐）", "conflict_fork", "primary", { nonce }),
-      button("仍在原会话继续", "conflict_takeover", "default", { nonce }),
+      button("立即切换到手机", "conflict_takeover", "primary", { nonce }),
+      button("分叉到新话题", "conflict_fork", "default", { nonce }),
       button("取消", "conflict_cancel", "default", { nonce }),
     ]),
-    note("分叉：复制到目前为止的对话，在新话题里继续，本机的会话不受影响。仍在原会话继续：回到电脑后，需要在 VS Code 中重新打开这个会话才能看到飞书里的内容。"),
+    note("立即切换：不等电脑上这一轮结束，现在就发送，两边的内容可能交错。分叉：复制到目前为止的对话，在新话题里继续，电脑上的会话不受影响。"),
   ]);
 }
 
@@ -378,8 +385,8 @@ export function claudeHelpCard(): CardDefinition {
   return card("Claude 桥接帮助", "wathet", [
     markdown([
       "本机 Claude Code（VS Code 或终端）的会话会同步到这个群：每个会话一个话题，每一轮对话一张卡片，执行记录折叠在卡片里。",
-      "**继续对话**：在会话话题里直接回复即可。Claude 在本机运行，使用你本机的设置；需要你确认的权限、提问和计划会以卡片发到话题里。会话正在 VS Code 或终端中打开时，会先问你要分叉还是接管。",
-      "**话题中的命令**：`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
+      "**继续对话**：在会话话题里直接回复即可。Claude 在本机运行，使用你本机的设置；需要你确认的权限、提问和计划会以卡片发到话题里。在手机上发消息会切换到手机侧控制；电脑上这一轮还在运行时，会等它结束后再发送。",
+      "**话题中的命令**：`/` 在话题最新处调出会话控制卡片（同根卡片）；`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
       "**新建会话**：控制台点“新建会话”，或在群主消息中发送 `/new <目录> <任务>`。",
       "最近几天有活动的会话会自动建话题；更早的会话可以在“最近会话”中搜索后打开。只想同步部分目录时，在环境文件中设置 `SYNC_DIRS`。",
       "",

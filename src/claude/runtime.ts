@@ -7,8 +7,8 @@ import { shorten } from "../card-kit.js";
 import { isRetryableTransportError } from "../inbound-events.js";
 import { isExpiredFeishuMessage } from "../safe-log.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage } from "../types.js";
-import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeConflictCard, claudeHelpCard, claudeHomeCard,
-  claudeInteractionDoneCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudePermissionCard, claudePlanCard,
+import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeHelpCard, claudeHomeCard,
+  claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudePermissionCard, claudePlanCard,
   claudeQuestionCard, claudeRecentCard, claudeRootCard, claudeStartedCard, claudeTurnCard, displayPath, promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown,
   turnMarkdown, turnText, type LiveState } from "./cards.js";
 import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
@@ -32,8 +32,9 @@ const WAITING_NOTICE_MAX_AGE_MS = 10 * 60_000;
 const STALE_TURN_MS = 30 * 60_000;
 const PAGE_SIZE = 8;
 const CLEANUP_CONFIRM_MS = 10 * 60_000;
-/** How long the choice between forking and continuing a session open on this computer stays valid. */
-const CONFLICT_CONFIRM_MS = 10 * 60_000;
+/** How long messages wait for a turn running on this computer to end before they are dropped. */
+const LOCAL_TURN_WAIT_MS = 2 * 60 * 60_000;
+const PHONE_CONTROL_NOTICE = "已切换到手机侧控制：接下来由飞书继续这个会话。电脑上已打开的 VS Code 或终端窗口不会显示这里的对话；回到电脑后，重新打开这个会话（或运行 claude --resume）即可看到并接着用。";
 /** How long a task sent in the main timeline waits for its directory to be picked. */
 const DRAFT_MS = 30 * 60_000;
 /** Images per message and bytes per image Claude accepts. */
@@ -43,7 +44,7 @@ const RUNNER_CLOSE_WAIT_MS = 5_000;
 /** Live reply text is pushed to the card at most this often; the card itself is updated at most every CARD_UPDATE_INTERVAL_MS. */
 const LIVE_TEXT_RENDER_MS = 300;
 /** Raised when the root card's layout changes, so existing topics get the new card once. */
-const ROOT_CARD_VERSION = "3";
+const ROOT_CARD_VERSION = "4";
 const FALLBACK_MODELS = [{ value: "opus", label: "Opus" }, { value: "sonnet", label: "Sonnet" }, { value: "haiku", label: "Haiku" }];
 /** Withdrawing a message that is already deleted (230110) or recalled (230011) counts as done. */
 const ALREADY_GONE = /\b(?:230110|230011)\b/;
@@ -89,8 +90,12 @@ interface FeishuInput {
 /** A Claude Code process the bridge runs for a session continued from Feishu. */
 interface RunnerEntry {
   runner: SessionRunner;
-  /** The person chose to continue in the session although it is open on this computer. */
+  /** The phone has control although the session is also open on this computer. */
   takeover: boolean;
+  /** When the process started; hook reports older than this are not activity on the computer. */
+  startedAtMs: number;
+  /** The session was used on the computer while this process was busy; it exits after the turn. */
+  yieldWhenIdle: boolean;
   /** The process was asked to exit; new messages start a fresh one. */
   closing: boolean;
   idleTimer: NodeJS.Timeout | null;
@@ -115,7 +120,8 @@ export class ClaudeRuntime {
   private readonly rootHashes = new Map<string, string>();
   private readonly runners = new Map<string, RunnerEntry>();
   private readonly interactions = new InteractionRegistry();
-  private readonly conflicts = new Map<string, { sessionId: string; input: FeishuInput; expiresAt: number }>();
+  /** Messages waiting for a turn running in VS Code or a terminal to end, by nonce. */
+  private readonly localWaits = new Map<string, { sessionId: string; inputs: FeishuInput[]; expiresAt: number; cardMessageId: string | null }>();
   private readonly drafts = new Map<string, { input: FeishuInput; expiresAt: number }>();
   private scanTimer: NodeJS.Timeout | null = null;
   private livenessTimer: NodeJS.Timeout | null = null;
@@ -293,7 +299,12 @@ export class ClaudeRuntime {
 
   private async periodicSync(): Promise<void> {
     const now = Date.now();
-    for (const [nonce, pending] of this.conflicts) if (pending.expiresAt < now) this.conflicts.delete(nonce);
+    for (const [nonce, pending] of this.localWaits) {
+      if (pending.expiresAt >= now) continue;
+      this.localWaits.delete(nonce);
+      if (pending.cardMessageId) void this.feishu.updateCard(pending.cardMessageId, claudeNoticeCard("已取消", "电脑上这一轮超过 2 小时仍未结束，消息没有发给 Claude。"))
+        .catch((error) => this.fail("local_wait_card", { sessionId: pending.sessionId }, error));
+    }
     for (const [nonce, draft] of this.drafts) if (draft.expiresAt < now) this.drafts.delete(nonce);
     if (!this.boundChatId() || this.paused()) return;
     await this.syncAll();
@@ -539,6 +550,7 @@ export class ClaudeRuntime {
     if (!before && !path) return;
     const session = this.db.updatePresence({ sessionId: record.sessionId, path, cwd: record.cwd, state: record.state, atMs: record.at,
       pid: record.pid, pidStart: record.pidStartTime, message: record.message });
+    if (session && session.presenceAtMs === record.at) this.onLocalActivity(session, record);
     if (!session?.rootMessageId || !this.inScope(session.cwd)) return;
     if (record.state === "waiting" && session.presenceAtMs === record.at && session.waitingNotifiedAtMs < record.at && record.at >= Date.now() - WAITING_NOTICE_MAX_AGE_MS) {
       this.db.setWaitingNotified(session.sessionId, record.at);
@@ -554,6 +566,7 @@ export class ClaudeRuntime {
       if (session.presencePid === null || processAlive(session.presencePid, session.presencePidStart)) continue;
       this.db.updatePresence({ sessionId: session.sessionId, path: null, cwd: null, state: "closed", atMs: Math.max(Date.now(), session.presenceAtMs),
         pid: null, pidStart: null, message: null });
+      this.releaseLocalWait(session.sessionId);
       if (session.rootMessageId) void this.renderSession(session.sessionId);
     }
   }
@@ -595,7 +608,7 @@ export class ClaudeRuntime {
 
   private startRunner(sessionId: string, options: { mode: "new" | "resume" | "fork"; cwd: string; forkFrom?: string }, takeover = false): RunnerEntry {
     const session = this.db.getSession(sessionId)!;
-    const entry = { takeover, closing: false, idleTimer: null, livePrompt: null, liveText: "" } as Omit<RunnerEntry, "runner"> as RunnerEntry;
+    const entry = { takeover, startedAtMs: Date.now(), yieldWhenIdle: false, closing: false, idleTimer: null, livePrompt: null, liveText: "" } as Omit<RunnerEntry, "runner"> as RunnerEntry;
     entry.runner = new SessionRunner({
       sessionId, mode: options.mode, ...(options.forkFrom ? { forkFrom: options.forkFrom } : {}), cwd: options.cwd, claudeBin: this.config.claudeBin,
       permissionMode: this.feishuMode(session), model: session.prefModel, effort: effortLevel(session.prefEffort),
@@ -638,7 +651,8 @@ export class ClaudeRuntime {
   private onTurnEnd(sessionId: string, entry: RunnerEntry, result: { interrupted: boolean; error: string | null }): void {
     entry.liveText = "";
     if (result.error) void this.topicNotice(sessionId, `⚠️ 这一轮没有正常完成：${result.error.slice(0, 500)}`);
-    if (!entry.runner.busy) this.armIdle(sessionId, entry);
+    if (!entry.runner.busy && entry.yieldWhenIdle) this.yieldToComputer(sessionId, entry);
+    else if (!entry.runner.busy) this.armIdle(sessionId, entry);
     // The turn's last records are in the transcript now; read them at once rather than waiting for the watcher.
     void this.flushTranscript(sessionId);
     this.refreshRoot(sessionId);
@@ -735,8 +749,63 @@ export class ClaudeRuntime {
     await this.sendToRunner(entry, session.sessionId, input, "next");
   }
 
+  /**
+   * The phone takes control of a session that is also open on this computer: the messages go to
+   * the bridge's own process, and the topic says how to pick the session up on the computer again.
+   */
+  private async switchToPhone(session: ClaudeSession, inputs: readonly FeishuInput[]): Promise<void> {
+    const entry = this.runners.get(session.sessionId);
+    if (!entry?.takeover && this.openElsewhere(session)) await this.topicNotice(session.sessionId, PHONE_CONTROL_NOTICE);
+    for (const input of inputs) await this.continueSession(session, input, true);
+  }
+
+  private localWait(sessionId: string): [string, { sessionId: string; inputs: FeishuInput[]; expiresAt: number; cardMessageId: string | null }] | null {
+    for (const item of this.localWaits) if (item[1].sessionId === sessionId) return item;
+    return null;
+  }
+
+  /** The turn on the computer ended (or its process exited): messages waiting for it go out, and the phone takes control. */
+  private releaseLocalWait(sessionId: string): void {
+    const waiting = this.localWait(sessionId);
+    if (!waiting) return;
+    const [nonce, pending] = waiting;
+    this.localWaits.delete(nonce);
+    const session = this.db.getSession(sessionId);
+    if (!session) return;
+    if (pending.cardMessageId) void this.feishu.updateCard(pending.cardMessageId, claudeNoticeCard("已切换到手机侧控制", "电脑上这一轮已结束，你的消息已发给 Claude。", "green"))
+      .catch((error) => this.fail("local_wait_card", { sessionId }, error));
+    void this.switchToPhone(session, pending.inputs).catch((error) => {
+      this.fail("continue_session", { sessionId }, error);
+      void this.topicNotice(sessionId, `无法继续：${errorText(error)}`);
+    });
+  }
+
+  /**
+   * What the Claude Code hooks report from VS Code or a terminal. A turn there ending releases
+   * messages that waited for it; a new prompt there hands control back to the computer.
+   */
+  private onLocalActivity(session: ClaudeSession, record: PresenceRecord): void {
+    if (record.state === "idle" || record.state === "closed") { this.releaseLocalWait(session.sessionId); return; }
+    if (record.state !== "running") return;
+    const entry = this.runners.get(session.sessionId);
+    if (!entry || entry.closing || record.at <= entry.startedAtMs) return;
+    entry.takeover = false;
+    if (entry.runner.busy) entry.yieldWhenIdle = true;
+    else this.yieldToComputer(session.sessionId, entry);
+  }
+
+  /** The session was continued on the computer: the bridge's process exits, so the next message from Feishu resumes the latest state. */
+  private yieldToComputer(sessionId: string, entry: RunnerEntry): void {
+    this.clearIdle(entry);
+    entry.closing = true;
+    entry.runner.close();
+    setTimeout(() => { if (this.runners.get(sessionId) === entry) entry.runner.terminate(); }, 30_000).unref();
+    void this.topicNotice(sessionId, "电脑上继续了这个会话，已切回电脑侧控制。在这里再发消息，会重新切换到手机侧。");
+    this.refreshRoot(sessionId);
+  }
+
   /** Copies the session so far into a new session with its own topic and continues there; the original stays untouched. */
-  private async forkSession(source: ClaudeSession, input: FeishuInput): Promise<void> {
+  private async forkSession(source: ClaudeSession, input: FeishuInput, more: readonly FeishuInput[] = []): Promise<void> {
     if (!source.cwd || !(await isDirectory(source.cwd))) {
       await this.topicNotice(source.sessionId, `找不到这个会话的工作目录（${displayPath(source.cwd)}），无法分叉。`);
       return;
@@ -753,8 +822,8 @@ export class ClaudeRuntime {
         .catch((error) => this.fail("fork_notice", { sessionId: source.sessionId }, error));
     }
     const entry = this.startRunner(forkId, { mode: "fork", forkFrom: source.sessionId, cwd: source.cwd });
-    // The message is in the original topic, so the fork's topic shows it as the first prompt.
-    await this.sendToRunner(entry, forkId, { ...input, shownMessageId: null }, "next");
+    // The messages are in the original topic, so the fork's topic shows them as prompts.
+    for (const item of [input, ...more]) await this.sendToRunner(entry, forkId, { ...item, shownMessageId: null }, "next");
   }
 
   /** Starts a new session in `cwd` with its own topic. */
@@ -1016,7 +1085,12 @@ export class ClaudeRuntime {
     const rootId = session.rootMessageId!;
     const reply = (text: string) => this.topicText(session.sessionId, rootId, text);
     const normalized = command.toLowerCase();
-    // Only these two are the bridge's; every other message, slash commands included, goes to Claude.
+    // Only these are the bridge's; every other message, slash commands included, goes to Claude.
+    if (normalized === "/" || normalized === "/menu") {
+      // The root card's controls at the bottom of the topic, so a long topic need not be scrolled back up.
+      await this.topicCard(session.sessionId, rootId, this.rootCard(session));
+      return;
+    }
     if (normalized === "/export") {
       await reply("正在导出完整记录…");
       await this.exportSession(session.sessionId);
@@ -1031,6 +1105,15 @@ export class ClaudeRuntime {
     const text = later ? command.slice(2).trim() : command;
     if (!text && !message.imageKeys.length) return;
     const input: FeishuInput = { text, imageKeys: message.imageKeys, sourceMessageId: message.messageId, shownMessageId: message.messageId };
+    const waiting = this.localWait(session.sessionId);
+    if (waiting) {
+      // Keep the order: this message goes out after the ones already waiting for the computer.
+      const [nonce, pending] = waiting;
+      pending.inputs.push(input);
+      if (pending.cardMessageId) await this.feishu.updateCard(pending.cardMessageId, claudeLocalBusyCard(session, nonce, pending.inputs.length))
+        .catch((error) => this.fail("local_wait_card", { sessionId: session.sessionId }, error));
+      return;
+    }
     const entry = await this.activeRunner(session.sessionId);
     if (entry?.runner.busy) {
       // Like typing while Claude works in the terminal: the message reaches Claude after the current step.
@@ -1038,13 +1121,16 @@ export class ClaudeRuntime {
       if (later) await reply("已排队：这一轮结束后发给 Claude。");
       return;
     }
-    if (!entry?.takeover && this.openElsewhere(session)) {
+    // Messages from the phone take control of the session. Only a turn still running on the
+    // computer is waited for, since both sides would otherwise write into the session at once.
+    if (!entry?.takeover && this.openElsewhere(session) && (session.presenceState === "running" || session.presenceState === "waiting")) {
       const nonce = randomUUID();
-      this.conflicts.set(nonce, { sessionId: session.sessionId, input, expiresAt: Date.now() + CONFLICT_CONFIRM_MS });
-      await this.topicCard(session.sessionId, rootId, claudeConflictCard(session, nonce));
+      const pending = { sessionId: session.sessionId, inputs: [input], expiresAt: Date.now() + LOCAL_TURN_WAIT_MS, cardMessageId: null as string | null };
+      this.localWaits.set(nonce, pending);
+      pending.cardMessageId = await this.topicCard(session.sessionId, rootId, claudeLocalBusyCard(session, nonce, 1));
       return;
     }
-    await this.continueSession(session, input, entry?.takeover ?? false);
+    await this.switchToPhone(session, [input]);
   }
 
   async onCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
@@ -1070,7 +1156,8 @@ export class ClaudeRuntime {
     // Buttons on a root card answer with the root card itself; remember what it shows now.
     const replaceRoot = (session: ClaudeSession): CardActionOutcome => {
       const card = this.rootCard(session);
-      this.rootHashes.set(session.sessionId, cardContentHash(card));
+      // A copy of the root card further down the topic answers the same way; only the root itself is tracked.
+      if (event.openMessageId === session.rootMessageId) this.rootHashes.set(session.sessionId, cardContentHash(card));
       return replace(card);
     };
     const expired = () => replace(claudeNoticeCard("请求已失效", "这个请求已经处理或取消，或者桥接服务重启过。"));
@@ -1221,24 +1308,25 @@ export class ClaudeRuntime {
       case "conflict_fork":
       case "conflict_takeover":
       case "conflict_cancel": {
-        const pending = this.conflicts.get(nonce);
-        this.conflicts.delete(nonce);
-        if (!pending || pending.expiresAt < Date.now()) return replace(claudeNoticeCard("已过期", "请重新发送这条消息。"));
-        if (event.action === "conflict_cancel") return replace(claudeNoticeCard("已取消", "这条消息没有发给 Claude。"));
+        const pending = this.localWaits.get(nonce);
+        this.localWaits.delete(nonce);
+        if (!pending || pending.expiresAt < Date.now()) return replace(claudeNoticeCard("已处理", "这些消息已经发送或取消；需要时请重新发送。"));
+        if (event.action === "conflict_cancel") return replace(claudeNoticeCard("已取消", `${pending.inputs.length > 1 ? `这 ${pending.inputs.length} 条消息` : "这条消息"}没有发给 Claude。`));
         const session = this.db.getSession(pending.sessionId);
         if (!session) return replace(claudeNoticeCard("无法继续", "没有找到这个会话。", "red"));
-        if (event.action === "conflict_fork") {
-          void this.forkSession(session, pending.input).catch((error) => {
+        const [first, ...rest] = pending.inputs;
+        if (event.action === "conflict_fork" && first) {
+          void this.forkSession(session, first, rest).catch((error) => {
             this.fail("fork_session", { sessionId: session.sessionId }, error);
             void this.topicNotice(session.sessionId, `分叉失败：${errorText(error)}`);
           });
           return replace(claudeNoticeCard("正在分叉", "会新建一个话题，在那里继续这段对话。", "blue"));
         }
-        void this.continueSession(session, pending.input, true).catch((error) => {
+        void this.switchToPhone(session, pending.inputs).catch((error) => {
           this.fail("continue_session", { sessionId: session.sessionId }, error);
           void this.topicNotice(session.sessionId, `无法继续：${errorText(error)}`);
         });
-        return replace(claudeNoticeCard("在原会话继续", "回到电脑后，在 VS Code 中重新打开这个会话，才能看到飞书里的这几轮。", "blue"));
+        return replace(claudeNoticeCard("已切换到手机侧控制", "消息已发给 Claude。", "green"));
       }
 
       case "new_session": return replace(this.newSessionCard());

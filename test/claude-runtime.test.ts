@@ -469,7 +469,7 @@ test("while Claude works, replies reach it, >> waits for the turn, a reply refus
   } finally { await env.cleanup(); }
 });
 
-test("a session open in VS Code asks first; forking continues in a new topic and leaves the original untouched", async () => {
+test("messages from the phone take control; a turn still running on the computer is waited for, or forked away from", async () => {
   const env = await setup("claude-fork-");
   try {
     const now = Date.now();
@@ -477,36 +477,43 @@ test("a session open in VS Code asks first; forking continues in a new topic and
     const history = atCwd([prompt(RECENT, "r-p1", now - 2 * MINUTE, "原来的问题"), reply(RECENT, "r-a1", now - MINUTE, "原来的回答")], env.project);
     await writeFile(env.path(RECENT), jsonl(history));
     await env.bind();
-    const original = env.db.getSession(RECENT)!;
-    const root = original.rootMessageId!;
+    const root = env.db.getSession(RECENT)!.rootMessageId!;
     const presenceDir = join(env.config.stateDir, "presence");
     await mkdir(presenceDir, { recursive: true });
-    await writeFile(join(presenceDir, `${RECENT}.json`), JSON.stringify({ version: 1, sessionId: RECENT, event: "SessionStart", state: "idle", notificationType: null,
-      message: null, transcriptPath: env.path(RECENT), cwd: env.project, source: "resume", reason: null, pid: process.pid, pidStartTime: null, at: Date.now() }));
-    await env.internals.presence.scan();
+    let clock = Date.now();
+    const local = async (state: string, event: string) => {
+      clock = Math.max(clock + 1, Date.now());
+      await writeFile(join(presenceDir, `${RECENT}.json`), JSON.stringify({ version: 1, sessionId: RECENT, event, state, notificationType: null,
+        message: null, transcriptPath: env.path(RECENT), cwd: env.project, source: null, reason: null, pid: process.pid, pidStartTime: null, at: clock }));
+      await env.internals.presence.scan();
+    };
+    const busyCards = () => env.feishu.repliesTo(root).filter((item) => title(item.card) === "电脑上这一轮还在运行");
 
-    await env.runtime.onFeishuMessage(env.message({ messageId: "m-fork", rootId: root, mentionedBot: false, text: "换个思路试试" }));
+    // A turn runs in VS Code: messages wait for it, in order, on one card.
+    await local("running", "UserPromptSubmit");
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "换个思路试试" }));
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "再补充一点" }));
     assert.equal(env.queries.length, 0);
-    const conflict = env.feishu.repliesTo(root).find((item) => title(item.card) === "这个会话正在本机打开")!;
-    assert.match(JSON.stringify(conflict.card), /VS Code 中已打开（空闲）/);
-    assert.equal(title((await env.action("conflict_fork", { nonce: nonceOf(conflict.card) }, {}, conflict.id)).card), "正在分叉");
+    assert.equal(busyCards().length, 1);
+    const waiting = busyCards()[0]!;
+    assert.match(JSON.stringify(env.feishu.updated.filter((update) => update.id === waiting.id).at(-1)?.card), /你的 2 条消息会在电脑上这一轮结束后自动发送/);
+
+    // Forking leaves the computer's session alone and continues both messages in a new topic.
+    assert.equal(title((await env.action("conflict_fork", { nonce: nonceOf(waiting.card) }, {}, waiting.id)).card), "正在分叉");
     await waitUntil(() => env.queries.length === 1);
     const query = env.queries[0]!;
     const forkId = String(query.options.sessionId);
-    assert.equal(query.options.resume, RECENT);
-    assert.equal(query.options.forkSession, true);
-    assert.notEqual(forkId, RECENT);
+    assert.deepEqual([query.options.resume, query.options.forkSession], [RECENT, true]);
     const sent = await query.nextMessage(1);
     assert.equal(sent.message.content, "换个思路试试");
+    assert.equal((await query.nextMessage(2)).message.content, "再补充一点");
     const fork = env.db.getSession(forkId)!;
-    assert.equal(fork.forkedFrom, RECENT);
-    assert.equal(fork.entrypoint, "feishu");
+    assert.deepEqual([fork.forkedFrom, fork.entrypoint], [RECENT, "feishu"]);
     assert.match(title(env.feishu.roots.find((item) => item.id === fork.rootMessageId)?.card), /（分叉）$/);
     await waitUntil(() => env.feishu.repliesTo(root).some((item) => item.text?.startsWith("已分叉到新话题继续：https://example.test/")));
 
     // The fork's transcript repeats the history with the same record ids.
-    const forkPath = join(env.projects, `${forkId}.jsonl`);
-    await writeFile(forkPath, jsonl([...history.map((record) => ({ ...record, sessionId: forkId, entrypoint: "sdk-ts" })),
+    await writeFile(join(env.projects, `${forkId}.jsonl`), jsonl([...history.map((record) => ({ ...record, sessionId: forkId, entrypoint: "sdk-ts" })),
       sdkRecord({ ...prompt(forkId, sent.uuid!, Date.now(), "换个思路试试"), sessionId: forkId }, env.project)]));
     const originalCards = env.feishu.repliesTo(root).filter((item) => item.kind === "card").map((item) => item.id);
     const updatesBefore = env.feishu.updated.filter((update) => originalCards.includes(update.id)).length;
@@ -516,16 +523,50 @@ test("a session open in VS Code asks first; forking continues in a new topic and
     assert.equal(env.db.getTurn(RECENT, "r-p1")?.view.status, "done");
     assert.match(rootCardOf(env, fork.rootMessageId!), /分叉自/);
 
-    // Continuing in the original session needs the same choice again; taking over resumes it in place.
+    // Another message waits again; when the turn on the computer ends, it goes out and the phone has control.
     await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "就在这里继续" }));
-    const second = env.feishu.repliesTo(root).filter((item) => title(item.card) === "这个会话正在本机打开").at(-1)!;
-    assert.notEqual(second.id, conflict.id);
-    assert.equal(title((await env.action("conflict_takeover", { nonce: nonceOf(second.card) }, {}, second.id)).card), "在原会话继续");
+    const second = busyCards().at(-1)!;
+    assert.notEqual(second.id, waiting.id);
+    assert.equal(env.queries.length, 1);
+    await local("idle", "Stop");
     await waitUntil(() => env.queries.length === 2);
-    assert.equal(env.queries[1]!.options.resume, RECENT);
-    assert.equal(env.queries[1]!.options.forkSession, undefined);
-    assert.equal((await env.queries[1]!.nextMessage(1)).message.content, "就在这里继续");
-    assert.equal(title((await env.action("conflict_cancel", { nonce: nonceOf(second.card) }, {}, "again")).card), "已过期");
+    const resumed = env.queries[1]!;
+    assert.deepEqual([resumed.options.resume, resumed.options.forkSession], [RECENT, undefined]);
+    assert.equal((await resumed.nextMessage(1)).message.content, "就在这里继续");
+    assert.equal(title(env.feishu.updated.filter((update) => update.id === second.id).at(-1)?.card), "已切换到手机侧控制");
+    assert.ok(env.feishu.repliesTo(root).some((item) => item.text?.startsWith("已切换到手机侧控制")));
+    assert.equal(title((await env.action("conflict_cancel", { nonce: nonceOf(second.card) }, {}, "again")).card), "已处理");
+
+    // While the phone has control, further messages go straight to Claude.
+    resumed.result([resumed.received[0]!.uuid!]);
+    await waitUntil(() => rootCardOf(env, root).includes("飞书中已连接（空闲）"));
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "再来一轮" }));
+    assert.equal((await resumed.nextMessage(2)).message.content, "再来一轮");
+    resumed.result([resumed.received[1]!.uuid!]);
+    await waitUntil(() => rootCardOf(env, root).includes("飞书中已连接（空闲）"));
+
+    // A new prompt on the computer hands control back: the bridge's process exits.
+    await local("running", "UserPromptSubmit");
+    await waitUntil(() => env.feishu.repliesTo(root).some((item) => item.text?.startsWith("电脑上继续了这个会话，已切回电脑侧控制")));
+    await waitUntil(() => !rootCardOf(env, root).includes("飞书中"));
+  } finally { await env.cleanup(); }
+});
+
+test("a lone / in a topic posts the session's controls at the bottom of the topic", async () => {
+  const env = await setup("claude-menu-");
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "r-p1", now - HOUR, "问题"), reply(RECENT, "r-a1", now - HOUR + MINUTE, "回答")], env.project)));
+    await env.bind();
+    const root = env.db.getSession(RECENT)!.rootMessageId!;
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "/" }));
+    const copy = env.feishu.repliesTo(root).at(-1)!;
+    assert.match(JSON.stringify(copy.card), /"action":"model_card"/);
+    assert.match(JSON.stringify(copy.card), /"action":"mode_card"/);
+    assert.equal(env.queries.length, 0);
+    // Its buttons work like the root card's.
+    await env.action("model_card", { sessionId: RECENT }, {}, copy.id);
+    await waitUntil(() => env.feishu.repliesTo(root).some((item) => title(item.card) === "飞书续聊的模型"));
   } finally { await env.cleanup(); }
 });
 

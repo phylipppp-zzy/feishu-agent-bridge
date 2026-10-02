@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { configureCardUi } from "../src/card-kit.js";
-import { CARD_TEXT_LIMIT, claudeConflictCard, claudeInteractionDoneCard, claudeModeCard, claudeNewSessionCard, claudePermissionCard, claudePlanCard,
+import { CARD_TEXT_LIMIT, claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeNewSessionCard, claudePermissionCard, claudePlanCard,
   claudeQuestionCard, claudeRootCard, claudeTurnCard, formatDuration, presenceLabel, promptLine, transcriptMarkdown } from "../src/claude/cards.js";
 import type { Interaction } from "../src/claude/interactions.js";
 import type { TurnView } from "../src/claude/conversation.js";
@@ -105,8 +105,9 @@ test("request cards show what Claude wants and every way to answer", () => {
   assert.match(plan, /1\. 改代码/);
   assert.match(plan, /"action":"plan_edits"/);
   assert.equal((claudeInteractionDoneCard(interaction(), "已允许", "green", "npm test").header as { title: { content: string } }).title.content, "使用 Bash · 已允许");
-  const conflict = JSON.stringify(claudeConflictCard(session, "n-2"));
+  const conflict = JSON.stringify(claudeLocalBusyCard(session, "n-2", 2));
   assert.match(conflict, /VS Code 中等待你处理/);
+  assert.match(conflict, /你的 2 条消息会在电脑上这一轮结束后自动发送/);
   assert.match(conflict, /"action":"conflict_fork"/);
   const modes = JSON.stringify(claudeModeCard(session, "default", ["default", "acceptEdits", "plan", "auto"]));
   assert.doesNotMatch(modes, /bypassPermissions/);
