@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { choiceCard, configureCardUi, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, rootGrantCard, sessionCard, wizardReadyCard } from "../src/cards.js";
+import { archivedSessionActionCard, choiceCard, configureCardUi, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, rootGrantCard, sessionCard, wizardReadyCard } from "../src/cards.js";
 import type { ModelCapability } from "../src/types.js";
 
 function actions(card: Record<string, unknown>): string[] {
@@ -110,4 +110,15 @@ test("remote root and approval cards keep only opaque callback state", () => {
   assert.match(approval, /opaque-nonce/);
   assert.match(approval, /remote_approve/);
   assert.doesNotMatch(approval, /acceptForSession/);
+});
+
+
+test("archived session cards require an opaque explicit decision", () => {
+  const card = archivedSessionActionCard("opaque-nonce", "Archived topic");
+  assert.deepEqual(actions(card), ["unarchive_confirm", "unarchive_cancel"]);
+  const serialized = JSON.stringify(card);
+  assert.match(serialized, /opaque-nonce/);
+  assert.doesNotMatch(serialized, /threadId|sessionId|prompt/);
+  assert.deepEqual(actions(sessionCard({ cwd: "/work", firstUserText: "x", sessionId: "s1", lifecycle: "abandoned" })), ["turn_review"]);
+  assert.match(JSON.stringify(sessionCard({ cwd: "/work", firstUserText: "x", sessionId: "s1", lifecycle: "abandoned" })), /创建失败，未执行/);
 });

@@ -1,3 +1,6 @@
+import { access } from "node:fs/promises";
+import { constants } from "node:fs";
+import { join } from "node:path";
 import { BridgeDatabase } from "./db.js";
 import { CodexCliProbe } from "./codex.js";
 import { loadConfig } from "./config.js";
@@ -5,9 +8,29 @@ import { FeishuClient } from "./feishu.js";
 import { SyncService } from "./sync.js";
 import { CodexAppServer } from "./app-server.js";
 import { configureCardUi } from "./cards.js";
+import { installSafeLogging } from "./safe-log.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  installSafeLogging([config.appSecret, config.bindToken]);
+  const disableFile = process.env.FEISHU_BRIDGE_DISABLE_FILE ?? join(config.stateDir, "disabled");
+  try {
+    await access(disableFile, constants.F_OK);
+    console.log(`feishu-codex-bridge is disabled by marker: ${disableFile}`);
+    await new Promise<void>((resolve) => {
+      const keepAlive = setInterval(() => undefined, 60 * 60 * 1_000);
+      const stop = () => {
+        clearInterval(keepAlive);
+        resolve();
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    });
+    return;
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? String(error.code) : "";
+    if (code !== "ENOENT") throw error;
+  }
   configureCardUi(config.cardUiVersion ?? 1);
   const db = new BridgeDatabase(config.stateDir);
   const feishu = new FeishuClient(config.appId, config.appSecret);

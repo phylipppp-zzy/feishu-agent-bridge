@@ -182,22 +182,33 @@ export interface SessionCardPresentation {
   hasActiveWork?: boolean;
 }
 
-export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null; collaborationMode?: string | null }, status = "可继续", presentation: SessionCardPresentation = {}): CardDefinition {
+export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null; collaborationMode?: string | null; lifecycle?: string | null }, status = "可继续", presentation: SessionCardPresentation = {}): CardDefinition {
   const title = shorten(session.title || session.firstUserText) || "Codex 会话";
   const plan = session.collaborationMode === "plan";
+  const lifecycle = session.lifecycle ?? "active";
+  if (lifecycle !== "active") status = lifecycle === "archived" ? "已归档" : lifecycle === "deleted" ? "已删除" : "创建失败，未执行";
   const mode = plan ? "Plan（只读规划）" : "Default（执行）";
   const root = presentation.executionMode === "root-danger-full-access";
   const risk = root
     ? (presentation.rootExecutionReady === false ? "Root 容器预检失败：" + ((presentation.rootPreflightReasons ?? []).join("；") || "执行已禁用") : "专用容器 Root 模式：本任务可读写容器、访问网络并启动进程；每次任务单独授权。")
     : plan ? "Plan：只读沙箱、禁止网络，不会请求 Root。" : "Default：仅允许 canonical 工作目录写入，禁止网络。";
-  const controls = [button("修改模型", "session_model", "primary"), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode"), button("查看本轮审阅", "turn_review")];
+  const controls = lifecycle === "active"
+    ? [button("修改模型", "session_model", "primary"), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode"), button("查看本轮审阅", "turn_review")]
+    : [button("查看本轮审阅", "turn_review")];
   const tick = "\\x60";
-  return card(title, status === "运行中" ? "orange" : "green", [
+  return card(title, status === "运行中" ? "orange" : lifecycle === "active" ? "green" : "grey", [
     markdown("项目：" + tick + safeMarkdown(session.cwd) + tick + "\\n模型：" + tick + safeMarkdown(session.model ?? "继承全局配置") + tick + "　强度：" + tick + safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认") + tick + "\\n模式：**" + safeMarkdown(mode) + "**\\n状态：**" + safeMarkdown(status) + "**　ID：" + tick + session.sessionId.slice(0, 8) + tick),
     actionRow(controls),
     note(risk + (presentation.hasActiveWork ? " 当前有任务运行中，设置只在下一轮生效。" : "")),
   ]);
 }
+export function archivedSessionActionCard(nonce: string, title: string): CardDefinition {
+  return card("会话已归档", "orange", [
+    markdown("会话 **" + safeMarkdown(shorten(title || "Codex 会话")) + "** 已归档。原消息已保留，只有确认取消归档后才会执行。"),
+    actionRow([button("取消归档并继续", "unarchive_confirm", "primary", { nonce }), button("保持归档", "unarchive_cancel", "default", { nonce })]),
+  ]);
+}
+
 export function runStatusCard(state: string, detail: string, cancellable = false, sessionId?: string): CardDefinition {
   return card("Codex 运行状态", state === "失败" ? "red" : state === "完成" ? "green" : "orange", [
     markdown(`状态：**${safeMarkdown(state)}**\n${safeMarkdown(detail || "等待 Codex 输出")}`),

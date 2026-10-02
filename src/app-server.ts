@@ -9,10 +9,20 @@ export type JsonRpcId = string | number;
 export interface JsonRpcMessage { jsonrpc?: "2.0"; id?: JsonRpcId; method?: string; params?: Record<string, unknown>; result?: unknown; error?: unknown; }
 export type ServerRequestHandler = (request: JsonRpcMessage) => Promise<unknown>;
 export type ServerNotificationHandler = (notification: JsonRpcMessage) => Promise<void> | void;
+export function notificationTurnId(params: Record<string, unknown>): string | null {
+  if (typeof params.turnId === "string") return params.turnId;
+  if (typeof params.turn_id === "string") return params.turn_id;
+  const turn = params.turn;
+  return turn && typeof turn === "object" && typeof (turn as Record<string, unknown>).id === "string"
+    ? (turn as { id: string }).id : null;
+}
 export type AppServerExitHandler = (event: { epoch: number; code: number | null; error?: Error }) => void;
 export type AppServerHealthState = "stopped" | "starting" | "healthy" | "unhealthy" | "restarting";
 export interface AppServerHealth { state: AppServerHealthState; epoch: number; sinceMs: number; lastError?: string; }
 export interface AppServerLifecycleEvent { kind: "started" | "exited" | "stopped"; epoch: number; error?: Error; }
+export class AppServerRpcError extends Error {
+  constructor(readonly code: number, message: string, readonly data?: unknown) { super(message); this.name = "AppServerRpcError"; }
+}
 export interface AppServerPort {
   readonly appServerEpoch: number;
   readonly isHealthy: boolean;
@@ -22,11 +32,13 @@ export interface AppServerPort {
   respond(id: JsonRpcId, result: unknown): Promise<void>;
   reject(id: JsonRpcId, error: { code: number; message: string; data?: unknown }): Promise<void>;
   interrupt(threadId: string, turnId: string): Promise<void>;
+  unarchiveThread(threadId: string): Promise<void>;
+  unsubscribeThread(threadId: string): Promise<void>;
   restart(reason?: string): Promise<void>;
   close(): Promise<void>;
 }
 const execFileAsync = promisify(execFile);
-const REQUIRED_PROTOCOL_TOKENS = ["thread/start", "thread/resume", "thread/list", "turn/start", "turn/steer", "turn/interrupt", "item/tool/requestUserInput", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "turn/completed"];
+const REQUIRED_PROTOCOL_TOKENS = ["thread/start", "thread/resume", "thread/list", "thread/archive", "turn/start", "turn/steer", "turn/interrupt", "item/tool/requestUserInput", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "turn/completed", "thread/unarchive", "thread/unsubscribe", "thread/archived", "thread/unarchived", "thread/deleted"];
 
 /** Bidirectional JSON-RPC transport for local Codex app-server clients. */
 export class CodexAppServer {
@@ -63,6 +75,14 @@ export class CodexAppServer {
   async ensureStarted(): Promise<void> { await this.start(); }
   async restart(reason = "manual restart"): Promise<void> { this.setHealth("restarting", new Error(reason)); await this.close(); await this.start(); }
   async interrupt(threadId: string, turnId: string): Promise<void> { await this.request("turn/interrupt", { threadId, turnId }, 10_000); }
+  async unarchiveThread(threadId: string): Promise<void> { await this.request("thread/unarchive", { threadId }, 15_000); }
+  async unsubscribeThread(threadId: string): Promise<void> {
+    try { await this.request("thread/unsubscribe", { threadId }, 10_000); }
+    catch (error) {
+      if (error instanceof AppServerRpcError && /unsubscribed|notSubscribed|not subscribed|notLoaded|not loaded/i.test(error.message)) return;
+      throw error;
+    }
+  }
 
   async start(): Promise<void> {
     if (this.child && this.healthy) return;
@@ -196,7 +216,13 @@ export class CodexAppServer {
       if (!pending) return;
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(typeof message.error === "string" ? message.error : JSON.stringify(message.error)));
+      if (message.error) {
+        const value = message.error;
+        if (value && typeof value === "object" && typeof (value as Record<string, unknown>).code === "number" && typeof (value as Record<string, unknown>).message === "string") {
+          const error = value as Record<string, unknown>;
+          pending.reject(new AppServerRpcError(Number(error.code), String(error.message), error.data));
+        } else pending.reject(new Error(typeof value === "string" ? value : JSON.stringify(value)));
+      }
       else pending.resolve(message.result);
       return;
     }

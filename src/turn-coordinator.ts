@@ -1,4 +1,4 @@
-import type { AppServerLifecycleEvent, JsonRpcMessage } from "./app-server.js";
+import { notificationTurnId, type AppServerLifecycleEvent, type JsonRpcMessage } from "./app-server.js";
 import type { TurnCoordinatorPort } from "./bridge-contracts.js";
 import type { QueuedTask, TurnState } from "./types.js";
 
@@ -31,14 +31,15 @@ export class TurnCoordinator implements TurnCoordinatorPort {
   handleNotification(event: JsonRpcMessage): Promise<void> {
     const params = event.params && typeof event.params === "object" ? event.params : {};
     const sessionId = this.stringAt(params, "threadId", "thread_id") ?? "unscoped";
-    const turnId = this.stringAt(params, "turnId", "turn_id") ?? "none";
+    const turnId = notificationTurnId(params) ?? "none";
     const key = `${sessionId}:${turnId}`;
     const previous = this.notificationQueues.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(() => this.options.onNotification(event));
     this.notificationQueues.set(key, next);
-    void next.finally(() => {
+    const cleanup = () => {
       if (this.notificationQueues.get(key) === next) this.notificationQueues.delete(key);
-    });
+    };
+    void next.then(cleanup, cleanup);
     return next;
   }
 

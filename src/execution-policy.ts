@@ -4,6 +4,13 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ApprovalContext, BridgeConfig, RemoteRequestType, SafeApprovalSummary } from "./types.js";
 
 export interface RootPreflightResult { ok: boolean; reasons: string[]; }
+/** thread/start and thread/resume use SandboxMode; turn/start uses SandboxPolicy. */
+export function threadSandboxMode(policy: Record<string, unknown>): "read-only" | "workspace-write" | "danger-full-access" {
+  if (policy.type === "readOnly") return "read-only";
+  if (policy.type === "workspaceWrite") return "workspace-write";
+  if (policy.type === "dangerFullAccess") return "danger-full-access";
+  throw new Error("Unsupported thread sandbox policy");
+}
 const SOCKETS = ["/var/run/docker.sock", "/run/docker.sock", "/var/run/podman/podman.sock", "/run/podman/podman.sock", "/var/run/containerd/containerd.sock"];
 const CAP_SYS_MODULE = 16n;
 const CAP_SYS_ADMIN = 21n;

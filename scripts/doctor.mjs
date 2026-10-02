@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { parseEnvironment } from "../dist/src/installer.js";
 import { rootExecutionPreflight } from "../dist/src/execution-policy.js";
+import { installSafeLogging } from "../dist/src/safe-log.js";
 
 const execFileAsync = promisify(execFile);
 const envPath = join(homedir(), ".config/feishu-codex-bridge/env");
@@ -20,6 +21,7 @@ try {
   result((info.mode & 0o077) === 0, `${envPath} permissions are ${ (info.mode & 0o777).toString(8) } (expected 600)`);
   const raw = await readFile(envPath, "utf8");
   values = parseEnvironment(raw);
+  installSafeLogging([values.FEISHU_APP_SECRET, values.FEISHU_BIND_TOKEN].filter(Boolean));
   result(Boolean(values.FEISHU_APP_ID), "FEISHU_APP_ID is configured");
   result(Boolean(values.FEISHU_APP_SECRET), "FEISHU_APP_SECRET is configured");
   result(Boolean(values.FEISHU_BIND_TOKEN), "FEISHU_BIND_TOKEN is configured");
@@ -71,12 +73,30 @@ if (rootMode) {
   result(preflight.ok, "Root dedicated-container preflight passed");
   if (!preflight.ok) console.log(`INFO  Root preflight: ${preflight.reasons.join("; ")}`);
 }
+let bridgeCodexVersion = "";
 try {
   const { stdout } = await execFileAsync(codexBin, ["--version"]);
-  result(true, `Codex available: ${stdout.trim()}`);
+  bridgeCodexVersion = stdout.trim();
+  result(true, `Codex available: ${bridgeCodexVersion}`);
   await execFileAsync(codexBin, ["login", "status"]);
   result(true, "Codex login is available");
 } catch (error) { result(false, `Codex unavailable: ${error}`); }
+
+try {
+  const { stdout: processList } = await execFileAsync("ps", ["-eo", "args="]);
+  const binaries = new Set([codexBin]);
+  for (const line of processList.split("\n")) {
+    if (!/codex.*app-server/i.test(line)) continue;
+    const binary = line.trim().split(/\s+/, 1)[0];
+    if (binary && (binary === "codex" || binary.endsWith("/codex"))) binaries.add(binary);
+  }
+  const versions = new Set();
+  for (const binary of binaries) {
+    try { versions.add((await execFileAsync(binary, ["--version"], { timeout: 5_000 })).stdout.trim()); } catch { /* ignore wrappers */ }
+  }
+  if (versions.size > 1) console.log(`WARN  Codex client version skew detected: ${[...versions].join(" vs ")}; active-writer conflicts can span incompatible clients`);
+  else console.log(`INFO  Codex client versions observed: ${[...versions].join(", ") || bridgeCodexVersion || "unknown"}`);
+} catch (error) { console.log(`INFO  unable to inspect other Codex client versions: ${error instanceof Error ? error.message : error}`); }
 
 try {
   await execFileAsync(codexBin, ["sandbox", "--", "/usr/bin/true"]);
@@ -88,8 +108,12 @@ try {
 }
 
 try {
-  const { stdout } = await execFileAsync(codexBin, ["app-server", "generate-json-schema", "--experimental", "--out", "/tmp/feishu-codex-bridge-doctor-schema"], { maxBuffer: 1_000_000 });
+  const schemaDir = "/tmp/feishu-codex-bridge-doctor-schema";
+  const { stdout } = await execFileAsync(codexBin, ["app-server", "generate-json-schema", "--experimental", "--out", schemaDir], { maxBuffer: 1_000_000 });
   void stdout;
+  const schemaFiles = (await readdir(schemaDir, { recursive: true })).filter((name) => String(name).endsWith(".json"));
+  const schemaText = (await Promise.all(schemaFiles.map((name) => readFile(join(schemaDir, String(name)), "utf8")))).join("\n");
+  for (const token of ["thread/unarchive", "thread/unsubscribe", "thread/archived", "thread/unarchived", "thread/deleted"]) result(schemaText.includes(token), `Codex app-server protocol supports ${token}`);
   result(true, "Codex app-server experimental schema is available");
 } catch (error) { result(false, `Codex app-server schema generation failed: ${error instanceof Error ? error.message : error}`); }
 
@@ -117,6 +141,15 @@ if (containerArgument || values.FEISHU_RUNTIME === "container") {
   try {
     await execFileAsync("systemctl", ["--user", "is-active", "--quiet", "feishu-codex-bridge.service"]);
     result(true, "feishu-codex-bridge user service is active");
+    const { stdout: mainPid } = await execFileAsync("systemctl", ["--user", "show", "feishu-codex-bridge.service", "-p", "MainPID", "--value"]);
+    if (process.platform === "linux" && /^[1-9][0-9]*$/.test(mainPid.trim())) {
+      try {
+        const profile = (await readFile(`/proc/${mainPid.trim()}/attr/current`, "utf8")).trim();
+        result(!profile.includes("unprivileged_userns"), `Bridge service AppArmor context: ${profile}; inherited user-namespace restrictions break nested Codex sandboxing`);
+      } catch (error) {
+        console.log(`WARN  unable to verify service AppArmor context: ${error instanceof Error ? error.message : error}`);
+      }
+    }
   } catch { result(false, "feishu-codex-bridge user service is not active; run systemctl --user restart feishu-codex-bridge.service"); }
 }
 

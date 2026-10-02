@@ -71,6 +71,10 @@ export class BridgeDatabase {
     this.ensureColumn("sessions", "thread_id", "TEXT");
     this.ensureColumn("sessions", "session_card_message_id", "TEXT");
     this.ensureColumn("sessions", "session_card_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("sessions", "lifecycle", "TEXT NOT NULL DEFAULT 'active'");
+    this.ensureColumn("sessions", "lifecycle_updated_at_ms", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("sessions", "created_by_task_id", "TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS sessions_created_by_task ON sessions(created_by_task_id) WHERE created_by_task_id IS NOT NULL");
     this.ensureColumn("messages", "source_path", "TEXT");
     this.ensureColumn("messages", "source_kind", "TEXT");
     this.ensureColumn("messages", "recalled_at", "TEXT");
@@ -123,6 +127,16 @@ export class BridgeDatabase {
     // The status-constraint migration rebuilds task_queue, so add new columns afterwards.
     this.ensureColumn("task_queue", "root_grant_nonce", "TEXT");
     this.ensureColumn("task_queue", "terminal_reason", "TEXT");
+    this.ensureColumn("task_queue", "phase", "TEXT");
+    this.ensureColumn("task_queue", "task_fingerprint", "TEXT");
+    this.ensureColumn("task_queue", "creation_attempt_id", "TEXT");
+    this.ensureColumn("task_queue", "creation_started_at_ms", "INTEGER");
+    this.ensureColumn("task_queue", "retry_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("task_queue", "next_attempt_at_ms", "INTEGER");
+    this.ensureColumn("task_queue", "expires_at_ms", "INTEGER");
+    this.ensureColumn("task_queue", "action_nonce", "TEXT");
+    this.ensureColumn("task_queue", "unarchive_approved", "INTEGER NOT NULL DEFAULT 0");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS task_queue_action_nonce ON task_queue(action_nonce) WHERE action_nonce IS NOT NULL");
     this.db.exec(`CREATE TABLE IF NOT EXISTS turn_runs (
       turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, epoch INTEGER NOT NULL, mode TEXT NOT NULL,
       state TEXT NOT NULL, root_message_id TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL DEFAULT '',
@@ -150,7 +164,7 @@ export class BridgeDatabase {
     CREATE INDEX IF NOT EXISTS inbound_events_status ON inbound_events(status,updated_at_ms);
     CREATE TABLE IF NOT EXISTS task_root_grants (
       nonce TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES task_queue(id) ON DELETE CASCADE,
-      session_id TEXT NOT NULL, canonical_cwd TEXT NOT NULL, open_id TEXT NOT NULL, chat_id TEXT NOT NULL,
+      session_id TEXT, task_fingerprint TEXT NOT NULL DEFAULT 'legacy', canonical_cwd TEXT NOT NULL, open_id TEXT NOT NULL, chat_id TEXT NOT NULL,
       epoch INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','approved','denied','expired','consumed','cancelled')),
       created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );
@@ -159,6 +173,7 @@ export class BridgeDatabase {
       session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, open_id TEXT NOT NULL, epoch INTEGER NOT NULL,
       expires_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );`);
+    this.migrateTaskRootGrants();
     this.ensureColumn("inbound_events", "claim_token", "TEXT");
     this.ensureColumn("inbound_events", "service_epoch", "TEXT");
     this.ensureColumn("inbound_events", "lease_until_ms", "INTEGER");
@@ -177,42 +192,39 @@ export class BridgeDatabase {
 
   private migrateTaskQueueStatusConstraint(): void {
     const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_queue'").get() as { sql?: string } | undefined;
-    if (row?.sql?.includes("'awaiting_root_consent'")) return;
+    if (row?.sql?.includes("'creation_uncertain'")) return;
+    this.db.exec("PRAGMA foreign_keys=OFF");
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.exec(`ALTER TABLE task_queue RENAME TO task_queue_legacy;
-        CREATE TABLE task_queue (
-          id TEXT PRIMARY KEY,
-          kind TEXT NOT NULL CHECK(kind IN ('new','resume')),
-          session_id TEXT,
-          cwd TEXT NOT NULL,
-          prompt TEXT NOT NULL,
-          image_keys TEXT NOT NULL DEFAULT '[]',
-          source_message_id TEXT NOT NULL UNIQUE,
-          chat_id TEXT NOT NULL,
-          root_message_id TEXT,
-          model TEXT,
-          reasoning_effort TEXT,
-          status TEXT NOT NULL CHECK(status IN ('pending','running','awaiting_root_consent','awaiting_input','awaiting_approval','awaiting_sync','completed','failed','cancelled','interrupted')),
-          run_card_message_id TEXT,
-          expected_session_id TEXT,
-          sync_status TEXT NOT NULL DEFAULT 'none',
-          last_sync_offset INTEGER,
-          turn_id TEXT,
-          engine TEXT NOT NULL DEFAULT 'exec',
-          error TEXT,
-          created_at_ms INTEGER NOT NULL,
-          updated_at_ms INTEGER NOT NULL
-        );
-        INSERT INTO task_queue(id,kind,session_id,cwd,prompt,image_keys,source_message_id,chat_id,root_message_id,model,reasoning_effort,status,run_card_message_id,expected_session_id,sync_status,last_sync_offset,turn_id,engine,error,created_at_ms,updated_at_ms)
-        SELECT id,kind,session_id,cwd,prompt,image_keys,source_message_id,chat_id,root_message_id,model,reasoning_effort,status,run_card_message_id,expected_session_id,COALESCE(sync_status,'none'),last_sync_offset,NULL,'exec',error,created_at_ms,updated_at_ms FROM task_queue_legacy;
-        DROP TABLE task_queue_legacy;
-        CREATE INDEX IF NOT EXISTS task_queue_session_status ON task_queue(session_id,status,created_at_ms);`);
+      this.db.exec(`CREATE TABLE task_queue_next (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('new','resume')), session_id TEXT, cwd TEXT NOT NULL, prompt TEXT NOT NULL,
+        image_keys TEXT NOT NULL DEFAULT '[]', source_message_id TEXT NOT NULL UNIQUE, chat_id TEXT NOT NULL, root_message_id TEXT, model TEXT, reasoning_effort TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending','authorized','creating_thread','thread_created','starting_turn','running','awaiting_root_consent','awaiting_writer','awaiting_unarchive','creation_uncertain','awaiting_input','awaiting_approval','awaiting_sync','completed','failed','cancelled','interrupted','expired')),
+        run_card_message_id TEXT, expected_session_id TEXT, sync_status TEXT NOT NULL DEFAULT 'none', last_sync_offset INTEGER, turn_id TEXT, engine TEXT NOT NULL DEFAULT 'app_server', error TEXT,
+        root_grant_nonce TEXT, terminal_reason TEXT, phase TEXT, task_fingerprint TEXT, creation_attempt_id TEXT, creation_started_at_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at_ms INTEGER, expires_at_ms INTEGER, action_nonce TEXT, unarchive_approved INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+      );
+      INSERT INTO task_queue_next(id,kind,session_id,cwd,prompt,image_keys,source_message_id,chat_id,root_message_id,model,reasoning_effort,status,run_card_message_id,expected_session_id,sync_status,last_sync_offset,turn_id,engine,error,root_grant_nonce,terminal_reason,created_at_ms,updated_at_ms)
+      SELECT id,kind,session_id,cwd,prompt,image_keys,source_message_id,chat_id,root_message_id,model,reasoning_effort,status,run_card_message_id,expected_session_id,COALESCE(sync_status,'none'),last_sync_offset,turn_id,engine,error,root_grant_nonce,terminal_reason,created_at_ms,updated_at_ms FROM task_queue;
+      DROP TABLE task_queue; ALTER TABLE task_queue_next RENAME TO task_queue;
+      CREATE INDEX task_queue_session_status ON task_queue(session_id,status,created_at_ms);`);
       this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    finally { this.db.exec("PRAGMA foreign_keys=ON"); }
+  }
+
+  private migrateTaskRootGrants(): void {
+    const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_root_grants'").get() as { sql?: string } | undefined;
+    if (!row?.sql || row.sql.includes("task_fingerprint TEXT")) return;
+    this.db.exec("PRAGMA foreign_keys=OFF");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`CREATE TABLE task_root_grants_next (nonce TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES task_queue(id) ON DELETE CASCADE, session_id TEXT, task_fingerprint TEXT NOT NULL, canonical_cwd TEXT NOT NULL, open_id TEXT NOT NULL, chat_id TEXT NOT NULL, epoch INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','approved','denied','expired','consumed','cancelled')), created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+      INSERT INTO task_root_grants_next(nonce,task_id,session_id,task_fingerprint,canonical_cwd,open_id,chat_id,epoch,expires_at_ms,status,created_at_ms,updated_at_ms) SELECT nonce,task_id,session_id,COALESCE((SELECT task_fingerprint FROM task_queue WHERE id=task_id),'legacy:'||task_id),canonical_cwd,open_id,chat_id,epoch,expires_at_ms,status,created_at_ms,updated_at_ms FROM task_root_grants;
+      DROP TABLE task_root_grants; ALTER TABLE task_root_grants_next RENAME TO task_root_grants; CREATE INDEX task_root_grants_scope ON task_root_grants(session_id,status,expires_at_ms);`);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    finally { this.db.exec("PRAGMA foreign_keys=ON"); }
   }
 
   close(): void { this.db.close(); }
@@ -247,17 +259,20 @@ export class BridgeDatabase {
   }
 
   upsertSession(session: SessionMetadata): void {
-    this.db.prepare(`INSERT INTO sessions(session_id,path,cwd,started_at,source,first_user_text,title,collaboration_mode,model,reasoning_effort)
-      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET path=excluded.path,cwd=excluded.cwd,
+    this.db.prepare(`INSERT INTO sessions(session_id,path,cwd,started_at,source,first_user_text,title,collaboration_mode,model,reasoning_effort,lifecycle,lifecycle_updated_at_ms,created_by_task_id)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET path=excluded.path,cwd=excluded.cwd,
       started_at=excluded.started_at,source=excluded.source,
       first_user_text=CASE WHEN excluded.first_user_text<>'' THEN excluded.first_user_text ELSE sessions.first_user_text END,
       title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE sessions.title END,
       collaboration_mode=COALESCE(excluded.collaboration_mode,sessions.collaboration_mode),
       model=COALESCE(excluded.model,sessions.model),reasoning_effort=COALESCE(excluded.reasoning_effort,sessions.reasoning_effort),
-      updated_at=CURRENT_TIMESTAMP`).run(
+      lifecycle=CASE WHEN excluded.lifecycle_updated_at_ms>0 THEN excluded.lifecycle ELSE sessions.lifecycle END,
+      lifecycle_updated_at_ms=MAX(sessions.lifecycle_updated_at_ms,excluded.lifecycle_updated_at_ms),
+      created_by_task_id=COALESCE(excluded.created_by_task_id,sessions.created_by_task_id),updated_at=CURRENT_TIMESTAMP`).run(
       session.sessionId, session.path, session.cwd, session.startedAt, session.source, session.firstUserText,
       session.title ?? "", session.collaborationMode ?? "default",
-      session.model ?? null, session.reasoningEffort ?? null,
+      session.model ?? null, session.reasoningEffort ?? null, session.lifecycle ?? "active",
+      session.lifecycleUpdatedAtMs ?? (session.lifecycle ? Date.now() : 0), session.createdByTaskId ?? null,
     );
   }
 
@@ -276,6 +291,8 @@ export class BridgeDatabase {
       sessionCardMessageId: row.session_card_message_id ? String(row.session_card_message_id) : null,
       model: row.model ? String(row.model) : null,
       reasoningEffort: row.reasoning_effort ? String(row.reasoning_effort) : null,
+      lifecycle: (["archived", "deleted", "abandoned"].includes(String(row.lifecycle)) ? String(row.lifecycle) : "active") as NonNullable<SessionMetadata["lifecycle"]>,
+      lifecycleUpdatedAtMs: Number(row.lifecycle_updated_at_ms ?? 0), createdByTaskId: row.created_by_task_id ? String(row.created_by_task_id) : null,
     };
   }
 
@@ -294,6 +311,8 @@ export class BridgeDatabase {
       sessionCardMessageId: row.session_card_message_id ? String(row.session_card_message_id) : null,
       model: row.model ? String(row.model) : null,
       reasoningEffort: row.reasoning_effort ? String(row.reasoning_effort) : null,
+      lifecycle: (["archived", "deleted", "abandoned"].includes(String(row.lifecycle)) ? String(row.lifecycle) : "active") as NonNullable<SessionMetadata["lifecycle"]>,
+      lifecycleUpdatedAtMs: Number(row.lifecycle_updated_at_ms ?? 0), createdByTaskId: row.created_by_task_id ? String(row.created_by_task_id) : null,
     };
   }
 
@@ -319,6 +338,11 @@ export class BridgeDatabase {
   setSessionTitle(sessionId: string, title: string | null, preview?: string): void {
     this.db.prepare("UPDATE sessions SET title=CASE WHEN ?<>'' THEN ? ELSE title END, first_user_text=CASE WHEN ?<>'' THEN ? ELSE first_user_text END, updated_at=CURRENT_TIMESTAMP WHERE session_id=?")
       .run(title ?? "", title ?? "", preview ?? "", preview ?? "", sessionId);
+  }
+
+  setSessionLifecycle(sessionId: string, lifecycle: NonNullable<SessionMetadata["lifecycle"]>, updatedAtMs = Date.now()): void {
+    this.db.prepare("UPDATE sessions SET lifecycle=?,lifecycle_updated_at_ms=?,updated_at=CURRENT_TIMESTAMP WHERE session_id=? AND lifecycle_updated_at_ms<=?")
+      .run(lifecycle, updatedAtMs, sessionId, updatedAtMs);
   }
 
   setCollaborationMode(sessionId: string, mode: "default" | "plan"): void {
@@ -385,7 +409,11 @@ export class BridgeDatabase {
     this.db.prepare("INSERT INTO app_server_deliveries(session_id,turn_id,role,started_at_ms,ended_at_ms,content_hash,content_bytes,feishu_message_id,source_message_id,source_path,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,turn_id,role) DO UPDATE SET started_at_ms=COALESCE(excluded.started_at_ms,app_server_deliveries.started_at_ms),ended_at_ms=COALESCE(excluded.ended_at_ms,app_server_deliveries.ended_at_ms),content_hash=excluded.content_hash,content_bytes=excluded.content_bytes,feishu_message_id=COALESCE(excluded.feishu_message_id,app_server_deliveries.feishu_message_id),source_message_id=COALESCE(excluded.source_message_id,app_server_deliveries.source_message_id),source_path=COALESCE(excluded.source_path,app_server_deliveries.source_path),updated_at_ms=excluded.updated_at_ms").run(delivery.sessionId, delivery.turnId, delivery.role, delivery.startedAtMs ?? null, delivery.endedAtMs ?? null, delivery.contentHash, delivery.contentBytes, delivery.feishuMessageId ?? null, delivery.sourceMessageId ?? null, delivery.sourcePath ?? null, Date.now(), Date.now());
   }
   findAppServerDelivery(sessionId: string, role: string, contentHash: string): { turnId: string; feishuMessageId: string | null } | null {
-    const row = this.db.prepare("SELECT turn_id,feishu_message_id FROM app_server_deliveries WHERE session_id=? AND role=? AND content_hash=? ORDER BY updated_at_ms DESC LIMIT 1").get(sessionId, role, contentHash) as { turn_id?: string; feishu_message_id?: string } | undefined;
+    let row = this.db.prepare("SELECT turn_id,feishu_message_id FROM app_server_deliveries WHERE session_id=? AND role=? AND content_hash=? ORDER BY updated_at_ms DESC LIMIT 1").get(sessionId, role, contentHash) as { turn_id?: string; feishu_message_id?: string } | undefined;
+    if (!row?.feishu_message_id && role === "assistant") {
+      row = this.db.prepare("SELECT i.turn_id,i.feishu_message_id FROM turn_items i JOIN turn_runs r ON r.turn_id=i.turn_id WHERE r.session_id=? AND i.kind='agentMessage' AND i.feishu_message_id IS NOT NULL AND json_extract(i.payload,'$.assistantTextHash')=? ORDER BY i.updated_at_ms DESC LIMIT 1")
+        .get(sessionId, contentHash) as { turn_id?: string; feishu_message_id?: string } | undefined;
+    }
     return row?.turn_id ? { turnId: row.turn_id, feishuMessageId: row.feishu_message_id ? String(row.feishu_message_id) : null } : null;
   }
 
@@ -425,6 +453,7 @@ export class BridgeDatabase {
 
   private reviewPayload(payload: Record<string, unknown>): Record<string, unknown> {
     const result: Record<string, unknown> = {};
+    if (typeof payload.assistantTextHash === "string" && /^[a-f0-9]{64}$/.test(payload.assistantTextHash)) result.assistantTextHash = payload.assistantTextHash;
     if (typeof payload.type === "string") result.type = payload.type.slice(0, 120);
     if (typeof payload.status === "string") result.status = payload.status.slice(0, 80);
     if (typeof payload.command === "string") result.command = payload.command.replace(/(?:authorization|cookie|token|password|secret|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[REDACTED]").slice(0, 200);
@@ -448,6 +477,11 @@ export class BridgeDatabase {
       try { payload = JSON.parse(String(row.payload)) as Record<string, unknown>; } catch { /* corrupt data remains safely empty */ }
       return { itemId: String(row.item_id), kind: String(row.kind), status: String(row.status), payload };
     });
+  }
+
+  setTurnAssistantDelivery(turnId: string, messageId: string): void {
+    this.db.prepare("UPDATE turn_items SET feishu_message_id=?,updated_at_ms=? WHERE turn_id=? AND kind='agentMessage' AND status='completed'")
+      .run(messageId, Date.now(), turnId);
   }
 
   saveServerRequest(request: PendingServerRequest): void {
@@ -516,14 +550,14 @@ export class BridgeDatabase {
   revokeLegacyRootGrants(): void { this.db.prepare("DELETE FROM root_grants").run(); }
 
   private taskRootGrantFromRow(row: Record<string, unknown>): TaskRootGrant {
-    return { nonce: String(row.nonce), taskId: String(row.task_id), sessionId: String(row.session_id),
-      canonicalCwd: String(row.canonical_cwd), openId: String(row.open_id), chatId: String(row.chat_id),
+    return { nonce: String(row.nonce), taskId: String(row.task_id), sessionId: row.session_id ? String(row.session_id) : null,
+      taskFingerprint: String(row.task_fingerprint), canonicalCwd: String(row.canonical_cwd), openId: String(row.open_id), chatId: String(row.chat_id),
       epoch: Number(row.epoch), expiresAt: Number(row.expires_at_ms), status: String(row.status) as TaskRootGrant["status"] };
   }
 
   createTaskRootGrant(grant: Omit<TaskRootGrant, "status">): TaskRootGrant {
-    this.db.prepare("INSERT INTO task_root_grants(nonce,task_id,session_id,canonical_cwd,open_id,chat_id,epoch,expires_at_ms,status,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,'pending',?,?)")
-      .run(grant.nonce, grant.taskId, grant.sessionId, grant.canonicalCwd, grant.openId, grant.chatId, grant.epoch, grant.expiresAt, Date.now(), Date.now());
+    this.db.prepare("INSERT INTO task_root_grants(nonce,task_id,session_id,task_fingerprint,canonical_cwd,open_id,chat_id,epoch,expires_at_ms,status,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?)")
+      .run(grant.nonce, grant.taskId, grant.sessionId, grant.taskFingerprint, grant.canonicalCwd, grant.openId, grant.chatId, grant.epoch, grant.expiresAt, Date.now(), Date.now());
     this.db.prepare("UPDATE task_queue SET root_grant_nonce=?,updated_at_ms=? WHERE id=?").run(grant.nonce, Date.now(), grant.taskId);
     return { ...grant, status: "pending" };
   }
@@ -544,19 +578,42 @@ export class BridgeDatabase {
       const row = this.db.prepare("SELECT * FROM task_root_grants WHERE nonce=? AND status='pending' AND open_id=? AND chat_id=? AND epoch=? AND expires_at_ms>?").get(nonce, openId, chatId, epoch, Date.now()) as Record<string, unknown> | undefined;
       if (!row) { this.db.exec("COMMIT"); return null; }
       this.db.prepare("UPDATE task_root_grants SET status='approved',updated_at_ms=? WHERE nonce=? AND status='pending'").run(Date.now(), nonce);
-      this.db.prepare("UPDATE task_queue SET status='pending',updated_at_ms=? WHERE id=? AND status='awaiting_root_consent'").run(Date.now(), String(row.task_id));
+      this.db.prepare("UPDATE task_queue SET status=CASE WHEN kind='new' THEN 'authorized' ELSE 'pending' END,phase=CASE WHEN kind='new' THEN 'authorized' ELSE phase END,updated_at_ms=? WHERE id=? AND status='awaiting_root_consent'").run(Date.now(), String(row.task_id));
       this.db.exec("COMMIT");
       return this.getTaskRootGrant(nonce);
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
-  consumeTaskRootGrant(taskId: string, sessionId: string, canonicalCwd: string, epoch: number): boolean {
+  consumeTaskRootGrant(taskId: string, sessionId: string | null, canonicalCwd: string, epoch: number, taskFingerprint?: string): boolean {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const result = this.db.prepare("UPDATE task_root_grants SET status='consumed',updated_at_ms=? WHERE task_id=? AND session_id=? AND canonical_cwd=? AND epoch=? AND status='approved' AND expires_at_ms>?")
-        .run(Date.now(), taskId, sessionId, canonicalCwd, epoch, Date.now());
+      const result = this.db.prepare("UPDATE task_root_grants SET status='consumed',updated_at_ms=? WHERE task_id=? AND session_id IS ? AND canonical_cwd=? AND epoch=? AND status='approved' AND expires_at_ms>? AND (? IS NULL OR task_fingerprint=?)")
+        .run(Date.now(), taskId, sessionId, canonicalCwd, epoch, Date.now(), taskFingerprint ?? null, taskFingerprint ?? null);
       this.db.exec("COMMIT");
       return result.changes === 1;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  beginNewTaskCreation(taskId: string, taskFingerprint: string, canonicalCwd: string, epoch: number, attemptId: string, now = Date.now()): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const grant = this.db.prepare("SELECT 1 FROM task_root_grants WHERE task_id=? AND session_id IS NULL AND task_fingerprint=? AND canonical_cwd=? AND epoch=? AND status='approved' AND expires_at_ms>?").get(taskId, taskFingerprint, canonicalCwd, epoch, now);
+      const task = this.db.prepare("SELECT 1 FROM task_queue WHERE id=? AND kind='new' AND session_id IS NULL AND status='authorized' AND task_fingerprint=?").get(taskId, taskFingerprint);
+      if (!grant || !task) { this.db.exec("COMMIT"); return false; }
+      this.db.prepare("UPDATE task_root_grants SET status='consumed',updated_at_ms=? WHERE task_id=? AND status='approved'").run(now, taskId);
+      this.db.prepare("UPDATE task_queue SET status='creating_thread',phase='creating_thread',creation_attempt_id=?,creation_started_at_ms=?,updated_at_ms=? WHERE id=? AND status='authorized'").run(attemptId, now, now, taskId);
+      this.db.exec("COMMIT"); return true;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  persistCreatedSession(taskId: string, session: SessionMetadata): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.db.prepare("SELECT 1 FROM task_queue WHERE id=? AND kind='new' AND session_id IS NULL AND status='creating_thread'").get(taskId);
+      if (!task) { this.db.exec("COMMIT"); return false; }
+      this.upsertSession({ ...session, lifecycle: "active", lifecycleUpdatedAtMs: Date.now(), createdByTaskId: taskId });
+      this.db.prepare("UPDATE task_queue SET session_id=?,expected_session_id=?,status='thread_created',phase='thread_created',updated_at_ms=? WHERE id=? AND session_id IS NULL AND status='creating_thread'").run(session.sessionId, session.sessionId, Date.now(), taskId);
+      this.db.exec("COMMIT"); return true;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
@@ -566,7 +623,7 @@ export class BridgeDatabase {
       const row = this.db.prepare("SELECT * FROM task_root_grants WHERE nonce=? AND status IN ('pending','approved') AND open_id=? AND chat_id=? AND epoch=?").get(nonce, openId, chatId, epoch) as Record<string, unknown> | undefined;
       if (!row) { this.db.exec("COMMIT"); return null; }
       this.db.prepare("UPDATE task_root_grants SET status=?,updated_at_ms=? WHERE nonce=?").run(status, Date.now(), nonce);
-      this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason='Root authorization was declined',updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted')").run(Date.now(), String(row.task_id));
+      this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason='Root authorization was declined',updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')").run(Date.now(), String(row.task_id));
       this.db.exec("COMMIT");
       return this.getTaskRootGrant(nonce);
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -579,7 +636,7 @@ export class BridgeDatabase {
     try {
       for (const row of rows) {
         this.db.prepare("UPDATE task_root_grants SET status='expired',updated_at_ms=? WHERE nonce=? AND status IN ('pending','approved')").run(Date.now(), String(row.nonce));
-        this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason='Root authorization expired',updated_at_ms=? WHERE id=? AND status='awaiting_root_consent'").run(Date.now(), String(row.task_id));
+        this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason='Root authorization expired',updated_at_ms=? WHERE id=? AND status IN ('awaiting_root_consent','authorized')").run(Date.now(), String(row.task_id));
       }
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -588,11 +645,12 @@ export class BridgeDatabase {
 
   enqueueTask(task: QueuedTask): boolean {
     const result = this.db.prepare(`INSERT OR IGNORE INTO task_queue(
-      id,kind,session_id,cwd,prompt,image_keys,source_message_id,chat_id,root_message_id,model,reasoning_effort,status,run_card_message_id,expected_session_id,sync_status,last_sync_offset,turn_id,engine,created_at_ms,updated_at_ms
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      id,kind,session_id,cwd,prompt,image_keys,source_message_id,chat_id,root_message_id,model,reasoning_effort,status,run_card_message_id,expected_session_id,sync_status,last_sync_offset,turn_id,engine,root_grant_nonce,terminal_reason,phase,task_fingerprint,creation_attempt_id,creation_started_at_ms,retry_count,next_attempt_at_ms,expires_at_ms,action_nonce,unarchive_approved,created_at_ms,updated_at_ms
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       task.id, task.kind, task.sessionId, task.cwd, task.prompt, JSON.stringify(task.imageKeys), task.sourceMessageId,
       task.chatId, task.rootMessageId, task.model, task.reasoningEffort, task.status, task.runCardMessageId,
-      task.expectedSessionId, task.syncStatus, task.lastSyncOffset, task.turnId ?? null, "app_server", Date.now(), Date.now(),
+      task.expectedSessionId, task.syncStatus, task.lastSyncOffset, task.turnId ?? null, "app_server", task.rootGrantNonce ?? null, task.terminalReason ?? null, task.phase ?? null, task.taskFingerprint ?? null,
+      task.creationAttemptId ?? null, task.creationStartedAtMs ?? null, task.retryCount ?? 0, task.nextAttemptAtMs ?? null, task.expiresAtMs ?? null, task.actionNonce ?? null, task.unarchiveApproved ? 1 : 0, Date.now(), Date.now(),
     );
     return result.changes > 0;
   }
@@ -606,11 +664,11 @@ export class BridgeDatabase {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const query = sessionId === null
-        ? "SELECT * FROM task_queue WHERE session_id IS NULL AND status='pending' ORDER BY created_at_ms LIMIT 1"
-        : "SELECT * FROM task_queue WHERE session_id=? AND status='pending' ORDER BY created_at_ms LIMIT 1";
+        ? "SELECT * FROM task_queue WHERE session_id IS NULL AND status IN ('pending','authorized','thread_created') AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms<=strftime('%s','now')*1000) ORDER BY created_at_ms LIMIT 1"
+        : "SELECT * FROM task_queue q WHERE q.session_id=? AND q.status IN ('pending','authorized','thread_created') AND (q.next_attempt_at_ms IS NULL OR q.next_attempt_at_ms<=strftime('%s','now')*1000) AND NOT EXISTS (SELECT 1 FROM task_queue older WHERE older.session_id=q.session_id AND older.status IN ('awaiting_writer','awaiting_unarchive','awaiting_root_consent','authorized','creating_thread','thread_created','starting_turn','creation_uncertain','awaiting_input','awaiting_approval') AND (older.created_at_ms<q.created_at_ms OR (older.created_at_ms=q.created_at_ms AND older.id<q.id))) ORDER BY q.created_at_ms,q.id LIMIT 1";
       const row = (sessionId === null ? this.db.prepare(query).get() : this.db.prepare(query).get(sessionId)) as Record<string, unknown> | undefined;
       if (!row) { this.db.exec("COMMIT"); return null; }
-      this.db.prepare("UPDATE task_queue SET status='running',updated_at_ms=? WHERE id=? AND status='pending'").run(Date.now(), String(row.id));
+      this.db.prepare("UPDATE task_queue SET status=CASE WHEN status='pending' THEN 'running' ELSE status END,updated_at_ms=? WHERE id=? AND status IN ('pending','authorized','thread_created')").run(Date.now(), String(row.id));
       this.db.exec("COMMIT");
       return this.getTask(String(row.id));
     } catch (error) {
@@ -622,35 +680,126 @@ export class BridgeDatabase {
   updateTask(id: string, status: QueuedTask["status"], details: {
     error?: string | null; runCardMessageId?: string | null; expectedSessionId?: string | null;
     syncStatus?: QueuedTask["syncStatus"]; lastSyncOffset?: number | null; turnId?: string | null; sessionId?: string | null; terminalReason?: string | null;
+    phase?: string | null; taskFingerprint?: string | null; creationAttemptId?: string | null; creationStartedAtMs?: number | null; retryCount?: number; nextAttemptAtMs?: number | null; expiresAtMs?: number | null; actionNonce?: string | null; unarchiveApproved?: boolean;
   } = {}): void {
     const current = this.getTask(id);
-    if (current && ["completed", "failed", "cancelled", "interrupted"].includes(current.status) && current.status !== status) return;
+    if (current && ["completed", "failed", "cancelled", "interrupted", "expired"].includes(current.status) && current.status !== status) return;
     this.db.prepare(`UPDATE task_queue SET status=?,error=COALESCE(?,error),terminal_reason=COALESCE(?,terminal_reason),run_card_message_id=COALESCE(?,run_card_message_id),
-      session_id=COALESCE(?,session_id),expected_session_id=COALESCE(?,expected_session_id),sync_status=COALESCE(?,sync_status),last_sync_offset=COALESCE(?,last_sync_offset),turn_id=COALESCE(?,turn_id),updated_at_ms=? WHERE id=?`)
+      session_id=COALESCE(?,session_id),expected_session_id=COALESCE(?,expected_session_id),sync_status=COALESCE(?,sync_status),last_sync_offset=COALESCE(?,last_sync_offset),turn_id=COALESCE(?,turn_id),
+      phase=COALESCE(?,phase),task_fingerprint=COALESCE(?,task_fingerprint),creation_attempt_id=COALESCE(?,creation_attempt_id),creation_started_at_ms=COALESCE(?,creation_started_at_ms),
+      retry_count=COALESCE(?,retry_count),next_attempt_at_ms=COALESCE(?,next_attempt_at_ms),expires_at_ms=COALESCE(?,expires_at_ms),action_nonce=COALESCE(?,action_nonce),unarchive_approved=COALESCE(?,unarchive_approved),updated_at_ms=? WHERE id=?`)
       .run(status, details.error ?? null, details.terminalReason ?? null, details.runCardMessageId ?? null, details.sessionId ?? null, details.expectedSessionId ?? null,
-        details.syncStatus ?? null, details.lastSyncOffset ?? null, details.turnId ?? null, Date.now(), id);
+        details.syncStatus ?? null, details.lastSyncOffset ?? null, details.turnId ?? null, details.phase ?? null, details.taskFingerprint ?? null, details.creationAttemptId ?? null,
+        details.creationStartedAtMs ?? null, details.retryCount ?? null, details.nextAttemptAtMs ?? null, details.expiresAtMs ?? null, details.actionNonce ?? null,
+        details.unarchiveApproved === undefined ? null : details.unarchiveApproved ? 1 : 0, Date.now(), id);
+  }
+
+  attachTaskRunCard(id: string, messageId: string | null): void {
+    // Card delivery can complete after a scheduler claim or even task completion.
+    // Attaching delivery metadata must never rewind the task state.
+    this.db.prepare("UPDATE task_queue SET run_card_message_id=COALESCE(?,run_card_message_id),updated_at_ms=? WHERE id=?")
+      .run(messageId, Date.now(), id);
   }
 
   transitionTask(id: string, status: QueuedTask["status"], details: Parameters<BridgeDatabase["updateTask"]>[2] = {}): boolean {
     const current = this.getTask(id);
-    if (!current || ["completed", "failed", "cancelled", "interrupted"].includes(current.status)) return false;
-    const allowed: Record<QueuedTask["status"], readonly QueuedTask["status"][]> = {
-      pending: ["running", "cancelled", "failed", "interrupted"],
-      running: ["awaiting_root_consent", "awaiting_input", "awaiting_approval", "awaiting_sync", "completed", "failed", "cancelled", "interrupted"],
-      awaiting_root_consent: ["pending", "cancelled", "interrupted"],
-      awaiting_input: ["running", "cancelled", "failed", "interrupted"],
-      awaiting_approval: ["running", "cancelled", "failed", "interrupted"],
-      awaiting_sync: ["completed", "failed", "cancelled", "interrupted"],
-      completed: [], failed: [], cancelled: [], interrupted: [],
-    };
-    if (!allowed[current.status].includes(status)) return false;
+    if (!current || ["completed", "failed", "cancelled", "interrupted", "expired"].includes(current.status)) return false;
     this.updateTask(id, status, details);
     return true;
   }
 
   pendingTaskSessionIds(): Array<string | null> {
-    return (this.db.prepare("SELECT DISTINCT session_id FROM task_queue WHERE status='pending'").all() as Array<{ session_id: string | null }>)
+    return (this.db.prepare("SELECT DISTINCT session_id FROM task_queue WHERE status IN ('pending','authorized','thread_created')").all() as Array<{ session_id: string | null }>)
       .map((row) => row.session_id);
+  }
+
+  deferTaskForWriter(taskId: string, now = Date.now()): QueuedTask | null {
+    const current = this.getTask(taskId);
+    if (!current || ["completed", "failed", "cancelled", "interrupted", "expired"].includes(current.status)) return current;
+    const expiresAt = current.expiresAtMs ?? now + 30 * 60_000;
+    if (now >= expiresAt) { this.updateTask(taskId, "expired", { terminalReason: "Local Codex writer did not release the thread within 30 minutes", phase: "expired" }); return this.getTask(taskId); }
+    const retryCount = (current.retryCount ?? 0) + 1;
+    const delays = [5_000, 10_000, 20_000, 30_000];
+    this.updateTask(taskId, "awaiting_writer", { phase: "awaiting_writer", retryCount, nextAttemptAtMs: now + (delays[Math.min(retryCount - 1, delays.length - 1)] ?? 30_000), expiresAtMs: expiresAt });
+    return this.getTask(taskId);
+  }
+
+  releaseDueWriterTasks(now = Date.now()): Array<string | null> {
+    this.db.prepare("UPDATE task_queue SET status='expired',phase='expired',terminal_reason='Local Codex writer did not release the thread within 30 minutes',updated_at_ms=? WHERE status='awaiting_writer' AND expires_at_ms<=?").run(now, now);
+    const rows = this.db.prepare("SELECT DISTINCT session_id FROM task_queue WHERE status='awaiting_writer' AND next_attempt_at_ms<=? AND expires_at_ms>?").all(now, now) as Array<{ session_id: string | null }>;
+    this.db.prepare("UPDATE task_queue SET status='pending',updated_at_ms=? WHERE status='awaiting_writer' AND next_attempt_at_ms<=? AND expires_at_ms>?").run(now, now, now);
+    return rows.map((row) => row.session_id);
+  }
+
+  awaitUnarchive(taskId: string, actionNonce: string): QueuedTask | null {
+    this.updateTask(taskId, "awaiting_unarchive", { phase: "awaiting_unarchive", actionNonce, unarchiveApproved: false });
+    return this.getTask(taskId);
+  }
+
+  approveUnarchive(actionNonce: string): QueuedTask | null {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db.prepare("SELECT id FROM task_queue WHERE action_nonce=? AND status='awaiting_unarchive' AND unarchive_approved=0").get(actionNonce) as { id?: string } | undefined;
+      if (!row?.id) { this.db.exec("COMMIT"); return null; }
+      this.db.prepare("UPDATE task_queue SET unarchive_approved=1,updated_at_ms=? WHERE id=? AND status='awaiting_unarchive' AND unarchive_approved=0").run(Date.now(), row.id);
+      this.db.exec("COMMIT"); return this.getTask(row.id);
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  getTaskByActionNonce(actionNonce: string): QueuedTask | null {
+    const row = this.db.prepare("SELECT * FROM task_queue WHERE action_nonce=?").get(actionNonce) as Record<string, unknown> | undefined;
+    return row ? this.taskFromRow(row) : null;
+  }
+
+  cancelUnarchive(actionNonce: string): QueuedTask | null {
+    const task = this.getTaskByActionNonce(actionNonce);
+    if (!task || task.status !== "awaiting_unarchive" || task.unarchiveApproved) return null;
+    this.updateTask(task.id, "cancelled", { terminalReason: "Unarchive was declined", phase: "cancelled" });
+    return this.getTask(task.id);
+  }
+
+  repairHistoricalDuplicateNewTask(): Array<NonNullable<ReturnType<BridgeDatabase["getSession"]>>> {
+    const taskId = "4bcdfe40-f225-4c76-a888-3f773ff7d6a7";
+    const sessionIds = ["01a02f01-f4ba-74e3-aae1-b32726266501", "01a02f02-3c7f-7e82-a490-c272fce922ee"];
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const turnCount = Number((this.db.prepare(`SELECT COUNT(*) count FROM turn_runs WHERE session_id IN (${placeholders})`).get(...sessionIds) as { count: number }).count);
+    const deliveryCount = Number((this.db.prepare(`SELECT COUNT(*) count FROM app_server_deliveries WHERE session_id IN (${placeholders})`).get(...sessionIds) as { count: number }).count);
+    if (turnCount || deliveryCount) return [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE task_queue SET status='cancelled',phase='cancelled',terminal_reason='旧版状态机重复创建，提示词未执行',error='legacy duplicate thread creation before Root grant consumption',updated_at_ms=? WHERE id=?").run(Date.now(), taskId);
+      for (const sessionId of sessionIds) this.db.prepare("UPDATE sessions SET lifecycle='abandoned',lifecycle_updated_at_ms=?,updated_at=CURRENT_TIMESTAMP WHERE session_id=?").run(Date.now(), sessionId);
+      this.db.prepare("UPDATE task_root_grants SET status='cancelled',updated_at_ms=? WHERE task_id=? AND status IN ('pending','approved','expired')").run(Date.now(), taskId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return sessionIds.flatMap((sessionId) => { const session = this.getSession(sessionId); return session ? [session] : []; });
+  }
+
+  creationUncertainTasks(): QueuedTask[] {
+    return (this.db.prepare("SELECT * FROM task_queue WHERE status='creation_uncertain' AND kind='new' AND session_id IS NULL ORDER BY created_at_ms").all() as Record<string, unknown>[])
+      .map((row) => this.taskFromRow(row));
+  }
+
+  claimUncertainCreatedSession(taskId: string, session: SessionMetadata): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.db.prepare("SELECT 1 FROM task_queue WHERE id=? AND kind='new' AND session_id IS NULL AND status='creation_uncertain'").get(taskId);
+      const mapped = this.db.prepare("SELECT 1 FROM sessions WHERE session_id=? OR created_by_task_id=?").get(session.sessionId, taskId);
+      if (!task || mapped) { this.db.exec("COMMIT"); return false; }
+      this.upsertSession({ ...session, lifecycle: "active", lifecycleUpdatedAtMs: Date.now(), createdByTaskId: taskId });
+      this.db.prepare("UPDATE task_queue SET session_id=?,expected_session_id=?,status='thread_created',phase='thread_created',error=NULL,next_attempt_at_ms=NULL,updated_at_ms=? WHERE id=? AND status='creation_uncertain' AND session_id IS NULL").run(session.sessionId, session.sessionId, Date.now(), taskId);
+      this.db.exec("COMMIT"); return true;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  approvedUnarchiveTasks(): QueuedTask[] {
+    return (this.db.prepare("SELECT * FROM task_queue WHERE status='awaiting_unarchive' AND unarchive_approved=1 ORDER BY created_at_ms").all() as Record<string, unknown>[])
+      .map((row) => this.taskFromRow(row));
+  }
+
+  requeueUnarchivedTask(taskId: string): boolean {
+    const result = this.db.prepare("UPDATE task_queue SET status='pending',phase='pending',updated_at_ms=? WHERE id=? AND status='awaiting_unarchive' AND unarchive_approved=1").run(Date.now(), taskId);
+    return result.changes === 1;
   }
 
   awaitingSyncTasks(): QueuedTask[] {
@@ -660,9 +809,9 @@ export class BridgeDatabase {
 
   cancelTasks(rootMessageId: string | null, sessionId: string | null, reason: string): QueuedTask[] {
     const query = sessionId
-      ? "SELECT * FROM task_queue WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')"
+      ? "SELECT * FROM task_queue WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')"
       : rootMessageId
-        ? "SELECT * FROM task_queue WHERE root_message_id=? AND status NOT IN ('completed','failed','cancelled','interrupted')"
+        ? "SELECT * FROM task_queue WHERE root_message_id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')"
         : "SELECT * FROM task_queue WHERE 1=0";
     const value = sessionId ?? rootMessageId;
     const rows = value === null ? this.db.prepare(query).all() as Record<string, unknown>[] : this.db.prepare(query).all(value) as Record<string, unknown>[];
@@ -671,7 +820,7 @@ export class BridgeDatabase {
     try {
       const ids = rows.map((row) => String(row.id));
       for (const id of ids) {
-        this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason=?,updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted')").run(reason, Date.now(), id);
+        this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason=?,updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')").run(reason, Date.now(), id);
         this.db.prepare("UPDATE task_root_grants SET status='cancelled',updated_at_ms=? WHERE task_id=? AND status IN ('pending','approved')").run(Date.now(), id);
       }
       this.db.exec("COMMIT");
@@ -682,10 +831,10 @@ export class BridgeDatabase {
   cancelTasksBySession(sessionId: string, reason: string): QueuedTask[] { return this.cancelTasks(null, sessionId, reason); }
   cancelTasksByRoot(rootMessageId: string, reason: string): QueuedTask[] { return this.cancelTasks(rootMessageId, null, reason); }
   cancelAllTasks(reason: string): QueuedTask[] {
-    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status NOT IN ('completed','failed','cancelled','interrupted')").all() as Record<string, unknown>[];
+    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status NOT IN ('completed','failed','cancelled','interrupted','expired')").all() as Record<string, unknown>[];
     if (!rows.length) return [];
     this.db.exec("BEGIN IMMEDIATE");
-    try { for (const row of rows) { const id = String(row.id); this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason=?,updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted')").run(reason, Date.now(), id); this.db.prepare("UPDATE task_root_grants SET status='cancelled',updated_at_ms=? WHERE task_id=? AND status IN ('pending','approved')").run(Date.now(), id); } this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    try { for (const row of rows) { const id = String(row.id); this.db.prepare("UPDATE task_queue SET status='cancelled',terminal_reason=?,updated_at_ms=? WHERE id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')").run(reason, Date.now(), id); this.db.prepare("UPDATE task_root_grants SET status='cancelled',updated_at_ms=? WHERE task_id=? AND status IN ('pending','approved')").run(Date.now(), id); } this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     return rows.map((row) => this.taskFromRow(row));
   }
 
@@ -703,9 +852,14 @@ export class BridgeDatabase {
     this.db.prepare("UPDATE task_queue SET status='pending',updated_at_ms=? WHERE session_id=? AND status='awaiting_root_consent'").run(Date.now(), sessionId);
   }
 
+  recoverCreatingThreadsAsUncertain(): number {
+    const result = this.db.prepare("UPDATE task_queue SET status='creation_uncertain',phase='creation_uncertain',terminal_reason='bridge restarted while thread/start result was unresolved',updated_at_ms=? WHERE status='creating_thread' AND session_id IS NULL").run(Date.now());
+    return Number(result.changes);
+  }
+
   markRunningTasksInterrupted(): QueuedTask[] {
-    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status IN ('running','awaiting_input','awaiting_approval')").all() as Record<string, unknown>[];
-    this.db.prepare("UPDATE task_queue SET status='interrupted',terminal_reason='app-server lifecycle ended',updated_at_ms=? WHERE status IN ('running','awaiting_input','awaiting_approval')").run(Date.now());
+    const rows = this.db.prepare("SELECT * FROM task_queue WHERE status IN ('running','starting_turn','awaiting_input','awaiting_approval')").all() as Record<string, unknown>[];
+    this.db.prepare("UPDATE task_queue SET status='interrupted',terminal_reason='app-server lifecycle ended',updated_at_ms=? WHERE status IN ('running','starting_turn','awaiting_input','awaiting_approval')").run(Date.now());
     return rows.map((row) => this.taskFromRow(row));
   }
 
@@ -760,7 +914,7 @@ export class BridgeDatabase {
 
   pruneRetainedData(now = Date.now()): void {
     const day = 24 * 60 * 60 * 1_000;
-    this.db.prepare("DELETE FROM task_queue WHERE status IN ('completed','failed','cancelled','interrupted') AND updated_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM task_queue WHERE status IN ('completed','failed','cancelled','interrupted','expired') AND updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM turn_runs WHERE state IN ('completed','failed','interrupted') AND updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM app_server_deliveries WHERE updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM turn_items WHERE turn_id NOT IN (SELECT turn_id FROM turn_runs)").run();
@@ -849,6 +1003,11 @@ export class BridgeDatabase {
       turnId: row.turn_id ? String(row.turn_id) : null,
       terminalReason: row.terminal_reason ? String(row.terminal_reason) : null,
       rootGrantNonce: row.root_grant_nonce ? String(row.root_grant_nonce) : null,
+      phase: row.phase ? String(row.phase) : null, taskFingerprint: row.task_fingerprint ? String(row.task_fingerprint) : null,
+      creationAttemptId: row.creation_attempt_id ? String(row.creation_attempt_id) : null, creationStartedAtMs: row.creation_started_at_ms === null || row.creation_started_at_ms === undefined ? null : Number(row.creation_started_at_ms),
+      retryCount: Number(row.retry_count ?? 0), nextAttemptAtMs: row.next_attempt_at_ms === null || row.next_attempt_at_ms === undefined ? null : Number(row.next_attempt_at_ms),
+      expiresAtMs: row.expires_at_ms === null || row.expires_at_ms === undefined ? null : Number(row.expires_at_ms), actionNonce: row.action_nonce ? String(row.action_nonce) : null,
+      unarchiveApproved: Number(row.unarchive_approved ?? 0) === 1,
     };
   }
 }

@@ -52,5 +52,7 @@ export function loadConfig(): BridgeConfig {
     rootGrantTtlMs: positiveInteger("ROOT_GRANT_TTL_SECONDS", 600) * 1_000,
     rootFullAccessAck: ack,
     allowedMcpServers: (process.env.CODEX_ALLOWED_MCP_SERVERS ?? "").split(",").map((value) => value.trim()).filter(Boolean),
+    ...(process.env.NEW_SESSION_MODEL ? { defaultNewModel: process.env.NEW_SESSION_MODEL.trim() } : {}),
+    ...(process.env.NEW_SESSION_REASONING_EFFORT ? { defaultNewReasoningEffort: process.env.NEW_SESSION_REASONING_EFFORT.trim() } : {}),
   };
 }

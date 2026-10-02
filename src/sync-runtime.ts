@@ -1,13 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
-import { CodexAppServer, type JsonRpcMessage } from "./app-server.js";
+import { archivedSessionActionCard, assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
+import { isExpiredFeishuMessage } from "./safe-log.js";
+import { AppServerRpcError, CodexAppServer, notificationTurnId, type JsonRpcMessage } from "./app-server.js";
 import { CodexCliProbe } from "./codex.js";
 import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
 import { resolveAllowedPath } from "./path-policy.js";
-import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight } from "./execution-policy.js";
+import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { parseJsonlChunk } from "./session-parser.js";
 import type { FeishuRouterPort } from "./bridge-contracts.js";
@@ -30,6 +31,7 @@ const MAX_IMAGES_PER_TASK = 5;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 25 * 1024 * 1024;
 const TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const THREAD_STATE_REFRESH_MS = 60_000;
 
 interface PendingChoiceState {
   request: ChoiceRequest;
@@ -65,6 +67,9 @@ function collaborationPrompt(prompt: string, mode: "default" | "plan" = "default
 }
 
 function textHash(text: string): string { return createHash("sha256").update(text).digest("hex"); }
+function taskFingerprint(cwd: string, prompt: string, model: string | null, effort: string | null, imageKeys: string[]): string {
+  return textHash(JSON.stringify({ cwd, prompt, model, effort, imageKeys: [...imageKeys].sort() }));
+}
 
 export function forbiddenRemoteQuestion(request: ChoiceRequest): boolean {
   const text = request.questions.flatMap((question) => [question.header, question.question,
@@ -114,12 +119,14 @@ export class SyncRuntime implements FeishuRouterPort {
   private readonly approvalService: ApprovalService;
   private readonly taskScheduler: TaskScheduler;
   private scanTimer: NodeJS.Timeout | null = null;
+  private stopping = false;
   private messageLinkPermissionDenied = false;
   private models: ModelCapability[] = [];
   private titleIndex: Map<string, string> | null = null;
   private rootExecutionReady = false;
   private appServerRestartAttempts = 0;
   private appServerRestartTimer: NodeJS.Timeout | null = null;
+  private threadStateTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -184,7 +191,11 @@ export class SyncRuntime implements FeishuRouterPort {
       this.appServer.onServerRequest((request) => this.approvalService.handleServerRequest(request));
       await this.appServer.start();
       await this.expireRemoteState();
+      this.db.recoverCreatingThreadsAsUncertain();
       await this.refreshThreadsFromAppServer();
+      await this.repairHistoricalDuplicateCreation();
+      this.threadStateTimer = setInterval(() => { void this.refreshThreadsFromAppServer().catch((error) => this.db.recordFailure("thread_state_refresh", {}, error)); }, THREAD_STATE_REFRESH_MS);
+      this.threadStateTimer.unref();
     }
     const sandboxAvailable = await this.codex.sandboxSmokeTest();
     this.db.setSetting("codex.sandbox_available", sandboxAvailable ? "1" : "0");
@@ -218,6 +229,7 @@ export class SyncRuntime implements FeishuRouterPort {
       void this.drainPendingTasks();
       void this.reconcileAwaitingSyncTasks();
       void this.expireRootGrants();
+      void this.retryDueWriterTasks();
     }, this.config.scanIntervalMs);
     this.scanTimer.unref();
     if (this.boundChatId()) {
@@ -231,17 +243,25 @@ export class SyncRuntime implements FeishuRouterPort {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.appServerRestartTimer) clearTimeout(this.appServerRestartTimer);
-    await Promise.all(this.turnCoordinator.sessionIds().map((sessionId) => this.cancelSessionWork(sessionId, null, "service stopping")));
-    await this.cancelAllWork("service stopping");
+    if (this.threadStateTimer) clearInterval(this.threadStateTimer);
     await this.sessionImporter.stopWatching();
     await this.appServer?.close();
+    this.db.markRunningTasksInterrupted();
+    for (const turn of this.turnCoordinator.states()) {
+      turn.state = "interrupted";
+      this.db.saveTurn(turn);
+      await this.cleanupTurnImages(turn.turnId);
+    }
+    this.turnCoordinator.clearTurns();
+    this.approvalService.clear();
   }
 
   private boundChatId(): string | null { return this.db.getSetting("feishu.chat_id"); }
   private boundOpenId(): string | null { return this.db.getSetting("feishu.open_id"); }
-  private paused(): boolean { return this.db.getSetting("sync.paused") === "1"; }
+  private paused(): boolean { return this.stopping || this.db.getSetting("sync.paused") === "1"; }
 
   private cachedModels(): ModelCapability[] {
     const raw = this.db.getSetting(MODEL_CATALOG_KEY);
@@ -486,10 +506,21 @@ export class SyncRuntime implements FeishuRouterPort {
   private async restoreRootCards(): Promise<void> {
     for (const session of this.db.listSessions()) {
       if (!session.rootMessageId) continue;
+      const marker = `feishu.expired_card.${session.rootMessageId}`;
+      if (this.db.getSetting(marker)) {
+        this.db.resolveFailure("restore_root_card", { sessionId: session.sessionId });
+        continue;
+      }
       try {
         await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续"));
         this.db.setSessionCardMessage(session.sessionId, session.rootMessageId);
+        this.db.resolveFailure("restore_root_card", { sessionId: session.sessionId });
       } catch (error) {
+        if (isExpiredFeishuMessage(error)) {
+          this.db.setSetting(marker, "230031");
+          this.db.resolveFailure("restore_root_card", { sessionId: session.sessionId });
+          continue;
+        }
         this.db.recordFailure("restore_root_card", { sessionId: session.sessionId }, error);
       }
     }
@@ -510,6 +541,9 @@ export class SyncRuntime implements FeishuRouterPort {
     const fileStat = await stat(path);
     if (!fileStat.isFile()) return;
     const ownerSessionId = sessionIdFromPath(path);
+    // The live stream owns delivery until its final card and deduplication
+    // records are committed. Leave the cursor untouched so import retries later.
+    if (ownerSessionId && this.turnCoordinator.hasActiveTurn(ownerSessionId)) return;
     let cursor = this.db.getCursor(path);
     if (ownerSessionId && cursor.sessionId !== ownerSessionId) {
       cursor = { ...cursor, sessionId: null, parsedOffset: 0, carry: "" };
@@ -701,6 +735,7 @@ export class SyncRuntime implements FeishuRouterPort {
     return cancelled.length;
   }
   private async handleAppServerExit(epoch: number, error?: Error): Promise<void> {
+    if (this.stopping) return;
     const interrupted = this.db.markRunningTasksInterrupted();
     for (const turn of this.turnCoordinator.states()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
     this.turnCoordinator.clearTurns();
@@ -714,6 +749,7 @@ export class SyncRuntime implements FeishuRouterPort {
   }
 
   private scheduleAppServerRestart(): void {
+    if (this.stopping) return;
     if (!this.appServer || this.appServerRestartTimer || this.appServerRestartAttempts >= 5) return;
     const delays = [1_000, 2_000, 5_000, 10_000, 30_000];
     const delay = delays[this.appServerRestartAttempts++] ?? 30_000;
@@ -738,31 +774,79 @@ export class SyncRuntime implements FeishuRouterPort {
   private async expireRootGrants(): Promise<void> {
     const expired = this.db.expireTaskRootGrants(this.appServer?.appServerEpoch);
     for (const grant of expired) {
-      await this.cancelSessionWork(grant.sessionId, null, "Root authorization expired");
-      const session = this.db.getSession(grant.sessionId);
-      if (session?.rootMessageId) void this.updateRunCard(grant.sessionId, session.rootMessageId, "已取消", "Root 授权已过期，任务未执行。", false).catch(() => undefined);
+      if (grant.sessionId) {
+        await this.cancelSessionWork(grant.sessionId, null, "Root authorization expired");
+        const session = this.db.getSession(grant.sessionId);
+        if (session?.rootMessageId) void this.updateRunCard(grant.sessionId, session.rootMessageId, "已取消", "Root 授权已过期，任务未执行。", false).catch(() => undefined);
+      } else {
+        const task = this.db.getTask(grant.taskId);
+        if (task?.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已取消", "Root 授权已过期；未创建 Codex 会话。", false)).catch(() => undefined);
+      }
     }
+  }
+
+  private async repairHistoricalDuplicateCreation(): Promise<void> {
+    if (this.db.getSetting("migration.duplicate_new_task_repair.v1") === "1") return;
+    const sessions = this.db.repairHistoricalDuplicateNewTask();
+    for (const session of sessions) {
+      if (this.appServer) {
+        try { await this.appServer.request("thread/archive", { threadId: session.sessionId }, 15_000); }
+        catch (error) { if (!/not found|does not exist|unknown thread|no rollout found/i.test(String(error))) this.db.recordFailure("historical_thread_archive", { sessionId: session.sessionId }, error); }
+      }
+      const current = this.db.getSession(session.sessionId);
+      if (current?.rootMessageId) {
+        try { await this.feishu.updateCard(current.rootMessageId, sessionCard(this.sessionView(current), "创建失败，未执行；请重新新建会话")); }
+        catch (error) { this.db.recordFailure("historical_duplicate_card", { sessionId: session.sessionId }, error); }
+      }
+    }
+    this.db.setSetting("migration.duplicate_new_task_repair.v1", "1");
   }
 
   private async refreshThreadsFromAppServer(): Promise<void> {
     if (!this.appServer) return;
-    let cursor: string | null = null;
-    do {
-      const result = this.asRecord(await this.appServer.request("thread/list", {
-        sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"], ...(cursor ? { cursor } : {}),
-      }));
-      const threads = Array.isArray(result.threads) ? result.threads : Array.isArray(result.data) ? result.data : [];
-      for (const item of threads) {
-        const thread = this.asRecord(item);
-        const sessionId = this.stringAt(thread, "id");
-        if (!sessionId) continue;
-        const existing = this.db.getSession(sessionId);
-        if (!existing) continue;
-        const title = this.stringAt(thread, "name") ?? this.stringAt(thread, "preview") ?? existing.title;
-        if (title) this.db.setSessionTitle(sessionId, title);
+    const unmapped: Record<string, unknown>[] = [];
+    for (const archived of [false, true]) {
+      let cursor: string | null = null;
+      do {
+        const result = this.asRecord(await this.appServer.request("thread/list", {
+          archived, sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"], ...(cursor ? { cursor } : {}),
+        }));
+        const threads = Array.isArray(result.threads) ? result.threads : Array.isArray(result.data) ? result.data : [];
+        for (const item of threads) {
+          const thread = this.asRecord(item); const sessionId = this.stringAt(thread, "id");
+          if (!sessionId) continue;
+          const existing = this.db.getSession(sessionId); if (!existing) { unmapped.push(thread); continue; }
+          if (existing.lifecycle === "abandoned") continue;
+          const title = this.stringAt(thread, "name") ?? this.stringAt(thread, "preview") ?? existing.title;
+          const lifecycle = archived ? "archived" : "active"; const changed = existing.lifecycle !== lifecycle || Boolean(title && title !== existing.title);
+          if (title) this.db.setSessionTitle(sessionId, title);
+          this.db.setSessionLifecycle(sessionId, lifecycle);
+          if (changed && existing.rootMessageId) { const current = this.db.getSession(sessionId); if (current) await this.feishu.updateCard(existing.rootMessageId, sessionCard(this.sessionView(current), lifecycle === "archived" ? "已归档" : this.turnCoordinator.hasActiveTurn(sessionId) ? "运行中" : "可继续")); }
+        }
+        cursor = this.stringAt(result, "nextCursor", "next_cursor");
+      } while (cursor);
+    }
+    for (const task of this.db.creationUncertainTasks()) {
+      const started = task.creationStartedAtMs ?? 0;
+      let canonicalCwd: string;
+      try { canonicalCwd = await resolveAllowedPath(task.cwd, this.config.allowedRoot); } catch { continue; }
+      const candidates = unmapped.filter((thread) => {
+        const source = this.stringAt(thread, "source");
+        const cwd = this.stringAt(thread, "cwd");
+        const created = Number(thread.createdAt ?? 0) * 1000;
+        const parent = this.stringAt(thread, "parentThreadId");
+        return source === "appServer" && !parent && cwd === canonicalCwd && created >= started - 5_000 && created <= started + 120_000;
+      });
+      if (candidates.length !== 1) continue;
+      const thread = candidates[0]!; const sessionId = this.stringAt(thread, "id"); if (!sessionId) continue;
+      const metadata: SessionMetadata = { sessionId, path: this.stringAt(thread, "path") ?? join(this.sessionsDir, "app-server", `.jsonl`), cwd: canonicalCwd,
+        startedAt: new Date(Number(thread.createdAt ?? 0) * 1000).toISOString(), source: "appServer", firstUserText: task.prompt,
+        title: this.stringAt(thread, "name") ?? this.stringAt(thread, "preview") ?? shortText(task.prompt), collaborationMode: "default", model: task.model, reasoningEffort: task.reasoningEffort };
+      if (this.db.claimUncertainCreatedSession(task.id, metadata)) {
+        if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard("已恢复创建", "已唯一认领 app-server 返回前后创建的线程；不会再次调用 thread/start。"));
+        void this.taskScheduler.drain(sessionId);
       }
-      cursor = this.stringAt(result, "nextCursor", "next_cursor");
-    } while (cursor);
+    }
   }
 
   private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { executionMode: BridgeConfig["executionMode"]; rootExecutionReady: boolean; rootPreflightReasons: string[]; hasActiveWork: boolean } {
@@ -894,11 +978,18 @@ export class SyncRuntime implements FeishuRouterPort {
   }
 
   private async onAppServerNotification(message: JsonRpcMessage): Promise<void> {
+    if (this.stopping) return;
     const params = this.asRecord(message.params); const method = message.method ?? "";
-    const sessionId = this.stringAt(params, "threadId", "thread_id"); const turnId = this.stringAt(params, "turnId", "turn_id");
+    const sessionId = this.stringAt(params, "threadId", "thread_id"); const turnId = notificationTurnId(params);
     if (method === "thread/name/updated" && sessionId) {
       const title = this.stringAt(params, "threadName", "thread_name", "name");
       if (title) { this.db.setSessionTitle(sessionId, title); const session = this.db.getSession(sessionId); if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(sessionId) ? "运行中" : "可继续")); }
+      return;
+    }
+    if ((method === "thread/archived" || method === "thread/unarchived" || method === "thread/deleted") && sessionId) {
+      const lifecycle = method === "thread/archived" ? "archived" : method === "thread/deleted" ? "deleted" : "active";
+      if (this.db.getSession(sessionId)?.lifecycle !== "abandoned") this.db.setSessionLifecycle(sessionId, lifecycle); const session = this.db.getSession(sessionId);
+      if (session?.rootMessageId) await this.feishu.updateCard(session.rootMessageId, sessionCard(this.sessionView(session), lifecycle === "active" ? "可继续" : lifecycle === "archived" ? "已归档" : "已删除"));
       return;
     }
     if (method === "turn/started" && sessionId && turnId) {
@@ -913,7 +1004,19 @@ export class SyncRuntime implements FeishuRouterPort {
       await this.flushTurnStream(state, method.includes("plan") ? "Plan" : "Codex"); return;
     }
     if ((method === "item/started" || method === "item/completed") && sessionId && turnId) {
-      const item = this.asRecord(params.item); const itemId = this.stringAt(item, "id") ?? this.stringAt(params, "itemId") ?? turnId + ":" + method; const kind = this.stringAt(item, "type") ?? "unknown"; const status = this.stringAt(item, "status") ?? (method === "item/completed" ? "completed" : "inProgress"); this.db.saveTurnItem(turnId, itemId, kind, status, item); return;
+      const item = this.asRecord(params.item); const itemId = this.stringAt(item, "id") ?? this.stringAt(params, "itemId") ?? turnId + ":" + method; const kind = this.stringAt(item, "type") ?? "unknown"; const status = this.stringAt(item, "status") ?? (method === "item/completed" ? "completed" : "inProgress");
+      const text = kind === "agentMessage" && method === "item/completed" ? this.stringAt(item, "text") : null;
+      this.db.saveTurnItem(turnId, itemId, kind, status, text ? { ...item, assistantTextHash: textHash(text) } : item);
+      if (text) {
+        const state = this.turnCoordinator.mutableTurn(sessionId);
+        if (state?.turnId === turnId) {
+          state.agentMessages ??= {};
+          state.agentMessages[itemId] = text;
+          state.text = appendBoundedText("", Object.values(state.agentMessages).join("\n\n"), MAX_LIVE_TEXT_BYTES);
+          this.db.saveTurn(state);
+        }
+      }
+      return;
     }
     if (method === "serverRequest/resolved") {
       const requestId = this.stringAt(params, "requestId", "request_id"); if (!requestId) return;
@@ -922,10 +1025,12 @@ export class SyncRuntime implements FeishuRouterPort {
     }
     if (method === "turn/completed" && sessionId && turnId) {
       const state = this.turnCoordinator.mutableTurn(sessionId); if (!state || state.turnId !== turnId) return; const turn = this.asRecord(params.turn); const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
-      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed"; state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text); this.db.saveTurn(state); this.turnCoordinator.deleteTurn(sessionId);
+      state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed"; state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text); this.db.saveTurn(state);
       const task = this.db.taskForTurn(turnId); if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: "turn " + state.state }); await this.cleanupTurnImages(turnId);
-      try { const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : "Codex " + state.state); const content = state.plan || state.text; if (content && feishuMessageId) this.db.upsertAppServerDelivery({ sessionId, turnId, role: "assistant", startedAtMs: state.startedAtMs ?? null, endedAtMs: state.endedAtMs ?? null, contentHash: textHash(content), contentBytes: Buffer.byteLength(content, "utf8"), feishuMessageId }); } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
-      void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error)); void this.drainTaskQueue(sessionId);
+      try { const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : "Codex " + state.state); const content = state.plan || state.text; if (content && feishuMessageId) { this.db.upsertAppServerDelivery({ sessionId, turnId, role: "assistant", startedAtMs: state.startedAtMs ?? null, endedAtMs: state.endedAtMs ?? null, contentHash: textHash(content), contentBytes: Buffer.byteLength(content, "utf8"), feishuMessageId }); this.db.setTurnAssistantDelivery(turnId, feishuMessageId); } } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
+      finally { this.turnCoordinator.deleteTurn(sessionId); }
+      void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
+      await this.releaseThreadSubscription(sessionId, "turn_completed"); void this.drainTaskQueue(sessionId);
     }
   }
 
@@ -948,7 +1053,7 @@ export class SyncRuntime implements FeishuRouterPort {
     const counts = this.db.taskStateCounts();
     const health = this.appServer?.getHealth();
     return { paused: this.paused(), sessions: this.db.listSessions().length, active: counts.running ?? this.turnCoordinator.activeCount(),
-      queued: counts.pending ?? 0, waiting: (counts.awaiting_root_consent ?? 0) + (counts.awaiting_input ?? 0) + (counts.awaiting_approval ?? 0),
+      queued: (counts.pending ?? 0) + (counts.authorized ?? 0) + (counts.thread_created ?? 0), waiting: (counts.awaiting_root_consent ?? 0) + (counts.awaiting_input ?? 0) + (counts.awaiting_approval ?? 0) + (counts.awaiting_writer ?? 0) + (counts.awaiting_unarchive ?? 0) + (counts.creation_uncertain ?? 0) + (counts.creating_thread ?? 0),
       failedTasks: counts.failed ?? 0, failures: this.db.failureCount(), appServer: health ? `${health.state} / epoch ${health.epoch}` : "未启用" };
   }
 
@@ -1138,8 +1243,15 @@ export class SyncRuntime implements FeishuRouterPort {
 
   private beginNewWizard(openId: string, chatId: string, partial: Partial<WizardState> = {}): WizardState {
     return this.saveWizard(openId, {
-      id: randomUUID(), mode: "new", chatId, expiresAt: 0, ...partial,
+      id: randomUUID(), mode: "new", chatId, expiresAt: 0, ...this.newModelDefaults(), ...partial,
     });
+  }
+
+  private newModelDefaults(): Partial<WizardState> {
+    const model = this.modelBySlug(this.config.defaultNewModel);
+    const effort = this.config.defaultNewReasoningEffort;
+    if (!model || !effort || !model.supportedReasoningEfforts.includes(effort)) return {};
+    return { model: model.slug, reasoningEffort: effort };
   }
 
   private validWizard(openId: string, event: IncomingCardAction, expected?: "new" | "session"): WizardState | null {
@@ -1175,7 +1287,7 @@ export class SyncRuntime implements FeishuRouterPort {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
-      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_guidance"].includes(event.action)) {
+      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_guidance", "unarchive_confirm", "unarchive_cancel"].includes(event.action)) {
         return { delivery: "reply", rootMessageId: rootCardSession.rootMessageId,
           card: errorCard("此会话话题默认用于继续对话；新建、搜索和服务管理请在群主消息或控制台中操作。") };
       }
@@ -1232,7 +1344,8 @@ export class SyncRuntime implements FeishuRouterPort {
           if (!entered) return errorCard("请输入项目目录，或选择一个历史项目。");
           const cwd = await resolveAllowedPath(entered, this.config.allowedRoot);
           wizard.cwd = cwd; delete wizard.model; delete wizard.reasoningEffort;
-          return { delivery: "replace", card: modelCard(this.models, this.saveWizard(event.openId, wizard).id, undefined, cwd, "new") };
+          Object.assign(wizard, this.newModelDefaults());
+          return { delivery: "replace", card: modelCard(this.models, this.saveWizard(event.openId, wizard).id, wizard.model, cwd, "new") };
         }
         case "select_project": {
           const wizard = this.validWizard(event.openId, event, "new");
@@ -1241,9 +1354,10 @@ export class SyncRuntime implements FeishuRouterPort {
           wizard.cwd = await resolveAllowedPath(cwd, this.config.allowedRoot);
           delete wizard.model;
           delete wizard.reasoningEffort;
+          Object.assign(wizard, this.newModelDefaults());
           const current = this.saveWizard(event.openId, wizard);
           if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重新开始。 ");
-          return { delivery: "replace", card: modelCard(this.models, current.id, undefined, current.cwd, "new") };
+          return { delivery: "replace", card: modelCard(this.models, current.id, current.model, current.cwd, "new") };
         }
         case "show_models": {
           const wizard = this.validWizard(event.openId, event);
@@ -1258,7 +1372,10 @@ export class SyncRuntime implements FeishuRouterPort {
           if (!model) return errorCard("该模型已不可用，请使用最新模型卡片重新选择。");
           wizard.model = model.slug;
           delete wizard.reasoningEffort;
-          return { delivery: "replace", card: reasoningEffortCard(model, this.saveWizard(event.openId, wizard).id, wizard.cwd, wizard.mode) };
+          const defaults = wizard.mode === "new" ? this.newModelDefaults() : {};
+          const displayModel = defaults.model === model.slug && defaults.reasoningEffort
+            ? { ...model, defaultReasoningEffort: defaults.reasoningEffort } : model;
+          return { delivery: "replace", card: reasoningEffortCard(displayModel, this.saveWizard(event.openId, wizard).id, wizard.cwd, wizard.mode) };
         }
         case "select_reasoning_effort": {
           const wizard = this.validWizard(event.openId, event);
@@ -1338,6 +1455,25 @@ export class SyncRuntime implements FeishuRouterPort {
             ? { delivery: "replace", card }
             : session.rootMessageId ? { delivery: "reply", rootMessageId: session.rootMessageId, card } : { delivery: "send", card };
         }
+        case "unarchive_confirm": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const task = this.db.getTaskByActionNonce(nonce);
+          const epoch = Number(this.db.getSetting(`unarchive.${nonce}.epoch`) ?? -1);
+          if (!task || !task.sessionId || task.chatId !== event.chatId || task.rootMessageId === null || this.db.getSetting(`unarchive.${nonce}.message`) !== event.openMessageId || task.status !== "awaiting_unarchive" || task.unarchiveApproved || epoch !== this.appServer?.appServerEpoch) return errorCard("该取消归档请求已过期、已处理或不属于当前会话。");
+          const approved = this.db.approveUnarchive(nonce);
+          if (!approved) return errorCard("该取消归档请求已被处理。");
+          const completed = await this.finishApprovedUnarchive(approved);
+          if (completed) { this.db.deleteSetting(`unarchive.${nonce}.epoch`); this.db.deleteSetting(`unarchive.${nonce}.message`); }
+          return { delivery: "replace", card: remoteRequestResolvedCard(completed ? "已取消归档" : "已确认，等待重试", completed ? "原消息已重新排队。" : "app-server 暂时不可用；服务会继续恢复该请求。", completed) };
+        }
+        case "unarchive_cancel": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const task = this.db.getTaskByActionNonce(nonce);
+          const epoch = Number(this.db.getSetting(`unarchive.${nonce}.epoch`) ?? -1);
+          if (!task || task.chatId !== event.chatId || task.rootMessageId === null || this.db.getSetting(`unarchive.${nonce}.message`) !== event.openMessageId || epoch !== this.appServer?.appServerEpoch || !this.db.cancelUnarchive(nonce)) return errorCard("该取消归档请求已过期或已处理。");
+          this.db.deleteSetting(`unarchive.${nonce}.epoch`); this.db.deleteSetting(`unarchive.${nonce}.message`);
+          return { delivery: "replace", card: remoteRequestResolvedCard("保持归档", "原消息已取消，不会执行。", false) };
+        }
         case "root_grant": return errorCard("普通 workspace-write 回合不需要 Root 授权；Root 任务会单独显示一次性授权卡。");
         case "root_grant_confirm": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
@@ -1350,7 +1486,8 @@ export class SyncRuntime implements FeishuRouterPort {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const grant = this.appServer ? this.db.denyTaskRootGrant(nonce, event.openId, event.chatId, this.appServer.appServerEpoch) : null;
           if (!grant) return errorCard("该 Root 授权已过期、已处理或不属于当前用户/会话。");
-          await this.cancelSessionWork(grant.sessionId, null, "Root authorization was declined");
+          if (grant.sessionId) await this.cancelSessionWork(grant.sessionId, null, "Root authorization was declined");
+          else await this.taskScheduler.cancel({ kind: "task", taskId: grant.taskId }, "Root authorization was declined");
           return { delivery: "replace", card: remoteRequestResolvedCard("Root 授权已拒绝", "该任务已取消；不会影响其他任务。", false) };
         }
         case "root_revoke": return errorCard("Root 授权是一次性任务授权，无会话级权限可撤销。");
@@ -1693,11 +1830,12 @@ export class SyncRuntime implements FeishuRouterPort {
     const task: QueuedTask = {
       id: randomUUID(), kind: "new", sessionId: null, cwd, prompt, imageKeys, sourceMessageId: message.messageId,
       chatId: message.chatId, rootMessageId: message.rootId ?? null, model, reasoningEffort, status: "pending", runCardMessageId: null,
-      expectedSessionId: null, syncStatus: "none", lastSyncOffset: null,
+      expectedSessionId: null, syncStatus: "none", lastSyncOffset: null, phase: "queued",
+      taskFingerprint: taskFingerprint(cwd, prompt, model, reasoningEffort, imageKeys),
     };
     if (!this.db.enqueueTask(task)) return;
     const cardId = await this.respondCard(message, runStatusCard("已排队", `正在创建 Codex 会话：${relative(this.config.allowedRoot, cwd) || "."}`));
-    this.db.updateTask(task.id, "pending", { runCardMessageId: cardId });
+    this.db.attachTaskRunCard(task.id, cardId);
     void this.drainTaskQueue(null);
   }
 
@@ -1731,6 +1869,28 @@ export class SyncRuntime implements FeishuRouterPort {
     }
     this.db.setSessionModel(session.sessionId, model.slug, match[2]);
     await this.respond(message, `已更新后续续聊模型：${model.displayName} / ${match[2]}。`);
+  }
+
+  private async finishApprovedUnarchive(task: QueuedTask): Promise<boolean> {
+    if (!this.appServer || !task.sessionId) return false;
+    const session = this.db.getSession(task.sessionId);
+    if (!session?.rootMessageId) return false;
+    try {
+      await this.appServer.unarchiveThread(task.sessionId);
+      this.db.setSessionLifecycle(task.sessionId, "active");
+      if (!this.db.requeueUnarchivedTask(task.id)) return false;
+      await this.updateRunCard(task.sessionId, session.rootMessageId, "已取消归档", "原消息已重新排队，将恰好执行一次。", true);
+      void this.taskScheduler.drain(task.sessionId);
+      return true;
+    } catch (error) {
+      this.db.recordFailure("thread_unarchive", { taskId: task.id, sessionId: task.sessionId }, error);
+      return false;
+    }
+  }
+
+  private async retryDueWriterTasks(): Promise<void> {
+    for (const sessionId of this.db.releaseDueWriterTasks()) void this.taskScheduler.drain(sessionId);
+    for (const task of this.db.approvedUnarchiveTasks()) void this.finishApprovedUnarchive(task);
   }
 
   private async drainPendingTasks(): Promise<void> {
@@ -1806,13 +1966,16 @@ export class SyncRuntime implements FeishuRouterPort {
       id: randomUUID(), kind: "resume", sessionId: session.sessionId, cwd: session.cwd, prompt, imageKeys: message.imageKeys,
       sourceMessageId: message.messageId, chatId: message.chatId, rootMessageId: session.rootMessageId,
       model: configured ? selectedModel : null, reasoningEffort: configured ? selectedEffort : null, status: "pending", runCardMessageId: null,
-      expectedSessionId: session.sessionId, syncStatus: "none", lastSyncOffset: null,
+      expectedSessionId: session.sessionId, syncStatus: "none", lastSyncOffset: null, phase: "queued",
+      taskFingerprint: taskFingerprint(session.cwd, prompt, configured ? selectedModel : null, configured ? selectedEffort : null, message.imageKeys),
     };
     if (!this.db.enqueueTask(task)) return;
     if (!session.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session root unavailable" }); return; }
     await this.updateRunCard(session.sessionId, session.rootMessageId, "已排队", "消息已进入会话队列。", true);
     const status = this.db.getRunStatus(session.sessionId);
-    this.db.updateTask(task.id, "pending", { runCardMessageId: status?.messageId ?? null });
+    this.db.attachTaskRunCard(task.id, status?.messageId ?? null);
+    if (session.lifecycle === "archived") { await this.placeTaskAwaitingUnarchive(this.db.getTask(task.id) ?? task, session.rootMessageId); return; }
+    if (session.lifecycle === "deleted" || session.lifecycle === "abandoned") { this.db.updateTask(task.id, "failed", { error: `session is ` }); return; }
     void this.drainTaskQueue(session.sessionId);
   }
 
@@ -1832,6 +1995,15 @@ export class SyncRuntime implements FeishuRouterPort {
     await this.executeAppServerNewTask(task);
   }
 
+  private async releaseThreadSubscription(sessionId: string, reason: string): Promise<void> {
+    if (!this.appServer) return;
+    try { await this.appServer.unsubscribeThread(sessionId); this.db.resolveFailure("thread_unsubscribe", { sessionId }); }
+    catch (error) {
+      this.db.recordFailure("thread_unsubscribe", { sessionId, reason }, error);
+      if (this.turnCoordinator.activeCount() === 0) void this.appServer.restart("release an uncertain thread subscription").catch((restartError) => this.db.recordFailure("app_server_restart", { reason: "unsubscribe" }, restartError));
+    }
+  }
+
   private appServerOutcomeUncertain(error: unknown): boolean { const text = error instanceof Error ? error.message : String(error); return /timed out|exited|not running|closed|stdin|write/i.test(text); }
 
   private resolveTurnExecutionPolicy(mode: "plan" | "default", canonicalCwd: string, rootAuthorized = false): { mode: "plan" | "default"; rootMode: boolean; approvalPolicy: "never" | "on-request"; sandboxPolicy: Record<string, unknown> } {
@@ -1843,65 +2015,174 @@ export class SyncRuntime implements FeishuRouterPort {
   }
 
   private async createRootGrant(task: QueuedTask): Promise<import("./types.js").TaskRootGrant | null> {
-    if (!task.sessionId || !this.appServer || !this.rootExecutionReady) return null;
-    const session = this.db.getSession(task.sessionId);
-    if (!session) return null;
-    const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
+    if (!this.appServer || !this.rootExecutionReady || !task.taskFingerprint) return null;
+    const session = task.sessionId ? this.db.getSession(task.sessionId) : null;
+    if (task.kind === "resume" && !session) return null;
+    const canonicalCwd = await resolveAllowedPath(session?.cwd ?? task.cwd, this.config.allowedRoot);
     const existing = this.db.getTaskRootGrantForTask(task.id);
-    if (existing) return existing;
+    if (existing) return existing.taskFingerprint === task.taskFingerprint && existing.canonicalCwd === canonicalCwd ? existing : null;
     return this.db.createTaskRootGrant({
-      nonce: randomUUID(), taskId: task.id, sessionId: session.sessionId, canonicalCwd,
+      nonce: randomUUID(), taskId: task.id, sessionId: task.kind === "new" ? null : session!.sessionId, taskFingerprint: task.taskFingerprint, canonicalCwd,
       openId: this.boundOpenId() ?? "", chatId: task.chatId, epoch: this.appServer.appServerEpoch,
       expiresAt: Date.now() + (this.config.rootGrantTtlMs ?? 600_000),
     });
   }
 
   private async consumeRootGrant(task: QueuedTask): Promise<boolean> {
-    if (!task.sessionId || !this.appServer) return false;
-    const session = this.db.getSession(task.sessionId);
-    if (!session) return false;
+    if (!task.sessionId || !this.appServer || !task.taskFingerprint) return false;
+    const session = this.db.getSession(task.sessionId); if (!session) return false;
     const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
     const grant = this.db.getTaskRootGrantForTask(task.id);
-    return grant?.status === "approved" && this.db.consumeTaskRootGrant(task.id, session.sessionId, canonicalCwd, this.appServer.appServerEpoch);
+    if (!grant || grant.sessionId !== session.sessionId || grant.canonicalCwd !== canonicalCwd || grant.epoch !== this.appServer.appServerEpoch || grant.taskFingerprint !== task.taskFingerprint) return false;
+    if (grant.status === "consumed") return true;
+    return grant.status === "approved" && this.db.consumeTaskRootGrant(task.id, session.sessionId, canonicalCwd, this.appServer.appServerEpoch, task.taskFingerprint);
+  }
+
+  private isWriterConflict(error: unknown): boolean {
+    return error instanceof AppServerRpcError && /already has an active writer/i.test(error.message);
+  }
+
+  private isArchivedThreadError(error: unknown): boolean {
+    return error instanceof AppServerRpcError && /(?:session|thread) is archived/i.test(error.message);
+  }
+
+  private async placeTaskAwaitingUnarchive(task: QueuedTask, rootMessageId: string): Promise<void> {
+    const nonce = task.actionNonce ?? randomUUID();
+    const waiting = this.db.awaitUnarchive(task.id, nonce);
+    if (this.appServer) this.db.setSetting(`unarchive.${nonce}.epoch`, String(this.appServer.appServerEpoch));
+    if (!waiting) throw new Error("Unable to persist unarchive confirmation");
+    if (task.sessionId) this.db.setSessionLifecycle(task.sessionId, "archived");
+    if (task.sessionId) await this.updateRunCard(task.sessionId, rootMessageId, "等待取消归档", "该 Codex 会话已归档，需要你的明确确认后才能继续。", true);
+    if (!task.actionNonce) {
+      const actionCardId = await this.feishu.replyCard(rootMessageId, archivedSessionActionCard(nonce, this.db.getSession(task.sessionId ?? "")?.title ?? "Codex 会话"));
+      this.db.setSetting(`unarchive.${nonce}.message`, actionCardId);
+    }
+  }
+
+  private newTaskRootAuthorized(task: QueuedTask, canonicalCwd: string): boolean {
+    if (!this.appServer || !task.taskFingerprint) return false;
+    const grant = this.db.getTaskRootGrantForTask(task.id);
+    return grant?.status === "consumed" && grant.sessionId === null && grant.taskFingerprint === task.taskFingerprint
+      && grant.canonicalCwd === canonicalCwd && grant.epoch === this.appServer.appServerEpoch;
   }
 
   private async executeAppServerNewTask(task: QueuedTask): Promise<void> {
     if (!this.appServer) return;
+    let subscribedSessionId: string | null = null;
+    let createdThisAttempt = false;
     try {
       const canonicalCwd = await resolveAllowedPath(task.cwd, this.config.allowedRoot);
-      const execution = this.resolveTurnExecutionPolicy("default", canonicalCwd, false);
-      const response = this.asRecord(await this.appServer.request("thread/start", { cwd: canonicalCwd,
-        approvalPolicy: execution.approvalPolicy, sandboxPolicy: execution.sandboxPolicy,
-        ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}) }));
-      const thread = this.asRecord(response.thread);
-      const sessionId = this.stringAt(thread, "id") ?? this.stringAt(response, "threadId", "thread_id");
-      if (!sessionId) throw new Error("Codex app-server thread/start returned no thread id");
-      const metadata: SessionMetadata = { sessionId, path: join(this.sessionsDir, "app-server", `${sessionId}.jsonl`), cwd: canonicalCwd,
-        startedAt: new Date().toISOString(), source: "appServer", firstUserText: task.prompt,
-        title: this.stringAt(thread, "name") ?? shortText(task.prompt), collaborationMode: "default", model: task.model, reasoningEffort: task.reasoningEffort };
-      this.db.upsertSession(metadata);
-      const session = this.db.getSession(sessionId)!;
-      const rootId = await this.ensureRoot(task.chatId, session);
-      this.db.updateTask(task.id, "running", { sessionId, expectedSessionId: sessionId });
-      await this.updateRunCard(sessionId, rootId, "已创建", "Codex 会话已创建，正在准备执行。", true);
-      await this.executeAppServerTurn({ ...task, sessionId, rootMessageId: rootId, expectedSessionId: sessionId });
+      let current = this.db.getTask(task.id) ?? task;
+      const rootModeRequested = this.config.executionMode === "root-danger-full-access";
+
+      if (!current.sessionId && rootModeRequested && current.status !== "authorized" && current.status !== "creating_thread") {
+        if (!this.rootExecutionReady) throw new Error("Root execution is disabled because container preflight failed");
+        const existing = this.db.getTaskRootGrantForTask(current.id);
+        const grant = existing?.status === "pending" ? existing : await this.createRootGrant(current);
+        if (!grant) throw new Error("Unable to create Root authorization for task");
+        this.db.updateTask(current.id, "awaiting_root_consent", { phase: "awaiting_root_consent" });
+        if (current.runCardMessageId) await this.feishu.updateCard(current.runCardMessageId, runStatusCard("等待 Root 授权", "批准前不会创建 Codex thread 或飞书话题。"));
+        if (!existing) await this.feishu.replyCard(current.sourceMessageId, rootGrantCard(grant.nonce, canonicalCwd, shortText(current.prompt, 500), grant.expiresAt));
+        return;
+      }
+
+      current = this.db.getTask(current.id) ?? current;
+      if (!current.sessionId) {
+        const attemptId = current.creationAttemptId ?? randomUUID();
+        if (rootModeRequested) {
+          if (!current.taskFingerprint || current.status !== "authorized" || !this.db.beginNewTaskCreation(current.id, current.taskFingerprint, canonicalCwd, this.appServer.appServerEpoch, attemptId))
+            throw new Error("Root grant did not match the authorized new task");
+        } else {
+          this.db.updateTask(current.id, "creating_thread", { phase: "creating_thread", creationAttemptId: attemptId, creationStartedAtMs: Date.now() });
+        }
+        current = this.db.getTask(current.id) ?? current;
+        const execution = this.resolveTurnExecutionPolicy("default", canonicalCwd, rootModeRequested);
+        const response = this.asRecord(await this.appServer.request("thread/start", { cwd: canonicalCwd,
+          approvalPolicy: execution.approvalPolicy, sandbox: threadSandboxMode(execution.sandboxPolicy),
+          ...(current.model ? { model: current.model } : {}) }));
+        const thread = this.asRecord(response.thread);
+        const sessionId = this.stringAt(thread, "id") ?? this.stringAt(response, "threadId", "thread_id");
+        if (!sessionId) throw new Error("Codex app-server thread/start returned no thread id");
+        subscribedSessionId = sessionId;
+        createdThisAttempt = true;
+        const metadata: SessionMetadata = { sessionId, path: join(this.sessionsDir, "app-server", `${sessionId}.jsonl`), cwd: canonicalCwd,
+          startedAt: new Date().toISOString(), source: "appServer", firstUserText: current.prompt,
+          title: this.stringAt(thread, "name") ?? shortText(current.prompt), collaborationMode: "default", model: current.model, reasoningEffort: current.reasoningEffort,
+          lifecycle: "active", lifecycleUpdatedAtMs: Date.now(), createdByTaskId: current.id };
+        if (!this.db.persistCreatedSession(current.id, metadata)) throw new Error("thread/start succeeded but the task-to-session mapping could not be committed");
+        current = this.db.getTask(current.id)!;
+      }
+
+      const session = this.db.getSession(current.sessionId!);
+      if (!session) throw new Error("Created Codex session is unavailable");
+      if (!createdThisAttempt) {
+        const execution = this.resolveTurnExecutionPolicy("default", canonicalCwd, !rootModeRequested || this.newTaskRootAuthorized(current, canonicalCwd));
+        await this.appServer.request("thread/resume", { threadId: session.sessionId, cwd: canonicalCwd, approvalPolicy: execution.approvalPolicy, sandbox: threadSandboxMode(execution.sandboxPolicy) });
+      }
+      subscribedSessionId = session.sessionId;
+      const rootId = session.rootMessageId ?? await this.ensureRoot(current.chatId, session);
+      this.db.updateTask(current.id, "starting_turn", { phase: "starting_turn", sessionId: session.sessionId, expectedSessionId: session.sessionId });
+      await this.updateRunCard(session.sessionId, rootId, "已创建", "Codex 会话已创建，正在启动首个回合。", true);
+      await this.executeAppServerTurn({ ...current, sessionId: session.sessionId, rootMessageId: rootId, expectedSessionId: session.sessionId }, !rootModeRequested || this.newTaskRootAuthorized(current, canonicalCwd));
+      subscribedSessionId = null;
     } catch (error) {
-      const uncertain = this.appServerOutcomeUncertain(error);
-      this.db.updateTask(task.id, uncertain ? "interrupted" : "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
-      this.db.recordFailure("app_server_new", { taskId: task.id }, error);
-      if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard(uncertain ? "已中断" : "失败", uncertain ? "app-server 结果不确定，任务不会自动重放。" : shortText(String(error), MAX_ERROR_CHARS)));
+      const latest = this.db.getTask(task.id);
+      if (latest?.status === "creating_thread") {
+        const uncertain = this.appServerOutcomeUncertain(error) || /mapping could not be committed/i.test(String(error));
+        this.db.updateTask(task.id, uncertain ? "creation_uncertain" : "failed", { phase: uncertain ? "creation_uncertain" : "failed", error: shortText(String(error), MAX_ERROR_CHARS) });
+      } else if (latest?.sessionId && !["running", "completed"].includes(latest.status)) {
+        this.db.updateTask(task.id, "thread_created", { phase: "thread_created", error: shortText(String(error), MAX_ERROR_CHARS), nextAttemptAtMs: Date.now() + 30_000 });
+      } else if (latest && !["running", "completed"].includes(latest.status)) {
+        this.db.updateTask(task.id, "failed", { phase: "failed", error: shortText(String(error), MAX_ERROR_CHARS) });
+      }
+      this.db.recordFailure("app_server_new", { taskId: task.id, sessionId: latest?.sessionId ?? null, creationAttemptId: latest?.creationAttemptId ?? null }, error);
+      if (subscribedSessionId) await this.releaseThreadSubscription(subscribedSessionId, "new_task_failed_before_turn");
+      if (task.runCardMessageId) await this.feishu.updateCard(task.runCardMessageId, runStatusCard(latest?.status === "creating_thread" ? "创建结果不确定" : "创建暂未完成", shortText(String(error), MAX_ERROR_CHARS)));
     }
   }
 
   private async executeAppServerResumeTask(task: QueuedTask): Promise<void> {
     const session = task.sessionId ? this.db.getSession(task.sessionId) : null;
     if (!session?.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session unavailable" }); return; }
+    if (session.lifecycle === "deleted" || session.lifecycle === "abandoned") {
+      this.db.updateTask(task.id, "failed", { error: `session is ${session.lifecycle}` });
+      await this.updateRunCard(session.sessionId, session.rootMessageId, "无法继续", `该会话状态为 ${session.lifecycle}。`, false);
+      return;
+    }
+    if (session.lifecycle === "archived" && !task.unarchiveApproved) { await this.placeTaskAwaitingUnarchive(task, session.rootMessageId); return; }
+    let subscribed = false;
     try {
       const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
-      const execution = this.resolveTurnExecutionPolicy(session.collaborationMode === "plan" ? "plan" : "default", canonicalCwd, false);
-      await this.appServer!.request("thread/resume", { threadId: session.sessionId, cwd: canonicalCwd, approvalPolicy: execution.approvalPolicy, sandboxPolicy: execution.sandboxPolicy });
-      await this.executeAppServerTurn(task);
+      const mode = session.collaborationMode === "plan" ? "plan" : "default";
+      const rootModeRequested = mode === "default" && this.config.executionMode === "root-danger-full-access";
+      let rootAuthorized = false;
+      if (rootModeRequested) {
+        if (!this.rootExecutionReady) throw new Error("Root execution is disabled because container preflight failed");
+        rootAuthorized = await this.consumeRootGrant(task);
+        if (!rootAuthorized) {
+          const existing = this.db.getTaskRootGrantForTask(task.id);
+          const grant = existing?.status === "pending" ? existing : await this.createRootGrant(task);
+          if (!grant) throw new Error("Unable to create Root authorization for task");
+          this.db.updateTask(task.id, "awaiting_root_consent", { phase: "awaiting_root_consent" });
+          await this.updateRunCard(session.sessionId, session.rootMessageId, "等待 Root 授权", "批准前不会 resume Codex thread。", false);
+          if (!existing) await this.feishu.replyCard(session.rootMessageId, rootGrantCard(grant.nonce, canonicalCwd, shortText(task.prompt, 500), grant.expiresAt));
+          return;
+        }
+      }
+      const execution = this.resolveTurnExecutionPolicy(mode, canonicalCwd, rootAuthorized);
+      await this.appServer!.request("thread/resume", { threadId: session.sessionId, cwd: canonicalCwd, approvalPolicy: execution.approvalPolicy, sandbox: threadSandboxMode(execution.sandboxPolicy) });
+      subscribed = true;
+      if (task.unarchiveApproved) this.db.setSessionLifecycle(session.sessionId, "active");
+      await this.executeAppServerTurn(task, rootAuthorized);
+      subscribed = false;
     } catch (error) {
+      if (subscribed) await this.releaseThreadSubscription(session.sessionId, "resume_or_turn_start_failed");
+      if (this.isWriterConflict(error)) {
+        const waiting = this.db.deferTaskForWriter(task.id);
+        await this.updateRunCard(session.sessionId, session.rootMessageId, waiting?.status === "expired" ? "等待写锁超时" : "等待本地 Codex", waiting?.status === "expired" ? "30 分钟内写锁未释放；请手动重试。" : "该会话正被 VS Code Codex 使用，释放后会自动继续。", true);
+        return;
+      }
+      if (this.isArchivedThreadError(error)) { await this.placeTaskAwaitingUnarchive(task, session.rootMessageId); return; }
       const uncertain = this.appServerOutcomeUncertain(error);
       this.db.updateTask(task.id, uncertain ? "interrupted" : "failed", { error: shortText(String(error), MAX_ERROR_CHARS) });
       this.db.recordFailure("app_server_resume", { sessionId: session.sessionId, taskId: task.id }, error);
@@ -1916,28 +2197,14 @@ export class SyncRuntime implements FeishuRouterPort {
     this.db.setSetting(`turn.${turnId}.images`, JSON.stringify([...existing, ...paths]));
   }
 
-  private async executeAppServerTurn(task: QueuedTask): Promise<void> {
+  private async executeAppServerTurn(task: QueuedTask, rootAuthorized = false): Promise<void> {
     if (!this.appServer || !task.sessionId) return;
     const session = this.db.getSession(task.sessionId);
     if (!session?.rootMessageId) throw new Error("session root unavailable");
     const mode = session.collaborationMode === "plan" ? "plan" : "default";
     const canonicalCwd = await resolveAllowedPath(session.cwd, this.config.allowedRoot);
-    let rootAuthorized = false;
     const rootModeRequested = mode === "default" && this.config.executionMode === "root-danger-full-access";
-    if (rootModeRequested) {
-      if (!this.rootExecutionReady) throw new Error("Root execution is disabled because container preflight failed");
-      const existing = this.db.getTaskRootGrantForTask(task.id);
-      const canRun = await this.approvalService.consumeRootGrant(task);
-      rootAuthorized = canRun;
-      if (!canRun) {
-        const grant = existing?.status === "pending" ? existing : await this.approvalService.requestRootConsent(task);
-        if (!grant) throw new Error("Unable to create Root authorization for task");
-        this.db.updateTask(task.id, "awaiting_root_consent", { sessionId: session.sessionId });
-        await this.updateRunCard(session.sessionId, session.rootMessageId, "等待 Root 授权", "Root 模式需要本任务的一次性授权。", false);
-        await this.feishu.replyCard(session.rootMessageId, rootGrantCard(grant.nonce, canonicalCwd, shortText(task.prompt, 500), grant.expiresAt));
-        return;
-      }
-    }
+    if (rootModeRequested && !rootAuthorized) throw new Error("Root authorization must be completed before subscribing to the thread");
     const imagePaths = await this.downloadImages(this.taskMessage(task), task.imageKeys);
     const input: Array<Record<string, unknown>> = [{ type: "text", text: task.prompt }, ...imagePaths.map((path) => ({ type: "localImage", path }))];
     const execution = this.resolveTurnExecutionPolicy(mode, canonicalCwd, rootAuthorized);
@@ -1948,14 +2215,17 @@ export class SyncRuntime implements FeishuRouterPort {
       ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}),
       collaborationMode: { mode, settings: { model: task.model ?? null, reasoning_effort: task.reasoningEffort ?? null, developer_instructions: null } },
     };
-    const response = this.asRecord(await this.appServer.request("turn/start", params));
+    this.db.updateTask(task.id, "starting_turn", { phase: "starting_turn" });
+    let response: Record<string, unknown>;
+    try { response = this.asRecord(await this.appServer.request("turn/start", params)); }
+    catch (error) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw error; }
     const turn = this.asRecord(response.turn);
     const turnId = this.stringAt(turn, "id") ?? this.stringAt(response, "turnId", "turn_id");
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
     const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt) };
     this.turnCoordinator.setTurn(state); this.db.saveTurn(state);
     this.db.upsertAppServerDelivery({ sessionId: session.sessionId, turnId, role: "user", startedAtMs: state.startedAtMs ?? null, contentHash: textHash(task.prompt), contentBytes: Buffer.byteLength(task.prompt, "utf8"), sourceMessageId: task.sourceMessageId });
-    this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId });
+    this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId, phase: "running" });
     this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
     await this.updateRunCard(session.sessionId, session.rootMessageId, "运行中", mode === "plan" ? "Codex 正在只读规划。" : execution.rootMode ? "Codex 正在专用 Root 容器中执行。" : "Codex 正在受限工作区中执行。", true);
   }

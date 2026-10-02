@@ -57,7 +57,7 @@ test("remote request and root grant state is scoped, atomic, and expires", async
   try {
     const db = new BridgeDatabase(dir);
     db.enqueueTask({ id: "root-task", kind: "resume", sessionId: "s1", cwd: "/work", prompt: "p", imageKeys: [], sourceMessageId: "root-message", chatId: "c1", rootMessageId: "r1", model: null, reasoningEffort: null, status: "awaiting_root_consent", runCardMessageId: null, expectedSessionId: "s1", syncStatus: "none", lastSyncOffset: null });
-    db.createTaskRootGrant({ nonce: "root-nonce", taskId: "root-task", sessionId: "s1", canonicalCwd: "/work", openId: "u1", chatId: "c1", epoch: 7, expiresAt: Date.now() + 60_000 });
+    db.createTaskRootGrant({ nonce: "root-nonce", taskId: "root-task", sessionId: "s1", taskFingerprint: "fp-1", canonicalCwd: "/work", openId: "u1", chatId: "c1", epoch: 7, expiresAt: Date.now() + 60_000 });
     assert.equal(db.approveTaskRootGrant("root-nonce", "u2", "c1", 7), null);
     assert.equal(db.approveTaskRootGrant("root-nonce", "u1", "c1", 7)?.status, "approved");
     assert.equal(db.consumeTaskRootGrant("root-task", "s1", "/work", 7), true);
@@ -122,6 +122,57 @@ test("inbound events deduplicate completed work and allow retryable failures", a
     assert.equal(db.claimInboundEvent("event-1"), true);
     db.completeInboundEvent("event-1");
     assert.equal(db.claimInboundEvent("event-1"), false);
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test("new Root task authorizes before exactly-once thread mapping", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-new-root-"));
+  try {
+    const db = new BridgeDatabase(dir);
+    db.enqueueTask({ id: "new-root", kind: "new", sessionId: null, cwd: "/work", prompt: "hello", imageKeys: [], sourceMessageId: "new-message", chatId: "c1", rootMessageId: null, model: "gpt-test", reasoningEffort: "medium", status: "awaiting_root_consent", runCardMessageId: null, expectedSessionId: null, syncStatus: "none", lastSyncOffset: null, phase: "awaiting_root_consent", taskFingerprint: "fp-new" });
+    db.createTaskRootGrant({ nonce: "new-nonce", taskId: "new-root", sessionId: null, taskFingerprint: "fp-new", canonicalCwd: "/work", openId: "u1", chatId: "c1", epoch: 9, expiresAt: Date.now() + 60_000 });
+    assert.equal(db.approveTaskRootGrant("new-nonce", "other", "c1", 9), null);
+    assert.equal(db.approveTaskRootGrant("new-nonce", "u1", "c1", 9)?.status, "approved");
+    assert.equal(db.getTask("new-root")?.status, "authorized");
+    assert.equal(db.beginNewTaskCreation("new-root", "wrong", "/work", 9, "attempt-bad"), false);
+    assert.equal(db.beginNewTaskCreation("new-root", "fp-new", "/work", 9, "attempt-1"), true);
+    assert.equal(db.beginNewTaskCreation("new-root", "fp-new", "/work", 9, "attempt-2"), false);
+    const session = { sessionId: "thread-1", path: "/tmp/thread-1.jsonl", cwd: "/work", startedAt: new Date().toISOString(), source: "appServer", firstUserText: "hello", title: "hello", collaborationMode: "default" as const, model: "gpt-test", reasoningEffort: "medium" };
+    assert.equal(db.persistCreatedSession("new-root", session), true);
+    assert.equal(db.persistCreatedSession("new-root", { ...session, sessionId: "thread-2", path: "/tmp/thread-2.jsonl" }), false);
+    assert.equal(db.getTask("new-root")?.sessionId, "thread-1");
+    assert.equal(db.getSession("thread-1")?.createdByTaskId, "new-root");
+    assert.equal(db.getTaskRootGrant("new-nonce")?.status, "consumed");
+    db.close();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("writer backoff and unarchive decisions are durable and CAS protected", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-writer-unarchive-"));
+  try {
+    const db = new BridgeDatabase(dir);
+    const base = { kind: "resume" as const, sessionId: "s1", cwd: "/work", prompt: "continue", imageKeys: [], chatId: "c1", rootMessageId: "r1", model: null, reasoningEffort: null, runCardMessageId: null, expectedSessionId: "s1", syncStatus: "none" as const, lastSyncOffset: null, taskFingerprint: "fp" };
+    db.enqueueTask({ ...base, id: "writer", sourceMessageId: "writer-message", status: "running" });
+    const waiting = db.deferTaskForWriter("writer", 1_000)!;
+    assert.equal(waiting.status, "awaiting_writer");
+    assert.equal(waiting.nextAttemptAtMs, 6_000);
+    db.enqueueTask({ ...base, id: "later", sourceMessageId: "later-message", status: "pending" });
+    assert.equal(db.claimNextTask("s1"), null);
+    assert.deepEqual(db.releaseDueWriterTasks(5_999), []);
+    assert.deepEqual(db.releaseDueWriterTasks(6_000), ["s1"]);
+    assert.equal(db.claimNextTask("s1")?.id, "writer");
+    db.updateTask("writer", "completed");
+    assert.equal(db.claimNextTask("s1")?.id, "later");
+    db.updateTask("later", "completed");
+
+    db.enqueueTask({ ...base, id: "archived", sourceMessageId: "archived-message", status: "pending" });
+    assert.equal(db.awaitUnarchive("archived", "nonce-1")?.status, "awaiting_unarchive");
+    assert.equal(db.approveUnarchive("nonce-1")?.unarchiveApproved, true);
+    assert.equal(db.approveUnarchive("nonce-1"), null);
+    assert.equal(db.requeueUnarchivedTask("archived"), true);
+    assert.equal(db.requeueUnarchivedTask("archived"), false);
     db.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

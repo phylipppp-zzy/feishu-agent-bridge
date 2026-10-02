@@ -15,6 +15,9 @@ export interface BridgeConfig {
   rootFullAccessAck?: boolean;
   /** Explicitly allowed MCP server identifiers. Empty means no MCP escalation. */
   allowedMcpServers?: string[];
+  /** Preferred new-session selection, validated against the live catalog. */
+  defaultNewModel?: string;
+  defaultNewReasoningEffort?: string;
 }
 
 export interface SessionMetadata {
@@ -29,6 +32,9 @@ export interface SessionMetadata {
   collaborationMode?: "default" | "plan" | null;
   model?: string | null;
   reasoningEffort?: string | null;
+  lifecycle?: "active" | "archived" | "deleted" | "abandoned";
+  lifecycleUpdatedAtMs?: number | null;
+  createdByTaskId?: string | null;
 }
 
 export interface ModelCapability {
@@ -100,7 +106,8 @@ export interface PendingServerRequest {
 export interface TaskRootGrant {
   nonce: string;
   taskId: string;
-  sessionId: string;
+  sessionId: string | null;
+  taskFingerprint: string;
   canonicalCwd: string;
   openId: string;
   chatId: string;
@@ -110,6 +117,7 @@ export interface TaskRootGrant {
 }
 
 export interface TurnState {
+  agentMessages?: Record<string, string>;
   sessionId: string;
   turnId: string;
   epoch: number;
@@ -220,7 +228,7 @@ export interface QueuedTask {
   rootMessageId: string | null;
   model: string | null;
   reasoningEffort: string | null;
-  status: "pending" | "running" | "awaiting_root_consent" | "awaiting_input" | "awaiting_approval" | "awaiting_sync" | "completed" | "failed" | "cancelled" | "interrupted";
+  status: "pending" | "authorized" | "creating_thread" | "thread_created" | "starting_turn" | "running" | "awaiting_root_consent" | "awaiting_writer" | "awaiting_unarchive" | "creation_uncertain" | "awaiting_input" | "awaiting_approval" | "awaiting_sync" | "completed" | "failed" | "cancelled" | "interrupted" | "expired";
   runCardMessageId: string | null;
   expectedSessionId: string | null;
   syncStatus: "none" | "awaiting" | "synced";
@@ -230,4 +238,13 @@ export interface QueuedTask {
   terminalReason?: string | null;
   /** Authorization nonce while awaiting a Root-only execution. */
   rootGrantNonce?: string | null;
+  phase?: string | null;
+  taskFingerprint?: string | null;
+  creationAttemptId?: string | null;
+  creationStartedAtMs?: number | null;
+  retryCount?: number;
+  nextAttemptAtMs?: number | null;
+  expiresAtMs?: number | null;
+  actionNonce?: string | null;
+  unarchiveApproved?: boolean;
 }
