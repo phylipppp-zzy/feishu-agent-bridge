@@ -1,10 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { isRetryableTransportError } from "../inbound-events.js";
+import { isExpiredFeishuMessage } from "../safe-log.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage } from "../types.js";
-import { CARD_TEXT_LIMIT, claudeCommandMenuCard, claudeHelpCard, claudeHomeCard, claudeNoticeCard, claudeRecentCard, claudeRootCard, claudeTurnCard,
-  promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown, turnMarkdown, turnText } from "./cards.js";
+import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeHelpCard, claudeHomeCard, claudeNoticeCard, claudeRecentCard,
+  claudeRootCard, claudeTurnCard, promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown, turnMarkdown, turnText } from "./cards.js";
 import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
 import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
@@ -22,6 +23,9 @@ const READONLY_NOTICE_INTERVAL_MS = 10 * 60_000;
 /** A running turn with no new records for this long, in a session not running locally, is shown as unfinished. */
 const STALE_TURN_MS = 30 * 60_000;
 const PAGE_SIZE = 8;
+const CLEANUP_CONFIRM_MS = 10 * 60_000;
+/** Withdrawing a message that is already gone counts as done. */
+const ALREADY_GONE = /\b(230011|230006)\b|not exist|has been (?:recalled|deleted)|already (?:recalled|deleted)/i;
 
 function textHash(text: string): string { return createHash("sha256").update(text).digest("hex"); }
 
@@ -101,7 +105,7 @@ export class ClaudeRuntime {
   private bootstrap(): Promise<void> {
     this.bootstrapping ??= (async () => {
       await this.syncAll();
-      await this.applyScopeChange();
+      await this.reconcileTopics();
       await this.presence.scan();
       await this.checkLiveness();
     })().catch((error) => this.fail("bootstrap", {}, error)).finally(() => { this.bootstrapping = null; });
@@ -109,27 +113,73 @@ export class ClaudeRuntime {
   }
 
   /**
-   * After SYNC_DIRS changes, sessions that came into scope are treated as at binding:
-   * those active within HISTORY_DAYS get a topic with their latest turn.
+   * At every start, each existing topic's root card is brought in line with SYNC_DIRS: topics
+   * out of scope are marked once, topics back in scope are restored. No topic is created for
+   * past activity, because Feishu can only append: a topic appears when its session is active,
+   * so the group keeps the order in which sessions were actually used.
    */
-  private async applyScopeChange(): Promise<void> {
-    const scope = JSON.stringify(this.config.syncDirs);
-    const previous = this.db.getSetting("sync.scope");
-    if (previous === scope) return;
-    this.db.setSetting("sync.scope", scope);
-    if (previous === null) return;
-    const activeSince = Date.now() - this.config.historyDays * DAY_MS;
-    for (let offset = 0; ; offset += 200) {
-      const sessions = this.db.listRecentSessions(200, offset, "", this.config.syncDirs);
-      for (const session of sessions) {
-        if (session.lastActivityMs < activeSince) return;
-        const turn = !session.rootMessageId && session.currentTurnId ? this.db.getTurn(session.currentTurnId) : null;
-        if (!turn) continue;
-        this.db.saveTurn(session.sessionId, turn.view, "pending");
-        await this.renderSession(session.sessionId);
+  private async reconcileTopics(): Promise<void> {
+    this.db.setSetting("sync.scope", JSON.stringify(this.config.syncDirs));
+    for (const session of this.db.topicSessions()) await this.renderSession(session.sessionId);
+  }
+
+  /** Topics whose session lies outside SYNC_DIRS. */
+  private outOfScopeTopics(): ClaudeSession[] {
+    return this.db.topicSessions().filter((session) => !this.inScope(session.cwd));
+  }
+
+  // Everything posted in a session's topic is recorded, so a cleanup can withdraw it again.
+  private async topicText(sessionId: string, rootId: string, text: string): Promise<string> {
+    const id = await this.feishu.replyText(rootId, text);
+    this.db.recordSentMessage(sessionId, id);
+    return id;
+  }
+  private async topicCard(sessionId: string, rootId: string, card: CardDefinition): Promise<string> {
+    const id = await this.feishu.replyCard(rootId, card);
+    this.db.recordSentMessage(sessionId, id);
+    return id;
+  }
+  private async topicFile(sessionId: string, rootId: string, name: string, data: Buffer): Promise<string> {
+    const id = await this.feishu.replyFile(rootId, name, data);
+    this.db.recordSentMessage(sessionId, id);
+    return id;
+  }
+
+  /** Updates a root card; one too old for Feishu to edit is left as it is instead of failing every render. */
+  private async updateRootCard(session: ClaudeSession, card: CardDefinition): Promise<void> {
+    try { await this.feishu.updateCard(session.rootMessageId!, card); }
+    catch (error) { if (!isExpiredFeishuMessage(error)) throw error; }
+  }
+
+  /**
+   * Withdraws every message the bridge posted in the given out-of-scope topics. A topic whose
+   * root could be withdrawn is forgotten; one whose root stays (for example past Feishu's recall
+   * window) keeps its link, so it can still be marked and continued.
+   */
+  private async cleanupTopics(sessionIds: readonly string[]): Promise<void> {
+    const kept: Array<{ title: string; reason: string }> = [];
+    let withdrawn = 0;
+    let topics = 0;
+    for (const sessionId of sessionIds) {
+      const session = this.db.getSession(sessionId);
+      if (!session?.rootMessageId || this.inScope(session.cwd)) continue;
+      topics += 1;
+      let rootGone = false;
+      for (const messageId of this.db.topicMessages(sessionId)) {
+        try {
+          await this.feishu.deleteMessage(messageId);
+          withdrawn += 1;
+          if (messageId === session.rootMessageId) rootGone = true;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          if (ALREADY_GONE.test(reason)) { if (messageId === session.rootMessageId) rootGone = true; continue; }
+          kept.push({ title: messageId === session.rootMessageId ? `${sessionTitle(session)}（根卡片）` : sessionTitle(session), reason: reason.slice(0, 120) });
+        }
       }
-      if (sessions.length < 200) return;
+      if (rootGone) this.db.detachTopic(sessionId);
     }
+    const chatId = this.boundChatId();
+    if (chatId) await this.feishu.sendCard(chatId, claudeCleanupResultCard({ topics, withdrawn, kept }));
   }
 
   private async periodicSync(): Promise<void> {
@@ -166,7 +216,12 @@ export class ClaudeRuntime {
       // Out of scope: keep only the latest turn, so the session can still be shown if SYNC_DIRS changes.
       if (result.current) saved.set(result.current.turnId, result.current);
     } else if (!fromStart) {
-      for (const turn of result.touched) { visible.add(turn.turnId); saved.set(turn.turnId, turn); }
+      for (const turn of result.touched) {
+        saved.set(turn.turnId, turn);
+        // A turn that began while it was not shown (history, or outside SYNC_DIRS) stays hidden even
+        // when it ends now; only turns that start from here on are appended to the topic.
+        if (turn.turnId !== stored?.turnId || stored.renderState !== "hidden") visible.add(turn.turnId);
+      }
     } else {
       const recent = (lastActivityMs ?? info.mtimeMs) >= Date.now() - this.config.historyDays * DAY_MS;
       const justStarted = startedAtMs !== null && startedAtMs >= this.newSessionCutoffMs;
@@ -222,13 +277,13 @@ export class ClaudeRuntime {
   }
 
   /** Sends a turn card; if Feishu rejects the folded tool panel, falls back to plain lines for good. */
-  private async sendTurnCard(rootId: string, turn: TurnView, stale: boolean): Promise<{ messageId: string; hash: string }> {
+  private async sendTurnCard(sessionId: string, rootId: string, turn: TurnView, stale: boolean): Promise<{ messageId: string; hash: string }> {
     const simple = this.simpleCards();
-    try { return { messageId: await this.feishu.replyCard(rootId, claudeTurnCard(turn, { simpleTools: simple, stale })), hash: this.cardHash(turn, simple, stale) }; }
+    try { return { messageId: await this.topicCard(sessionId, rootId, claudeTurnCard(turn, { simpleTools: simple, stale })), hash: this.cardHash(turn, simple, stale) }; }
     catch (error) {
       if (simple || isRetryableTransportError(error)) throw error;
       // Switch for good only when the same card without the folded panel is accepted.
-      const messageId = await this.feishu.replyCard(rootId, claudeTurnCard(turn, { simpleTools: true, stale }));
+      const messageId = await this.topicCard(sessionId, rootId, claudeTurnCard(turn, { simpleTools: true, stale }));
       this.db.setSetting("cards.simple_tools", "1");
       this.fail("collapsible_panel", {}, error);
       return { messageId, hash: this.cardHash(turn, true, stale) };
@@ -244,12 +299,21 @@ export class ClaudeRuntime {
     const chatId = this.boundChatId();
     if (!chatId || this.stopping) return;
     let session = this.db.getSession(sessionId);
-    if (!session || !this.inScope(session.cwd)) return;
+    if (!session) return;
+    if (!this.inScope(session.cwd)) {
+      // Out of scope: the topic is left as it is, apart from saying so on its root card once.
+      if (session.rootMessageId && !session.rootOutOfScope) {
+        await this.updateRootCard(session, claudeRootCard(session, { outOfScope: scopeLabel(this.config.syncDirs) }));
+        this.db.setRootOutOfScope(sessionId, true);
+      }
+      return;
+    }
     const turns = this.db.turnsToRender(sessionId);
     if (!session.rootMessageId) {
       if (!turns.length) return;
       const root = await this.feishu.createSessionRoot(chatId, sessionTitle(session), "", claudeRootCard(session));
       this.db.setSessionRoot(sessionId, root.messageId, root.appLink, root.chatId);
+      this.db.recordSentMessage(sessionId, root.messageId);
       session = this.db.getSession(sessionId)!;
     }
     const rootId = session.rootMessageId!;
@@ -261,9 +325,9 @@ export class ClaudeRuntime {
       if (!turn.cardMessageId) {
         if (!turn.promptMessageId) {
           const line = promptLine(view);
-          if (line) this.db.setTurnPromptMessage(turn.turnId, await this.feishu.replyText(rootId, line));
+          if (line) this.db.setTurnPromptMessage(turn.turnId, await this.topicText(sessionId, rootId, line));
         }
-        const sent = await this.sendTurnCard(rootId, view, stale);
+        const sent = await this.sendTurnCard(sessionId, rootId, view, stale);
         this.db.setTurnCard(turn.turnId, sent.messageId, sent.hash);
       } else {
         const hash = this.cardHash(view, simple, stale);
@@ -276,12 +340,13 @@ export class ClaudeRuntime {
       }
       if (view.status !== "running" && !turn.attachmentMessageId && turnText(view).length > CARD_TEXT_LIMIT) {
         const name = `${sessionTitle(session).slice(0, 20).replace(/[\\/:*?"<>|\s]+/g, "_")}-${turn.turnId.slice(0, 8)}.md`;
-        this.db.setTurnAttachment(turn.turnId, await this.feishu.replyFile(rootId, name, Buffer.from(turnMarkdown(session, view))));
+        this.db.setTurnAttachment(turn.turnId, await this.topicFile(sessionId, rootId, name, Buffer.from(turnMarkdown(session, view))));
       }
     }
-    if (this.db.getSession(sessionId)?.rootDirty) {
-      await this.feishu.updateCard(rootId, claudeRootCard(this.db.getSession(sessionId)!));
-      this.db.clearRootDirty(sessionId);
+    const latest = this.db.getSession(sessionId)!;
+    if (latest.rootDirty || latest.rootOutOfScope) {
+      await this.updateRootCard(latest, claudeRootCard(latest));
+      this.db.setRootOutOfScope(sessionId, false);
     }
     if (deferMs) this.scheduleRender(sessionId, deferMs);
   }
@@ -296,7 +361,7 @@ export class ClaudeRuntime {
     if (!session?.rootMessageId || !this.inScope(session.cwd)) return;
     if (record.state === "waiting" && session.presenceAtMs === record.at && session.waitingNotifiedAtMs < record.at && record.at >= Date.now() - WAITING_NOTICE_MAX_AGE_MS) {
       this.db.setWaitingNotified(session.sessionId, record.at);
-      await this.feishu.replyText(session.rootMessageId, `⏳ 这个会话在${sourceLabel(session.entrypoint)}中等待你处理${record.message ? `：${record.message}` : "。"}`)
+      await this.topicText(session.sessionId, session.rootMessageId, `⏳ 这个会话在${sourceLabel(session.entrypoint)}中等待你处理${record.message ? `：${record.message}` : "。"}`)
         .catch((error) => this.fail("waiting_notice", { sessionId: session.sessionId }, error));
     }
     await this.renderSession(session.sessionId);
@@ -314,7 +379,7 @@ export class ClaudeRuntime {
 
   private homeCard(notice = ""): CardDefinition {
     return claudeHomeCard({ paused: this.paused(), ...this.db.sessionCounts(this.config.syncDirs), failures: this.db.failureCount(),
-      scope: scopeLabel(this.config.syncDirs) }, notice);
+      scope: scopeLabel(this.config.syncDirs), outOfScopeTopics: this.outOfScopeTopics().length }, notice);
   }
 
   private recentCard(search = "", page = 0): CardDefinition {
@@ -352,7 +417,7 @@ export class ClaudeRuntime {
     const { events } = await readTranscriptEvents(session.path, 0, (await stat(session.path)).size);
     const turns = reduceTranscript(sessionId, null, events).touched;
     const name = `${sessionTitle(session).slice(0, 30).replace(/[\\/:*?"<>|\s]+/g, "_")}-${sessionId.slice(0, 8)}.md`;
-    await this.feishu.replyFile(session.rootMessageId, name, Buffer.from(transcriptMarkdown(session, turns)));
+    await this.topicFile(sessionId, session.rootMessageId, name, Buffer.from(transcriptMarkdown(session, turns)));
   }
 
   async onFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
@@ -393,37 +458,40 @@ export class ClaudeRuntime {
     const command = message.text.trim();
     const normalized = command.toLowerCase();
     const session = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
+    // Replies inside a session topic are recorded with the topic, so a cleanup removes them too.
+    const reply = (text: string) => session?.rootMessageId ? this.topicText(session.sessionId, session.rootMessageId, text) : this.respond(message, text);
+    const replyCard = (card: CardDefinition) => session?.rootMessageId ? this.topicCard(session.sessionId, session.rootMessageId, card) : this.respondCard(message, card);
     if (message.chatType === "group" && !message.mentionedBot && !session && !command.startsWith("/")) return;
     // As in the Codex bridge, plain-word shortcuts only count in the group's main timeline.
     const isCommand = (slash: readonly string[], words: readonly string[] = []) => slash.includes(normalized) || (!session && words.includes(normalized));
-    if (normalized === "/") { await this.respondCard(message, claudeCommandMenuCard()); return; }
-    if (isCommand(["/help"], ["help", "帮助", "?", "？"])) { await this.respondCard(message, claudeHelpCard()); return; }
-    if (isCommand(["/home", "/status"], ["控制台", "状态"])) { await this.respondCard(message, this.homeCard()); return; }
-    if (isCommand(["/sessions"], ["会话", "最近"])) { await this.respondCard(message, this.recentCard()); return; }
+    if (normalized === "/") { await replyCard(claudeCommandMenuCard()); return; }
+    if (isCommand(["/help"], ["help", "帮助", "?", "？"])) { await replyCard(claudeHelpCard()); return; }
+    if (isCommand(["/home", "/status"], ["控制台", "状态"])) { await replyCard(this.homeCard()); return; }
+    if (isCommand(["/sessions"], ["会话", "最近"])) { await replyCard(this.recentCard()); return; }
     if (normalized === "/search" || normalized.startsWith("/search ")) {
-      await this.respondCard(message, this.recentCard([...command.slice(7).trim()].slice(0, 120).join("")));
+      await replyCard(this.recentCard([...command.slice(7).trim()].slice(0, 120).join("")));
       return;
     }
-    if (isCommand(["/sync"], ["同步"])) { await this.respondCard(message, this.homeCard("已开始同步")); void this.syncAll(); return; }
-    if (isCommand(["/pause"], ["暂停"])) { this.db.setSetting("sync.paused", "1"); await this.respondCard(message, this.homeCard("同步已暂停")); return; }
+    if (isCommand(["/sync"], ["同步"])) { await replyCard(this.homeCard("已开始同步")); void this.syncAll(); return; }
+    if (isCommand(["/pause"], ["暂停"])) { this.db.setSetting("sync.paused", "1"); await replyCard(this.homeCard("同步已暂停")); return; }
     if (isCommand(["/resume-sync"], ["恢复"])) {
       this.db.setSetting("sync.paused", "0");
-      await this.respondCard(message, this.homeCard("同步已恢复"));
+      await replyCard(this.homeCard("同步已恢复"));
       void this.syncAll();
       return;
     }
     if (session && normalized === "/export") {
-      await this.respond(message, "正在导出完整记录…");
+      await reply("正在导出完整记录…");
       await this.exportSession(session.sessionId);
       return;
     }
     if (session) {
       if (Date.now() - session.readonlyNoticeAtMs < READONLY_NOTICE_INTERVAL_MS) return;
       this.db.setReadonlyNotice(session.sessionId, Date.now());
-      await this.respond(message, `目前是只读镜像，飞书里的消息不会发给 Claude。要继续这个会话：在电脑上用 VS Code 打开它，或运行 claude --resume ${session.sessionId}；手机上可以先在 VS Code 中输入 /rc，再用 Claude App 接续。发送 /export 可以导出完整记录。`);
+      await reply(`目前是只读镜像，飞书里的消息不会发给 Claude。要继续这个会话：在电脑上用 VS Code 打开它，或运行 claude --resume ${session.sessionId}；手机上可以先在 VS Code 中输入 /rc，再用 Claude App 接续。发送 /export 可以导出完整记录。`);
       return;
     }
-    await this.respondCard(message, claudeCommandMenuCard(command.startsWith("/") ? `未知命令：${command.slice(0, 40)}` : "目前是只读镜像：可以查看本机 Claude 会话，暂不支持从飞书新建或继续对话。"));
+    await replyCard(claudeCommandMenuCard(command.startsWith("/") ? `未知命令：${command.slice(0, 40)}` : "目前是只读镜像：可以查看本机 Claude 会话，暂不支持从飞书新建或继续对话。"));
   }
 
   async onCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
@@ -456,6 +524,24 @@ export class ClaudeRuntime {
       case "sync": void this.syncAll(); return replace(this.homeCard("已开始同步"));
       case "pause": this.db.setSetting("sync.paused", "1"); return replace(this.homeCard("同步已暂停"));
       case "resume": this.db.setSetting("sync.paused", "0"); void this.syncAll(); return replace(this.homeCard("同步已恢复"));
+      case "cleanup_preview": {
+        const sessions = this.outOfScopeTopics();
+        if (!sessions.length) return replace(this.homeCard("没有范围外的话题"));
+        const nonce = randomUUID();
+        this.db.setSetting("cleanup.pending", JSON.stringify({ nonce, sessionIds: sessions.map((session) => session.sessionId), expiresAt: Date.now() + CLEANUP_CONFIRM_MS }));
+        return replace(claudeCleanupCard(sessions, nonce, scopeLabel(this.config.syncDirs)));
+      }
+      case "cleanup_confirm": {
+        let pending: { nonce?: unknown; sessionIds?: unknown; expiresAt?: unknown } = {};
+        try { pending = JSON.parse(this.db.getSetting("cleanup.pending") ?? "{}") as typeof pending; } catch { /* treated as expired */ }
+        if (pending.nonce !== event.value.nonce || typeof pending.expiresAt !== "number" || pending.expiresAt < Date.now() || !Array.isArray(pending.sessionIds)) {
+          return replace(claudeNoticeCard("清理已过期", "请回到控制台，重新点击“清理范围外话题”。", "red"));
+        }
+        this.db.deleteSetting("cleanup.pending");
+        const ids = pending.sessionIds.filter((id): id is string => typeof id === "string");
+        void this.cleanupTopics(ids).catch((error) => this.fail("cleanup_topics", {}, error));
+        return replace(claudeNoticeCard("正在清理", `正在撤回 ${ids.length} 个话题中的消息，完成后会在群里发送结果。`, "orange"));
+      }
       case "open_session": {
         const session = await this.openSession(sessionId);
         if (!session) return replace(claudeNoticeCard("无法打开", "没有找到这个会话。", "red"));

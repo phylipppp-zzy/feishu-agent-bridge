@@ -35,6 +35,8 @@ export interface ClaudeSession {
   presenceMessage: string | null;
   waitingNotifiedAtMs: number;
   rootDirty: boolean;
+  /** The root card currently says the session is outside SYNC_DIRS. */
+  rootOutOfScope: boolean;
   readonlyNoticeAtMs: number;
 }
 
@@ -127,7 +129,17 @@ export class ClaudeBridgeDatabase {
       CREATE TABLE IF NOT EXISTS failures (
         key TEXT PRIMARY KEY, operation TEXT NOT NULL, detail TEXT NOT NULL, error TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 1,
         resolved INTEGER NOT NULL DEFAULT 0, first_at_ms INTEGER NOT NULL, last_at_ms INTEGER NOT NULL
-      );`);
+      );
+      CREATE TABLE IF NOT EXISTS sent_messages (
+        message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS sent_messages_session ON sent_messages(session_id, created_at_ms);`);
+    this.ensureColumn("sessions", "root_out_of_scope", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   close(): void { this.db.close(); }
@@ -169,7 +181,7 @@ export class ClaudeBridgeDatabase {
       presenceState: state === "idle" || state === "running" || state === "waiting" || state === "closed" ? state : null,
       presenceAtMs: Number(row.presence_at_ms), presencePid: row.presence_pid === null || row.presence_pid === undefined ? null : Number(row.presence_pid),
       presencePidStart: text(row.presence_pid_start), presenceMessage: text(row.presence_message), waitingNotifiedAtMs: Number(row.waiting_notified_at_ms),
-      rootDirty: Number(row.root_dirty) === 1, readonlyNoticeAtMs: Number(row.readonly_notice_at_ms),
+      rootDirty: Number(row.root_dirty) === 1, rootOutOfScope: Number(row.root_out_of_scope) === 1, readonlyNoticeAtMs: Number(row.readonly_notice_at_ms),
     };
   }
 
@@ -212,6 +224,48 @@ export class ClaudeBridgeDatabase {
   }
   markRootDirty(sessionId: string): void { this.db.prepare("UPDATE sessions SET root_dirty=1 WHERE session_id=?").run(sessionId); }
   clearRootDirty(sessionId: string): void { this.db.prepare("UPDATE sessions SET root_dirty=0 WHERE session_id=?").run(sessionId); }
+  setRootOutOfScope(sessionId: string, outOfScope: boolean): void {
+    this.db.prepare("UPDATE sessions SET root_out_of_scope=?,root_dirty=0 WHERE session_id=?").run(outOfScope ? 1 : 0, sessionId);
+  }
+  /** Sessions that have a Feishu topic, most recently active first. */
+  topicSessions(): ClaudeSession[] {
+    return (this.db.prepare("SELECT * FROM sessions WHERE root_message_id IS NOT NULL ORDER BY last_activity_ms DESC").all() as Record<string, unknown>[])
+      .map((row) => this.sessionFromRow(row));
+  }
+
+  recordSentMessage(sessionId: string, messageId: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO sent_messages(message_id,session_id,created_at_ms) VALUES(?,?,?)").run(messageId, sessionId, Date.now());
+  }
+  /**
+   * Every message the bridge posted in a session's topic, newest first and the root last, so
+   * that withdrawing them in this order removes replies before the topic itself. Turns and the
+   * root are included for messages sent before the bridge kept this record.
+   */
+  topicMessages(sessionId: string): string[] {
+    const session = this.getSession(sessionId);
+    const ids = new Set((this.db.prepare("SELECT message_id FROM sent_messages WHERE session_id=? ORDER BY created_at_ms DESC").all(sessionId) as Array<{ message_id: string }>)
+      .map((row) => row.message_id));
+    for (const row of this.db.prepare("SELECT prompt_message_id,card_message_id,attachment_message_id FROM turns WHERE session_id=? ORDER BY seq DESC").all(sessionId) as Array<Record<string, string | null>>) {
+      for (const id of [row.attachment_message_id, row.card_message_id, row.prompt_message_id]) if (id) ids.add(id);
+    }
+    if (session?.rootMessageId) { ids.delete(session.rootMessageId); ids.add(session.rootMessageId); }
+    return [...ids];
+  }
+  /**
+   * Forgets a session's topic after its messages were withdrawn: the session stays indexed with
+   * its latest turn hidden, so new activity in scope opens a fresh topic.
+   */
+  detachTopic(sessionId: string): void {
+    this.transaction(() => {
+      const session = this.getSession(sessionId);
+      this.db.prepare("DELETE FROM turns WHERE session_id=? AND turn_id IS NOT ?").run(sessionId, session?.currentTurnId ?? null);
+      this.db.prepare(`UPDATE turns SET render_state='hidden',prompt_message_id=NULL,card_message_id=NULL,rendered_hash=NULL,rendered_at_ms=0,attachment_message_id=NULL
+        WHERE session_id=?`).run(sessionId);
+      this.db.prepare("DELETE FROM sent_messages WHERE session_id=?").run(sessionId);
+      this.db.prepare(`UPDATE sessions SET root_message_id=NULL,root_app_link=NULL,chat_id=NULL,root_dirty=0,root_out_of_scope=0,waiting_notified_at_ms=0,
+        readonly_notice_at_ms=0,updated_at_ms=? WHERE session_id=?`).run(Date.now(), sessionId);
+    });
+  }
   setReadonlyNotice(sessionId: string, atMs: number): void {
     this.db.prepare("UPDATE sessions SET readonly_notice_at_ms=? WHERE session_id=?").run(atMs, sessionId);
   }

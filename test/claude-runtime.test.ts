@@ -46,7 +46,14 @@ class FakeFeishu implements FeishuPort {
   async sendText(_chat: string, text: string): Promise<string> { this.sent.push({ kind: "text", text }); return this.next("text"); }
   async sendCard(_chat: string, card: CardDefinition): Promise<string> { this.sent.push({ kind: "card", card }); return this.next("card"); }
   async updateCard(id: string, card: CardDefinition): Promise<void> { this.updated.push({ id, card }); }
-  async deleteMessage(): Promise<void> {}
+  deleted: string[] = [];
+  /** Message ids whose withdrawal fails, with the error Feishu would return. */
+  undeletable = new Map<string, string>();
+  async deleteMessage(id: string): Promise<void> {
+    const failure = this.undeletable.get(id);
+    if (failure) throw new Error(failure);
+    this.deleted.push(id);
+  }
   async getMessageMetadata() { return null; }
   repliesTo(root: string): Reply[] { return this.replies.filter((reply) => reply.root === root); }
 }
@@ -61,6 +68,13 @@ const prompt = (sessionId: string, uuid: string, at: number, text: string) => ({
 const reply = (sessionId: string, uuid: string, at: number, text: string, stop = "end_turn") => ({ ...common(sessionId), type: "assistant", uuid, timestamp: iso(at), message: { id: `msg-${uuid}`, model: "claude-opus-5-5", role: "assistant", stop_reason: stop, content: [{ type: "text", text }] } });
 const toolUse = (sessionId: string, uuid: string, at: number, id: string, command: string) => ({ ...common(sessionId), type: "assistant", uuid, timestamp: iso(at), message: { id: `msg-${uuid}`, model: "claude-opus-5-5", role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id, name: "Bash", input: { command } }] } });
 const toolResult = (sessionId: string, uuid: string, at: number, id: string) => ({ ...common(sessionId), type: "user", uuid, timestamp: iso(at), message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] } });
+async function waitUntil(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("condition was not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 const jsonl = (records: unknown[]) => `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
 
 const atCwd = (records: Array<Record<string, unknown>>, cwd: string) => records.map((record) => "cwd" in record ? { ...record, cwd } : record);
@@ -82,7 +96,8 @@ async function setup(prefix: string, syncDirs: string[] = []) {
   });
   const bind = async () => { await runtime.onFeishuMessage(message({ text: "/bind token" })); await internals.bootstrapping; };
   /** A restarted service over the same state, for example with a different SYNC_DIRS. */
-  const restart = (overrides: Partial<ClaudeBridgeConfig>) => new ClaudeRuntime({ ...config, ...overrides }, db, feishu) as unknown as Internals;
+  type Restarted = Pick<ClaudeRuntime, "syncAll" | "renderSession" | "onCardAction" | "onFeishuMessage"> & { bootstrap(): Promise<void> };
+  const restart = (overrides: Partial<ClaudeBridgeConfig>) => new ClaudeRuntime({ ...config, ...overrides }, db, feishu) as unknown as Restarted;
   return { home, config, db, feishu, runtime, path, internals, message, bind, restart, cleanup: async () => { db.close(); await rm(home, { recursive: true, force: true }); } };
 }
 
@@ -249,12 +264,88 @@ test("SYNC_DIRS limits topics, lists and notices to sessions working in those di
     await env.runtime.syncAll();
     assert.equal(env.feishu.roots.length, 1);
 
-    // After a restart with every directory in scope, the recent session that was left out gets its topic.
+    // Widening the scope creates no topic for past activity: Feishu can only append, and a topic
+    // must appear in the order sessions were really used. The session's next turn opens it.
     const widened = env.restart({ syncDirs: [] });
     await widened.bootstrap();
+    assert.equal(env.feishu.roots.length, 1);
+    assert.equal(env.db.getSession(OLD)?.rootMessageId, null);
+    await appendFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p3", now + MINUTE, "范围扩大后的问题")], "/home/tester/project-other")));
+    await widened.syncAll();
     const other = env.db.getSession(OLD)!;
-    assert.ok(other.rootMessageId);
+    assert.equal(env.feishu.roots.at(-1)?.id, other.rootMessageId);
     assert.deepEqual(env.feishu.repliesTo(other.rootMessageId!).map((item) => item.kind === "text" ? item.text : title(item.card)),
-      ["VS Code：别处的新问题", "Claude · 进行中"]);
+      ["VS Code：范围扩大后的问题", "Claude · 进行中"]);
+  } finally { await env.cleanup(); }
+});
+
+test("narrowing the scope marks topics instead of deleting them, and widening it again continues them in place", async () => {
+  const env = await setup("claude-scope-mark-");
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "r-p1", now - HOUR, "项目内"), reply(RECENT, "r-a1", now - HOUR + MINUTE, "好")], "/home/tester/project")));
+    await writeFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p1", now - 2 * HOUR, "别处"), reply(OLD, "o-a1", now - 2 * HOUR + MINUTE, "好")], "/home/tester/elsewhere")));
+    await env.bind();
+    const other = env.db.getSession(OLD)!.rootMessageId!;
+    const repliesBefore = env.feishu.replies.length;
+
+    const narrowed = env.restart({ syncDirs: ["/home/tester/project"] });
+    await narrowed.bootstrap();
+    assert.match(title(env.feishu.updated.filter((update) => update.id === other).at(-1)?.card), /已移出同步范围/);
+    assert.equal(env.feishu.updated.filter((update) => update.id === other).length, 1);
+    await appendFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p2", now, "别处的新问题")], "/home/tester/elsewhere")));
+    await narrowed.syncAll();
+    await narrowed.renderSession(OLD);
+    assert.equal(env.feishu.replies.length, repliesBefore);
+    assert.equal(env.feishu.updated.filter((update) => update.id === other).length, 1);
+
+    const widened = env.restart({ syncDirs: [] });
+    await widened.bootstrap();
+    assert.doesNotMatch(title(env.feishu.updated.filter((update) => update.id === other).at(-1)?.card), /已移出同步范围/);
+    await appendFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p3", now + MINUTE, "回到范围内")], "/home/tester/elsewhere")));
+    await widened.syncAll();
+    assert.equal(env.feishu.roots.length, 2);
+    assert.deepEqual(env.feishu.repliesTo(other).filter((item) => item.kind === "text").map((item) => item.text), ["VS Code：别处", "VS Code：回到范围内"]);
+  } finally { await env.cleanup(); }
+});
+
+test("cleanup withdraws the bridge's messages in out-of-scope topics after confirmation and reports what stays", async () => {
+  const env = await setup("claude-cleanup-");
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "r-p1", now - HOUR, "项目内"), reply(RECENT, "r-a1", now - HOUR + MINUTE, "好")], "/home/tester/project")));
+    await writeFile(env.path(OLD), jsonl(atCwd([prompt(OLD, "o-p1", now - 2 * HOUR, "别处"), reply(OLD, "o-a1", now - 2 * HOUR + MINUTE, "好")], "/home/tester/elsewhere")));
+    await writeFile(env.path(FRESH), jsonl(atCwd([prompt(FRESH, "f-p1", now - 3 * HOUR, "另一处"), reply(FRESH, "f-a1", now - 3 * HOUR + MINUTE, "好")], "/home/tester/third")));
+    await env.bind();
+    const other = env.db.getSession(OLD)!;
+    const third = env.db.getSession(FRESH)!;
+    await env.runtime.onFeishuMessage(env.message({ rootId: other.rootMessageId!, mentionedBot: false, text: "继续" }));
+    const otherMessages = [other.rootMessageId!, ...env.feishu.repliesTo(other.rootMessageId!).map((item) => item.id)];
+    // The third topic's root is too old to withdraw.
+    env.feishu.undeletable.set(third.rootMessageId!, "Feishu API 230027: the message is beyond the recall time limit");
+
+    const narrowed = env.restart({ syncDirs: ["/home/tester/project"] });
+    await narrowed.bootstrap();
+    const action = (name: string, value: Record<string, unknown> = {}) => narrowed.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: name, value, formValues: {} });
+    assert.match(JSON.stringify((await action("home")).card), /清理范围外话题（2）/);
+    const preview = (await action("cleanup_preview")).card;
+    assert.equal(title(preview), "清理 2 个范围外话题");
+    assert.equal(env.feishu.deleted.length, 0);
+    const nonce = JSON.parse(env.db.getSetting("cleanup.pending")!).nonce as string;
+    assert.equal(title((await action("cleanup_confirm", { nonce: "stale" })).card), "清理已过期");
+    assert.equal(title((await action("cleanup_confirm", { nonce })).card), "正在清理");
+    await waitUntil(() => env.feishu.sent.some((item) => title(item.card) === "范围外话题清理完成"));
+
+    // Replies go first and the root last; the whole topic of the reachable session is gone.
+    assert.deepEqual(env.feishu.deleted.filter((id) => otherMessages.includes(id)).sort(), [...otherMessages].sort());
+    assert.equal(env.feishu.deleted.filter((id) => otherMessages.includes(id)).at(-1), other.rootMessageId);
+    assert.equal(env.db.getSession(OLD)?.rootMessageId, null);
+    // The third root stays, so that topic keeps its link and is reported.
+    assert.equal(env.db.getSession(FRESH)?.rootMessageId, third.rootMessageId);
+    const result = JSON.stringify(env.feishu.sent.find((item) => title(item.card) === "范围外话题清理完成")?.card);
+    assert.match(result, /处理话题：\*\*2\*\*/);
+    assert.match(result, /未能撤回：\*\*1\*\*/);
+    assert.match(result, /230027/);
+    assert.equal(env.feishu.deleted.includes(env.db.getSession(RECENT)!.rootMessageId!), false);
   } finally { await env.cleanup(); }
 });

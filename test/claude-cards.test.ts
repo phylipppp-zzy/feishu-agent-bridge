@@ -20,7 +20,7 @@ const session: ClaudeSession = {
   sessionId: "aaaaaaaa-0000-4000-8000-000000000001", path: "/x.jsonl", cwd: "/srv/project", customTitle: null, aiTitle: "Fix login page", firstPrompt: "修复登录页",
   entrypoint: "claude-vscode", model: "claude-opus-5-5", permissionMode: "auto", gitBranch: "main", startedAtMs: 0, lastActivityMs: Date.parse("2026-10-02T06:01:00Z"),
   rootMessageId: null, rootAppLink: null, chatId: null, currentTurnId: null, presenceState: "waiting", presenceAtMs: 0, presencePid: null, presencePidStart: null,
-  presenceMessage: "Claude needs your permission to use Bash", waitingNotifiedAtMs: 0, rootDirty: false, readonlyNoticeAtMs: 0,
+  presenceMessage: "Claude needs your permission to use Bash", waitingNotifiedAtMs: 0, rootDirty: false, rootOutOfScope: false, readonlyNoticeAtMs: 0,
 };
 
 test("turn cards show progress, the folded tool log and the final duration", () => {

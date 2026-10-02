@@ -137,8 +137,23 @@ export function claudeTurnCard(turn: TurnView, options: { simpleTools?: boolean;
   return card(title, template, elements);
 }
 
-export function claudeRootCard(session: ClaudeSession): CardDefinition {
+/**
+ * The topic's root card. `outOfScope` (the current SYNC_DIRS, as text) marks a session that is
+ * no longer mirrored; its topic stays as it was.
+ */
+export function claudeRootCard(session: ClaudeSession, options: { outOfScope?: string } = {}): CardDefinition {
   const resume = `claude --resume ${session.sessionId}`;
+  if (options.outOfScope !== undefined) {
+    return card(`${sessionTitle(session)}（已移出同步范围）`, "grey", [
+      markdown([
+        `项目：${safeMarkdown(displayPath(session.cwd))}`,
+        "状态：**已移出同步范围，不再更新**",
+        `当前同步范围：${safeMarkdown(options.outOfScope)}`,
+        `会话 ID：\`${session.sessionId}\``,
+      ].join("\n")),
+      note("这个话题保留在群里，内容停在移出范围之前。同步范围再次包含该目录后，会在这里继续更新；不需要时可在控制台“清理范围外话题”。"),
+    ]);
+  }
   return card(sessionTitle(session), presenceTemplate(session), [
     markdown([
       `项目：${safeMarkdown(displayPath(session.cwd))}`,
@@ -151,7 +166,7 @@ export function claudeRootCard(session: ClaudeSession): CardDefinition {
   ]);
 }
 
-export function claudeHomeCard(status: { paused: boolean; indexed: number; topics: number; open: number; failures: number; scope: string }, notice = ""): CardDefinition {
+export function claudeHomeCard(status: { paused: boolean; indexed: number; topics: number; open: number; failures: number; scope: string; outOfScopeTopics?: number }, notice = ""): CardDefinition {
   return card("Claude 控制台", status.paused ? "orange" : "blue", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
     markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　已索引会话：**${status.indexed}**　已建话题：**${status.topics}**　本机打开中：**${status.open}**　未解决失败：**${status.failures}**\n同步范围：${safeMarkdown(status.scope)}`),
@@ -161,6 +176,28 @@ export function claudeHomeCard(status: { paused: boolean; indexed: number; topic
       button(status.paused ? "恢复同步" : "暂停同步", status.paused ? "resume" : "pause"),
       button("帮助", "help"),
     ]),
+    ...(status.outOfScopeTopics ? [actionRow([button(`清理范围外话题（${status.outOfScopeTopics}）`, "cleanup_preview", "danger")])] : []),
+  ]);
+}
+
+/** Lists the topics a cleanup would withdraw; nothing happens until the person confirms. */
+export function claudeCleanupCard(sessions: ClaudeSession[], nonce: string, scope: string): CardDefinition {
+  const lines = sessions.slice(0, 20).map((session, index) => `${index + 1}. ${safeMarkdown(sessionTitle(session))} · ${safeMarkdown(displayPath(session.cwd))}`);
+  if (sessions.length > 20) lines.push(`…另有 ${sessions.length - 20} 个`);
+  return card(`清理 ${sessions.length} 个范围外话题`, "red", [
+    markdown(`以下话题的工作目录不在当前同步范围（${safeMarkdown(scope)}）内：\n${lines.join("\n")}`),
+    note("确认后会撤回机器人在这些话题里发过的全部消息（根卡片、提问、回复卡片、附件和提醒）。你自己发的消息机器人无法撤回；超过飞书撤回时限的消息也撤不掉，结果里会逐条列出。会话仍保留在本机索引中，以后同步范围包含它们、且有新活动时，会重新建话题。"),
+    actionRow([button("确认清理", "cleanup_confirm", "danger", { nonce }), button("取消", "home")]),
+  ]);
+}
+
+export function claudeCleanupResultCard(result: { topics: number; withdrawn: number; kept: Array<{ title: string; reason: string }> }): CardDefinition {
+  const kept = result.kept.slice(0, 20).map((item) => `- ${safeMarkdown(item.title)}：${safeMarkdown(item.reason)}`);
+  if (result.kept.length > 20) kept.push(`- …另有 ${result.kept.length - 20} 条`);
+  return card("范围外话题清理完成", result.kept.length ? "orange" : "green", [
+    markdown(`处理话题：**${result.topics}**　撤回消息：**${result.withdrawn}**　未能撤回：**${result.kept.length}**`),
+    ...(kept.length ? [markdown(`未能撤回的消息：\n${kept.join("\n")}`)] : []),
+    actionRow([button("返回控制台", "home")]),
   ]);
 }
 
