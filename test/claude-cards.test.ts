@@ -111,7 +111,10 @@ test("request cards show what Claude wants and every way to answer", () => {
   assert.match(conflict, /"action":"conflict_fork"/);
   const modes = JSON.stringify(claudeModeCard(session, "default", ["default", "acceptEdits", "plan", "auto"]));
   assert.doesNotMatch(modes, /bypassPermissions/);
-  const picker = JSON.stringify(claudeNewSessionCard(["/srv/project"], "全部目录", { nonce: "d-1", preview: "整理 README" }));
+  const picker = JSON.stringify(claudeNewSessionCard(["/srv/project", "/srv/a-very-long-directory-name/with/many/levels/below"], "全部目录", { nonce: "d-1", preview: "整理 README" }));
+  // Full paths are listed as text; buttons carry a number and a short name.
+  assert.match(picker, /2\. \/srv\/a\\\\-very\\\\-long\\\\-directory\\\\-name\/with\/many\/levels\/below/);
+  assert.match(picker, /"content":"2 · below"/);
   assert.match(picker, /任务：整理 README/);
   assert.match(picker, /"draft":"d-1"/);
   // Feishu rejects a card whose input allows more than 1000 characters.

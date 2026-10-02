@@ -318,15 +318,14 @@ export function claudeModelCard(session: ClaudeSession, models: ReadonlyArray<{ 
  */
 export function claudeNewSessionCard(directories: readonly string[], scope: string, draft?: { nonce: string; preview: string }, notice = ""): CardDefinition {
   const extra = draft ? { draft: draft.nonce } : {};
-  const rows: Record<string, unknown>[] = [];
-  for (let index = 0; index < directories.length; index += 2) {
-    rows.push(actionRow(directories.slice(index, index + 2).map((dir) => button(shorten(displayPath(dir), 28), "new_pick", "default", { cwd: dir, ...extra }))));
-  }
+  // Full paths go in the text, which wraps; a button label that long would be cut to "…" on a phone.
+  const list = directories.map((dir, index) => `${index + 1}. ${safeMarkdown(displayPath(dir))}`);
+  const buttons = directories.map((dir, index) => button(`${index + 1} · ${shorten(basename(dir) || dir, 12)}`, "new_pick", "default", { cwd: dir, ...extra }));
   return card("新建 Claude 会话", "turquoise", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
     ...(draft ? [markdown(`任务：${safeMarkdown(shorten(draft.preview, 200) || "（图片）")}`)] : []),
-    markdown(`${draft ? "选择在哪个目录中开始" : "选择项目目录"}（同步范围：${safeMarkdown(scope)}）：`),
-    ...rows,
+    markdown(`${draft ? "选择在哪个目录中开始" : "选择项目目录"}（同步范围：${safeMarkdown(scope)}）：${list.length ? `\n${list.join("\n")}` : ""}`),
+    ...(buttons.length ? [actionRow(buttons)] : []),
     ...inputForm({ formName: "new_dir_form", inputName: "new_dir", elementId: "new_dir", placeholder: "或输入目录的绝对路径，例如 ~/usr/zhangzy/workspace/项目", maxLength: 300,
       buttons: [{ label: "使用这个目录", action: "new_pick_path", type: "primary", extra }] }),
     actionRow([button("返回控制台", "home")]),
