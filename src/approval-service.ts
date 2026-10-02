@@ -8,7 +8,7 @@ type Resolver = (value: unknown) => void;
 export interface ApprovalServiceOptions {
   readonly db: BridgeDatabase;
   readonly onServerRequest: (request: JsonRpcMessage) => Promise<unknown>;
-  readonly onResolveAction: (request: PendingServerRequest, decision: string, answer?: string) => Promise<void>;
+  readonly onResolveAction: (request: PendingServerRequest, decision: string, answers?: readonly string[]) => Promise<void>;
   readonly onRootConsent: (task: QueuedTask) => Promise<TaskRootGrant | null>;
   readonly onConsumeRootGrant: (task: QueuedTask) => Promise<boolean>;
   readonly onExpire: () => Promise<void>;
@@ -32,10 +32,10 @@ export class ApprovalService implements ApprovalServicePort {
     return this.options.onServerRequest(request);
   }
 
-  async resolveAction(nonce: string, decision: string, answer?: string): Promise<void> {
+  async resolveAction(nonce: string, decision: string, answers?: readonly string[]): Promise<void> {
     const request = this.options.db.getServerRequest(nonce);
     if (!request) return;
-    await this.options.onResolveAction(request, decision, answer);
+    await this.options.onResolveAction(request, decision, answers);
   }
 
   waitFor(nonce: string): Promise<unknown> {

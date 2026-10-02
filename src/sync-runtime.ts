@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { archivedSessionActionCard, assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
+import { archivedSessionActionCard, assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { isExpiredFeishuMessage } from "./safe-log.js";
 import { AppServerRpcError, CodexAppServer, notificationTurnId, type JsonRpcMessage } from "./app-server.js";
 import { CodexCliProbe } from "./codex.js";
@@ -16,12 +16,15 @@ import { jsonlFiles, SessionImporter } from "./session-importer.js";
 import { TaskScheduler } from "./task-scheduler.js";
 import { ApprovalService } from "./approval-service.js";
 import { TurnCoordinator } from "./turn-coordinator.js";
-import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
+import type { BridgeConfig, CardActionOutcome, CardDefinition, ChoiceQuestion, ChoiceRequest, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage, ModelCapability, PendingServerRequest, QueuedTask, RemoteRequestType, SessionMetadata, TurnState } from "./types.js";
 
 const MAX_ERROR_CHARS = 3_000;
 const MAX_INLINE_MESSAGE_BYTES = 45_000;
 const MAX_LIVE_TEXT_BYTES = 200_000;
 const PENDING_PROMPT_TTL_MS = 10 * 60_000;
+// A Feishu message reaches the JSONL only when its turn is imported, which can be
+// long after it was sent; keep the echo marker for the lifetime of a long turn.
+const INBOUND_MIRROR_TTL_MS = 24 * 60 * 60_000;
 const MODEL_CATALOG_KEY = "codex.model_catalog.v1";
 const MODEL_BACKFILL_MIGRATION_KEY = "migration.session_model_backfill.v1";
 const LOG_SYNC_ATTEMPTS = 10;
@@ -169,7 +172,7 @@ export class SyncRuntime implements FeishuRouterPort {
     this.approvalService = new ApprovalService({
       db,
       onServerRequest: (request) => this.onAppServerRequest(request),
-      onResolveAction: (request, decision, answer) => this.resolveRemoteRequest(request, decision, answer),
+      onResolveAction: (request, decision, answers) => this.resolveRemoteRequest(request, decision, answers),
       onRootConsent: (task) => this.createRootGrant(task),
       onConsumeRootGrant: (task) => this.consumeRootGrant(task),
       onExpire: () => this.expireRemoteState(),
@@ -642,18 +645,37 @@ export class SyncRuntime implements FeishuRouterPort {
       }
       this.db.saveMessage(message.id, session.sessionId, "outbound", feishuId, { path, kind: "primary" });
     }
+    // A question is settled once its tool call has an output or a newer user
+    // message moved the conversation on; either happened in some frontend.
+    const answeredCallIds = new Set(batch?.answeredCallIds ?? []);
+    let latestUserAtMs = 0;
+    let latestLocalUserAtMs = 0;
+    for (const message of batch?.messages ?? []) {
+      const at = message.role === "user" ? Date.parse(message.timestamp) : Number.NaN;
+      if (!Number.isFinite(at)) continue;
+      latestUserAtMs = Math.max(latestUserAtMs, at);
+      if (this.db.getMessage(message.id)?.direction !== "inbound_mirror") latestLocalUserAtMs = Math.max(latestLocalUserAtMs, at);
+    }
     for (const request of batch?.choiceRequests ?? []) {
       if (this.db.hasMessage(request.id)) continue;
+      // Questions of bridge-started turns were asked through the app-server request
+      // card; app-server item ids are expected to equal the logged call ids.
+      if (answeredCallIds.has(request.id) || latestUserAtMs > Date.parse(request.timestamp) || this.db.hasServerRequestForItem(session.sessionId, request.id)) {
+        this.db.saveMessage(request.id, session.sessionId, "outbound_choice", null, { path, kind: "settled" });
+        continue;
+      }
       let feishuId: string;
       if (forbiddenRemoteQuestion(request)) {
         feishuId = await this.feishu.replyText(rootId, "Codex 请求了不允许远程确认的安全信息或权限。请在本机处理；飞书不会提供批准按钮。");
       } else {
+        // The asking turn is still running locally, so the session stays active
+        // and a Feishu answer waits until the terminal releases it.
         this.savePendingChoice({ request, rootId, questionIndex: 0, answers: [] });
-        this.db.setSetting(`session.${session.sessionId}.active`, "0");
         feishuId = await this.feishu.replyCard(rootId, choiceCard(request, 0));
       }
       this.db.saveMessage(request.id, session.sessionId, "outbound_choice", feishuId, { path, kind: "primary" });
     }
+    if (answeredCallIds.size || latestUserAtMs) await this.settleChoices(session.sessionId, rootId, answeredCallIds, latestUserAtMs, latestLocalUserAtMs);
     if (batch?.turnActive !== undefined) this.db.setSetting(`session.${session.sessionId}.active`, batch.turnActive ? "1" : "0");
     cursor.parsedOffset = parsedEnd;
 
@@ -939,7 +961,9 @@ export class SyncRuntime implements FeishuRouterPort {
     const decisions = Array.isArray(params.availableDecisions) ? params.availableDecisions.flatMap((item) => typeof item === "string" ? [item] : []) : undefined;
     const secret = type === "user_input" && this.requestContainsSecret(params);
     if (secret) throw new Error("Secret input is never accepted through Feishu");
-    const card = remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(decisions ? { decisions } : {}), secret });
+    const card = type === "user_input"
+      ? remoteQuestionCard(nonce, this.userInputQuestions(pending), 0)
+      : remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(decisions ? { decisions } : {}), secret });
     const cardMessageId = await this.feishu.replyCard(rootMessageId, card);
     pending.cardMessageId = cardMessageId; this.db.saveServerRequest(pending);
     await this.updateRunCard(scopedSessionId, rootMessageId, type === "user_input" ? "等待输入" : "等待批准", "Codex 正在等待你的选择。", true);
@@ -952,16 +976,22 @@ export class SyncRuntime implements FeishuRouterPort {
     return this.approvalService.waitFor(nonce);
   }
 
-  private async resolveRemoteRequest(request: PendingServerRequest, decision: string, answer?: string): Promise<void> {
+  private async resolveRemoteRequest(request: PendingServerRequest, decision: string, answers: readonly string[] = []): Promise<void> {
     const resolver = this.approvalService.take(request.nonce);
+    this.db.deleteSetting(this.userInputAnswersKey(request.nonce));
     if (!resolver) { this.db.setServerRequestStatus(request.nonce, "expired"); return; }
     const params = request.payload;
     let result: unknown;
     if (request.type === "user_input") {
-      const questions = Array.isArray(params.questions) ? params.questions.map((item) => this.asRecord(item)) : [];
-      const first = questions[0];
-      if (decision === "accept" && first) result = { answers: { [this.stringAt(first, "id") ?? "answer"]: { answers: [answer ?? "已确认"] } } };
-      else result = { answers: {} };
+      // One answer list per question id; declining sends no answers at all.
+      const answered: Record<string, { answers: string[] }> = {};
+      if (decision === "accept") {
+        this.userInputQuestions(request).forEach((question, index) => {
+          const answer = answers[index];
+          if (answer) answered[question.id] = { answers: [answer] };
+        });
+      }
+      result = { answers: answered };
     } else if (request.type === "permissions") {
       result = decision === "accept" || decision === "acceptForSession"
         ? { permissions: Array.isArray(params.permissions) ? params.permissions : [], scope: decision === "acceptForSession" ? "session" : "turn" }
@@ -974,7 +1004,53 @@ export class SyncRuntime implements FeishuRouterPort {
     this.db.setServerRequestStatus(request.nonce, decision === "decline" ? "declined" : "resolved");
     if (request.turnId) { const task = this.db.taskForTurn(request.turnId); if (task) this.db.transitionTask(task.id, "running"); }
     resolver(result);
-    if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", decision === "accept" || decision === "acceptForSession" ? "已批准。" : "已拒绝或取消。", decision === "accept" || decision === "acceptForSession"));
+    const accepted = decision === "accept" || decision === "acceptForSession";
+    const detail = request.type === "user_input"
+      ? accepted ? "回答已提交，Codex 在本轮内继续。" : "未回答，Codex 在本轮内继续。"
+      : accepted ? "已批准。" : "已拒绝或取消。";
+    if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", detail, accepted));
+  }
+
+  private userInputAnswersKey(nonce: string): string { return `remote_input.${nonce}.answers`; }
+
+  /** Questions of a native Codex input request, as sanitized into the stored payload. */
+  private userInputQuestions(request: PendingServerRequest): ChoiceQuestion[] {
+    const questions = Array.isArray(request.payload.questions) ? request.payload.questions : [];
+    return questions.map((item, index) => {
+      const question = this.asRecord(item);
+      const options = Array.isArray(question.options) ? question.options.flatMap((option) => {
+        const value = this.asRecord(option);
+        return typeof value.label === "string" ? [{ label: value.label, description: typeof value.description === "string" ? value.description : "" }] : [];
+      }) : [];
+      return { id: this.stringAt(question, "id") ?? `question_${index + 1}`, header: this.stringAt(question, "header") ?? "问题", question: this.stringAt(question, "question") ?? "", options };
+    });
+  }
+
+  /** Answers already given to the earlier questions of a multi-question request. */
+  private userInputAnswers(nonce: string): string[] {
+    try {
+      const value = JSON.parse(this.db.getSetting(this.userInputAnswersKey(nonce)) ?? "[]") as unknown;
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    } catch { return []; }
+  }
+
+  private liveUserInputRequest(nonce: string, openId: string, chatId: string): PendingServerRequest | null {
+    const request = this.db.getServerRequest(nonce);
+    return request?.type === "user_input" && request.status === "pending" && request.openId === openId && request.chatId === chatId
+      && request.epoch === this.appServer?.appServerEpoch && request.expiresAt > Date.now() ? request : null;
+  }
+
+  /** Records one more answer; the last one submits every answer to Codex within the same turn. */
+  private answerUserInput(request: PendingServerRequest, answers: string[], openId: string, chatId: string): CardDefinition {
+    const questions = this.userInputQuestions(request);
+    if (answers.length < questions.length) {
+      this.db.setSetting(this.userInputAnswersKey(request.nonce), JSON.stringify(answers));
+      return remoteQuestionCard(request.nonce, questions, answers.length);
+    }
+    const claimed = this.db.claimServerRequest(request.nonce, openId, chatId, this.appServer?.appServerEpoch ?? -1);
+    if (!claimed) return errorCard("该 Codex 问题已过期或已被处理。");
+    void this.resolveRemoteRequest(claimed, "accept", answers).catch((error) => this.db.recordFailure("remote_input", { nonce: claimed.nonce }, error));
+    return remoteRequestResolvedCard("回答已提交", "Codex 正在本轮内继续处理。");
   }
 
   private async onAppServerNotification(message: JsonRpcMessage): Promise<void> {
@@ -1132,16 +1208,29 @@ export class SyncRuntime implements FeishuRouterPort {
 
   private choiceKey(sessionId: string): string { return `choice.${sessionId}`; }
 
-  private promptKey(sessionId: string, prompt: string): string { return `prompt.${sessionId}.${textHash(prompt)}`; }
+  private promptKey(sessionId: string, prompt: string): string { return `prompt.${sessionId}.${textHash(prompt.trim())}`; }
 
+  /** Marks text that is already visible in the topic so its JSONL copy is not posted again. */
   private queuePendingPrompt(sessionId: string, prompt: string, feishuMessageId: string): void {
     const key = this.promptKey(sessionId, prompt);
     const raw = this.db.getSetting(key);
     let pending: Array<{ messageId: string; expiresAt: number }> = [];
     try { if (raw) pending = JSON.parse(raw) as typeof pending; } catch { /* replace malformed state */ }
     pending = pending.filter((item) => item.expiresAt > Date.now());
-    pending.push({ messageId: feishuMessageId, expiresAt: Date.now() + PENDING_PROMPT_TTL_MS });
+    pending.push({ messageId: feishuMessageId, expiresAt: Date.now() + INBOUND_MIRROR_TTL_MS });
     this.db.setSetting(key, JSON.stringify(pending));
+  }
+
+  /** Withdraws a marker when Codex rejected the input, so a later identical message is still shown. */
+  private dropPendingPrompt(sessionId: string, prompt: string, feishuMessageId: string): void {
+    const key = this.promptKey(sessionId, prompt);
+    const raw = this.db.getSetting(key);
+    if (!raw) return;
+    try {
+      const pending = (JSON.parse(raw) as Array<{ messageId: string; expiresAt: number }>)
+        .filter((item) => item.expiresAt > Date.now() && item.messageId !== feishuMessageId);
+      if (pending.length) this.db.setSetting(key, JSON.stringify(pending)); else this.db.deleteSetting(key);
+    } catch { this.db.deleteSetting(key); }
   }
 
   private consumePendingPrompt(sessionId: string, prompt: string): string | null {
@@ -1193,6 +1282,55 @@ export class SyncRuntime implements FeishuRouterPort {
     this.db.deleteSetting(this.choiceKey(state.request.sessionId));
     return { complete: true, prompt: state.request.questions.map((item, index) =>
       `问题：${item.question}\n我的回答：${state.answers[index] ?? ""}`).join("\n\n") };
+  }
+
+  private pendingChoices(sessionId: string): PendingChoiceState[] {
+    const states = new Map<string, PendingChoiceState>();
+    for (const raw of [...this.db.listChoices(sessionId).map((row) => row.payload), this.db.getSetting(this.choiceKey(sessionId))]) {
+      if (!raw) continue;
+      try {
+        const state = JSON.parse(raw) as PendingChoiceState;
+        if (typeof state.request?.id === "string") states.set(state.request.id, state);
+      } catch { /* getPendingChoice removes malformed entries */ }
+    }
+    return [...states.values()];
+  }
+
+  private closePendingChoice(sessionId: string, requestId: string): void {
+    this.db.deleteChoice(requestId);
+    const raw = this.db.getSetting(this.choiceKey(sessionId));
+    let current: string | undefined;
+    try { current = raw ? (JSON.parse(raw) as PendingChoiceState).request?.id : undefined; } catch { current = requestId; }
+    if (current === requestId) this.db.deleteSetting(this.choiceKey(sessionId));
+  }
+
+  private choiceTaskPrefix(sessionId: string): string { return `choice_task.${sessionId}.`; }
+
+  /**
+   * Closes question cards that another frontend already handled, and withdraws a
+   * queued Feishu answer when the terminal answered first or moved on locally.
+   */
+  private async settleChoices(sessionId: string, rootId: string, answeredCallIds: ReadonlySet<string>, latestUserAtMs: number, latestLocalUserAtMs: number): Promise<void> {
+    for (const state of this.pendingChoices(sessionId)) {
+      if (!answeredCallIds.has(state.request.id) && !(latestUserAtMs > Date.parse(state.request.timestamp))) continue;
+      this.closePendingChoice(sessionId, state.request.id);
+      const cardMessageId = this.db.getMessage(state.request.id)?.feishuMessageId;
+      if (cardMessageId) await this.feishu.updateCard(cardMessageId, choiceResolvedElsewhereCard()).catch((error) => this.db.recordFailure("choice_settled_card", { sessionId }, error));
+    }
+    for (const { key, value } of this.db.listSettings(this.choiceTaskPrefix(sessionId))) {
+      let link: { taskId?: unknown; requestId?: unknown; timestamp?: unknown } = {};
+      try { link = JSON.parse(value) as typeof link; } catch { /* malformed links are dropped below */ }
+      const task = typeof link.taskId === "string" ? this.db.getTask(link.taskId) : null;
+      // Only an answer that has not started yet can be withdrawn; other links are stale.
+      if (!task || (task.status !== "pending" && task.status !== "awaiting_writer") || typeof link.requestId !== "string" || typeof link.timestamp !== "string") {
+        this.db.deleteSetting(key);
+        continue;
+      }
+      if (!answeredCallIds.has(link.requestId) && !(latestLocalUserAtMs > Date.parse(link.timestamp))) continue;
+      this.db.deleteSetting(key);
+      await this.taskScheduler.cancel({ kind: "task", taskId: task.id }, "question was handled in another Codex frontend");
+      await this.updateRunCard(sessionId, rootId, "已取消", "这个问题已在终端处理，你在飞书里的回答没有发送。", false);
+    }
   }
 
   private optionAnswer(state: PendingChoiceState, value: unknown): string | null {
@@ -1287,7 +1425,7 @@ export class SyncRuntime implements FeishuRouterPort {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
-      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_guidance", "unarchive_confirm", "unarchive_cancel"].includes(event.action)) {
+      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_answer", "remote_guidance", "unarchive_confirm", "unarchive_cancel"].includes(event.action)) {
         return { delivery: "reply", rootMessageId: rootCardSession.rootMessageId,
           card: errorCard("此会话话题默认用于继续对话；新建、搜索和服务管理请在群主消息或控制台中操作。") };
       }
@@ -1507,6 +1645,16 @@ export class SyncRuntime implements FeishuRouterPort {
           void this.resolveRemoteRequest(request, decision).catch((error) => this.db.recordFailure("remote_request_response", { nonce }, error));
           return { delivery: "replace", card: remoteRequestResolvedCard("正在提交", "已向 Codex 提交你的决定。") };
         }
+        case "remote_answer": {
+          const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
+          const request = this.liveUserInputRequest(nonce, event.openId, event.chatId);
+          if (!request) return errorCard("该 Codex 问题已过期、已回答或不属于当前用户。");
+          const answers = this.userInputAnswers(nonce);
+          if (Number(event.value.questionIndex) !== answers.length) return errorCard("该问题已经回答，请使用最新的问题卡片。");
+          const option = this.userInputQuestions(request)[answers.length]?.options[Number(event.value.optionIndex ?? event.option)];
+          if (!option) return errorCard("选项无效，请使用最新的问题卡片。");
+          return { delivery: "replace", card: this.answerUserInput(request, [...answers, option.label], event.openId, event.chatId) };
+        }
         case "remote_guidance": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const request = this.db.getServerRequest(nonce);
@@ -1586,11 +1734,14 @@ export class SyncRuntime implements FeishuRouterPort {
     const sessionInTopic = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const slashCommand = !sessionInTopic && command.startsWith("/");
     if (message.chatType === "group" && !message.mentionedBot && !sessionInTopic && !slashCommand) return;
+    // Plain-word shortcuts are bridge commands only in the group's main timeline.
+    // Inside a mapped session topic every non-slash message belongs to Codex, as
+    // it would in the terminal; only explicit slash commands reach the bridge.
+    const isCommand = (slash: readonly string[], words: readonly string[] = []) =>
+      slash.includes(normalized) || (!sessionInTopic && words.includes(normalized));
     if (normalized === "/") { await this.respondCard(message, commandMenuCard()); return; }
-    if (["/help", "help", "帮助", "?", "？", "/home", "控制台"].includes(normalized)) {
-      await this.respondCard(message, normalized === "/help" || normalized === "help" || normalized === "帮助" || normalized === "?" || normalized === "？" ? helpCard() : homeCard(this.cardStatus()));
-      return;
-    }
+    if (isCommand(["/help"], ["help", "帮助", "?", "？"])) { await this.respondCard(message, helpCard()); return; }
+    if (isCommand(["/home"], ["控制台"])) { await this.respondCard(message, homeCard(this.cardStatus())); return; }
     if (!sessionInTopic && ["新建", "/new"].includes(normalized)) {
       await this.respondCard(message, this.projectCard(this.beginNewWizard(message.senderOpenId, message.chatId)));
       return;
@@ -1599,30 +1750,30 @@ export class SyncRuntime implements FeishuRouterPort {
       await this.respondCard(message, this.projectCard(this.beginNewWizard(message.senderOpenId, message.chatId)));
       return;
     }
-    if (["会话", "最近", "/sessions"].includes(normalized)) { await this.respondCard(message, this.recentCard()); return; }
+    if (isCommand(["/sessions"], ["会话", "最近"])) { await this.respondCard(message, this.recentCard()); return; }
     if (normalized === "/search" || normalized.startsWith("/search ")) {
       const query = [...command.slice(7).trim()].slice(0, 120).join("");
       await this.respondCard(message, this.recentCard(query));
       return;
     }
-    if (["状态", "/status"].includes(normalized)) { await this.respondCard(message, homeCard(this.cardStatus())); return; }
-    if (["同步", "/sync"].includes(normalized)) {
+    if (isCommand(["/status"], ["状态"])) { await this.respondCard(message, homeCard(this.cardStatus())); return; }
+    if (isCommand(["/sync"], ["同步"])) {
       await this.respondCard(message, homeCard(this.cardStatus(), "已启动全量扫描"));
       void this.syncAll();
       return;
     }
-    if (["暂停", "/pause"].includes(normalized)) {
+    if (isCommand(["/pause"], ["暂停"])) {
       this.db.setSetting("sync.paused", "1");
       await this.respondCard(message, homeCard(this.cardStatus(), "同步已暂停"));
       return;
     }
-    if (["恢复", "/resume-sync"].includes(normalized)) {
+    if (isCommand(["/resume-sync"], ["恢复"])) {
       this.db.setSetting("sync.paused", "0");
       await this.respondCard(message, homeCard(this.cardStatus(), "同步已恢复"));
       void this.syncAll();
       return;
     }
-    if (["重试", "/retry"].includes(normalized)) {
+    if (isCommand(["/retry"], ["重试"])) {
       this.messageLinkPermissionDenied = false;
       const modelsReady = await this.refreshModels();
       let appServerReady = true;
@@ -1635,7 +1786,7 @@ export class SyncRuntime implements FeishuRouterPort {
       void this.backfillSessionLinks();
       return;
     }
-    if (["取消", "/cancel"].includes(normalized)) {
+    if (isCommand(["/cancel"], ["取消"])) {
       if (!sessionInTopic && this.getWizard(message.senderOpenId)) {
         this.db.deleteSetting(this.wizardKey(message.senderOpenId, "new"));
         await this.respondCard(message, homeCard(this.cardStatus(), "已取消新建向导"));
@@ -1653,7 +1804,7 @@ export class SyncRuntime implements FeishuRouterPort {
       }
       return this.cancel(message);
     }
-    if (command === "/model" || command === "模型") {
+    if (command === "/model" || (!sessionInTopic && command === "模型")) {
       await this.startSessionModelWizard(message);
       return;
     }
@@ -1691,19 +1842,24 @@ export class SyncRuntime implements FeishuRouterPort {
           await this.respondCard(message, remoteRequestResolvedCard("指导已提交", "已拒绝原命令，并尝试将你的说明发送给当前 Codex 回合。"));
           void (async () => {
             await this.resolveRemoteRequest(claimed, "decline");
-            if (claimed.turnId && this.appServer) await this.appServer.request("turn/steer", { threadId: claimed.sessionId, expectedTurnId: claimed.turnId, input: [{ type: "text", text: command }] });
+            if (!claimed.turnId || !this.appServer) return;
+            this.queuePendingPrompt(claimed.sessionId, command, message.messageId);
+            try { await this.appServer.request("turn/steer", { threadId: claimed.sessionId, expectedTurnId: claimed.turnId, input: [{ type: "text", text: command }] }); }
+            catch (error) { this.dropPendingPrompt(claimed.sessionId, command, message.messageId); throw error; }
           })().catch((error) => this.db.recordFailure("remote_guidance", { nonce: claimed.nonce }, error));
           return;
         }
       }
       const remoteInput = session ? this.db.nextServerRequest(session.sessionId, "user_input") : null;
-      if (remoteInput && command) {
-        const claimed = this.db.claimServerRequest(remoteInput.nonce, message.senderOpenId, message.chatId, this.appServer?.appServerEpoch ?? -1);
-        if (claimed) {
-          await this.respondCard(message, remoteRequestResolvedCard("输入已提交", "Codex 正在继续处理。"));
-          void this.resolveRemoteRequest(claimed, "accept", command).catch((error) => this.db.recordFailure("remote_input", { nonce: claimed.nonce }, error));
-          return;
-        }
+      const liveInput = remoteInput ? this.liveUserInputRequest(remoteInput.nonce, message.senderOpenId, message.chatId) : null;
+      if (liveInput && command) {
+        // A topic reply answers the current question; "2" picks the second option.
+        const answers = this.userInputAnswers(liveInput.nonce);
+        const options = this.userInputQuestions(liveInput)[answers.length]?.options ?? [];
+        const numeric = command.match(/^([1-9]\d*)$/);
+        const picked = numeric ? options[Number(numeric[1]) - 1] : undefined;
+        await this.respondCard(message, this.answerUserInput(liveInput, [...answers, picked?.label ?? command], message.senderOpenId, message.chatId));
+        return;
       }
       const pending = session ? this.getPendingChoice(session.sessionId) : null;
       if (pending && command) {
@@ -1958,7 +2114,8 @@ export class SyncRuntime implements FeishuRouterPort {
     };
   }
 
-  private async enqueueResumeTask(session: NonNullable<ReturnType<BridgeDatabase["getSession"]>>, message: IncomingFeishuMessage, prompt: string): Promise<void> {
+  /** Returns the queued task id, or null when nothing will run. */
+  private async enqueueResumeTask(session: NonNullable<ReturnType<BridgeDatabase["getSession"]>>, message: IncomingFeishuMessage, prompt: string): Promise<string | null> {
     const selectedModel = session.model ?? null;
     const selectedEffort = session.reasoningEffort ?? null;
     const configured = selectedModel !== null && selectedEffort !== null;
@@ -1969,14 +2126,15 @@ export class SyncRuntime implements FeishuRouterPort {
       expectedSessionId: session.sessionId, syncStatus: "none", lastSyncOffset: null, phase: "queued",
       taskFingerprint: taskFingerprint(session.cwd, prompt, configured ? selectedModel : null, configured ? selectedEffort : null, message.imageKeys),
     };
-    if (!this.db.enqueueTask(task)) return;
-    if (!session.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session root unavailable" }); return; }
+    if (!this.db.enqueueTask(task)) return null;
+    if (!session.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session root unavailable" }); return null; }
     await this.updateRunCard(session.sessionId, session.rootMessageId, "已排队", "消息已进入会话队列。", true);
     const status = this.db.getRunStatus(session.sessionId);
     this.db.attachTaskRunCard(task.id, status?.messageId ?? null);
-    if (session.lifecycle === "archived") { await this.placeTaskAwaitingUnarchive(this.db.getTask(task.id) ?? task, session.rootMessageId); return; }
-    if (session.lifecycle === "deleted" || session.lifecycle === "abandoned") { this.db.updateTask(task.id, "failed", { error: `session is ` }); return; }
+    if (session.lifecycle === "archived") { await this.placeTaskAwaitingUnarchive(this.db.getTask(task.id) ?? task, session.rootMessageId); return task.id; }
+    if (session.lifecycle === "deleted" || session.lifecycle === "abandoned") { this.db.updateTask(task.id, "failed", { error: `session is ${session.lifecycle}` }); return null; }
     void this.drainTaskQueue(session.sessionId);
+    return task.id;
   }
 
   private async executeResumeTask(task: QueuedTask): Promise<void> {
@@ -2216,9 +2374,17 @@ export class SyncRuntime implements FeishuRouterPort {
       collaborationMode: { mode, settings: { model: task.model ?? null, reasoning_effort: task.reasoningEffort ?? null, developer_instructions: null } },
     };
     this.db.updateTask(task.id, "starting_turn", { phase: "starting_turn" });
+    // A topic reply is already visible in Feishu, so its JSONL copy must not be
+    // posted again. A new-session prompt was typed outside the topic and stays.
+    const mirrored = task.kind === "resume";
+    if (mirrored) this.queuePendingPrompt(session.sessionId, task.prompt, task.sourceMessageId);
     let response: Record<string, unknown>;
     try { response = this.asRecord(await this.appServer.request("turn/start", params)); }
-    catch (error) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw error; }
+    catch (error) {
+      if (mirrored && !this.appServerOutcomeUncertain(error)) this.dropPendingPrompt(session.sessionId, task.prompt, task.sourceMessageId);
+      await Promise.all(imagePaths.map((path) => rm(path, { force: true })));
+      throw error;
+    }
     const turn = this.asRecord(response.turn);
     const turnId = this.stringAt(turn, "id") ?? this.stringAt(response, "turnId", "turn_id");
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
@@ -2262,6 +2428,7 @@ export class SyncRuntime implements FeishuRouterPort {
     const active = this.turnCoordinator.mutableTurn(session.sessionId);
     if (active && this.appServer) {
       const paths = await this.downloadImages(message, message.imageKeys);
+      this.queuePendingPrompt(session.sessionId, userPrompt, message.messageId);
       try {
         await this.appServer.request("turn/steer", { threadId: session.sessionId, expectedTurnId: active.turnId,
           input: [{ type: "text", text: userPrompt }, ...paths.map((path) => ({ type: "localImage", path }))] });
@@ -2269,6 +2436,7 @@ export class SyncRuntime implements FeishuRouterPort {
         await this.respond(message, "已发送给当前 Codex 回合。");
         return;
       } catch (error) {
+        this.dropPendingPrompt(session.sessionId, userPrompt, message.messageId);
         await Promise.all(paths.map((path) => rm(path, { force: true })));
         console.warn("turn/steer unavailable; queueing next turn", error);
       }
@@ -2293,10 +2461,19 @@ export class SyncRuntime implements FeishuRouterPort {
     }
     try { await resolveAllowedPath(session.cwd, this.config.allowedRoot); }
     catch (error) { await this.feishu.replyText(state.rootId, `会话目录被拒绝：${String(error)}`); return; }
-    await this.enqueueResumeTask(session, {
+    // The terminal cannot receive this answer inside its waiting turn, so it is
+    // sent as a new message once the terminal releases the session.
+    const terminalWaiting = await this.hasLocalActiveSession(session);
+    const taskId = await this.enqueueResumeTask(session, {
       messageId: sourceMessageId, chatId: this.boundChatId() ?? "", chatType: "group", rootId: state.rootId,
       senderOpenId: this.boundOpenId() ?? "", mentionedBot: true, text: answerPrompt, imageKeys: [],
     }, answerPrompt);
+    if (!taskId) return;
+    this.db.setSetting(this.choiceTaskPrefix(session.sessionId) + state.request.id,
+      JSON.stringify({ taskId, requestId: state.request.id, timestamp: state.request.timestamp }));
+    if (terminalWaiting) {
+      await this.feishu.replyText(state.rootId, "本机终端仍在运行这个会话。你的回答已排队，等终端结束这一轮或关闭后发送；如果你先在终端回答了这个问题，这条回答会自动取消。");
+    }
   }
 
   private async cancel(message: IncomingFeishuMessage): Promise<void> {

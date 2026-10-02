@@ -1,5 +1,5 @@
 import { basename, relative } from "node:path";
-import type { CardDefinition, ChoiceRequest, ModelCapability, SessionMetadata } from "./types.js";
+import type { CardDefinition, ChoiceOption, ChoiceQuestion, ChoiceRequest, ModelCapability, SessionMetadata } from "./types.js";
 
 type SessionView = SessionMetadata & { rootMessageId: string | null; rootAppLink: string | null; chatId: string | null; threadId: string | null; sessionCardMessageId: string | null };
 
@@ -87,7 +87,7 @@ export function serviceCard(status: { paused: boolean; sessions: number; active:
 
 export function helpCard(): CardDefinition {
   return card("Codex 使用帮助", "wathet", [
-    markdown("**快捷工作流**\n点击“新建会话”，依次选择项目、模型、强度，然后在卡片或聊天中输入任务。\n\n在任一会话话题中直接回复即可继续，且无需 @ 机器人。修改该会话后续续聊的模型时，优先点击会话根卡的“修改模型”；`/model` 与 `/model <模型> <思考强度>` 是文字兜底，同样无需 @。\n\n群主消息中发送单独的 `/` 后会返回命令菜单；这是发送后的操作面板，不是飞书输入框的实时命令补全。会话搜索支持目录、首条用户消息和短会话 ID，多关键词按 AND 匹配。\n\n示例：`/search example-project`、`/search GUI Agent`、`/search 1a2b3c4d`。\n\n文字入口：`/new <目录> <任务>`、`/sessions`、`/search <关键词>`、`/help`、`/status`、`/sync`、`/pause`、`/resume-sync`、`/retry`、`/cancel`。"),
+    markdown("**快捷工作流**\n点击“新建会话”，依次选择项目、模型、强度，然后在卡片或聊天中输入任务。\n\n在任一会话话题中直接回复即可继续，且无需 @ 机器人。话题里只有 `/` 开头的命令由桥接处理，其他文字（包括“状态”“重试”这类单个词）都会发给 Codex。修改该会话后续续聊的模型时，优先点击会话根卡的“修改模型”；`/model` 与 `/model <模型> <思考强度>` 是文字兜底，同样无需 @。\n\n群主消息中发送单独的 `/` 后会返回命令菜单；这是发送后的操作面板，不是飞书输入框的实时命令补全。会话搜索支持目录、首条用户消息和短会话 ID，多关键词按 AND 匹配。\n\n示例：`/search example-project`、`/search GUI Agent`、`/search 1a2b3c4d`。\n\n文字入口：`/new <目录> <任务>`、`/sessions`、`/search <关键词>`、`/help`、`/status`、`/sync`、`/pause`、`/resume-sync`、`/retry`、`/cancel`。"),
     actionRow([button("返回控制台", "home", "primary"), button("新建会话", "new")]),
   ]);
 }
@@ -220,25 +220,52 @@ export function assistantMarkdownCard(text: string): CardDefinition { return car
 
 export function errorCard(message: string): CardDefinition { return card("操作失败", "red", [markdown(safeMarkdown(message)), actionRow([button("返回控制台", "home")])]); }
 
+/** Option buttons (or a Card 2.0 dropdown for long lists); `value` identifies the question. */
+function optionControls(options: ChoiceOption[], action: string, value: Record<string, unknown>, selectId: string, selectName: string): Record<string, unknown>[] {
+  if (options.length <= 3) {
+    return [actionRow(options.map((option, optionIndex) =>
+      button(`${optionIndex + 1}. ${option.label}`, action, optionIndex === 0 ? "primary" : "default", { ...value, optionIndex })))];
+  }
+  if (cardUiVersion === 2) {
+    return [{ tag: "select_static", element_id: selectId, name: selectName,
+      placeholder: plain("选择一个选项"), options: options.map((option, optionIndex) => ({ text: plain(`${optionIndex + 1}. ${option.label}`), value: String(optionIndex) })),
+      behaviors: [{ type: "callback", value: { action, ...value } }] }];
+  }
+  const rows: Record<string, unknown>[] = [];
+  for (let index = 0; index < options.length; index += 3) rows.push(actionRow(options.slice(index, index + 3).map((option, offset) =>
+    button(`${index + offset + 1}. ${option.label}`, action, index === 0 ? "primary" : "default", { ...value, optionIndex: index + offset }))));
+  return rows;
+}
+
+function questionDetails(question: ChoiceQuestion): Record<string, unknown>[] {
+  const details = question.options.map((option, index) => `${index + 1}. **${safeMarkdown(option.label)}**${option.description ? `：${safeMarkdown(option.description)}` : ""}`);
+  return [markdown(`**${safeMarkdown(question.header || "需要确认")}**\n\n${safeMarkdown(question.question)}`), ...(details.length ? [markdown(details.join("\n"))] : [])];
+}
+
+/** A question found in the local Codex log; the terminal may still be waiting for it. */
 export function choiceCard(request: ChoiceRequest, questionIndex: number): CardDefinition {
   const question = request.questions[questionIndex];
   if (!question) return errorCard("待选问题已失效。");
-  const optionRows: Record<string, unknown>[] = [];
-  if (question.options.length <= 3) {
-    optionRows.push(actionRow(question.options.map((option, optionIndex) =>
-      button(`${optionIndex + 1}. ${option.label}`, "choice_answer", optionIndex === 0 ? "primary" : "default", { requestId: request.id, sessionId: request.sessionId, questionIndex, optionIndex }))));
-  } else if (cardUiVersion === 2) {
-    optionRows.push({ tag: "select_static", element_id: `choice_${request.id}_${questionIndex}`, name: `choice_${questionIndex}`,
-      placeholder: plain("选择一个选项"), options: question.options.map((option, optionIndex) => ({ text: plain(`${optionIndex + 1}. ${option.label}`), value: String(optionIndex) })),
-      behaviors: [{ type: "callback", value: { action: "choice_answer", requestId: request.id, sessionId: request.sessionId, questionIndex } }] });
-  } else {
-    for (let index = 0; index < question.options.length; index += 3) optionRows.push(actionRow(question.options.slice(index, index + 3).map((option, offset) =>
-      button(`${index + offset + 1}. ${option.label}`, "choice_answer", index === 0 ? "primary" : "default", { requestId: request.id, sessionId: request.sessionId, questionIndex, optionIndex: index + offset }))));
-  }
-  const details = question.options.map((option, index) => `${index + 1}. **${safeMarkdown(option.label)}**${option.description ? `：${safeMarkdown(option.description)}` : ""}`);
-  return card(`Codex 等待你的选择 ${questionIndex + 1}/${request.questions.length}`, "orange", [markdown(`**${safeMarkdown(question.header || "需要确认")}**\n\n${safeMarkdown(question.question)}`), ...(details.length ? [markdown(details.join("\n"))] : []), ...optionRows,
-    actionRow([button("取消本次选择", "choice_cancel", "danger", { requestId: request.id, sessionId: request.sessionId })]), note(question.options.length ? "按钮不可用时，在本话题回复 1；也可以直接回复自定义答案。" : "请直接在本话题回复你的答案。")]);
+  const optionRows = optionControls(question.options, "choice_answer", { requestId: request.id, sessionId: request.sessionId, questionIndex },
+    `choice_${request.id}_${questionIndex}`, `choice_${questionIndex}`);
+  return card(`Codex 等待你的选择 ${questionIndex + 1}/${request.questions.length}`, "orange", [...questionDetails(question), ...optionRows,
+    actionRow([button("取消本次选择", "choice_cancel", "danger", { requestId: request.id, sessionId: request.sessionId })]),
+    note((question.options.length ? "按钮不可用时，在本话题回复 1；也可以直接回复自定义答案。" : "请直接在本话题回复你的答案。")
+      + "\n这个问题来自本机 Codex：终端还在等待时，请直接在终端回答，回答后这张卡会自动关闭；终端已关闭时，可以在这里回答，回答会作为一条新消息继续会话。")]);
 }
+
+/** A native question from a Feishu-started turn; answers return to Codex within the same turn. */
+export function remoteQuestionCard(nonce: string, questions: ChoiceQuestion[], questionIndex: number): CardDefinition {
+  const decline = actionRow([button("不回答", "remote_approve", "default", { nonce, decision: "decline" })]);
+  const question = questions[questionIndex];
+  if (!question) return card("Codex 等待你的输入", "orange", [markdown("Codex 请求输入，但没有可以显示的问题。"), decline]);
+  return card(`Codex 等待你的回答 ${questionIndex + 1}/${questions.length}`, "orange", [...questionDetails(question),
+    ...(question.options.length ? optionControls(question.options, "remote_answer", { nonce, questionIndex }, `answer_${++elementSequence}`, `answer_${questionIndex}`) : []),
+    decline,
+    note((question.options.length ? "也可以在本话题回复选项编号，或直接回复自定义答案。" : "请直接在本话题回复你的答案。") + "回答会在 Codex 当前这一轮内生效。")]);
+}
+
+export function choiceResolvedElsewhereCard(): CardDefinition { return card("问题已在其它地方处理", "grey", [note("Codex 已经收到回答或已继续对话；这张卡片不再接受回答。")]); }
 export function choiceCancelledCard(): CardDefinition { return card("选择已取消", "grey", [note("本次问题已关闭；Codex 不会继续执行。")]); }
 export function choiceAcceptedCard(answer: string, complete: boolean): CardDefinition { return card(complete ? "选择已提交" : "选择已记录", "green", [markdown(`你的回答：**${safeMarkdown(answer)}**`), note(complete ? "Codex 正在继续处理。" : "请继续回答下一项。")]); }
 

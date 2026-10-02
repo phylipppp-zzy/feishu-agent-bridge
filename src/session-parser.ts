@@ -5,6 +5,8 @@ interface ParsedBatch {
   metadata?: Omit<SessionMetadata, "path" | "firstUserText">;
   messages: VisibleMessage[];
   choiceRequests: ChoiceRequest[];
+  /** Tool call ids that already have an output, i.e. questions answered in some frontend. */
+  answeredCallIds: string[];
   carry: string;
   completedTurn: boolean;
   turnActive: boolean | undefined;
@@ -89,6 +91,7 @@ export function parseJsonlChunk(input: string, previousCarry = "", knownSessionI
   const carry = endsWithNewline ? "" : (lines.pop() ?? "");
   const messages: VisibleMessage[] = [];
   const choiceRequests: ChoiceRequest[] = [];
+  const answeredCallIds: string[] = [];
   const unknownTypes = new Set<string>();
   let metadata: ParsedBatch["metadata"];
   let sessionId = knownSessionId;
@@ -164,6 +167,10 @@ export function parseJsonlChunk(input: string, previousCarry = "", knownSessionI
         if (request) choiceRequests.push(request);
         continue;
       }
+      if (payload.type === "function_call_output" && typeof payload.call_id === "string") {
+        answeredCallIds.push(payload.call_id);
+        continue;
+      }
       if (payload.type !== "message" || !sessionId) continue;
       const role = payload.role;
       if (role !== "user" && role !== "assistant") continue;
@@ -193,6 +200,7 @@ export function parseJsonlChunk(input: string, previousCarry = "", knownSessionI
     ...(metadata ? { metadata } : {}),
     messages,
     choiceRequests,
+    answeredCallIds,
     carry,
     completedTurn,
     turnActive,
