@@ -4,6 +4,8 @@
 
 Maintainer design: [docs/design.md](docs/design.md)
 
+The repository also contains a read-only Feishu mirror of Claude Code sessions with its own Feishu app, private group and service; see [docs/claude.md](docs/claude.md) (Chinese).
+
 This service mirrors local Codex conversations from `~/.codex/sessions` into a private Feishu topic group and lets you continue each conversation from its corresponding topic. It is a Feishu front end for the local Codex CLI: it does not install a Feishu desktop client, open an HTTP port, or require a public callback URL. Messages and card actions arrive over a Feishu WebSocket long connection.
 
 ## What It Does

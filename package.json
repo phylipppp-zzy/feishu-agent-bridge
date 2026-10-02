@@ -12,11 +12,16 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/index.js",
     "start:container": "node scripts/container-start.mjs",
+    "start:claude": "node dist/src/claude/index.js",
     "dev": "tsx src/index.ts",
+    "dev:claude": "tsx src/claude/index.ts",
     "doctor": "node scripts/doctor.mjs",
     "doctor:container": "node scripts/doctor.mjs --container",
+    "doctor:claude": "node scripts/doctor-claude.mjs",
     "install:local": "node scripts/install.mjs",
+    "install:claude": "node scripts/install-claude.mjs",
     "rebind": "node scripts/rebind.mjs",
+    "uninstall:claude-hooks": "node scripts/uninstall-claude-hooks.mjs",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {

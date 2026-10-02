@@ -4,6 +4,8 @@
 
 维护者设计文档：[docs/design.md](docs/design.md)
 
+同一仓库还包含 Claude Code 会话的飞书只读镜像（独立的飞书应用、私密群和服务）：见 [docs/claude.md](docs/claude.md)。
+
 该服务把本机 `~/.codex/sessions` 中的 Codex 会话同步到飞书私密话题群，并允许从对应话题继续会话。它是本机 Codex CLI 的飞书前端，不安装飞书桌面客户端；消息事件和卡片按钮均由飞书 WebSocket 长连接接收，不需要公网回调地址。
 
 ## 当前能力
