@@ -159,10 +159,15 @@ export function archivedSessionActionCard(nonce: string, title: string): CardDef
   ]);
 }
 
-export function runStatusCard(state: string, detail: string, cancellable = false, sessionId?: string): CardDefinition {
-  return card("Codex 运行状态", state === "失败" ? "red" : state === "完成" ? "green" : "orange", [
+/** `resendTurnId`: the turn whose result did not reach Feishu; the card offers to send it again without running anything. */
+export function runStatusCard(state: string, detail: string, cancellable = false, sessionId?: string, resendTurnId?: string): CardDefinition {
+  const actions = [
+    ...(cancellable ? [button("取消任务", "cancel_run", "danger", sessionId ? { sessionId } : {})] : []),
+    ...(resendTurnId ? [button("重发结果", "resend_result", "primary", { turnId: resendTurnId })] : []),
+  ];
+  return card("Codex 运行状态", state === "失败" || state === "结果发送失败" || state === "取消失败" ? "red" : state === "完成" ? "green" : "orange", [
     markdown(`状态：**${safeMarkdown(state)}**\n${safeMarkdown(detail || "等待 Codex 输出")}`),
-    ...(cancellable ? [actionRow([button("取消任务", "cancel_run", "danger", sessionId ? { sessionId } : {})])] : []),
+    ...(actions.length ? [actionRow(actions)] : []),
   ]);
 }
 

@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { FileCursor, PendingServerRequest, QueuedTask, SessionMetadata, TaskRootGrant, TurnState } from "./types.js";
+import type { FileCursor, PendingServerRequest, QueuedTask, SessionMetadata, TaskRootGrant, TurnOutput, TurnState } from "./types.js";
 
 
 export class BridgeDatabase {
@@ -143,6 +143,13 @@ export class BridgeDatabase {
       stream_json TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS turn_runs_session_state ON turn_runs(session_id,state);
+    CREATE TABLE IF NOT EXISTS turn_outputs (
+      turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, root_message_id TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, content TEXT NOT NULL,
+      card_status TEXT NOT NULL CHECK(card_status IN ('pending','sent','failed','uncertain')), card_message_id TEXT,
+      file_status TEXT NOT NULL CHECK(file_status IN ('none','pending','sent','failed','uncertain')), file_message_id TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS turn_outputs_open ON turn_outputs(card_status,file_status);
     CREATE TABLE IF NOT EXISTS app_server_deliveries (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, role TEXT NOT NULL, started_at_ms INTEGER, ended_at_ms INTEGER, content_hash TEXT NOT NULL, content_bytes INTEGER NOT NULL DEFAULT 0, feishu_message_id TEXT, source_message_id TEXT, source_path TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY(session_id,turn_id,role));
     CREATE INDEX IF NOT EXISTS app_server_deliveries_hash ON app_server_deliveries(session_id,role,content_hash);
     CREATE TABLE IF NOT EXISTS turn_items (
@@ -944,8 +951,47 @@ export class BridgeDatabase {
       .run(retryable ? "retryable_failed" : "permanent_failed", error instanceof Error ? error.message : String(error), Date.now(), eventId, this.serviceEpoch, claimToken ?? null, claimToken ?? null);
   }
 
+  /** Keeps a finished turn's output until Feishu has it; an existing record is left as it is. */
+  saveTurnOutput(output: Pick<TurnOutput, "turnId" | "sessionId" | "rootMessageId" | "title" | "summary" | "content"> & { needsFile: boolean }): void {
+    this.db.prepare(`INSERT INTO turn_outputs(turn_id,session_id,root_message_id,title,summary,content,card_status,file_status,created_at_ms,updated_at_ms)
+      VALUES(?,?,?,?,?,?,'pending',?,?,?) ON CONFLICT(turn_id) DO NOTHING`)
+      .run(output.turnId, output.sessionId, output.rootMessageId, output.title, output.summary, output.content, output.needsFile ? "pending" : "none", Date.now(), Date.now());
+  }
+
+  getTurnOutput(turnId: string): TurnOutput | null {
+    const row = this.db.prepare("SELECT * FROM turn_outputs WHERE turn_id=?").get(turnId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return { turnId: String(row.turn_id), sessionId: String(row.session_id), rootMessageId: String(row.root_message_id), title: String(row.title),
+      summary: String(row.summary), content: String(row.content), cardStatus: String(row.card_status) as TurnOutput["cardStatus"],
+      cardMessageId: row.card_message_id ? String(row.card_message_id) : null, fileStatus: String(row.file_status) as TurnOutput["fileStatus"],
+      fileMessageId: row.file_message_id ? String(row.file_message_id) : null, attempts: Number(row.attempts), lastError: row.last_error ? String(row.last_error) : null };
+  }
+
+  /** Records one delivery attempt; once card and file are both sent the stored text is dropped. */
+  updateTurnOutput(turnId: string, update: { cardStatus: TurnOutput["cardStatus"]; cardMessageId: string | null; fileStatus: TurnOutput["fileStatus"]; fileMessageId: string | null; error: string | null }): void {
+    const done = update.cardStatus === "sent" && (update.fileStatus === "sent" || update.fileStatus === "none");
+    this.db.prepare(`UPDATE turn_outputs SET card_status=?,card_message_id=COALESCE(?,card_message_id),file_status=?,file_message_id=COALESCE(?,file_message_id),
+      attempts=attempts+1,last_error=?,content=CASE WHEN ? THEN '' ELSE content END,updated_at_ms=? WHERE turn_id=?`)
+      .run(update.cardStatus, update.cardMessageId, update.fileStatus, update.fileMessageId, update.error, done ? 1 : 0, Date.now(), turnId);
+  }
+
+  /** Outputs never tried, for example because the service stopped while sending them. */
+  pendingTurnOutputs(): TurnOutput[] {
+    return (this.db.prepare("SELECT turn_id FROM turn_outputs WHERE card_status='pending' OR file_status='pending'").all() as Array<{ turn_id: string }>)
+      .flatMap((row) => { const output = this.getTurnOutput(row.turn_id); return output ? [output] : []; });
+  }
+
+  /** Whether a logged assistant message belongs to a bridge turn whose output has not yet reached Feishu. */
+  hasUndeliveredTurnOutput(sessionId: string, contentHash: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM turn_outputs o WHERE o.session_id=? AND o.card_status<>'sent' AND (
+        EXISTS(SELECT 1 FROM turn_items i WHERE i.turn_id=o.turn_id AND i.kind='agentMessage' AND json_extract(i.payload,'$.assistantTextHash')=?)
+        OR EXISTS(SELECT 1 FROM app_server_deliveries d WHERE d.turn_id=o.turn_id AND d.role='assistant' AND d.content_hash=?)) LIMIT 1`).get(sessionId, contentHash, contentHash);
+    return Boolean(row);
+  }
+
   pruneRetainedData(now = Date.now()): void {
     const day = 24 * 60 * 60 * 1_000;
+    this.db.prepare("DELETE FROM turn_outputs WHERE updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM task_queue WHERE status IN ('completed','failed','cancelled','interrupted','expired') AND updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM turn_runs WHERE state IN ('completed','failed','interrupted') AND updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM app_server_deliveries WHERE updated_at_ms<?").run(now - 30 * day);

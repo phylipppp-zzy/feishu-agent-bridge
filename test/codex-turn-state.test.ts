@@ -16,7 +16,7 @@ async function withHome(prefix: string, work: (home: string) => Promise<void>): 
 
 // F04 ------------------------------------------------------------------------------------------
 
-test("F04: a message Codex accepted into the running turn is not queued again when the Feishu confirmation fails", () => withHome("codex-steer-ack-", async (home) => {
+test("F04: a message Codex accepted into the running turn is not queued again when the Feishu confirmation fails", { timeout: 10_000 }, () => withHome("codex-steer-ack-", async (home) => {
   const app = fakeAppServer(turnStart);
   const env = await importedSession(home, app.server);
   await startTurn(env);
@@ -42,7 +42,7 @@ test("F04: a message Codex accepted into the running turn is not queued again wh
   await shutdown(env);
 }));
 
-test("F04: a refused message runs once in the next turn, and an unanswered one is not resubmitted", () => withHome("codex-steer-refused-", async (home) => {
+test("F04: a refused message runs once in the next turn, and an unanswered one is not resubmitted", { timeout: 10_000 }, () => withHome("codex-steer-refused-", async (home) => {
   let steer: () => unknown = () => new Error("turn already completed: expectedTurnId does not match");
   const app = fakeAppServer((method) => method === "turn/steer" ? steer() : turnStart(method));
   const env = await importedSession(home, app.server);
@@ -66,7 +66,7 @@ test("F04: a refused message runs once in the next turn, and an unanswered one i
 
 // F05 ------------------------------------------------------------------------------------------
 
-test("F05: a refused interrupt leaves the turn running, with its images, and says the cancellation failed", () => withHome("codex-cancel-refused-", async (home) => {
+test("F05: a refused interrupt leaves the turn running, with its images, and says the cancellation failed", { timeout: 10_000 }, () => withHome("codex-cancel-refused-", async (home) => {
   const app = fakeAppServer((method) => method === "turn/interrupt" ? new Error("interrupt rejected by Codex") : turnStart(method));
   const env = await importedSession(home, app.server);
   await startTurn(env);
@@ -86,7 +86,7 @@ test("F05: a refused interrupt leaves the turn running, with its images, and say
   await shutdown(env);
 }));
 
-test("F05: an accepted interrupt ends the turn only when Codex says so; repeats and new messages wait", () => withHome("codex-cancel-accepted-", async (home) => {
+test("F05: an accepted interrupt ends the turn only when Codex says so; repeats and new messages wait", { timeout: 10_000 }, () => withHome("codex-cancel-accepted-", async (home) => {
   const app = fakeAppServer(turnStart);
   const env = await importedSession(home, app.server);
   await startTurn(env);
@@ -106,7 +106,7 @@ test("F05: an accepted interrupt ends the turn only when Codex says so; repeats 
   await shutdown(env);
 }));
 
-test("F05: a turn that finishes on its own while being cancelled keeps its real result", () => withHome("codex-cancel-race-", async (home) => {
+test("F05: a turn that finishes on its own while being cancelled keeps its real result", { timeout: 10_000 }, () => withHome("codex-cancel-race-", async (home) => {
   const app = fakeAppServer(turnStart);
   const env = await importedSession(home, app.server);
   await startTurn(env);
@@ -184,7 +184,7 @@ const question = { id: "scope", header: "范围", question: "处理哪些内容�
 const userInput = (id: number, extra: Record<string, unknown> = {}) => ({ jsonrpc: "2.0" as const, id, method: "item/tool/requestUserInput",
   params: { threadId: SESSION_ID, turnId: "turn-1", itemId: `call-${id}`, questions: [question], ...extra } });
 
-test("F06: an answer given while the run card is still updating reaches Codex", () => withHome("codex-request-early-", async (home) => {
+test("F06: an answer given while the run card is still updating reaches Codex", { timeout: 10_000 }, () => withHome("codex-request-early-", async (home) => {
   const app = fakeAppServer(turnStart);
   const env = await importedSession(home, app.server);
   await startTurn(env);
@@ -203,7 +203,7 @@ test("F06: an answer given while the run card is still updating reaches Codex", 
   await shutdown(env);
 }));
 
-test("F06: an unanswered request is declined when its time is up, and a request whose card cannot be shown fails at once", () => withHome("codex-request-timeout-", async (home) => {
+test("F06: an unanswered request is declined when its time is up, and a request whose card cannot be shown fails at once", { timeout: 10_000 }, () => withHome("codex-request-timeout-", async (home) => {
   const app = fakeAppServer(turnStart);
   const env = await importedSession(home, app.server);
   await startTurn(env);
@@ -220,7 +220,7 @@ test("F06: an unanswered request is declined when its time is up, and a request 
   await shutdown(env);
 }));
 
-test("F06: a request Codex withdraws stops waiting, and a late answer finds nothing", () => withHome("codex-request-withdrawn-", async (home) => {
+test("F06: a request Codex withdraws stops waiting, and a late answer finds nothing", { timeout: 10_000 }, () => withHome("codex-request-withdrawn-", async (home) => {
   const app = fakeAppServer(turnStart);
   const env = await importedSession(home, app.server);
   await startTurn(env);
