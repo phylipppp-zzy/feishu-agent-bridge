@@ -1421,6 +1421,13 @@ export class SyncRuntime implements FeishuRouterPort {
     catch (error) { this.db.failInboundEvent(eventId, error, isRetryableTransportError(error), claimToken); throw error; }
   }
 
+  /** The session a button names; copies of a root card further down its topic carry it. */
+  private sessionFromCard(event: IncomingCardAction): ReturnType<BridgeDatabase["getSessionByRoot"]> {
+    const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
+    const session = sessionId ? this.db.getSession(sessionId) : null;
+    return session?.rootMessageId ? this.db.getSessionByRoot(session.rootMessageId) : null;
+  }
+
   async handleCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
@@ -1555,7 +1562,7 @@ export class SyncRuntime implements FeishuRouterPort {
           return { delivery: "replace", card: runStatusCard("已提交", "正在创建 Codex 会话。") };
         }
         case "session_model": {
-          const root = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          const root = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
           if (!root) return errorCard("请在对应会话话题内使用“修改模型”。");
           if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重试。");
           const wizard = this.saveWizard(event.openId, { id: randomUUID(), mode: "session", chatId: event.chatId, rootId: root.rootMessageId, sessionId: root.sessionId, expiresAt: 0 });
@@ -1566,13 +1573,13 @@ export class SyncRuntime implements FeishuRouterPort {
           return { delivery: "replace", card };
         }
         case "session_status": {
-          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
           if (!session) return errorCard("请在对应会话话题内刷新状态。");
           const card = sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续");
           return event.openMessageId === session.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: session.rootMessageId, card };
         }
         case "session_toggle_mode": {
-          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
           if (!session) return errorCard("请在对应会话话题内切换模式。");
           if (this.turnCoordinator.hasActiveTurn(session.sessionId) || (session.rootMessageId && this.db.runningTaskForRoot(session.rootMessageId))) return errorCard("当前回合正在运行；请完成或取消后再切换模式。");
           const mode = session.collaborationMode === "plan" ? "default" : "plan";
@@ -1583,7 +1590,7 @@ export class SyncRuntime implements FeishuRouterPort {
         }
         case "cancel_run": {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
-          const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
           if (!session) return errorCard("当前会话没有可取消的桥接任务。");
           const cancelled = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
           if (!this.turnCoordinator.hasActiveTurn(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
@@ -1631,7 +1638,7 @@ export class SyncRuntime implements FeishuRouterPort {
         case "root_revoke": return errorCard("Root 授权是一次性任务授权，无会话级权限可撤销。");
 
         case "turn_review": {
-          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId);
+          const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
           if (!session) return errorCard("当前会话不可用。");
           const turn = this.db.activeTurn(session.sessionId);
           const latest = turn ?? this.db.latestTurn(session.sessionId) ?? (this.turnCoordinator.mutableTurn(session.sessionId) ?? null);
@@ -1739,6 +1746,11 @@ export class SyncRuntime implements FeishuRouterPort {
     // it would in the terminal; only explicit slash commands reach the bridge.
     const isCommand = (slash: readonly string[], words: readonly string[] = []) =>
       slash.includes(normalized) || (!sessionInTopic && words.includes(normalized));
+    if (normalized === "/" && sessionInTopic) {
+      // The session's root card again at the bottom of the topic, so a long topic need not be scrolled back up.
+      await this.respondCard(message, sessionCard(this.sessionView(sessionInTopic), this.turnCoordinator.hasActiveTurn(sessionInTopic.sessionId) ? "运行中" : "可继续"));
+      return;
+    }
     if (normalized === "/") { await this.respondCard(message, commandMenuCard()); return; }
     if (isCommand(["/help"], ["help", "帮助", "?", "？"])) { await this.respondCard(message, helpCard()); return; }
     if (isCommand(["/home"], ["控制台"])) { await this.respondCard(message, homeCard(this.cardStatus())); return; }

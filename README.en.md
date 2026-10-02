@@ -164,7 +164,7 @@ This atomically changes future continuations. `/model` in a group root does not 
 
 In the bound private group, known slash commands do not need an `@bot`. A normal group-root prompt still must mention the bot. Send `/` by itself to display a panel with New, Search, Recent, Console, Service Management, and Help. Unknown `/xxx` commands only show that panel and never submit work to Codex.
 
-Inside a session topic only commands starting with `/` reach the bridge; every other message goes to Codex, as it would in the terminal. The plain-word shortcuts below (such as `status`, `retry`, or `pause` in Chinese) work only at the group root; inside a topic they are sent to Codex as ordinary messages.
+Inside a session topic, sending `/` by itself posts the session's root card again at the bottom of the topic (model, mode and turn review), so a long topic need not be scrolled back up. Only commands starting with `/` reach the bridge there; every other message goes to Codex, as it would in the terminal. The plain-word shortcuts below (such as `status`, `retry`, or `pause` in Chinese) work only at the group root; inside a topic they are sent to Codex as ordinary messages.
 
 - `/help`, `help`, `?`: show help.
 - `/`: show the command panel.

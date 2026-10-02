@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Asks Feishu to check every Claude bridge card without posting anything to a chat: each card is
+// Asks Feishu to check every card of the Claude and Codex bridges without posting anything to a chat: each card is
 // created as a CardKit card entity, which runs the same content checks as sending it (for example
 // the 1000-character input limit) but is never shown to anyone.
 // Feishu's CardKit accepts some properties a message would reject (such as an unknown property on a
@@ -12,8 +12,16 @@ import { configureCardUi } from "../dist/src/card-kit.js";
 import { parseEnvironment } from "../dist/src/installer.js";
 import { installSafeLogging } from "../dist/src/safe-log.js";
 import * as c from "../dist/src/claude/cards.js";
+import * as x from "../dist/src/cards.js";
 
-const env = parseEnvironment(await readFile(join(homedir(), ".config", "feishu-claude-bridge", "env"), "utf8"));
+// Any of the bridges' Feishu apps can create card entities; use whichever is configured here.
+async function readEnv() {
+  for (const name of ["feishu-claude-bridge", "feishu-codex-bridge"]) {
+    try { return parseEnvironment(await readFile(join(homedir(), ".config", name, "env"), "utf8")); } catch { /* try the next one */ }
+  }
+  throw new Error("没有找到 ~/.config/feishu-claude-bridge/env 或 ~/.config/feishu-codex-bridge/env。");
+}
+const env = await readEnv();
 installSafeLogging([env.FEISHU_APP_SECRET, env.FEISHU_BIND_TOKEN].filter(Boolean));
 configureCardUi(2);
 const client = new Lark.Client({ appId: env.FEISHU_APP_ID, appSecret: env.FEISHU_APP_SECRET, appType: Lark.AppType.SelfBuild,
@@ -64,6 +72,33 @@ const cards = {
   cleanupResult: c.claudeCleanupResultCard({ topics: 1, withdrawn: 2, kept: [{ title: "x", reason: "超时" }] }),
   notice: c.claudeNoticeCard("已新建会话", "目录：~/project"),
 };
+
+// Codex bridge cards.
+const codexModel = { slug: "gpt-test", displayName: "GPT Test", description: "测试模型", defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high"] };
+const codexQuestions = [{ id: "q1", header: "方案", question: "选择方案", options: [{ label: "一个很长的选项名称，用来检查按钮", description: "说明" }, { label: "B", description: "" }] }];
+const codexRequest = (count) => ({ id: "r", sessionId: "s", timestamp: new Date().toISOString(), expiresAt: Date.now() + 60_000,
+  questions: [{ ...codexQuestions[0], options: Array.from({ length: count }, (_, index) => ({ label: `选项 ${index + 1}`, description: "" })) }] });
+const codexSession = { cwd: join(home, "project"), firstUserText: "卡片检查", sessionId: "00000000-0000-4000-8000-000000000000", model: "gpt-test", reasoningEffort: "high" };
+Object.assign(cards, {
+  codexHome: x.homeCard({ paused: false, sessions: 3, active: 1, failures: 0 }),
+  codexHelp: x.helpCard(),
+  codexMenu: x.commandMenuCard("提示"),
+  codexProjects: x.projectsCard([{ cwd: dirs[1], count: 3 }, { cwd: dirs[0], count: 1 }], home, "w"),
+  codexModel: x.modelCard([codexModel], "w", "gpt-test", dirs[0], "session"),
+  codexEffort: x.reasoningEffortCard(codexModel, "w", dirs[0], "session"),
+  codexReady: x.wizardReadyCard(dirs[0], codexModel, "medium", "w"),
+  codexRecent: x.recentSessionsCard([{ sessionId: "s", path: "/dev/null", cwd: dirs[0], startedAt: new Date().toISOString(), source: "cli", firstUserText: "检查",
+    rootMessageId: "r", rootAppLink: "https://applink.feishu.cn/x", chatId: "c", threadId: "t", sessionCardMessageId: null }]),
+  codexSession: x.sessionCard(codexSession),
+  codexRun: x.runStatusCard("运行中", "正在执行", true, "s"),
+  codexChoice: x.choiceCard({ ...codexRequest(2), questions: codexQuestions }, 0),
+  codexChoiceMany: x.choiceCard(codexRequest(5), 0),
+  codexQuestion: x.remoteQuestionCard("n", codexQuestions, 0),
+  codexRootGrant: x.rootGrantCard("n", "/work", "修复部署脚本", Date.now() + 60_000),
+  codexApproval: x.remoteRequestCard({ nonce: "n", type: "command_approval", title: "批准", detail: "ls -la", decisions: ["accept", "decline"] }),
+  codexArchived: x.archivedSessionActionCard("n", "旧会话"),
+  codexError: x.errorCard("出错了"),
+});
 
 let failed = 0;
 for (const [name, card] of Object.entries(cards)) {

@@ -170,7 +170,7 @@ npm run uninstall:claude-hooks
 
 ```bash
 npm run doctor:claude                                   # 只读自检
-npm run check:claude-cards                              # 让飞书校验所有卡片的格式，不向任何群发送消息
+npm run check:cards                                     # 让飞书校验 Claude 和 Codex 的全部卡片，不向任何群发送消息
 systemctl --user status feishu-claude-bridge.service
 journalctl --user -u feishu-claude-bridge.service --since today
 ```

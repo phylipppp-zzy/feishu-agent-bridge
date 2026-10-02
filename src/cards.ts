@@ -34,7 +34,7 @@ export function serviceCard(status: { paused: boolean; sessions: number; active:
 
 export function helpCard(): CardDefinition {
   return card("Codex 使用帮助", "wathet", [
-    markdown("**快捷工作流**\n点击“新建会话”，依次选择项目、模型、强度，然后在卡片或聊天中输入任务。\n\n在任一会话话题中直接回复即可继续，且无需 @ 机器人。话题里只有 `/` 开头的命令由桥接处理，其他文字（包括“状态”“重试”这类单个词）都会发给 Codex。修改该会话后续续聊的模型时，优先点击会话根卡的“修改模型”；`/model` 与 `/model <模型> <思考强度>` 是文字兜底，同样无需 @。\n\n群主消息中发送单独的 `/` 后会返回命令菜单；这是发送后的操作面板，不是飞书输入框的实时命令补全。会话搜索支持目录、首条用户消息和短会话 ID，多关键词按 AND 匹配。\n\n示例：`/search example-project`、`/search GUI Agent`、`/search 1a2b3c4d`。\n\n文字入口：`/new <目录> <任务>`、`/sessions`、`/search <关键词>`、`/help`、`/status`、`/sync`、`/pause`、`/resume-sync`、`/retry`、`/cancel`。"),
+    markdown("**快捷工作流**\n点击“新建会话”，依次选择项目、模型、强度，然后在卡片或聊天中输入任务。\n\n在任一会话话题中直接回复即可继续，且无需 @ 机器人。话题里只有 `/` 开头的命令由桥接处理，其他文字（包括“状态”“重试”这类单个词）都会发给 Codex。修改该会话后续续聊的模型时，优先点击会话根卡的“修改模型”；`/model` 与 `/model <模型> <思考强度>` 是文字兜底，同样无需 @。\n\n群主消息中发送单独的 `/` 后会返回命令菜单；在会话话题里发送单独的 `/`，会在话题最新处再发一张会话根卡，长话题不用翻回顶部。这些是发送后的操作面板，不是飞书输入框的实时命令补全。会话搜索支持目录、首条用户消息和短会话 ID，多关键词按 AND 匹配。\n\n示例：`/search example-project`、`/search GUI Agent`、`/search 1a2b3c4d`。\n\n文字入口：`/new <目录> <任务>`、`/sessions`、`/search <关键词>`、`/help`、`/status`、`/sync`、`/pause`、`/resume-sync`、`/retry`、`/cancel`。"),
     actionRow([button("返回控制台", "home", "primary"), button("新建会话", "new")]),
   ]);
 }
@@ -49,11 +49,13 @@ export function commandMenuCard(notice = ""): CardDefinition {
 }
 
 export function projectsCard(directories: Array<{ cwd: string; count: number; latest?: string }>, allowedRoot: string, wizardId: string, search = ""): CardDefinition {
-  const rows: Record<string, unknown>[] = [];
-  for (let index = 0; index < directories.length; index += 3) rows.push(actionRow(directories.slice(index, index + 3).map(({ cwd, count }) =>
-    button(`${basename(cwd) || "home"} (${count})`, "select_project", index === 0 ? "primary" : "default", { cwd, label: relative(allowedRoot, cwd) || ".", wizardId }))));
+  // Full paths go in the text, which wraps; button labels that long would be cut to "…" on a phone.
+  const list = directories.map(({ cwd, count }, index) => `${index + 1}. ${safeMarkdown(cwd)}（${count} 个会话）`);
+  const buttons = directories.map(({ cwd }, index) =>
+    button(`${index + 1} · ${shorten(basename(cwd) || "home", 12)}`, "select_project", index === 0 ? "primary" : "default", { cwd, label: relative(allowedRoot, cwd) || ".", wizardId }));
+  const rows = buttons.length ? [actionRow(buttons)] : [];
   return card("1/4 选择项目", "turquoise", [
-    markdown(`${summary()}\n\n按历史使用记录选择项目，或输入新的已授权目录。`),
+    markdown(`${summary()}\n\n按历史使用记录选择项目，或输入新的已授权目录。${list.length ? `\n${list.join("\n")}` : ""}`),
     ...inputForm({ formName: "project_form", inputName: "project_path", elementId: "project_path", placeholder: `${allowedRoot.replace(/\/$/, "")}/项目目录`, maxLength: 500,
       buttons: [
         { label: "使用输入目录", action: "submit_project_path", type: "primary", extra: { wizardId } },
@@ -140,8 +142,9 @@ export function sessionCard(session: { cwd: string; firstUserText: string; title
     ? (presentation.rootExecutionReady === false ? "Root 容器预检失败：" + ((presentation.rootPreflightReasons ?? []).join("；") || "执行已禁用") : "专用容器 Root 模式：本任务可读写容器、访问网络并启动进程；每次任务单独授权。")
     : plan ? "Plan：只读沙箱、禁止网络，不会请求 Root。" : "Default：仅允许 canonical 工作目录写入，禁止网络。";
   const controls = lifecycle === "active"
-    ? [button("修改模型", "session_model", "primary"), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode"), button("查看本轮审阅", "turn_review")]
-    : [button("查看本轮审阅", "turn_review")];
+    ? [button("修改模型", "session_model", "primary", { sessionId: session.sessionId }), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode", "default", { sessionId: session.sessionId }),
+      button("查看本轮审阅", "turn_review", "default", { sessionId: session.sessionId })]
+    : [button("查看本轮审阅", "turn_review", "default", { sessionId: session.sessionId })];
   const tick = "\\x60";
   return card(title, status === "运行中" ? "orange" : lifecycle === "active" ? "green" : "grey", [
     markdown("项目：" + tick + safeMarkdown(session.cwd) + tick + "\\n模型：" + tick + safeMarkdown(session.model ?? "继承全局配置") + tick + "　强度：" + tick + safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认") + tick + "\\n模式：**" + safeMarkdown(mode) + "**\\n状态：**" + safeMarkdown(status) + "**　ID：" + tick + session.sessionId.slice(0, 8) + tick),
@@ -171,7 +174,7 @@ export function errorCard(message: string): CardDefinition { return card("操作
 function optionControls(options: ChoiceOption[], action: string, value: Record<string, unknown>, selectId: string, selectName: string): Record<string, unknown>[] {
   if (options.length <= 3) {
     return [actionRow(options.map((option, optionIndex) =>
-      button(`${optionIndex + 1}. ${option.label}`, action, optionIndex === 0 ? "primary" : "default", { ...value, optionIndex })))];
+      button(`${optionIndex + 1}. ${shorten(option.label, 14)}`, action, optionIndex === 0 ? "primary" : "default", { ...value, optionIndex })))];
   }
   if (cardUiVersion() === 2) {
     return [{ tag: "select_static", element_id: selectId, name: selectName,
@@ -180,7 +183,7 @@ function optionControls(options: ChoiceOption[], action: string, value: Record<s
   }
   const rows: Record<string, unknown>[] = [];
   for (let index = 0; index < options.length; index += 3) rows.push(actionRow(options.slice(index, index + 3).map((option, offset) =>
-    button(`${index + offset + 1}. ${option.label}`, action, index === 0 ? "primary" : "default", { ...value, optionIndex: index + offset }))));
+    button(`${index + offset + 1}. ${shorten(option.label, 14)}`, action, index === 0 ? "primary" : "default", { ...value, optionIndex: index + offset }))));
   return rows;
 }
 
