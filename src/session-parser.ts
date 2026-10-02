@@ -72,16 +72,47 @@ function stableMessageId(sessionId: string, timestamp: string, role: string, tex
   return createHash("sha256").update(`${sessionId}\0${timestamp}\0${role}\0${text}`).digest("hex");
 }
 
-// These envelopes are injected by Codex/the host, not authored by the user.
-// Filter only the complete synthetic record; arbitrary user XML must remain visible.
-function isSyntheticHostMessage(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed) return false;
-  const remaining = trimmed
-    .replace(/<recommended_plugins>[\s\S]*?<\/recommended_plugins>/gi, "")
-    .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, "")
-    .trim();
-  return remaining === "";
+// Context Codex and its host add to a user message (plugin lists, environment, AGENTS.md and
+// user instructions). The person did not type it, so it is not shown as their message.
+const HOST_BLOCKS = [
+  /^<recommended_plugins>[\s\S]*?<\/recommended_plugins>/i,
+  /^<environment_context>[\s\S]*?<\/environment_context>/i,
+  /^<user_instructions>[\s\S]*?<\/user_instructions>/i,
+  /^# AGENTS\.md instructions[^\n]*\n+<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/i,
+];
+
+/**
+ * A user text without the host context around it. Only whole blocks at the start or the end of
+ * the text count as context, as Codex places them; the same tags quoted inside a question, a
+ * quotation or a code example stay visible.
+ */
+export function stripHostContext(text: string): string {
+  let rest = text.trim();
+  for (let changed = true; changed && rest;) {
+    changed = false;
+    for (const block of HOST_BLOCKS) {
+      const match = rest.match(block);
+      if (match) { rest = rest.slice(match[0].length).trim(); changed = true; }
+    }
+    for (const block of HOST_BLOCKS) {
+      const end = new RegExp(`${block.source.slice(1)}$`, block.flags);
+      // Only a block that starts on its own line can end the text as context.
+      const match = rest.match(end);
+      if (match && (match.index === 0 || rest[match.index! - 1] === "\n")) { rest = rest.slice(0, match.index).trim(); changed = true; }
+    }
+  }
+  return rest;
+}
+
+/**
+ * The text of a user message as recorded (its message id is derived from it, so messages
+ * imported before this filter keep their ids) and as shown, without host context. Codex puts
+ * each piece of context in its own content item; each item is cleaned on its own.
+ */
+export function userMessageText(content: unknown): { raw: string; visible: string } {
+  const items = Array.isArray(content) ? content.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .filter((item) => item.type === "input_text" && typeof item.text === "string" && item.text) .map((item) => String(item.text)) : [];
+  return { raw: items.join("\n"), visible: items.map(stripHostContext).filter(Boolean).join("\n") };
 }
 
 export function parseJsonlChunk(input: string, previousCarry = "", knownSessionId = "", expectedSessionId = ""): ParsedBatch {
@@ -176,7 +207,13 @@ export function parseJsonlChunk(input: string, previousCarry = "", knownSessionI
       if (role !== "user" && role !== "assistant") continue;
       let text = textFromContent(payload.content);
       if (!text) continue;
-      if (role === "user" && isSyntheticHostMessage(text)) continue;
+      let idText = text;
+      if (role === "user") {
+        const user = userMessageText(payload.content);
+        if (!user.visible) continue;
+        idText = user.raw;
+        text = user.visible;
+      }
       if (role === "assistant") {
         const embedded = embeddedChoice(sessionId, timestamp, text);
         if (embedded) {
@@ -186,7 +223,7 @@ export function parseJsonlChunk(input: string, previousCarry = "", knownSessionI
         }
       }
       messages.push({
-        id: stableMessageId(sessionId, timestamp, role, text),
+        id: stableMessageId(sessionId, timestamp, role, role === "user" ? idText : text),
         sessionId,
         timestamp,
         role,

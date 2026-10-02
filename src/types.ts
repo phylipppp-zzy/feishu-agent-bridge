@@ -132,6 +132,8 @@ export interface TurnState {
   inputHash?: string;
   finalOutputHash?: string;
   stream?: { cardId: string; messageId: string; elementId: string; sequence: number; lastSentAt: number };
+  /** Whether this turn was started with Root (danger-full-access) permissions. */
+  rootMode?: boolean;
 }
 
 /** What part of a finished turn's output reached Feishu; `uncertain` means the request may or may not have arrived. */
