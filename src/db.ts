@@ -531,14 +531,31 @@ export class BridgeDatabase {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
+  /**
+   * Claims a request whose answer time is up, so the timeout can decline it. Unlike a person's
+   * claim it ignores the expiry (which has passed by definition); only a still-pending request is taken.
+   */
+  timeOutServerRequest(nonce: string): PendingServerRequest | null {
+    const changed = this.db.prepare("UPDATE server_requests SET status='submitting',updated_at_ms=? WHERE nonce=? AND status='pending'").run(Date.now(), nonce);
+    if (Number(changed.changes) !== 1) return null;
+    const request = this.getServerRequest(nonce);
+    return request ? { ...request, status: "submitting" } : null;
+  }
+
+  setServerRequestCard(nonce: string, cardMessageId: string): void {
+    this.db.prepare("UPDATE server_requests SET card_message_id=?,updated_at_ms=? WHERE nonce=?").run(cardMessageId, Date.now(), nonce);
+  }
+
   setServerRequestStatus(nonce: string, status: PendingServerRequest["status"]): void {
     this.db.prepare("UPDATE server_requests SET status=?,updated_at_ms=? WHERE nonce=?").run(status, Date.now(), nonce);
   }
 
   resolveServerRequestsByRpcId(rpcId: string | number, epoch: number): PendingServerRequest[] {
+    // The id may come back as a number or as its string form.
     const encoded = JSON.stringify(rpcId);
-    const rows = this.db.prepare("SELECT nonce FROM server_requests WHERE rpc_id_json=? AND epoch=? AND status IN ('pending','submitting')").all(encoded, epoch) as Array<{ nonce: string }>;
-    this.db.prepare("UPDATE server_requests SET status='resolved',updated_at_ms=? WHERE rpc_id_json=? AND epoch=? AND status IN ('pending','submitting')").run(Date.now(), encoded, epoch);
+    const alternative = typeof rpcId === "number" ? JSON.stringify(String(rpcId)) : /^-?\d+$/.test(rpcId) ? rpcId : encoded;
+    const rows = this.db.prepare("SELECT nonce FROM server_requests WHERE rpc_id_json IN (?,?) AND epoch=? AND status IN ('pending','submitting')").all(encoded, alternative, epoch) as Array<{ nonce: string }>;
+    this.db.prepare("UPDATE server_requests SET status='resolved',updated_at_ms=? WHERE rpc_id_json IN (?,?) AND epoch=? AND status IN ('pending','submitting')").run(Date.now(), encoded, alternative, epoch);
     return rows.flatMap((row) => this.getServerRequest(row.nonce) ? [this.getServerRequest(row.nonce)!] : []);
   }
 
@@ -815,14 +832,16 @@ export class BridgeDatabase {
       .map((row) => this.taskFromRow(row));
   }
 
-  cancelTasks(rootMessageId: string | null, sessionId: string | null, reason: string): QueuedTask[] {
+  /** `keepTurnIds`: turns still running in Codex, whose tasks end with the turn rather than here. */
+  cancelTasks(rootMessageId: string | null, sessionId: string | null, reason: string, keepTurnIds: readonly string[] = []): QueuedTask[] {
     const query = sessionId
       ? "SELECT * FROM task_queue WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')"
       : rootMessageId
         ? "SELECT * FROM task_queue WHERE root_message_id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')"
         : "SELECT * FROM task_queue WHERE 1=0";
     const value = sessionId ?? rootMessageId;
-    const rows = value === null ? this.db.prepare(query).all() as Record<string, unknown>[] : this.db.prepare(query).all(value) as Record<string, unknown>[];
+    const all = value === null ? this.db.prepare(query).all() as Record<string, unknown>[] : this.db.prepare(query).all(value) as Record<string, unknown>[];
+    const rows = all.filter((row) => !(typeof row.turn_id === "string" && keepTurnIds.includes(row.turn_id)));
     if (!rows.length) return [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -836,8 +855,8 @@ export class BridgeDatabase {
     return rows.map((row) => this.taskFromRow(row));
   }
 
-  cancelTasksBySession(sessionId: string, reason: string): QueuedTask[] { return this.cancelTasks(null, sessionId, reason); }
-  cancelTasksByRoot(rootMessageId: string, reason: string): QueuedTask[] { return this.cancelTasks(rootMessageId, null, reason); }
+  cancelTasksBySession(sessionId: string, reason: string, keepTurnIds: readonly string[] = []): QueuedTask[] { return this.cancelTasks(null, sessionId, reason, keepTurnIds); }
+  cancelTasksByRoot(rootMessageId: string, reason: string, keepTurnIds: readonly string[] = []): QueuedTask[] { return this.cancelTasks(rootMessageId, null, reason, keepTurnIds); }
   cancelAllTasks(reason: string): QueuedTask[] {
     const rows = this.db.prepare("SELECT * FROM task_queue WHERE status NOT IN ('completed','failed','cancelled','interrupted','expired')").all() as Record<string, unknown>[];
     if (!rows.length) return [];

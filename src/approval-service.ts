@@ -17,6 +17,7 @@ export interface ApprovalServiceOptions {
 /** Owns transient resolvers; durable approval state remains in BridgeDatabase. */
 export class ApprovalService implements ApprovalServicePort {
   private readonly requestResolvers = new Map<string, Resolver>();
+  private readonly requestTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly options: ApprovalServiceOptions) {}
 
@@ -38,15 +39,27 @@ export class ApprovalService implements ApprovalServicePort {
     await this.options.onResolveAction(request, decision, answers);
   }
 
+  /** Registers the waiter before the request can be answered; each request is settled exactly once, through `take`. */
   waitFor(nonce: string): Promise<unknown> {
     return new Promise((resolve) => this.requestResolvers.set(nonce, resolve));
+  }
+
+  /** The timeout of a waiting request; cleared when the request is settled any other way. */
+  setTimer(nonce: string, timer: NodeJS.Timeout): void {
+    if (!this.requestResolvers.has(nonce)) { clearTimeout(timer); return; }
+    this.requestTimers.set(nonce, timer);
   }
 
   take(nonce: string): Resolver | undefined {
     const resolver = this.requestResolvers.get(nonce);
     this.requestResolvers.delete(nonce);
+    const timer = this.requestTimers.get(nonce);
+    if (timer) clearTimeout(timer);
+    this.requestTimers.delete(nonce);
     return resolver;
   }
+
+  pendingCount(): number { return this.requestResolvers.size; }
 
   async cancelForSession(sessionId: string): Promise<void> {
     for (const request of this.options.db.cancelServerRequestsForSession(sessionId)) {
@@ -57,6 +70,8 @@ export class ApprovalService implements ApprovalServicePort {
   clear(): void {
     for (const resolver of this.requestResolvers.values()) resolver({ action: "cancel", decision: "cancel" });
     this.requestResolvers.clear();
+    for (const timer of this.requestTimers.values()) clearTimeout(timer);
+    this.requestTimers.clear();
   }
 
   expire(): Promise<void> {
