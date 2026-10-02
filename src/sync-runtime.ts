@@ -10,7 +10,7 @@ import { messageAppLink } from "./feishu.js";
 import { resolveAllowedPath } from "./path-policy.js";
 import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
-import { boundedPreview, serializedBytes } from "./text-limits.js";
+import { boundedPreview, cardContentBytes, serializedBytes } from "./text-limits.js";
 import { parseJsonlChunk } from "./session-parser.js";
 import type { FeishuRouterPort } from "./bridge-contracts.js";
 import { jsonlFiles, SessionImporter } from "./session-importer.js";
@@ -100,7 +100,7 @@ function appendBoundedText(current: string, delta: string, maxBytes: number): st
 
 /** Text for a card: whole if it fits Feishu's card size once serialized, else its start and end. */
 function inlinePreview(text: string): string {
-  return boundedPreview(text, MAX_INLINE_MESSAGE_BYTES, "[…正文超过飞书卡片上限，完整内容见 Markdown 附件…]");
+  return boundedPreview(text, MAX_INLINE_MESSAGE_BYTES, "[…正文超过飞书卡片上限，完整内容见 Markdown 附件…]", cardContentBytes);
 }
 
 /** Feishu drops a repeated message with the same uuid (at most 50 characters) within an hour. */
@@ -139,6 +139,7 @@ export class SyncRuntime implements FeishuRouterPort {
   private appServerRestartAttempts = 0;
   private appServerRestartTimer: NodeJS.Timeout | null = null;
   private readonly cancelTimers = new Map<string, NodeJS.Timeout>();
+  private outputDelivery: Promise<void> | null = null;
   /** When an interrupt was last sent for a turn, so a repeated cancel only resends one that went unconfirmed. */
   private readonly cancelRequestedAt = new Map<string, number>();
   private threadStateTimer: NodeJS.Timeout | null = null;
@@ -247,6 +248,7 @@ export class SyncRuntime implements FeishuRouterPort {
       void this.reconcileAwaitingSyncTasks();
       void this.expireRootGrants();
       void this.retryDueWriterTasks();
+      void this.deliverPendingOutputs(true);
     }, this.config.scanIntervalMs);
     this.scanTimer.unref();
     if (this.boundChatId()) {
@@ -837,6 +839,9 @@ export class SyncRuntime implements FeishuRouterPort {
     const interrupted = this.db.markRunningTasksInterrupted();
     const cutOff: string[] = [];
     for (const turn of this.turnCoordinator.states()) {
+      // A turn that already ended is being reported by its completion; it is left to that.
+      if (TERMINAL_TURN_STATES.has(turn.state)) continue;
+      if (turn.stream && this.feishu.finishStreamingReply) void this.feishu.finishStreamingReply(turn.stream, "Codex 已中断").catch(() => undefined);
       try { this.storeTurnOutput(turn, "Codex 已中断（app-server 退出）"); cutOff.push(turn.turnId); } catch (error) { this.db.recordFailure("turn_output_store", { turnId: turn.turnId }, error); }
       turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId);
     }
@@ -1226,6 +1231,8 @@ export class SyncRuntime implements FeishuRouterPort {
       const executed = ended === "completed" ? "完成" : ended === "interrupted" ? "已取消" : "失败";
       const report = this.deliveryReport(output, executed, ended === "completed" ? "本轮已完成。" : "本轮未完成。");
       void this.updateRunCard(sessionId, state.rootMessageId, report.state, report.detail, false, report.resendTurnId).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
+      // The run card is shared with later turns; the resend button also stays in a notice of its own.
+      void this.noteDeliveryOutcome(output, report).catch((error) => this.db.recordFailure("output_notice", { turnId }, error));
       await this.releaseThreadSubscription(sessionId, "turn_completed"); void this.drainTaskQueue(sessionId);
     }
   }
@@ -1315,15 +1322,47 @@ export class SyncRuntime implements FeishuRouterPort {
     };
   }
 
-  /** Outputs whose sending never started or was cut off, for example by a restart of this service. */
-  private async deliverPendingOutputs(): Promise<void> {
-    for (const pending of this.db.pendingTurnOutputs()) {
+  /** How a stored turn ran, for reports about its output sent later. */
+  private executedLabel(turnId: string): string {
+    const state = this.db.getTurn(turnId)?.state;
+    return state === "completed" ? "完成" : state === "failed" ? "失败" : "已中断";
+  }
+
+  /**
+   * Sends outputs that have not reached Feishu: never tried (cut off by a restart) or, with `failed`,
+   * also earlier failures, retried a few times at growing intervals. Each turn still missing its
+   * result gets its own notice in the topic with a resend button, which no later status replaces.
+   */
+  private deliverPendingOutputs(includeFailed = false): Promise<void> {
+    // One pass at a time, so a slow upload is not started twice by the periodic scan.
+    this.outputDelivery ??= this.deliverOutputsOnce(includeFailed).finally(() => { this.outputDelivery = null; });
+    return this.outputDelivery;
+  }
+
+  private async deliverOutputsOnce(includeFailed: boolean): Promise<void> {
+    for (const pending of includeFailed ? this.db.undeliveredTurnOutputs(Date.now()) : this.db.pendingTurnOutputs()) {
       try {
         const output = await this.deliverTurnOutput(pending.turnId);
-        const report = this.deliveryReport(output, "完成", "本轮结果已补发。");
-        if (report.resendTurnId) await this.updateRunCard(pending.sessionId, pending.rootMessageId, report.state, report.detail, false, report.resendTurnId);
+        const report = this.deliveryReport(output, this.executedLabel(pending.turnId), "本轮结果已补发。");
+        await this.noteDeliveryOutcome(output, report);
       } catch (error) { this.db.recordFailure("turn_output_delivery", { turnId: pending.turnId }, error); }
     }
+  }
+
+  /** Posts (once) or settles the topic notice for a turn whose result did not reach Feishu. */
+  private async noteDeliveryOutcome(output: TurnOutput | null, report: { state: string; detail: string; resendTurnId?: string }): Promise<void> {
+    if (!output) return;
+    const key = `output_notice.${output.turnId}`;
+    const notice = this.db.getSetting(key);
+    if (report.resendTurnId) {
+      if (notice) return;
+      try { this.db.setSetting(key, await this.feishu.replyCard(output.rootMessageId, runStatusCard(report.state, report.detail, false, output.sessionId, report.resendTurnId))); }
+      catch (error) { this.db.recordFailure("output_notice", { turnId: output.turnId }, error); }
+      return;
+    }
+    if (!notice) return;
+    this.db.deleteSetting(key);
+    await this.feishu.updateCard(notice, runStatusCard(report.state, "本轮结果已发到话题中。")).catch((error) => this.db.recordFailure("output_notice", { turnId: output.turnId }, error));
   }
 
   private cardStatus(): { paused: boolean; sessions: number; active: number; failures: number; queued: number; waiting: number; failedTasks: number; appServer?: string } {
@@ -1793,11 +1832,16 @@ export class SyncRuntime implements FeishuRouterPort {
           const turnId = typeof event.value.turnId === "string" ? event.value.turnId : "";
           const stored = this.db.getTurnOutput(turnId);
           if (!stored) return errorCard("没有找到这一轮的结果，可能已超过保留期限（30 天）。");
-          if (stored.cardStatus === "sent" && (stored.fileStatus === "sent" || stored.fileStatus === "none")) return { delivery: "replace", card: runStatusCard("完成", "本轮结果已在话题中。") };
-          const output = await this.deliverTurnOutput(turnId);
-          const report = this.deliveryReport(output, "完成", "本轮结果已重新发送。");
-          this.db.setRunStatus(stored.sessionId, report.state, report.detail);
-          return { delivery: "replace", card: runStatusCard(report.state, report.detail, false, stored.sessionId, report.resendTurnId) };
+          const executed = this.executedLabel(turnId);
+          if (stored.cardStatus === "sent" && (stored.fileStatus === "sent" || stored.fileStatus === "none")) return { delivery: "replace", card: runStatusCard(executed, "本轮结果已在话题中。") };
+          // Uploads can take longer than a card callback may; the card is updated when they are done.
+          const clicked = event.openMessageId;
+          void this.deliverTurnOutput(turnId).then(async (output) => {
+            const report = this.deliveryReport(output, executed, "本轮结果已重新发送。");
+            await this.feishu.updateCard(clicked, runStatusCard(report.state, report.detail, false, stored.sessionId, report.resendTurnId));
+            await this.noteDeliveryOutcome(output, report);
+          }).catch((error) => this.db.recordFailure("turn_output_resend", { turnId }, error));
+          return { delivery: "replace", card: runStatusCard("正在重新发送", "正在把本轮结果重新发到话题中，不会再次执行任务。") };
         }
         case "cancel_run": {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
@@ -1908,6 +1952,7 @@ export class SyncRuntime implements FeishuRouterPort {
           if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
           void this.syncAll();
           void this.backfillSessionLinks();
+          void this.deliverPendingOutputs(true);
           return homeCard(this.cardStatus(), modelsReady && appServerReady ? "正在重试未完成任务，模型目录和 app-server 已恢复" : "基础设施仍不可用；请稍后再次 /retry");
         }
         default: return errorCard(`未知卡片操作：${event.action}`);
@@ -2010,6 +2055,7 @@ export class SyncRuntime implements FeishuRouterPort {
       await this.respondCard(message, homeCard(this.cardStatus(), modelsReady && appServerReady ? "正在重试未完成任务，模型目录和 app-server 已恢复" : "基础设施仍不可用；请稍后再次 /retry"));
       void this.syncAll();
       void this.backfillSessionLinks();
+      void this.deliverPendingOutputs(true);
       return;
     }
     if (isCommand(["/cancel"], ["取消"])) {

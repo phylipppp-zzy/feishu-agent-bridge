@@ -8,6 +8,16 @@ export function serializedBytes(text: string): number {
   return Buffer.byteLength(JSON.stringify(text), "utf8") - 2;
 }
 
+/**
+ * Bytes `text` takes in a Feishu card message: the card is JSON text that is itself sent as a JSON
+ * string field, so quotes, backslashes and line breaks are escaped twice.
+ */
+export function cardContentBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(JSON.stringify(text)), "utf8") - 4;
+}
+
+type Measure = (text: string) => number;
+
 /** End index rounded down so that it does not split a surrogate pair. */
 function endBoundary(text: string, index: number): number {
   const code = text.charCodeAt(index - 1);
@@ -32,16 +42,16 @@ function largest(length: number, fits: (units: number) => boolean): number {
 }
 
 /** The longest start of `text` whose serialized size is at most `maxBytes`. */
-export function headByBytes(text: string, maxBytes: number): string {
+export function headByBytes(text: string, maxBytes: number, measure: Measure = serializedBytes): string {
   if (maxBytes <= 0) return "";
-  const units = largest(text.length, (count) => serializedBytes(text.slice(0, endBoundary(text, count))) <= maxBytes);
+  const units = largest(text.length, (count) => measure(text.slice(0, endBoundary(text, count))) <= maxBytes);
   return text.slice(0, endBoundary(text, units));
 }
 
 /** The longest end of `text` whose serialized size is at most `maxBytes`. */
-export function tailByBytes(text: string, maxBytes: number): string {
+export function tailByBytes(text: string, maxBytes: number, measure: Measure = serializedBytes): string {
   if (maxBytes <= 0) return "";
-  const units = largest(text.length, (count) => serializedBytes(text.slice(startBoundary(text, text.length - count))) <= maxBytes);
+  const units = largest(text.length, (count) => measure(text.slice(startBoundary(text, text.length - count))) <= maxBytes);
   return text.slice(startBoundary(text, text.length - units));
 }
 
@@ -49,11 +59,11 @@ export function tailByBytes(text: string, maxBytes: number): string {
  * `text` if it fits in `maxBytes` once serialized, else its start and end around `notice`, the
  * whole still within `maxBytes`. Start and end never overlap: together they are smaller than the text.
  */
-export function boundedPreview(text: string, maxBytes: number, notice: string): string {
-  if (serializedBytes(text) <= maxBytes) return text;
+export function boundedPreview(text: string, maxBytes: number, notice: string, measure: Measure = serializedBytes): string {
+  if (measure(text) <= maxBytes) return text;
   const separator = `\n\n${notice}\n\n`;
-  const budget = Math.max(0, maxBytes - serializedBytes(separator));
-  const head = headByBytes(text, Math.floor(budget * 0.75));
-  const tail = tailByBytes(text, budget - serializedBytes(head));
+  const budget = Math.max(0, maxBytes - measure(separator));
+  const head = headByBytes(text, Math.floor(budget * 0.75), measure);
+  const tail = tailByBytes(text, budget - measure(head), measure);
   return head + separator + tail;
 }

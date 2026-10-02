@@ -981,6 +981,16 @@ export class BridgeDatabase {
       .flatMap((row) => { const output = this.getTurnOutput(row.turn_id); return output ? [output] : []; });
   }
 
+  /**
+   * Outputs not fully in Feishu that are due for another try: never tried, or failed fewer than six
+   * times with a wait of 2^attempts minutes since the last try (2, 4, 8 … minutes).
+   */
+  undeliveredTurnOutputs(now: number): TurnOutput[] {
+    return (this.db.prepare(`SELECT turn_id FROM turn_outputs WHERE (card_status<>'sent' OR file_status NOT IN ('sent','none'))
+      AND (card_status='pending' OR file_status='pending' OR (attempts<6 AND updated_at_ms <= ? - (60000 * (1 << attempts))))`).all(now) as Array<{ turn_id: string }>)
+      .flatMap((row) => { const output = this.getTurnOutput(row.turn_id); return output ? [output] : []; });
+  }
+
   /** Whether a logged assistant message belongs to a bridge turn whose output has not yet reached Feishu. */
   hasUndeliveredTurnOutput(sessionId: string, contentHash: string): boolean {
     const row = this.db.prepare(`SELECT 1 FROM turn_outputs o WHERE o.session_id=? AND o.card_status<>'sent' AND (

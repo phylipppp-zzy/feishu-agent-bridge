@@ -3,7 +3,7 @@ import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { boundedPreview, headByBytes, serializedBytes, tailByBytes } from "../src/text-limits.js";
+import { boundedPreview, cardContentBytes, headByBytes, serializedBytes, tailByBytes } from "../src/text-limits.js";
 import { assistantRecord, cardAction, eventRecord, fakeAppServer, importedSession, jsonl, SESSION_ID, shutdown, startTurn, title, userRecord, waitFor } from "./codex-harness.js";
 
 const turnStart = (method: string) => method === "turn/start" ? { turn: { id: "turn-1" } } : {};
@@ -33,6 +33,10 @@ test("F08: previews are cut by serialized UTF-8 bytes, between characters, and n
     assert.ok(head!.length + tail!.length < text.length);
   }
   assert.equal(boundedPreview("短文本", 25_000, "[省略]"), "短文本");
+  // Card text is escaped twice on its way to Feishu; quotes and line breaks count double.
+  const quoted = "{\"key\": \"C:\\\\path\"}\n".repeat(3_000);
+  const cardPreview = boundedPreview(quoted, 25_000, "[省略]", cardContentBytes);
+  assert.ok(Buffer.byteLength(JSON.stringify(JSON.stringify({ text: cardPreview })), "utf8") <= 25_100);
   assert.equal(headByBytes("😀😀", 5), "😀");
   assert.equal(tailByBytes("😀😀", 5), "😀");
   assert.equal(headByBytes("ab", 0), "");
@@ -74,8 +78,9 @@ test("F07: a result that failed to send is sent again on request, without runnin
 
   env.feishu.failReplyCard = null;
   const calls = app.calls.length;
-  const resent = await env.service.onCardAction(cardAction("resend_result", { turnId: "turn-1" }));
-  assert.match(JSON.stringify(resent), /本轮结果已重新发送/);
+  const resent = await env.service.onCardAction(cardAction("resend_result", { turnId: "turn-1" }, "notice-card"));
+  assert.match(JSON.stringify(resent), /正在重新发送/);
+  await waitFor(() => JSON.stringify(env.feishu.latest("notice-card") ?? {}).includes("本轮结果已重新发送"));
   assert.equal(app.calls.length, calls);
   assert.equal(env.feishu.cards.filter((card) => JSON.stringify(card.card).includes("修改完成，测试通过。")).length, 1);
   const sent = env.db.getTurnOutput("turn-1")!;
@@ -94,10 +99,11 @@ test("F07: a resend only sends the missing part, and output cut off by a stop is
   env.feishu.failReplyFile = () => new Error("Feishu API 234001: file upload failed");
   await finishTurn(env, "长".repeat(16_000));
   assert.deepEqual([env.db.getTurnOutput("turn-1")!.cardStatus, env.db.getTurnOutput("turn-1")!.fileStatus], ["sent", "failed"]);
-  const cards = env.feishu.cards.length;
+  const cards = env.feishu.cards.filter((card) => title(card.card) === "Codex").length;
   env.feishu.failReplyFile = null;
   await env.service.onCardAction(cardAction("resend_result", { turnId: "turn-1" }));
-  assert.equal(env.feishu.cards.length, cards);
+  await waitFor(() => env.feishu.files.length === 1);
+  assert.equal(env.feishu.cards.filter((card) => title(card.card) === "Codex").length, cards);
   assert.equal(env.feishu.files.length, 1);
 
   // A second turn is cut off by the service stopping; its text is kept and sent later.
@@ -113,4 +119,28 @@ test("F07: a resend only sends the missing part, and output cut off by a stop is
   assert.equal(env.db.pendingTurnOutputs().length, 0);
   assert.ok(env.feishu.cards.some((card) => JSON.stringify(card.card).includes("写到一半")));
   env.db.close();
+}));
+
+test("F07: the resend button survives later turns in a notice of its own, and failed results are retried by /retry", () => withHome("codex-notice-", async (home) => {
+  let turns = 0;
+  const app = fakeAppServer((method) => method === "turn/start" ? { turn: { id: `turn-${++turns}` } } : {});
+  const env = await importedSession(home, app.server);
+  await startTurn(env);
+  env.feishu.failReplyCard = (card) => title(card) === "Codex" ? new Error("Feishu API 230099: card content is invalid") : null;
+  await finishTurn(env, "第一轮的结论");
+  await waitFor(() => env.feishu.cards.some((card) => card.root === "root-1" && JSON.stringify(card.card).includes("resend_result") && card.id !== env.db.getRunStatus(SESSION_ID)?.messageId));
+  const notice = env.feishu.cards.find((card) => JSON.stringify(card.card).includes("resend_result") && card.id !== env.db.getRunStatus(SESSION_ID)?.messageId)!;
+  // A next turn takes over the shared run card; the notice keeps its button.
+  await env.service.onFeishuMessage({ messageId: "next-1", chatId: "chat-1", chatType: "group", senderOpenId: "user-1", mentionedBot: false, text: "下一步", imageKeys: [], rootId: "root-1" });
+  await waitFor(() => env.internals.turnCoordinator.mutableTurn(SESSION_ID)?.turnId === "turn-2");
+  assert.match(JSON.stringify(env.feishu.latest(notice.id)), /"action":"resend_result"/);
+  // Once Feishu accepts cards again, /retry (or the periodic scan) sends the missing result.
+  env.feishu.failReplyCard = null;
+  env.db.db.prepare("UPDATE turn_outputs SET updated_at_ms=0 WHERE turn_id='turn-1'").run();
+  const retry = { messageId: "retry-1", chatId: "chat-1", chatType: "group" as const, senderOpenId: "user-1", mentionedBot: true, text: "/retry", imageKeys: [] };
+  await env.service.onFeishuMessage(retry);
+  await waitFor(() => env.db.getTurnOutput("turn-1")?.cardStatus === "sent");
+  assert.ok(env.feishu.cards.some((card) => title(card.card) === "Codex" && JSON.stringify(card.card).includes("第一轮的结论")));
+  await waitFor(() => JSON.stringify(env.feishu.latest(notice.id)).includes("本轮结果已发到话题中"));
+  await shutdown(env);
 }));
