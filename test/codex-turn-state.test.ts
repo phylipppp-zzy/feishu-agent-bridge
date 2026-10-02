@@ -118,6 +118,66 @@ test("F05: a turn that finishes on its own while being cancelled keeps its real 
   await shutdown(env);
 }));
 
+test("F05: a cancel that arrives while a finished turn's result is being sent changes nothing", () => withHome("codex-cancel-after-end-", async (home) => {
+  const app = fakeAppServer(turnStart);
+  const env = await importedSession(home, app.server);
+  await startTurn(env);
+  await env.internals.onAppServerNotification({ method: "item/completed", params: { threadId: SESSION_ID, turnId: "turn-1", item: { id: "m1", type: "agentMessage", text: "完成了" } } });
+  let release!: () => void;
+  env.feishu.replyCardGate = new Promise((resolve) => { release = resolve; });
+  const completing = env.internals.onAppServerNotification({ method: "turn/completed", params: { threadId: SESSION_ID, turn: { id: "turn-1", status: "completed" } } });
+  await waitFor(() => env.feishu.calls.includes("replyCard"));
+  await env.service.onFeishuMessage(inbound({ messageId: "late-cancel", text: "/cancel" }));
+  assert.equal(app.count("turn/interrupt"), 0);
+  assert.ok(env.feishu.texts.some((item) => item.text.startsWith("本轮已结束")));
+  release(); env.feishu.replyCardGate = null;
+  await completing;
+  assert.equal(env.db.taskForTurn("turn-1")?.status, "completed");
+  await waitFor(() => env.db.getRunStatus(SESSION_ID)?.state === "完成");
+  await shutdown(env);
+}));
+
+test("F05: a task cancelled while turn/start is on its way is stopped as soon as the turn exists", () => withHome("codex-cancel-starting-", async (home) => {
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { release = resolve; });
+  const app = fakeAppServer((method) => method === "turn/start" ? started.then(() => ({ turn: { id: "turn-1" } })) : {});
+  const env = await importedSession(home, app.server);
+  await env.service.onFeishuMessage(inbound({ messageId: "start-slow", text: "开始" }));
+  await waitFor(() => app.count("turn/start") === 1);
+  await env.service.onFeishuMessage(inbound({ messageId: "cancel-early", text: "/cancel" }));
+  assert.ok(env.feishu.texts.some((item) => item.text.includes("正在启动的任务如果已交给 Codex，会立即被停止")));
+  release();
+  await waitFor(() => app.count("turn/interrupt") === 1);
+  assert.equal(env.internals.turnCoordinator.mutableTurn(SESSION_ID)?.state, "cancelling");
+  await env.internals.onAppServerNotification({ method: "turn/completed", params: { threadId: SESSION_ID, turn: { id: "turn-1", status: "interrupted" } } });
+  assert.equal(env.internals.turnCoordinator.hasActiveTurn(SESSION_ID), false);
+  await shutdown(env);
+}));
+
+test("F05: an unanswered interrupt leaves the turn cancelling and says so; a turn that ends during the interrupt keeps its card", () => withHome("codex-cancel-unanswered-", async (home) => {
+  let interrupt: () => unknown = () => new Error("Codex app-server request turn/interrupt timed out after 15000ms");
+  let env!: Awaited<ReturnType<typeof importedSession>>;
+  const app = fakeAppServer((method) => method === "turn/interrupt" ? interrupt() : turnStart(method));
+  env = await importedSession(home, app.server);
+  await startTurn(env);
+  await env.service.onFeishuMessage(inbound({ messageId: "cancel-t1", text: "/cancel" }));
+  assert.equal(env.internals.turnCoordinator.mutableTurn(SESSION_ID)?.state, "cancelling");
+  assert.ok(env.feishu.texts.some((item) => item.text.startsWith("取消待确认")));
+  await env.service.onFeishuMessage(inbound({ messageId: "cancel-t2", text: "/cancel" }));
+  assert.equal(app.count("turn/interrupt"), 1);
+  await env.internals.onAppServerNotification({ method: "turn/completed", params: { threadId: SESSION_ID, turn: { id: "turn-1", status: "interrupted" } } });
+  await waitFor(() => env.db.getRunStatus(SESSION_ID)?.state === "已取消");
+
+  // Next turn: Codex ends it while answering the interrupt; the "cancelling" card must not come back.
+  await env.service.onFeishuMessage(inbound({ messageId: "start-2", text: "再来" }));
+  await waitFor(() => env.internals.turnCoordinator.hasActiveTurn(SESSION_ID));
+  interrupt = () => env.internals.onAppServerNotification({ method: "turn/completed", params: { threadId: SESSION_ID, turn: { id: "turn-1", status: "interrupted" } } }).then(() => ({}));
+  await env.service.onFeishuMessage(inbound({ messageId: "cancel-t3", text: "/cancel" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(env.db.getRunStatus(SESSION_ID)?.state, "已取消");
+  await shutdown(env);
+}));
+
 // F06 ------------------------------------------------------------------------------------------
 
 const question = { id: "scope", header: "范围", question: "处理哪些内容？", options: [{ label: "完整", description: "全部" }, { label: "精简", description: "重点" }] };

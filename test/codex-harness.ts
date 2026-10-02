@@ -42,8 +42,11 @@ export class FakeFeishu implements FeishuPort {
   async downloadImage(): Promise<Buffer> { return Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0]); }
   async sendText(_chat: string, text: string): Promise<string> { this.texts.push({ root: "", text }); return `text-${++this.sequence}`; }
   async sendCard(_chat: string, card: Record<string, unknown>): Promise<string> { const id = `card-${++this.sequence}`; this.cards.push({ root: "", id, card }); return id; }
+  /** When set, card replies wait for this promise. */
+  replyCardGate: Promise<void> | null = null;
   async replyCard(root: string, card: Record<string, unknown>): Promise<string> {
     this.calls.push("replyCard");
+    if (this.replyCardGate) await this.replyCardGate;
     const failure = this.failReplyCard?.(card); if (failure) throw failure;
     const id = `card-${++this.sequence}`; this.cards.push({ root, id, card }); return id;
   }
