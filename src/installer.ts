@@ -153,6 +153,17 @@ function quoted(value: string): string {
 
 function systemdQuoted(value: string): string { return quoted(value.replaceAll("%", "%%")); }
 
+/**
+ * A path for settings such as WorkingDirectory= and EnvironmentFile=. systemd takes their whole
+ * value literally (only Exec lines support quoting), so quotes would become part of the path.
+ */
+function systemdPath(value: string): string {
+  if (!value.startsWith("/") || value !== value.trim() || /[\r\n"\\]/.test(value)) {
+    throw new Error(`systemd path must be absolute and free of quotes, backslashes and line breaks: ${value}`);
+  }
+  return value.replaceAll("%", "%%");
+}
+
 export function generateBindToken(): string { return randomBytes(24).toString("base64url"); }
 
 export function renderEnvironment(values: Record<string, string>): string {
@@ -188,9 +199,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${systemdQuoted(input.projectDir)}
+WorkingDirectory=${systemdPath(input.projectDir)}
 Environment=NODE_ENV=production
-EnvironmentFile=${systemdQuoted(input.environmentFile)}
+EnvironmentFile=${systemdPath(input.environmentFile)}
 ExecStart=${systemdQuoted(input.nodeBin)} ${systemdQuoted(`${input.projectDir}/${input.entry ?? "dist/src/index.js"}`)}
 Restart=on-failure
 RestartSec=5
