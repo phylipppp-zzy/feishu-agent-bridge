@@ -616,6 +616,17 @@ test("questions and plans are answered on cards or by replying, and settings app
     const session = env.db.getSession(RECENT)!;
     assert.deepEqual([session.prefMode, session.prefModel, session.prefEffort], ["plan", "sonnet", "high"]);
     await waitUntil(() => rootCardOf(env, root).includes("计划模式（只读）"));
+
+    // Back to the default effort: a running process would fall back to the model's built-in default,
+    // not the person's saved setting, so the process is replaced once the turn ends.
+    await env.action("set_effort", { sessionId: RECENT, effort: "" });
+    assert.equal(query.calls.filter((call) => call.startsWith("flags")).length, 1);
+    query.result([query.received[0]!.uuid!]);
+    await waitUntil(() => query.calls.includes("close") || !rootCardOf(env, root).includes("飞书中"));
+    await waitUntil(() => !rootCardOf(env, root).includes("飞书中"));
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "继续" }));
+    const restarted = env.queries[1]!;
+    assert.deepEqual([restarted.options.model, restarted.options.effort, restarted.options.permissionMode], ["sonnet", undefined, "plan"]);
   } finally { await env.cleanup(); }
 });
 

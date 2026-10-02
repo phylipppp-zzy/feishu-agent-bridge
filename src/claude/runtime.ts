@@ -96,6 +96,8 @@ interface RunnerEntry {
   startedAtMs: number;
   /** The session was used on the computer while this process was busy; it exits after the turn. */
   yieldWhenIdle: boolean;
+  /** A setting changed back to the default, which a running process cannot take back; it exits after the turn. */
+  restartWhenIdle: boolean;
   /** The process was asked to exit; new messages start a fresh one. */
   closing: boolean;
   idleTimer: NodeJS.Timeout | null;
@@ -608,7 +610,7 @@ export class ClaudeRuntime {
 
   private startRunner(sessionId: string, options: { mode: "new" | "resume" | "fork"; cwd: string; forkFrom?: string }, takeover = false): RunnerEntry {
     const session = this.db.getSession(sessionId)!;
-    const entry = { takeover, startedAtMs: Date.now(), yieldWhenIdle: false, closing: false, idleTimer: null, livePrompt: null, liveText: "" } as Omit<RunnerEntry, "runner"> as RunnerEntry;
+    const entry = { takeover, startedAtMs: Date.now(), yieldWhenIdle: false, restartWhenIdle: false, closing: false, idleTimer: null, livePrompt: null, liveText: "" } as Omit<RunnerEntry, "runner"> as RunnerEntry;
     entry.runner = new SessionRunner({
       sessionId, mode: options.mode, ...(options.forkFrom ? { forkFrom: options.forkFrom } : {}), cwd: options.cwd, claudeBin: this.config.claudeBin,
       permissionMode: this.feishuMode(session), model: session.prefModel, effort: effortLevel(session.prefEffort),
@@ -652,6 +654,7 @@ export class ClaudeRuntime {
     entry.liveText = "";
     if (result.error) void this.topicNotice(sessionId, `⚠️ 这一轮没有正常完成：${result.error.slice(0, 500)}`);
     if (!entry.runner.busy && entry.yieldWhenIdle) this.yieldToComputer(sessionId, entry);
+    else if (!entry.runner.busy && entry.restartWhenIdle) this.retireRunner(sessionId, entry);
     else if (!entry.runner.busy) this.armIdle(sessionId, entry);
     // The turn's last records are in the transcript now; read them at once rather than waiting for the watcher.
     void this.flushTranscript(sessionId);
@@ -794,12 +797,29 @@ export class ClaudeRuntime {
     else this.yieldToComputer(session.sessionId, entry);
   }
 
-  /** The session was continued on the computer: the bridge's process exits, so the next message from Feishu resumes the latest state. */
-  private yieldToComputer(sessionId: string, entry: RunnerEntry): void {
+  /** Lets the bridge's process for a session exit; the next message from Feishu starts a fresh one. */
+  private retireRunner(sessionId: string, entry: RunnerEntry): void {
     this.clearIdle(entry);
     entry.closing = true;
     entry.runner.close();
     setTimeout(() => { if (this.runners.get(sessionId) === entry) entry.runner.terminate(); }, 30_000).unref();
+    this.refreshRoot(sessionId);
+  }
+
+  /**
+   * Back to the default model or effort. A running Claude Code process can only be switched to its
+   * built-in defaults (for example medium effort), not to the ones saved in the person's settings,
+   * so the process is replaced: at once when idle, else after the current turn.
+   */
+  private useDefaultsFromNextTurn(sessionId: string, entry: RunnerEntry | undefined): void {
+    if (!entry || entry.closing) return;
+    if (entry.runner.busy) entry.restartWhenIdle = true;
+    else this.retireRunner(sessionId, entry);
+  }
+
+  /** The session was continued on the computer: the bridge's process exits, so the next message from Feishu resumes the latest state. */
+  private yieldToComputer(sessionId: string, entry: RunnerEntry): void {
+    this.retireRunner(sessionId, entry);
     void this.topicNotice(sessionId, "电脑上继续了这个会话，已切回电脑侧控制。在这里再发消息，会重新切换到手机侧。");
     this.refreshRoot(sessionId);
   }
@@ -1241,12 +1261,15 @@ export class ClaudeRuntime {
           const model = value("model");
           if (model && !this.models().some((item) => item.value === model)) return replace(claudeNoticeCard("无法设置", "没有这个模型。", "red"));
           this.db.setSessionPrefs(sessionId, { model });
-          if (entry) void entry.runner.setModel(model || null).catch((error) => this.fail("set_model", { sessionId }, error));
+          if (!model) this.useDefaultsFromNextTurn(sessionId, entry);
+          else if (entry) void entry.runner.setModel(model).catch((error) => this.fail("set_model", { sessionId }, error));
         } else {
           const effort = value("effort");
           if (effort && !effortLevel(effort)) return replace(claudeNoticeCard("无法设置", "没有这个推理强度。", "red"));
           this.db.setSessionPrefs(sessionId, { effort });
-          if (entry) void entry.runner.setEffort(effortLevel(effort)).catch((error) => this.fail("set_effort", { sessionId }, error));
+          const level = effortLevel(effort);
+          if (!level) this.useDefaultsFromNextTurn(sessionId, entry);
+          else if (entry) void entry.runner.setEffort(level).catch((error) => this.fail("set_effort", { sessionId }, error));
         }
         this.refreshRoot(sessionId);
         const updated = this.db.getSession(sessionId)!;

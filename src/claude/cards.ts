@@ -308,7 +308,7 @@ export function claudeModelCard(session: ClaudeSession, models: ReadonlyArray<{ 
       ...models.map((model) => button(model.label, "set_model", model.value === current.model ? "primary" : "default", { sessionId: session.sessionId, model: model.value }))]),
     actionRow([button("默认强度", "set_effort", current.effort ? "default" : "primary", { sessionId: session.sessionId, effort: "" }),
       ...efforts.map((effort) => button(effort, "set_effort", effort === current.effort ? "primary" : "default", { sessionId: session.sessionId, effort }))]),
-    note("正在运行的会话立即生效，之后从飞书发送的消息也会使用这个设置。"),
+    note("选择具体的模型或强度，正在运行的会话立即生效；选“默认”时，从下一条消息开始改用你在 Claude Code 设置中保存的模型和强度（而不是模型自带的默认值）。设置只影响飞书里的对话，不会修改 VS Code 和终端的设置。"),
   ]);
 }
 
