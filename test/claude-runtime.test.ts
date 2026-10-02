@@ -322,7 +322,10 @@ test("cleanup withdraws the bridge's messages in out-of-scope topics after confi
     await env.runtime.onFeishuMessage(env.message({ rootId: other.rootMessageId!, mentionedBot: false, text: "继续" }));
     const otherMessages = [other.rootMessageId!, ...env.feishu.repliesTo(other.rootMessageId!).map((item) => item.id)];
     // The third topic's root is too old to withdraw.
-    env.feishu.undeletable.set(third.rootMessageId!, "Feishu API 230027: the message is beyond the recall time limit");
+    env.feishu.undeletable.set(third.rootMessageId!, "Feishu API 230009: Message has expired when recall message.");
+    // A reply someone already withdrew in Feishu counts as done.
+    const thirdReply = env.feishu.repliesTo(third.rootMessageId!)[0]!.id;
+    env.feishu.undeletable.set(thirdReply, "Feishu API 230110: Action unavailable as the message has been deleted.");
 
     const narrowed = env.restart({ syncDirs: ["/home/tester/project"] });
     await narrowed.bootstrap();
@@ -345,7 +348,8 @@ test("cleanup withdraws the bridge's messages in out-of-scope topics after confi
     const result = JSON.stringify(env.feishu.sent.find((item) => title(item.card) === "范围外话题清理完成")?.card);
     assert.match(result, /处理话题：\*\*2\*\*/);
     assert.match(result, /未能撤回：\*\*1\*\*/);
-    assert.match(result, /230027/);
+    assert.match(result, /超过撤回时限/);
+    assert.doesNotMatch(result, /230110/);
     assert.equal(env.feishu.deleted.includes(env.db.getSession(RECENT)!.rootMessageId!), false);
   } finally { await env.cleanup(); }
 });

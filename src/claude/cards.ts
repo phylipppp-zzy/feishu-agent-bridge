@@ -186,7 +186,7 @@ export function claudeCleanupCard(sessions: ClaudeSession[], nonce: string, scop
   if (sessions.length > 20) lines.push(`…另有 ${sessions.length - 20} 个`);
   return card(`清理 ${sessions.length} 个范围外话题`, "red", [
     markdown(`以下话题的工作目录不在当前同步范围（${safeMarkdown(scope)}）内：\n${lines.join("\n")}`),
-    note("确认后会撤回机器人在这些话题里发过的全部消息（根卡片、提问、回复卡片、附件和提醒）。你自己发的消息机器人无法撤回；超过飞书撤回时限的消息也撤不掉，结果里会逐条列出。会话仍保留在本机索引中，以后同步范围包含它们、且有新活动时，会重新建话题。"),
+    note("确认后会撤回机器人在这些话题里发过的全部消息（根卡片、提问、回复卡片、附件和提醒）。你自己发的消息机器人无法撤回；超过企业撤回时限（默认为发出后 24 小时，可由管理员调整）的消息也撤不掉，结果里会逐条列出。会话仍保留在本机索引中，以后同步范围包含它们、且有新活动时，会重新建话题。"),
     actionRow([button("确认清理", "cleanup_confirm", "danger", { nonce }), button("取消", "home")]),
   ]);
 }

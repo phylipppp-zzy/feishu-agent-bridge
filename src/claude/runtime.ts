@@ -24,8 +24,17 @@ const READONLY_NOTICE_INTERVAL_MS = 10 * 60_000;
 const STALE_TURN_MS = 30 * 60_000;
 const PAGE_SIZE = 8;
 const CLEANUP_CONFIRM_MS = 10 * 60_000;
-/** Withdrawing a message that is already gone counts as done. */
-const ALREADY_GONE = /\b(230011|230006)\b|not exist|has been (?:recalled|deleted)|already (?:recalled|deleted)/i;
+/** Withdrawing a message that is already deleted (230110) or recalled (230011) counts as done. */
+const ALREADY_GONE = /\b(?:230110|230011)\b/;
+/** Why Feishu refused to withdraw a message, for the cleanup report (codes from the recall API). */
+function recallFailure(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  if (/\b230009\b/.test(text)) return "超过撤回时限（默认为发出后 24 小时，可由企业管理员在管理后台调整）";
+  if (/\b230026\b/.test(text)) return "机器人无权撤回这条消息";
+  if (/\b230002\b/.test(text)) return "机器人已不在群里";
+  if (/\b232009\b/.test(text)) return "群已解散";
+  return text.slice(0, 120);
+}
 
 function textHash(text: string): string { return createHash("sha256").update(text).digest("hex"); }
 
@@ -171,9 +180,8 @@ export class ClaudeRuntime {
           withdrawn += 1;
           if (messageId === session.rootMessageId) rootGone = true;
         } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          if (ALREADY_GONE.test(reason)) { if (messageId === session.rootMessageId) rootGone = true; continue; }
-          kept.push({ title: messageId === session.rootMessageId ? `${sessionTitle(session)}（根卡片）` : sessionTitle(session), reason: reason.slice(0, 120) });
+          if (ALREADY_GONE.test(error instanceof Error ? error.message : String(error))) { if (messageId === session.rootMessageId) rootGone = true; continue; }
+          kept.push({ title: messageId === session.rootMessageId ? `${sessionTitle(session)}（根卡片）` : sessionTitle(session), reason: recallFailure(error) });
         }
       }
       if (rootGone) this.db.detachTopic(sessionId);
