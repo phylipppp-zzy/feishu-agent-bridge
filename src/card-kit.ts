@@ -22,8 +22,9 @@ export function button(label: string, action: string, type: "default" | "primary
 }
 export function actionRow(actions: Record<string, unknown>[]): Record<string, unknown> {
   if (uiVersion === 1) return { tag: "action", layout: "flow", actions };
+  // "flow" wraps buttons onto new lines on narrow screens instead of squeezing them until their labels turn into "…".
   return {
-    tag: "column_set", horizontal_spacing: "8px", horizontal_align: "left",
+    tag: "column_set", flex_mode: "flow", horizontal_spacing: "8px", horizontal_align: "left",
     columns: actions.map((action) => ({ tag: "column", width: "auto", elements: [action] })),
   };
 }

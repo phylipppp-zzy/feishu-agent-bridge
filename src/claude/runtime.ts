@@ -43,7 +43,7 @@ const RUNNER_CLOSE_WAIT_MS = 5_000;
 /** Live reply text is pushed to the card at most this often; the card itself is updated at most every CARD_UPDATE_INTERVAL_MS. */
 const LIVE_TEXT_RENDER_MS = 300;
 /** Raised when the root card's layout changes, so existing topics get the new card once. */
-const ROOT_CARD_VERSION = "2";
+const ROOT_CARD_VERSION = "3";
 const FALLBACK_MODELS = [{ value: "opus", label: "Opus" }, { value: "sonnet", label: "Sonnet" }, { value: "haiku", label: "Haiku" }];
 /** Withdrawing a message that is already deleted (230110) or recalled (230011) counts as done. */
 const ALREADY_GONE = /\b(?:230110|230011)\b/;

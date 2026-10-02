@@ -78,6 +78,8 @@ test("the root card offers Feishu controls while the bridge runs the session, an
   assert.match(running, /飞书中运行中/);
   assert.match(running, /飞书续聊：自动接受编辑　sonnet · high/);
   assert.match(running, /"action":"stop_turn"/);
+  // Button rows wrap on phones instead of shrinking the labels to "…".
+  assert.match(running, /"tag":"column_set","flex_mode":"flow"/);
   assert.doesNotMatch(JSON.stringify(claudeRootCard(session, { live: "idle" })), /"action":"stop_turn"/);
   const fork = claudeRootCard(session, { forkedFrom: { title: "原会话", link: "https://example.test/root" } });
   assert.equal((fork.header as { title: { content: string } }).title.content, "Fix login page（分叉）");
