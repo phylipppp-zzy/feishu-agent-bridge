@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { CodexAppServer, JsonRpcMessage } from "../src/app-server.js";
 import { CodexCliProbe } from "../src/codex.js";
 import { BridgeDatabase } from "../src/db.js";
 import { parseJsonlChunk } from "../src/session-parser.js";
@@ -284,6 +285,210 @@ test("binding sends one control card immediately", async () => {
     assert.equal((feishu.cards[0]?.header as { title: { content: string } }).title.content, "Codex 控制台");
     await service.onFeishuMessage(inbound({ messageId: "bind-duplicate", text: "/bind token" }));
     assert.equal(feishu.cards.filter((card) => (card.header as { title?: { content?: string } } | undefined)?.title?.content === "Codex 控制台").length, 1);
+    db.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+// --- Topic replies, echo suppression and questions answered in other frontends ---
+
+const baseMs = Date.now() - 60_000;
+const at = (seconds: number) => new Date(baseMs + seconds * 1_000).toISOString();
+const jsonl = (records: unknown[]) => `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+const userRecord = (seconds: number, text: string) => ({ timestamp: at(seconds), type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } });
+const assistantRecord = (seconds: number, text: string) => ({ timestamp: at(seconds), type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text }] } });
+const eventRecord = (seconds: number, type: string) => ({ timestamp: at(seconds), type: "event_msg", payload: { type } });
+const questionRecord = (seconds: number, callId: string) => ({ timestamp: at(seconds), type: "response_item", payload: {
+  type: "function_call", name: "request_user_input", call_id: callId,
+  arguments: JSON.stringify({ questions: [{ id: "scope", header: "范围", question: "处理哪些内容？", options: [{ label: "完整", description: "全部" }, { label: "精简", description: "重点" }] }] }),
+} });
+const answerRecord = (seconds: number, callId: string) => ({ timestamp: at(seconds), type: "response_item", payload: { type: "function_call_output", call_id: callId, output: "完整" } });
+
+type Internals = {
+  turnCoordinator: { hasActiveTurn(sessionId: string): boolean };
+  onAppServerNotification(message: JsonRpcMessage): Promise<void>;
+  onAppServerRequest(message: JsonRpcMessage): Promise<unknown>;
+  continueSession(message: IncomingFeishuMessage): Promise<void>;
+};
+
+function title(card: Record<string, unknown> | undefined): string {
+  return (card?.header as { title?: { content?: string } } | undefined)?.title?.content ?? "";
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("condition was not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function fakeAppServer(reply: (method: string) => unknown = () => ({})) {
+  const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const server = {
+    appServerEpoch: 1,
+    getHealth: () => ({ state: "healthy", epoch: 1, sinceMs: 0 }),
+    request: async (method: string, params: Record<string, unknown>) => { calls.push({ method, params }); return reply(method); },
+    unsubscribeThread: async () => undefined,
+    interrupt: async () => undefined,
+  } as unknown as CodexAppServer;
+  return { server, calls };
+}
+
+/** Imports one local Codex session so that its Feishu topic root is `root-1`. */
+async function importedSession(home: string, records: unknown[], options: { appServer?: CodexAppServer; activeSessionQuietMs?: number } = {}) {
+  const sessionId = "44444444-4444-4444-4444-444444444444";
+  const codexHome = join(home, ".codex");
+  const sessions = join(codexHome, "sessions", "2026", "08", "05");
+  const path = join(sessions, `rollout-2026-08-05T00-00-00-${sessionId}.jsonl`);
+  await mkdir(sessions, { recursive: true });
+  const meta = { timestamp: at(0), type: "session_meta", payload: { session_id: sessionId, cwd: home, timestamp: at(0), source: "cli" } };
+  await writeFile(path, jsonl([meta, ...records]));
+  const config: BridgeConfig = {
+    appId: "app", appSecret: "secret", allowedRoot: home, codexHome, codexBin: "/bin/false", stateDir: join(home, "state"),
+    bindToken: "token", scanIntervalMs: 1_000, activeSessionQuietMs: options.activeSessionQuietMs ?? 1,
+  };
+  const db = new BridgeDatabase(config.stateDir);
+  db.setSetting("feishu.chat_id", "chat-1"); db.setSetting("feishu.open_id", "user-1");
+  const feishu = new FakeFeishu();
+  const service = new SyncService(config, db, feishu, new CodexCliProbe("/bin/false", codexHome), options.appServer);
+  await service.syncAll();
+  return { service, db, feishu, path, sessionId, internals: service as unknown as Internals };
+}
+
+test("plain words in a session topic go to Codex while slash commands still reach the bridge", async () => {
+  const home = await mkdtemp(join(tmpdir(), "bridge-topic-words-"));
+  try {
+    const { service, db, feishu, internals } = await importedSession(home, [userRecord(1, "hello"), assistantRecord(2, "world"), eventRecord(3, "task_complete")]);
+    const continued: string[] = [];
+    internals.continueSession = async (message) => { continued.push(message.text); };
+    const words = ["重试", "暂停", "状态", "?", "取消", "模型", "恢复", "同步", "帮助"];
+    for (const [index, text] of words.entries()) {
+      await service.onFeishuMessage(inbound({ messageId: `topic-word-${index}`, rootId: "root-1", mentionedBot: false, text }));
+    }
+    assert.deepEqual(continued, words);
+    assert.notEqual(db.getSetting("sync.paused"), "1");
+    await service.onFeishuMessage(inbound({ messageId: "topic-slash-pause", rootId: "root-1", mentionedBot: false, text: "/pause" }));
+    assert.equal(db.getSetting("sync.paused"), "1");
+    await service.onFeishuMessage(inbound({ messageId: "root-status", text: "状态" }));
+    assert.equal(title(feishu.cards.at(-1)), "Codex 控制台");
+    assert.equal(continued.length, words.length);
+    db.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("topic replies and messages added to a running turn are not posted again after import", async () => {
+  const home = await mkdtemp(join(tmpdir(), "bridge-echo-"));
+  try {
+    const appServer = fakeAppServer((method) => method === "turn/start" ? { turn: { id: "turn-1" } } : {});
+    const { service, db, feishu, path, sessionId, internals } = await importedSession(home,
+      [userRecord(1, "hello"), assistantRecord(2, "world"), eventRecord(3, "task_complete")], { appServer: appServer.server });
+    const echoes = () => feishu.texts.filter((text) => text.startsWith("用户\n"));
+    assert.deepEqual(echoes(), ["用户\nhello"]);
+    await service.onFeishuMessage(inbound({ messageId: "topic-1", rootId: "root-1", mentionedBot: false, text: "继续优化" }));
+    await waitFor(() => internals.turnCoordinator.hasActiveTurn(sessionId));
+    await service.onFeishuMessage(inbound({ messageId: "topic-2", rootId: "root-1", mentionedBot: false, text: "顺便更新文档" }));
+    assert.deepEqual(appServer.calls.map((call) => call.method), ["thread/resume", "turn/start", "turn/steer"]);
+    await internals.onAppServerNotification({ method: "turn/completed", params: { threadId: sessionId, turn: { id: "turn-1", status: "completed" } } });
+    await appendFile(path, jsonl([eventRecord(10, "task_started"), userRecord(11, "继续优化"), assistantRecord(12, "已优化"),
+      userRecord(13, "顺便更新文档"), assistantRecord(14, "文档已更新"), eventRecord(15, "task_complete")]));
+    await service.syncAll();
+    assert.deepEqual(echoes(), ["用户\nhello"]);
+    // The marker is used once: the same words typed later in the terminal are shown.
+    await appendFile(path, jsonl([userRecord(20, "继续优化")]));
+    await service.syncAll();
+    assert.deepEqual(echoes(), ["用户\nhello", "用户\n继续优化"]);
+    db.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a question answered in the same log batch never becomes a pending Feishu question", async () => {
+  const home = await mkdtemp(join(tmpdir(), "bridge-answered-question-"));
+  try {
+    const { service, db, feishu, internals } = await importedSession(home, [eventRecord(1, "task_started"), userRecord(2, "开始"),
+      questionRecord(3, "call-done"), answerRecord(4, "call-done"), assistantRecord(5, "好的"), eventRecord(6, "task_complete")]);
+    assert.equal(feishu.cards.some((card) => title(card).startsWith("Codex 等待你的选择")), false);
+    const continued: string[] = [];
+    internals.continueSession = async (message) => { continued.push(message.text); };
+    await service.onFeishuMessage(inbound({ messageId: "topic-next", rootId: "root-1", mentionedBot: false, text: "下一步" }));
+    assert.deepEqual(continued, ["下一步"]);
+    db.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a question answered later in the terminal closes its card and stops capturing topic replies", async () => {
+  const home = await mkdtemp(join(tmpdir(), "bridge-terminal-answer-"));
+  try {
+    const { service, db, feishu, path, sessionId, internals } = await importedSession(home,
+      [eventRecord(1, "task_started"), userRecord(2, "开始"), questionRecord(3, "call-q1")]);
+    const questionCard = feishu.cards.findIndex((card) => title(card) === "Codex 等待你的选择 1/1");
+    assert.ok(questionCard >= 0);
+    const cardMessageId = db.getMessage("call-q1")?.feishuMessageId;
+    assert.equal(cardMessageId, `card-${questionCard + 1}`);
+    await appendFile(path, jsonl([answerRecord(4, "call-q1"), assistantRecord(5, "收到"), eventRecord(6, "task_complete")]));
+    await service.syncAll();
+    assert.ok(feishu.updated.some((update) => update.messageId === cardMessageId && title(update.card) === "问题已在其它地方处理"));
+    assert.equal(db.listChoices(sessionId).length, 0);
+    const continued: string[] = [];
+    internals.continueSession = async (message) => { continued.push(message.text); };
+    await service.onFeishuMessage(inbound({ messageId: "topic-after-answer", rootId: "root-1", mentionedBot: false, text: "1" }));
+    assert.deepEqual(continued, ["1"]);
+    db.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a Feishu answer queued behind a waiting terminal is withdrawn when the terminal answers first", async () => {
+  const home = await mkdtemp(join(tmpdir(), "bridge-queued-answer-"));
+  try {
+    const { service, db, feishu, path, sessionId } = await importedSession(home,
+      [eventRecord(1, "task_started"), userRecord(2, "开始"), questionRecord(3, "call-q2")], { activeSessionQuietMs: 60_000 });
+    assert.equal(db.getSetting(`session.${sessionId}.active`), "1");
+    await service.onFeishuMessage(inbound({ messageId: "topic-answer", rootId: "root-1", mentionedBot: false, text: "1" }));
+    await waitFor(() => feishu.texts.some((text) => text.includes("你的回答已排队")));
+    assert.equal(db.taskStateCounts().pending, 1);
+    assert.equal(db.listSettings(`choice_task.${sessionId}.`).length, 1);
+    await appendFile(path, jsonl([answerRecord(4, "call-q2"), assistantRecord(5, "按完整处理"), eventRecord(6, "task_complete")]));
+    await service.syncAll();
+    assert.equal(db.taskStateCounts().pending, undefined);
+    assert.equal(db.taskStateCounts().cancelled, 1);
+    assert.equal(db.listSettings(`choice_task.${sessionId}.`).length, 0);
+    assert.ok(feishu.updated.some((update) => JSON.stringify(update.card).includes("你在飞书里的回答没有发送")));
+    db.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("native Codex questions show their options and collect every answer within the turn", async () => {
+  const home = await mkdtemp(join(tmpdir(), "bridge-native-question-"));
+  try {
+    const appServer = fakeAppServer();
+    const { service, db, feishu, path, sessionId, internals } = await importedSession(home,
+      [userRecord(1, "hello"), assistantRecord(2, "world"), eventRecord(3, "task_complete")], { appServer: appServer.server });
+    db.enqueueTask({ id: "task-q", kind: "resume", sessionId, cwd: home, prompt: "整理", imageKeys: [], sourceMessageId: "source-q", chatId: "chat-1",
+      rootMessageId: "root-1", model: null, reasoningEffort: null, status: "running", runCardMessageId: null, expectedSessionId: sessionId,
+      syncStatus: "none", lastSyncOffset: null });
+    db.updateTask("task-q", "running", { turnId: "turn-q" });
+    const answered = internals.onAppServerRequest({ jsonrpc: "2.0", id: 7, method: "item/tool/requestUserInput", params: {
+      threadId: sessionId, turnId: "turn-q", itemId: "call-native", questions: [
+        { id: "scope", header: "范围", question: "处理哪些内容？", options: [{ label: "完整", description: "全部" }, { label: "精简", description: "重点" }] },
+        { id: "note", header: "备注", question: "还有什么要求？", options: [] },
+      ],
+    } });
+    await waitFor(() => db.nextServerRequest(sessionId, "user_input") !== null);
+    const nonce = db.nextServerRequest(sessionId, "user_input")!.nonce;
+    const card = feishu.cards.find((item) => title(item) === "Codex 等待你的回答 1/2");
+    assert.ok(card);
+    assert.match(JSON.stringify(card), /精简/);
+    assert.doesNotMatch(JSON.stringify(card), /批准一次/);
+    const next = await service.onCardAction(cardAction("remote_answer", { nonce, questionIndex: 0, optionIndex: 1 }));
+    assert.equal(next.delivery, "replace");
+    assert.equal(title(next.card), "Codex 等待你的回答 2/2");
+    await service.onFeishuMessage(inbound({ messageId: "topic-note", rootId: "root-1", mentionedBot: false, text: "只看 src 目录" }));
+    assert.equal(title(feishu.cards.at(-1)), "回答已提交");
+    assert.deepEqual(await answered, { answers: { scope: { answers: ["精简"] }, note: { answers: ["只看 src 目录"] } } });
+    assert.equal(db.getServerRequest(nonce)?.status, "resolved");
+    // The logged tool call of this bridge-asked question must not produce a second card.
+    await appendFile(path, jsonl([eventRecord(10, "task_started"), questionRecord(11, "call-native")]));
+    await service.syncAll();
+    assert.equal(feishu.cards.some((item) => title(item).startsWith("Codex 等待你的选择")), false);
     db.close();
   } finally { await rm(home, { recursive: true, force: true }); }
 });

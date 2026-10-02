@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { archivedSessionActionCard, choiceCard, configureCardUi, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteRequestCard, rootGrantCard, sessionCard, wizardReadyCard } from "../src/cards.js";
+import { archivedSessionActionCard, choiceCard, configureCardUi, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, rootGrantCard, sessionCard, wizardReadyCard } from "../src/cards.js";
 import type { ModelCapability } from "../src/types.js";
 
 function actions(card: Record<string, unknown>): string[] {
@@ -99,6 +99,30 @@ test("large choices use a dropdown in Card 2.0", () => {
     assert.match(json, /"tag":"select_static"/);
     assert.match(json, /"action":"choice_answer"/);
   } finally { configureCardUi(1); }
+});
+
+test("native question cards list the options and offer no fake approval", () => {
+  const questions = [
+    { id: "scope", header: "范围", question: "处理哪些内容？", options: [{ label: "完整", description: "全部" }, { label: "精简", description: "重点" }] },
+    { id: "note", header: "备注", question: "还有什么要求？", options: [] },
+  ];
+  const first = remoteQuestionCard("opaque-nonce", questions, 0);
+  assert.deepEqual(actions(first), ["remote_answer", "remote_answer", "remote_approve"]);
+  const json = JSON.stringify(first);
+  assert.match(json, /opaque-nonce/);
+  assert.match(json, /"decision":"decline"/);
+  assert.doesNotMatch(json, /"decision":"accept"|批准一次/);
+  assert.match(json, /精简/);
+  assert.equal((first.header as { title: { content: string } }).title.content, "Codex 等待你的回答 1/2");
+  assert.deepEqual(actions(remoteQuestionCard("opaque-nonce", questions, 1)), ["remote_approve"]);
+});
+
+test("choice cards from the local log say where to answer", () => {
+  const card = choiceCard({
+    id: "request-1", sessionId: "session-1", timestamp: "2026-08-03T00:00:00Z", expiresAt: Date.now() + 1000,
+    questions: [{ id: "q1", header: "方案", question: "选择方案", options: [{ label: "A", description: "" }] }],
+  }, 0);
+  assert.match(JSON.stringify(card), /终端还在等待时，请直接在终端回答/);
 });
 
 test("remote root and approval cards keep only opaque callback state", () => {

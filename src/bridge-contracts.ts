@@ -65,7 +65,7 @@ export interface ApprovalServicePort {
   requestRootConsent(task: QueuedTask): Promise<TaskRootGrant | null>;
   consumeRootGrant(task: QueuedTask): Promise<boolean>;
   handleServerRequest(request: JsonRpcMessage): Promise<unknown>;
-  resolveAction(nonce: string, decision: string, answer?: string): Promise<void>;
+  resolveAction(nonce: string, decision: string, answers?: readonly string[]): Promise<void>;
   cancelForSession(sessionId: string): Promise<void>;
   expire(): Promise<void>;
 }

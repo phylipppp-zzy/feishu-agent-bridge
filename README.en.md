@@ -9,7 +9,7 @@ This service mirrors local Codex conversations from `~/.codex/sessions` into a p
 ## What It Does
 
 - Scans and continuously watches `~/.codex/sessions/**/*.jsonl`. Each Codex `session_id` maps to a Feishu root message; topic replies form the readable conversation.
-- Sends only readable user messages, Codex text, and progress updates to Feishu. Messages sent from Feishu suppress their JSONL mirror, preventing duplicate `User` entries.
+- Sends only readable user messages, Codex text, and progress updates to Feishu. Messages sent in a session topic (including messages added to a running turn) are not posted again as `User` entries; the prompt of a new session is shown once in its new topic.
 - Provides JSON 2.0 console cards, project -> model -> reasoning effort -> task creation, session search, topic continuation, image input, pause, retry, and cancellation.
 - Sends bodies over 50,000 characters as Markdown attachments. Downloaded images are stored in a controlled `0600` temporary directory and removed after Codex receives them.
 - Stores mappings, parsing offsets, deduplication keys, and failures in `~/.local/state/feishu-codex-bridge/bridge.sqlite`.
@@ -162,6 +162,8 @@ This atomically changes future continuations. `/model` in a group root does not 
 
 In the bound private group, known slash commands do not need an `@bot`. A normal group-root prompt still must mention the bot. Send `/` by itself to display a panel with New, Search, Recent, Console, Service Management, and Help. Unknown `/xxx` commands only show that panel and never submit work to Codex.
 
+Inside a session topic only commands starting with `/` reach the bridge; every other message goes to Codex, as it would in the terminal. The plain-word shortcuts below (such as `status`, `retry`, or `pause` in Chinese) work only at the group root; inside a topic they are sent to Codex as ordinary messages.
+
 - `/help`, `help`, `?`: show help.
 - `/`: show the command panel.
 - `/sessions`: open the session-search card.
@@ -185,6 +187,10 @@ Recent sessions are grouped by project and shown eight at a time. Search queries
 ## When Codex Needs Your Answer
 
 Implementation choices and business confirmations are presented as real Feishu card buttons. If a card expires or cannot be used, reply `1` in the same topic to choose the first option, or reply with free text. Answer ordinary questions directly in the topic.
+
+- In a Feishu-started turn, a Codex question card lists its options and walks through multiple questions in order; the answers take effect within the current turn. "Don't answer" lets Codex continue the turn without an answer.
+- Questions asked by Codex in a local terminal are shown as cards too. While the terminal is still waiting, answer in the terminal and the card closes itself. An answer given in Feishu is queued and sent as a new message after the terminal finishes the turn or exits; if the terminal answers first, the queued answer is cancelled.
+- A question already answered in the terminal or in Feishu never produces a new card, and later ordinary messages in the topic are not taken as its answer.
 
 Cards may ask for confirmation to:
 

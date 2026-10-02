@@ -240,6 +240,10 @@ export class BridgeDatabase {
 
   deleteSetting(key: string): void { this.db.prepare("DELETE FROM settings WHERE key=?").run(key); }
 
+  listSettings(prefix: string): Array<{ key: string; value: string }> {
+    return this.db.prepare("SELECT key,value FROM settings WHERE substr(key,1,?)=? ORDER BY key").all(prefix.length, prefix) as Array<{ key: string; value: string }>;
+  }
+
   getCursor(path: string): FileCursor {
     const row = this.db.prepare("SELECT path, session_id, parsed_offset, archived_offset, carry, size, mtime_ms FROM file_cursors WHERE path = ?").get(path) as Record<string, unknown> | undefined;
     if (!row) return { path, sessionId: null, parsedOffset: 0, archivedOffset: 0, carry: "", size: 0, mtimeMs: 0 };
@@ -502,6 +506,10 @@ export class BridgeDatabase {
         cardMessageId: row.card_message_id ? String(row.card_message_id) : null, payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
         status: String(row.status) as PendingServerRequest["status"], expiresAt: Number(row.expires_at_ms) };
     } catch { return null; }
+  }
+
+  hasServerRequestForItem(sessionId: string, itemId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM server_requests WHERE session_id=? AND item_id=? LIMIT 1").get(sessionId, itemId));
   }
 
   nextServerRequest(sessionId: string, type?: PendingServerRequest["type"]): PendingServerRequest | null {
@@ -878,6 +886,11 @@ export class BridgeDatabase {
   nextChoice(sessionId: string): { requestId: string; payload: string } | null {
     const row = this.db.prepare("SELECT request_id,payload FROM choice_queue WHERE session_id=? ORDER BY created_at_ms LIMIT 1").get(sessionId) as { request_id: string; payload: string } | undefined;
     return row ? { requestId: row.request_id, payload: row.payload } : null;
+  }
+
+  listChoices(sessionId: string): Array<{ requestId: string; payload: string }> {
+    return (this.db.prepare("SELECT request_id,payload FROM choice_queue WHERE session_id=? ORDER BY created_at_ms").all(sessionId) as Array<{ request_id: string; payload: string }>)
+      .map((row) => ({ requestId: row.request_id, payload: row.payload }));
   }
 
   deleteChoice(requestId: string): void { this.db.prepare("DELETE FROM choice_queue WHERE request_id=?").run(requestId); }

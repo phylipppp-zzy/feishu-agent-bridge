@@ -90,3 +90,17 @@ test("uses the original request timestamp when expiring historical choices", () 
   const result = parseJsonlChunk(`${meta}\n${request}\n`);
   assert.ok(result.choiceRequests[0]!.expiresAt < Date.now());
 });
+
+test("reports tool call outputs so questions answered elsewhere can be closed", () => {
+  const request = JSON.stringify({ timestamp: "2026-08-03T00:00:01Z", type: "response_item", payload: {
+    type: "function_call", name: "request_user_input", call_id: "choice-1",
+    arguments: JSON.stringify({ questions: [{ question: "continue?", options: [{ label: "yes", description: "" }] }] }),
+  } });
+  const output = JSON.stringify({ timestamp: "2026-08-03T00:00:02Z", type: "response_item", payload: {
+    type: "function_call_output", call_id: "choice-1", output: "yes",
+  } });
+  const result = parseJsonlChunk(`${meta}\n${request}\n${output}\n`);
+  assert.deepEqual(result.choiceRequests.map((item) => item.id), ["choice-1"]);
+  assert.deepEqual(result.answeredCallIds, ["choice-1"]);
+  assert.deepEqual(result.unknownTypes, []);
+});
