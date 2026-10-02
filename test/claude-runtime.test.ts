@@ -6,6 +6,7 @@ import test from "node:test";
 import { configureCardUi } from "../src/card-kit.js";
 import type { ClaudeBridgeConfig } from "../src/claude/config.js";
 import { ClaudeBridgeDatabase } from "../src/claude/db.js";
+import { projectFolderName } from "../src/claude/importer.js";
 import { ClaudeRuntime } from "../src/claude/runtime.js";
 import type { CardDefinition, FeishuPort, IncomingFeishuMessage } from "../src/types.js";
 import { fakeQueries } from "./claude-fake-query.js";
@@ -654,5 +655,21 @@ test("an idle process exits and the next reply resumes the session; a crash is r
     second.crash(new Error("claude exited with code 1"));
     await waitUntil(() => env.feishu.repliesTo(root).some((item) => item.text?.startsWith("⚠️ Claude Code 进程异常退出：claude exited with code 1")));
     await waitUntil(() => !rootCardOf(env, root).includes("飞书中"));
+  } finally { await env.cleanup(); }
+});
+
+test("a session continues in the directory it was started in, not where its shell moved to", async () => {
+  const env = await setup("claude-project-dir-");
+  try {
+    const folder = join(env.config.claudeHome, "projects", projectFolderName(env.project));
+    await mkdir(folder, { recursive: true });
+    await mkdir(join(env.project, "src"), { recursive: true });
+    const now = Date.now();
+    await writeFile(join(folder, `${RECENT}.jsonl`), jsonl(atCwd([prompt(RECENT, "r-p1", now - HOUR, "问题"), reply(RECENT, "r-a1", now - HOUR + MINUTE, "回答")], join(env.project, "src"))));
+    await env.bind();
+    const session = env.db.getSession(RECENT)!;
+    assert.equal(session.cwd, env.project);
+    await env.runtime.onFeishuMessage(env.message({ rootId: session.rootMessageId!, mentionedBot: false, text: "继续" }));
+    assert.equal(env.queries[0]!.options.cwd, env.project);
   } finally { await env.cleanup(); }
 });

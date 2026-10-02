@@ -1,5 +1,5 @@
 import { open, readdir, stat } from "node:fs/promises";
-import { basename, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { watch, type FSWatcher } from "chokidar";
 import { parseTranscriptChunk, type TranscriptEvent } from "./transcript.js";
 
@@ -15,6 +15,23 @@ export function transcriptSessionId(path: string): string | null {
 export function isTranscriptPath(path: string, projectsDir: string): boolean {
   const parts = relative(projectsDir, path).split(sep);
   return parts.length === 2 && parts[0] !== ".." && Boolean(transcriptSessionId(path));
+}
+
+/** The folder under `projects/` where Claude Code keeps the transcripts of sessions started in `dir`. */
+export function projectFolderName(dir: string): string { return dir.replace(/[^a-zA-Z0-9]/g, "-"); }
+
+/**
+ * The directory a session was started in. Each record carries the session's current directory,
+ * which follows its shell into subdirectories; the transcript's folder keeps the starting one.
+ * Falls back to `cwd` when no parent matches (for example a directory added with --add-dir).
+ */
+export function sessionProjectDir(transcriptPath: string, cwd: string | null): string | null {
+  if (!cwd) return null;
+  const folder = basename(dirname(transcriptPath));
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (projectFolderName(dir) === folder) return dir;
+    if (dir === dirname(dir)) return cwd;
+  }
 }
 
 export async function transcriptFiles(projectsDir: string): Promise<string[]> {

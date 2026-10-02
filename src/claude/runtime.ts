@@ -14,7 +14,7 @@ import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeComm
 import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
 import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
-import { isTranscriptPath, readTranscriptEvents, TranscriptImporter, transcriptSessionId } from "./importer.js";
+import { isTranscriptPath, projectFolderName, readTranscriptEvents, sessionProjectDir, TranscriptImporter, transcriptSessionId } from "./importer.js";
 import { askedQuestions, InteractionRegistry, planResult, questionResult, typedAnswer, type Interaction } from "./interactions.js";
 import { PresenceWatcher, processAlive, type PresenceRecord } from "./presence.js";
 import { EFFORT_LEVELS, FEISHU_PERMISSION_MODES, imageMediaType, SessionRunner, type EffortLevel, type FeishuPermissionMode, type ImageInput,
@@ -199,6 +199,11 @@ export class ClaudeRuntime {
    */
   private async reconcileTopics(): Promise<void> {
     this.db.setSetting("sync.scope", JSON.stringify(this.config.syncDirs));
+    // Sessions indexed before the bridge resolved starting directories may record a subdirectory.
+    for (const session of this.db.sessionDirectories()) {
+      const projectDir = sessionProjectDir(session.path, session.cwd);
+      if (projectDir && projectDir !== session.cwd) this.db.setSessionCwd(session.sessionId, projectDir);
+    }
     for (const session of this.db.topicSessions()) await this.renderSession(session.sessionId);
   }
 
@@ -305,6 +310,9 @@ export class ClaudeRuntime {
     const session = this.db.getSession(sessionId);
     const stored = !fromStart && session?.currentTurnId ? this.db.getTurn(sessionId, session.currentTurnId) : null;
     const result = reduceTranscript(sessionId, stored?.view ?? null, events);
+    // The session belongs to the directory it was started in, wherever its shell has moved since.
+    const projectDir = sessionProjectDir(path, result.meta.cwd ?? session?.cwd ?? null);
+    const meta = projectDir ? { ...result.meta, cwd: projectDir } : result.meta;
     const lastActivityMs = result.lastAt ? Date.parse(result.lastAt) : null;
     const startedAtMs = result.firstAt ? Date.parse(result.firstAt) : null;
 
@@ -312,7 +320,7 @@ export class ClaudeRuntime {
     // turn of recently active sessions, everything of sessions that just started.
     const visible = new Set<string>();
     const saved = new Map<string, TurnView>();
-    const scoped = this.inScope(result.meta.cwd ?? session?.cwd ?? null);
+    const scoped = this.inScope(projectDir);
     if (!scoped) {
       // Out of scope: keep only the latest turn, so the session can still be shown if SYNC_DIRS changes.
       if (result.current) saved.set(result.current.turnId, result.current);
@@ -340,7 +348,7 @@ export class ClaudeRuntime {
       }
     }
     this.db.transaction(() => {
-      this.db.updateSession({ sessionId, path, meta: result.meta, firstPrompt: result.firstHumanPrompt,
+      this.db.updateSession({ sessionId, path, meta, firstPrompt: result.firstHumanPrompt,
         startedAtMs: fromStart ? startedAtMs : null, lastActivityMs });
       for (const turn of saved.values()) {
         // Prompts sent from Feishu are recorded by Claude Code as SDK input; show where they came from.
@@ -567,7 +575,7 @@ export class ClaudeRuntime {
   }
 
   private transcriptPathFor(cwd: string, sessionId: string): string {
-    return join(this.projectsDir, cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
+    return join(this.projectsDir, projectFolderName(cwd), `${sessionId}.jsonl`);
   }
 
   /** The session's process if it can take messages; one that is exiting is waited for, so a new one can start. */

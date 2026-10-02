@@ -315,6 +315,14 @@ export class ClaudeBridgeDatabase {
     return (this.db.prepare(`SELECT cwd, MAX(last_activity_ms) AS latest FROM sessions WHERE cwd IS NOT NULL AND last_activity_ms>0${scope.sql}
       GROUP BY cwd ORDER BY latest DESC LIMIT ?`).all(...scope.params, limit) as Array<{ cwd: string }>).map((row) => row.cwd);
   }
+  /** Every session's transcript path and recorded working directory. */
+  sessionDirectories(): Array<{ sessionId: string; path: string; cwd: string }> {
+    return (this.db.prepare("SELECT session_id, path, cwd FROM sessions WHERE cwd IS NOT NULL").all() as Array<{ session_id: string; path: string; cwd: string }>)
+      .map((row) => ({ sessionId: row.session_id, path: row.path, cwd: row.cwd }));
+  }
+  setSessionCwd(sessionId: string, cwd: string): void {
+    this.db.prepare("UPDATE sessions SET cwd=?,root_dirty=CASE WHEN root_message_id IS NULL THEN root_dirty ELSE 1 END WHERE session_id=?").run(cwd, sessionId);
+  }
   setForkedFrom(sessionId: string, source: string): void {
     this.db.prepare("UPDATE sessions SET forked_from=? WHERE session_id=?").run(source, sessionId);
   }
