@@ -42,6 +42,8 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const RUNNER_CLOSE_WAIT_MS = 5_000;
 /** Live reply text is pushed to the card at most this often; the card itself is updated at most every CARD_UPDATE_INTERVAL_MS. */
 const LIVE_TEXT_RENDER_MS = 300;
+/** Raised when the root card's layout changes, so existing topics get the new card once. */
+const ROOT_CARD_VERSION = "2";
 const FALLBACK_MODELS = [{ value: "opus", label: "Opus" }, { value: "sonnet", label: "Sonnet" }, { value: "haiku", label: "Haiku" }];
 /** Withdrawing a message that is already deleted (230110) or recalled (230011) counts as done. */
 const ALREADY_GONE = /\b(?:230110|230011)\b/;
@@ -203,6 +205,10 @@ export class ClaudeRuntime {
     for (const session of this.db.sessionDirectories()) {
       const projectDir = sessionProjectDir(session.path, session.cwd);
       if (projectDir && projectDir !== session.cwd) this.db.setSessionCwd(session.sessionId, projectDir);
+    }
+    if (this.db.getSetting("cards.root_version") !== ROOT_CARD_VERSION) {
+      for (const session of this.db.topicSessions()) this.db.markRootDirty(session.sessionId);
+      this.db.setSetting("cards.root_version", ROOT_CARD_VERSION);
     }
     for (const session of this.db.topicSessions()) await this.renderSession(session.sessionId);
   }
