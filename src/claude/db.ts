@@ -37,6 +37,12 @@ export interface ClaudeSession {
   rootDirty: boolean;
   /** The root card currently says the session is outside SYNC_DIRS. */
   rootOutOfScope: boolean;
+  /** Permission mode, model and effort chosen in Feishu for the turns it runs; null means the default. */
+  prefMode: string | null;
+  prefModel: string | null;
+  prefEffort: string | null;
+  /** The session this one was forked from in Feishu. */
+  forkedFrom: string | null;
   readonlyNoticeAtMs: number;
 }
 
@@ -82,6 +88,11 @@ export interface PresenceUpdate {
   message: string | null;
 }
 
+const TURNS_COLUMNS = `turn_id TEXT NOT NULL, session_id TEXT NOT NULL, seq INTEGER NOT NULL, view_json TEXT NOT NULL,
+  render_state TEXT NOT NULL CHECK(render_state IN ('pending','hidden')),
+  prompt_message_id TEXT, card_message_id TEXT, rendered_hash TEXT, rendered_at_ms INTEGER NOT NULL DEFAULT 0,
+  attachment_message_id TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY(session_id, turn_id)`;
+
 /** SQL condition limiting sessions to those whose cwd is one of `dirs` or below them; empty means all. */
 function scopeCondition(dirs: readonly string[]): { sql: string; params: string[] } {
   if (!dirs.length) return { sql: "", params: [] };
@@ -115,13 +126,11 @@ export class ClaudeBridgeDatabase {
         path TEXT PRIMARY KEY, session_id TEXT, inode TEXT NOT NULL DEFAULT '', offset INTEGER NOT NULL DEFAULT 0,
         size INTEGER NOT NULL DEFAULT 0, mtime_ms REAL NOT NULL DEFAULT 0
       );
-      CREATE TABLE IF NOT EXISTS turns (
-        turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, view_json TEXT NOT NULL,
-        render_state TEXT NOT NULL CHECK(render_state IN ('pending','hidden')),
-        prompt_message_id TEXT, card_message_id TEXT, rendered_hash TEXT, rendered_at_ms INTEGER NOT NULL DEFAULT 0,
-        attachment_message_id TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
-      );
+      CREATE TABLE IF NOT EXISTS turns (${TURNS_COLUMNS});
       CREATE INDEX IF NOT EXISTS turns_session_seq ON turns(session_id, seq);
+      CREATE TABLE IF NOT EXISTS feishu_prompts (
+        session_id TEXT NOT NULL, uuid TEXT NOT NULL, message_id TEXT, created_at_ms INTEGER NOT NULL, PRIMARY KEY(session_id, uuid)
+      );
       CREATE TABLE IF NOT EXISTS inbound_events (
         event_id TEXT PRIMARY KEY, status TEXT NOT NULL, claim_token TEXT, service_epoch TEXT, lease_until_ms INTEGER,
         attempt_count INTEGER NOT NULL DEFAULT 0, error TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
@@ -135,6 +144,28 @@ export class ClaudeBridgeDatabase {
       );
       CREATE INDEX IF NOT EXISTS sent_messages_session ON sent_messages(session_id, created_at_ms);`);
     this.ensureColumn("sessions", "root_out_of_scope", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("sessions", "pref_mode", "TEXT");
+    this.ensureColumn("sessions", "pref_model", "TEXT");
+    this.ensureColumn("sessions", "pref_effort", "TEXT");
+    this.ensureColumn("sessions", "forked_from", "TEXT");
+    this.migrateTurnKey();
+  }
+
+  /**
+   * Turn ids are prompt uuids, and a forked session repeats the uuids of the history it copied,
+   * so turns are keyed per session. Databases from before this change are converted once.
+   */
+  private migrateTurnKey(): void {
+    const columns = this.db.prepare("PRAGMA table_info(turns)").all() as Array<{ name: string; pk: number }>;
+    if (columns.find((column) => column.name === "session_id")?.pk) return;
+    this.transaction(() => {
+      this.db.exec(`CREATE TABLE turns_keyed (${TURNS_COLUMNS});
+        INSERT INTO turns_keyed(turn_id,session_id,seq,view_json,render_state,prompt_message_id,card_message_id,rendered_hash,rendered_at_ms,attachment_message_id,created_at_ms,updated_at_ms)
+          SELECT turn_id,session_id,seq,view_json,render_state,prompt_message_id,card_message_id,rendered_hash,rendered_at_ms,attachment_message_id,created_at_ms,updated_at_ms FROM turns;
+        DROP TABLE turns;
+        ALTER TABLE turns_keyed RENAME TO turns;
+        CREATE INDEX IF NOT EXISTS turns_session_seq ON turns(session_id, seq);`);
+    });
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -182,6 +213,7 @@ export class ClaudeBridgeDatabase {
       presenceAtMs: Number(row.presence_at_ms), presencePid: row.presence_pid === null || row.presence_pid === undefined ? null : Number(row.presence_pid),
       presencePidStart: text(row.presence_pid_start), presenceMessage: text(row.presence_message), waitingNotifiedAtMs: Number(row.waiting_notified_at_ms),
       rootDirty: Number(row.root_dirty) === 1, rootOutOfScope: Number(row.root_out_of_scope) === 1, readonlyNoticeAtMs: Number(row.readonly_notice_at_ms),
+      prefMode: text(row.pref_mode), prefModel: text(row.pref_model), prefEffort: text(row.pref_effort), forkedFrom: text(row.forked_from),
     };
   }
 
@@ -194,14 +226,18 @@ export class ClaudeBridgeDatabase {
     return row ? this.sessionFromRow(row) : null;
   }
 
-  /** Records what a transcript says about its session; later values win, missing values keep the stored ones. */
+  /**
+   * Records what a transcript says about its session; later values win, missing values keep the
+   * stored ones. Turns the bridge runs are recorded with an SDK entrypoint, which does not replace
+   * where the session is known to come from.
+   */
   updateSession(update: SessionUpdate): boolean {
     const before = this.getSession(update.sessionId);
     const now = Date.now();
     this.db.prepare(`INSERT INTO sessions(session_id,path,cwd,custom_title,ai_title,first_prompt,entrypoint,model,permission_mode,git_branch,started_at_ms,last_activity_ms,created_at_ms,updated_at_ms)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET path=excluded.path,
       cwd=COALESCE(excluded.cwd,sessions.cwd), custom_title=COALESCE(excluded.custom_title,sessions.custom_title), ai_title=COALESCE(excluded.ai_title,sessions.ai_title),
-      first_prompt=COALESCE(sessions.first_prompt,excluded.first_prompt), entrypoint=COALESCE(excluded.entrypoint,sessions.entrypoint), model=COALESCE(excluded.model,sessions.model),
+      first_prompt=COALESCE(sessions.first_prompt,excluded.first_prompt), entrypoint=CASE WHEN excluded.entrypoint LIKE 'sdk%' AND sessions.entrypoint IS NOT NULL THEN sessions.entrypoint ELSE COALESCE(excluded.entrypoint,sessions.entrypoint) END, model=COALESCE(excluded.model,sessions.model),
       permission_mode=COALESCE(excluded.permission_mode,sessions.permission_mode), git_branch=COALESCE(excluded.git_branch,sessions.git_branch),
       started_at_ms=CASE WHEN sessions.started_at_ms=0 THEN excluded.started_at_ms ELSE sessions.started_at_ms END,
       last_activity_ms=MAX(sessions.last_activity_ms,excluded.last_activity_ms), updated_at_ms=excluded.updated_at_ms`).run(
@@ -246,7 +282,8 @@ export class ClaudeBridgeDatabase {
     const ids = new Set((this.db.prepare("SELECT message_id FROM sent_messages WHERE session_id=? ORDER BY created_at_ms DESC").all(sessionId) as Array<{ message_id: string }>)
       .map((row) => row.message_id));
     for (const row of this.db.prepare("SELECT prompt_message_id,card_message_id,attachment_message_id FROM turns WHERE session_id=? ORDER BY seq DESC").all(sessionId) as Array<Record<string, string | null>>) {
-      for (const id of [row.attachment_message_id, row.card_message_id, row.prompt_message_id]) if (id) ids.add(id);
+      // "feishu:" marks a prompt the person typed in Feishu; it is theirs, not the bridge's.
+      for (const id of [row.attachment_message_id, row.card_message_id, row.prompt_message_id]) if (id && !id.startsWith("feishu:")) ids.add(id);
     }
     if (session?.rootMessageId) { ids.delete(session.rootMessageId); ids.add(session.rootMessageId); }
     return [...ids];
@@ -266,8 +303,20 @@ export class ClaudeBridgeDatabase {
         readonly_notice_at_ms=0,updated_at_ms=? WHERE session_id=?`).run(Date.now(), sessionId);
     });
   }
-  setReadonlyNotice(sessionId: string, atMs: number): void {
-    this.db.prepare("UPDATE sessions SET readonly_notice_at_ms=? WHERE session_id=?").run(atMs, sessionId);
+  /** Changes only the given preferences; an empty string resets one to the default. */
+  setSessionPrefs(sessionId: string, prefs: { mode?: string; model?: string; effort?: string }): void {
+    for (const [column, value] of [["pref_mode", prefs.mode], ["pref_model", prefs.model], ["pref_effort", prefs.effort]] as const) {
+      if (value !== undefined) this.db.prepare(`UPDATE sessions SET ${column}=?,root_dirty=CASE WHEN root_message_id IS NULL THEN root_dirty ELSE 1 END WHERE session_id=?`).run(value || null, sessionId);
+    }
+  }
+  /** Working directories of recent sessions, most recent first, for picking where a new session starts. */
+  recentDirectories(limit: number, syncDirs: readonly string[] = []): string[] {
+    const scope = scopeCondition(syncDirs);
+    return (this.db.prepare(`SELECT cwd, MAX(last_activity_ms) AS latest FROM sessions WHERE cwd IS NOT NULL AND last_activity_ms>0${scope.sql}
+      GROUP BY cwd ORDER BY latest DESC LIMIT ?`).all(...scope.params, limit) as Array<{ cwd: string }>).map((row) => row.cwd);
+  }
+  setForkedFrom(sessionId: string, source: string): void {
+    this.db.prepare("UPDATE sessions SET forked_from=? WHERE session_id=?").run(source, sessionId);
   }
 
   /** Stores the latest hook-reported state; older reports never overwrite newer ones. */
@@ -315,21 +364,31 @@ export class ClaudeBridgeDatabase {
       renderedAtMs: Number(row.rendered_at_ms), attachmentMessageId: row.attachment_message_id ? String(row.attachment_message_id) : null,
     };
   }
-  getTurn(turnId: string): StoredTurn | null {
-    const row = this.db.prepare("SELECT * FROM turns WHERE turn_id=?").get(turnId) as Record<string, unknown> | undefined;
+  getTurn(sessionId: string, turnId: string): StoredTurn | null {
+    const row = this.db.prepare("SELECT * FROM turns WHERE session_id=? AND turn_id=?").get(sessionId, turnId) as Record<string, unknown> | undefined;
     return row ? this.turnFromRow(row) : null;
   }
   /**
    * Saves a turn's content. A hidden turn (history imported without posting) can
-   * become visible, but a visible turn never becomes hidden again.
+   * become visible, but a visible turn never becomes hidden again. `promptMessageId`
+   * marks a prompt that is already in the topic, so no prompt line is posted for it.
    */
-  saveTurn(sessionId: string, view: TurnView, renderState: TurnRenderState): void {
+  saveTurn(sessionId: string, view: TurnView, renderState: TurnRenderState, promptMessageId: string | null = null): void {
     const now = Date.now();
     const seq = Number((this.db.prepare("SELECT COALESCE(MAX(seq),0)+1 AS next FROM turns WHERE session_id=?").get(sessionId) as { next: number }).next);
-    this.db.prepare(`INSERT INTO turns(turn_id,session_id,seq,view_json,render_state,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?)
-      ON CONFLICT(turn_id) DO UPDATE SET view_json=excluded.view_json,updated_at_ms=excluded.updated_at_ms,
-      render_state=CASE WHEN turns.render_state='pending' THEN 'pending' ELSE excluded.render_state END`)
-      .run(view.turnId, sessionId, seq, JSON.stringify(view), renderState, now, now);
+    this.db.prepare(`INSERT INTO turns(turn_id,session_id,seq,view_json,render_state,prompt_message_id,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)
+      ON CONFLICT(session_id,turn_id) DO UPDATE SET view_json=excluded.view_json,updated_at_ms=excluded.updated_at_ms,
+      render_state=CASE WHEN turns.render_state='pending' THEN 'pending' ELSE excluded.render_state END,
+      prompt_message_id=COALESCE(turns.prompt_message_id,excluded.prompt_message_id)`)
+      .run(view.turnId, sessionId, seq, JSON.stringify(view), renderState, promptMessageId, now, now);
+  }
+  /** A prompt sent from Feishu; `messageId` is the person's message in the topic, null when the bridge posts the prompt itself. */
+  recordFeishuPrompt(sessionId: string, uuid: string, messageId: string | null): void {
+    this.db.prepare("INSERT OR IGNORE INTO feishu_prompts(session_id,uuid,message_id,created_at_ms) VALUES(?,?,?,?)").run(sessionId, uuid, messageId, Date.now());
+  }
+  feishuPrompt(sessionId: string, uuid: string): { messageId: string | null } | null {
+    const row = this.db.prepare("SELECT message_id FROM feishu_prompts WHERE session_id=? AND uuid=?").get(sessionId, uuid) as { message_id: string | null } | undefined;
+    return row ? { messageId: row.message_id ?? null } : null;
   }
   /**
    * Visible turns that may need work: no card yet, changed since the last render, or long
@@ -350,14 +409,14 @@ export class ClaudeBridgeDatabase {
         OR (json_extract(view_json,'$.status')='running' AND updated_at_ms<?))
       UNION SELECT session_id FROM sessions WHERE root_dirty=1 AND root_message_id IS NOT NULL`).all(quietBeforeMs) as Array<{ session_id: string }>).map((row) => row.session_id);
   }
-  setTurnPromptMessage(turnId: string, messageId: string): void {
-    this.db.prepare("UPDATE turns SET prompt_message_id=? WHERE turn_id=?").run(messageId, turnId);
+  setTurnPromptMessage(sessionId: string, turnId: string, messageId: string): void {
+    this.db.prepare("UPDATE turns SET prompt_message_id=? WHERE session_id=? AND turn_id=?").run(messageId, sessionId, turnId);
   }
-  setTurnCard(turnId: string, messageId: string, hash: string): void {
-    this.db.prepare("UPDATE turns SET card_message_id=?,rendered_hash=?,rendered_at_ms=? WHERE turn_id=?").run(messageId, hash, Date.now(), turnId);
+  setTurnCard(sessionId: string, turnId: string, messageId: string, hash: string): void {
+    this.db.prepare("UPDATE turns SET card_message_id=?,rendered_hash=?,rendered_at_ms=? WHERE session_id=? AND turn_id=?").run(messageId, hash, Date.now(), sessionId, turnId);
   }
-  setTurnAttachment(turnId: string, messageId: string): void {
-    this.db.prepare("UPDATE turns SET attachment_message_id=? WHERE turn_id=?").run(messageId, turnId);
+  setTurnAttachment(sessionId: string, turnId: string, messageId: string): void {
+    this.db.prepare("UPDATE turns SET attachment_message_id=? WHERE session_id=? AND turn_id=?").run(messageId, sessionId, turnId);
   }
 
   claimInboundEvent(eventId: string, leaseMs = 5 * 60_000): boolean {
@@ -401,5 +460,6 @@ export class ClaudeBridgeDatabase {
     this.db.prepare("DELETE FROM inbound_events WHERE status IN ('completed','retryable_failed') AND updated_at_ms<?").run(now - 7 * day);
     this.db.prepare("DELETE FROM inbound_events WHERE status='permanent_failed' AND updated_at_ms<?").run(now - 30 * day);
     this.db.prepare("DELETE FROM failures WHERE resolved=1 AND last_at_ms<?").run(now - 30 * day);
+    this.db.prepare("DELETE FROM feishu_prompts WHERE created_at_ms<?").run(now - 30 * day);
   }
 }

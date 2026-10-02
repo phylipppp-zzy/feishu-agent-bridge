@@ -4,6 +4,7 @@ import { actionRow, button, card, inputForm, markdown, nextElementId, note, safe
 import type { CardDefinition } from "../types.js";
 import type { TurnBlock, TurnView } from "./conversation.js";
 import type { ClaudeSession } from "./db.js";
+import type { Interaction } from "./interactions.js";
 
 /** Longest assistant text kept in a card; Feishu rejects card content above roughly 30 KB. */
 export const CARD_TEXT_LIMIT = 18_000;
@@ -13,6 +14,7 @@ const TOOL_LINES = 40;
 export function sourceLabel(entrypoint: string | null): string {
   if (entrypoint === "claude-vscode") return "VS Code";
   if (entrypoint === "cli") return "终端";
+  if (entrypoint === "feishu") return "飞书";
   if (entrypoint?.startsWith("sdk")) return "SDK";
   return "本机";
 }
@@ -36,7 +38,7 @@ export function formatTime(ms: number): string {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function displayPath(path: string | null): string {
+export function displayPath(path: string | null): string {
   if (!path) return "未知";
   const home = homedir();
   return path === home ? "~" : path.startsWith(`${home}/`) ? `~/${path.slice(home.length + 1)}` : path;
@@ -55,7 +57,8 @@ export function presenceLabel(session: Pick<ClaudeSession, "presenceState" | "en
     case "waiting": return `${where} 中等待你处理`;
     case "idle": return `${where} 中已打开（空闲）`;
     case "closed": return "未在本机打开";
-    default: return "未知（尚未收到 hook 状态）";
+    // Sessions run from Feishu never report hook states; when the bridge is not running them, nothing is.
+    default: return session.entrypoint === "feishu" ? "未在运行" : "未知（尚未收到 hook 状态）";
   }
 }
 
@@ -141,7 +144,27 @@ export function claudeTurnCard(turn: TurnView, options: { simpleTools?: boolean;
  * The topic's root card. `outOfScope` (the current SYNC_DIRS, as text) marks a session that is
  * no longer mirrored; its topic stays as it was.
  */
-export function claudeRootCard(session: ClaudeSession, options: { outOfScope?: string } = {}): CardDefinition {
+export const MODE_LABELS: Record<string, string> = {
+  default: "默认（逐项确认）", acceptEdits: "自动接受编辑", plan: "计划模式（只读）", auto: "自动（由分类器判断）",
+  bypassPermissions: "跳过权限检查", dontAsk: "不询问",
+};
+export function modeLabel(mode: string | null): string { return mode ? MODE_LABELS[mode] ?? mode : "未知"; }
+
+/** A turn the bridge runs for Feishu right now: running, waiting for an answer, or connected but idle. */
+export type LiveState = "running" | "waiting" | "idle";
+
+export interface RootCardOptions {
+  outOfScope?: string;
+  live?: LiveState | null;
+  /** The permission mode, model and effort the next Feishu turn uses. */
+  feishuMode?: string;
+  feishuModel?: string | null;
+  feishuEffort?: string | null;
+  /** The session this one was forked from in Feishu, with a link to its topic. */
+  forkedFrom?: { title: string; link: string | null };
+}
+
+export function claudeRootCard(session: ClaudeSession, options: RootCardOptions = {}): CardDefinition {
   const resume = `claude --resume ${session.sessionId}`;
   if (options.outOfScope !== undefined) {
     return card(`${sessionTitle(session)}（已移出同步范围）`, "grey", [
@@ -154,15 +177,164 @@ export function claudeRootCard(session: ClaudeSession, options: { outOfScope?: s
       note("这个话题保留在群里，内容停在移出范围之前。同步范围再次包含该目录后，会在这里继续更新；不需要时可在控制台“清理范围外话题”。"),
     ]);
   }
-  return card(sessionTitle(session), presenceTemplate(session), [
+  const live = options.live ?? null;
+  const status = live === "running" ? "飞书中运行中" : live === "waiting" ? "飞书中等待你处理" : live === "idle" ? "飞书中已连接（空闲）" : presenceLabel(session);
+  const template = live === "running" ? "orange" : live === "waiting" ? "red" : live === "idle" ? "blue" : presenceTemplate(session);
+  const id = { sessionId: session.sessionId };
+  const fork = options.forkedFrom;
+  return card(`${sessionTitle(session)}${fork ? "（分叉）" : ""}`, template, [
     markdown([
       `项目：${safeMarkdown(displayPath(session.cwd))}`,
-      `来源：${sourceLabel(session.entrypoint)}　模型：${safeMarkdown(session.model ?? "未知")}　权限模式：${safeMarkdown(session.permissionMode ?? "未知")}`,
-      `状态：**${presenceLabel(session)}**　最后活动：${formatTime(session.lastActivityMs)}`,
+      ...(fork ? [`分叉自：${fork.link ? `[${safeMarkdown(fork.title)}](${fork.link})` : safeMarkdown(fork.title)}`] : []),
+      `来源：${sourceLabel(session.entrypoint)}　模型：${safeMarkdown(session.model ?? "未知")}　最近的权限模式：${safeMarkdown(modeLabel(session.permissionMode))}`,
+      `状态：**${status}**　最后活动：${formatTime(session.lastActivityMs)}`,
+      `飞书续聊：${safeMarkdown(modeLabel(options.feishuMode ?? "default"))}　${safeMarkdown(options.feishuModel ?? "默认模型")}${options.feishuEffort ? ` · ${safeMarkdown(options.feishuEffort)}` : ""}`,
       `会话 ID：\`${session.sessionId}\``,
     ].join("\n")),
-    note(`只读镜像：这里同步显示本机的对话。要继续这个会话，请在电脑上用 VS Code 打开它，或运行 \`${resume}\`；手机上可以先在 VS Code 中输入 /rc，再用 Claude App 接续。${session.presenceState === "waiting" && session.presenceMessage ? `\n等待处理：${safeMarkdown(session.presenceMessage)}` : ""}`),
-    actionRow([button("导出完整记录", "export_session", "primary", { sessionId: session.sessionId }), button("刷新", "refresh_session", "default", { sessionId: session.sessionId })]),
+    note(`在本话题直接回复就会继续这个会话：Claude 在本机运行，执行记录和需要你确认的事项都会发到这里。发送 /stop 停止当前回合；以 >> 开头的消息排到本轮结束后再发。会话正在 VS Code 或终端中打开时，会先问你要分叉还是接管。电脑上继续：\`${resume}\`。${session.presenceState === "waiting" && session.presenceMessage && !live ? `\n等待处理：${safeMarkdown(session.presenceMessage)}` : ""}`),
+    actionRow([
+      ...(live === "running" || live === "waiting" ? [button("停止本轮", "stop_turn", "danger", id)] : []),
+      button("权限模式", "mode_card", "default", id),
+      button("模型", "model_card", "default", id),
+      button("导出完整记录", "export_session", "default", id),
+      button("刷新", "refresh_session", "default", id),
+    ]),
+  ]);
+}
+
+function codeBlock(text: string, limit: number): string {
+  const clipped = text.length > limit ? `${text.slice(0, limit)}\n…（已截断）` : text;
+  return `\`\`\`\n${clipped.replace(/\`\`\`/g, "ˋˋˋ")}\n\`\`\``;
+}
+
+/** What a tool call would do, in a form readable on a phone. */
+function toolRequestDetail(toolName: string, input: Record<string, unknown>): string {
+  const text = (value: unknown) => typeof value === "string" ? value : "";
+  if (toolName === "Bash") return `${text(input.description) ? `${safeMarkdown(text(input.description))}\n` : ""}${codeBlock(text(input.command), 2_000)}`;
+  if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(toolName)) {
+    const path = text(input.file_path) || text(input.notebook_path);
+    const change = toolName === "Write" ? codeBlock(text(input.content), 1_200)
+      : toolName === "Edit" ? `删除：\n${codeBlock(text(input.old_string), 600)}\n替换为：\n${codeBlock(text(input.new_string), 600)}`
+      : codeBlock(JSON.stringify(input.edits ?? input.new_source ?? "", null, 2), 1_200);
+    return `文件：${safeMarkdown(path)}\n${change}`;
+  }
+  if (toolName === "WebFetch") return `网址：${safeMarkdown(text(input.url))}${text(input.prompt) ? `\n目的：${safeMarkdown(text(input.prompt))}` : ""}`;
+  return codeBlock(JSON.stringify(input, null, 2), 1_500);
+}
+
+/** A tool permission request, answered on the card or by replying with a reason to refuse. */
+export function claudePermissionCard(interaction: Interaction): CardDefinition {
+  const nonce = { nonce: interaction.nonce };
+  return card(`Claude 请求使用 ${toolName(interaction.toolName)}`, "orange", [
+    ...(interaction.title ? [markdown(`**${safeMarkdown(interaction.title)}**`)] : []),
+    markdown(toolRequestDetail(interaction.toolName, interaction.input)),
+    ...(interaction.reason ? [note(`原因：${safeMarkdown(interaction.reason)}`)] : []),
+    actionRow([
+      button("允许", "perm_allow", "primary", nonce),
+      ...(interaction.allowAlways ? [button("本会话都允许", "perm_always", "default", nonce)] : []),
+      button("拒绝", "perm_deny", "danger", nonce),
+    ]),
+    note("也可以直接在本话题回复文字：等于拒绝，并把这段话告诉 Claude。"),
+  ]);
+}
+
+/** One question of an AskUserQuestion request; multi-question requests are answered in turn. */
+export function claudeQuestionCard(interaction: Interaction, index: number): CardDefinition {
+  const question = interaction.questions[index];
+  if (!question) return claudeNoticeCard("问题已失效", "这个问题已经回答或已取消。");
+  const details = question.options.map((option, optionIndex) => `${optionIndex + 1}. **${safeMarkdown(option.label)}**${option.description ? `：${safeMarkdown(option.description)}` : ""}`);
+  return card(`Claude 提问 ${index + 1}/${interaction.questions.length}${question.header ? ` · ${shorten(question.header, 20)}` : ""}`, "orange", [
+    markdown(`**${safeMarkdown(question.question)}**${details.length ? `\n${details.join("\n")}` : ""}`),
+    ...(question.multiSelect ? [] : [actionRow(question.options.map((option, optionIndex) =>
+      button(`${optionIndex + 1}. ${shorten(option.label, 16)}`, "ask_answer", optionIndex === 0 ? "primary" : "default", { nonce: interaction.nonce, question: index, option: optionIndex })))]),
+    actionRow([button("不回答", "ask_skip", "default", { nonce: interaction.nonce })]),
+    note(question.multiSelect ? "可多选：在本话题回复选项编号，用逗号分隔，例如 1,3；也可以直接回复自己的答案。" : "也可以在本话题回复选项编号，或直接回复自己的答案。"),
+  ]);
+}
+
+/** Claude finished planning (ExitPlanMode); choose how to carry the plan out, or ask for changes. */
+export function claudePlanCard(interaction: Interaction): CardDefinition {
+  const plan = typeof interaction.input.plan === "string" ? interaction.input.plan : "";
+  const nonce = { nonce: interaction.nonce };
+  return card("Claude 提交了计划，等你确认", "orange", [
+    markdown(plan ? (plan.length > CARD_TEXT_LIMIT ? `${plan.slice(0, CARD_TEXT_LIMIT)}\n\n…（计划过长，已截断）` : plan) : "（没有收到计划正文）"),
+    actionRow([
+      button("执行，自动接受编辑", "plan_edits", "primary", nonce),
+      button("执行，逐项确认", "plan_default", "default", nonce),
+      button("继续修改计划", "plan_revise", "default", nonce),
+    ]),
+    note("也可以直接在本话题回复修改意见，Claude 会据此继续完善计划。"),
+  ]);
+}
+
+/** The session is open in VS Code or a terminal: writing from Feishu as well would interleave both. */
+export function claudeConflictCard(session: ClaudeSession, nonce: string): CardDefinition {
+  return card("这个会话正在本机打开", "orange", [
+    markdown(`会话在**${presenceLabel(session)}**。两边同时往同一个会话写入，对话会交错，本机那边也看不到飞书里的这几轮。`),
+    actionRow([
+      button("分叉继续（推荐）", "conflict_fork", "primary", { nonce }),
+      button("仍在原会话继续", "conflict_takeover", "default", { nonce }),
+      button("取消", "conflict_cancel", "default", { nonce }),
+    ]),
+    note("分叉：复制到目前为止的对话，在新话题里继续，本机的会话不受影响。仍在原会话继续：回到电脑后，需要在 VS Code 中重新打开这个会话才能看到飞书里的内容。"),
+  ]);
+}
+
+/** What became of a request once it is answered, cancelled or refused. */
+export function claudeInteractionDoneCard(interaction: Interaction, outcome: string, template: string, detail = ""): CardDefinition {
+  const subject = interaction.kind === "question" ? "Claude 提问" : interaction.kind === "plan" ? "Claude 的计划" : `使用 ${toolName(interaction.toolName)}`;
+  return card(`${subject} · ${outcome}`, template, detail ? [markdown(safeMarkdown(detail))] : [note("已处理。")]);
+}
+
+export function claudeModeCard(session: ClaudeSession, current: string, modes: readonly string[]): CardDefinition {
+  return card("飞书续聊的权限模式", "blue", [
+    markdown(`当前：**${safeMarkdown(modeLabel(current))}**\n会话：${safeMarkdown(sessionTitle(session))}`),
+    actionRow(modes.map((mode) => button(modeLabel(mode), "set_mode", mode === current ? "primary" : "default", { sessionId: session.sessionId, mode }))),
+    note("权限仍按你在 settings.json 中的允许和拒绝规则判断；没有被规则覆盖的操作，会在这里发卡片请你确认。飞书端不提供跳过权限检查的模式。"),
+  ]);
+}
+
+export function claudeModelCard(session: ClaudeSession, models: ReadonlyArray<{ value: string; label: string }>, efforts: readonly string[], current: { model: string | null; effort: string | null }): CardDefinition {
+  return card("飞书续聊的模型", "blue", [
+    markdown(`当前：**${safeMarkdown(current.model ?? "默认模型")}**${current.effort ? ` · 推理强度 ${safeMarkdown(current.effort)}` : ""}`),
+    actionRow([button("默认模型", "set_model", current.model ? "default" : "primary", { sessionId: session.sessionId, model: "" }),
+      ...models.map((model) => button(model.label, "set_model", model.value === current.model ? "primary" : "default", { sessionId: session.sessionId, model: model.value }))]),
+    actionRow([button("默认强度", "set_effort", current.effort ? "default" : "primary", { sessionId: session.sessionId, effort: "" }),
+      ...efforts.map((effort) => button(effort, "set_effort", effort === current.effort ? "primary" : "default", { sessionId: session.sessionId, effort }))]),
+    note("正在运行的会话立即生效，之后从飞书发送的消息也会使用这个设置。"),
+  ]);
+}
+
+/**
+ * Step one of a new session: pick a recent project directory or type one. With a draft (a
+ * message sent in the group's main timeline), picking the directory starts the session with it.
+ */
+export function claudeNewSessionCard(directories: readonly string[], scope: string, draft?: { nonce: string; preview: string }, notice = ""): CardDefinition {
+  const extra = draft ? { draft: draft.nonce } : {};
+  const rows: Record<string, unknown>[] = [];
+  for (let index = 0; index < directories.length; index += 2) {
+    rows.push(actionRow(directories.slice(index, index + 2).map((dir) => button(shorten(displayPath(dir), 28), "new_pick", "default", { cwd: dir, ...extra }))));
+  }
+  return card("新建 Claude 会话", "turquoise", [
+    ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
+    ...(draft ? [markdown(`任务：${safeMarkdown(shorten(draft.preview, 200) || "（图片）")}`)] : []),
+    markdown(`${draft ? "选择在哪个目录中开始" : "选择项目目录"}（同步范围：${safeMarkdown(scope)}）：`),
+    ...rows,
+    ...inputForm({ formName: "new_dir_form", inputName: "new_dir", elementId: "new_dir", placeholder: "或输入目录的绝对路径，例如 ~/usr/zhangzy/workspace/项目", maxLength: 300,
+      buttons: [{ label: "使用这个目录", action: "new_pick_path", type: "primary", extra }] }),
+    actionRow([button("返回控制台", "home")]),
+  ]);
+}
+
+/** Step two of a new session: the first message, in the chosen directory. */
+export function claudeNewTaskCard(cwd: string, notice = ""): CardDefinition {
+  return card("新建 Claude 会话", "turquoise", [
+    ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
+    markdown(`目录：${safeMarkdown(displayPath(cwd))}`),
+    ...inputForm({ formName: "new_task_form", inputName: "new_task", elementId: "new_task", placeholder: "要 Claude 做什么", maxLength: 4_000, multiline: true, rows: 5,
+      buttons: [{ label: "开始", action: "new_submit", type: "primary", extra: { cwd } }] }),
+    note("会在这个目录中启动 Claude Code（使用你本机的设置），并为它新建一个话题。"),
+    actionRow([button("重新选择目录", "new_session")]),
   ]);
 }
 
@@ -171,7 +343,8 @@ export function claudeHomeCard(status: { paused: boolean; indexed: number; topic
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
     markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**　已索引会话：**${status.indexed}**　已建话题：**${status.topics}**　本机打开中：**${status.open}**　未解决失败：**${status.failures}**\n同步范围：${safeMarkdown(status.scope)}`),
     actionRow([
-      button("最近会话", "recent", "primary"),
+      button("新建会话", "new_session", "primary"),
+      button("最近会话", "recent"),
       button("立即同步", "sync"),
       button(status.paused ? "恢复同步" : "暂停同步", status.paused ? "resume" : "pause"),
       button("帮助", "help"),
@@ -204,15 +377,15 @@ export function claudeCleanupResultCard(result: { topics: number; withdrawn: num
 export function claudeHelpCard(): CardDefinition {
   return card("Claude 桥接帮助", "wathet", [
     markdown([
-      "**当前是只读镜像阶段**：本机 Claude Code（VS Code 或终端）的会话会同步到这个群，每个会话一个话题，每一轮对话一张卡片，执行记录折叠在卡片里。",
-      "最近几天有活动的会话会自动建话题，并显示最后一轮；更早的内容可以在话题里点“导出完整记录”。更早的会话可以在“最近会话”中搜索后打开。",
-      "会话在 VS Code 或终端里等待你确认权限时，话题里会收到提醒。",
-      "只想同步部分目录时，在环境文件中设置 `SYNC_DIRS`（多个目录用英文逗号分隔），重启服务后生效；控制台会显示当前的同步范围。",
+      "本机 Claude Code（VS Code 或终端）的会话会同步到这个群：每个会话一个话题，每一轮对话一张卡片，执行记录折叠在卡片里。",
+      "**继续对话**：在会话话题里直接回复即可。Claude 在本机运行，使用你本机的设置；需要你确认的权限、提问和计划会以卡片发到话题里。会话正在 VS Code 或终端中打开时，会先问你要分叉还是接管。",
+      "**话题中的命令**：`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
+      "**新建会话**：控制台点“新建会话”，或在群主消息中发送 `/new <目录> <任务>`。",
+      "最近几天有活动的会话会自动建话题；更早的会话可以在“最近会话”中搜索后打开。只想同步部分目录时，在环境文件中设置 `SYNC_DIRS`。",
       "",
-      "**群主消息中的命令**：`/` 命令菜单、`/help` 帮助、`/status` 控制台、`/sessions` 最近会话、`/search <关键词>` 搜索、`/sync` 立即同步、`/pause` 与 `/resume-sync` 暂停或恢复同步。",
-      "**会话话题中的命令**：`/export` 导出完整记录。其它消息暂不会发给 Claude。",
+      "**群主消息中的命令**：`/` 命令菜单、`/help` 帮助、`/status` 控制台、`/new` 新建会话、`/sessions` 最近会话、`/search <关键词>` 搜索、`/sync` 立即同步、`/pause` 与 `/resume-sync` 暂停或恢复同步。",
     ].join("\n")),
-    actionRow([button("返回控制台", "home", "primary"), button("最近会话", "recent")]),
+    actionRow([button("返回控制台", "home", "primary"), button("新建会话", "new_session"), button("最近会话", "recent")]),
   ]);
 }
 
@@ -220,7 +393,7 @@ export function claudeCommandMenuCard(notice = ""): CardDefinition {
   return card("Claude 命令菜单", "blue", [
     ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
     markdown("群主消息中发送单独的 `/` 可以再次打开本菜单。"),
-    actionRow([button("最近会话", "recent", "primary"), button("控制台", "home"), button("帮助", "help")]),
+    actionRow([button("新建会话", "new_session", "primary"), button("最近会话", "recent"), button("控制台", "home"), button("帮助", "help")]),
   ]);
 }
 
@@ -248,6 +421,14 @@ export function claudeRecentCard(sessions: ClaudeSession[], search = "", page = 
 
 export function claudeNoticeCard(title: string, text: string, template = "grey"): CardDefinition {
   return card(title, template, [markdown(safeMarkdown(text))]);
+}
+
+/** A session was started from a card; links to its new topic. */
+export function claudeStartedCard(cwd: string, link: string | null): CardDefinition {
+  return card("已新建会话", "green", [
+    markdown(`目录：${safeMarkdown(displayPath(cwd))}`),
+    link ? markdown(`[打开话题](${link})`) : note("话题已在群里创建。"),
+  ]);
 }
 
 /** A readable Markdown transcript of every turn, for the export button and over-long replies. */

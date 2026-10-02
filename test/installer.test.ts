@@ -22,6 +22,13 @@ test("installer renders portable secret-safe environment and systemd files", () 
   assert.match(unit, /^EnvironmentFile=\/home\/alice\/\.config\/bridge\/env$/m);
   assert.match(unit, /ExecStart="\/usr\/bin\/node" "\/home\/alice\/tools\/bridge\/dist\/src\/index\.js"/);
   assert.doesNotMatch(unit, /zhangzy|v24\.18\.0/);
+  assert.match(unit, /^PrivateTmp=true$/m);
+  assert.match(unit, /^UMask=0077$/m);
+  // The Claude service runs the person's sessions: shared /tmp and the installing shell's umask, as in a terminal.
+  const sessions = renderSystemdUnit({ projectDir: "/home/alice/tools/bridge", nodeBin: "/usr/bin/node", environmentFile: "/home/alice/env", entry: "dist/src/claude/index.js", sessionUmask: 0o002 });
+  assert.doesNotMatch(sessions, /PrivateTmp/);
+  assert.match(sessions, /^UMask=0002$/m);
+  assert.match(sessions, /^NoNewPrivileges=true$/m);
   const spaced = renderSystemdUnit({ projectDir: "/home/alice/my tools/100%", nodeBin: "/usr/bin/node", environmentFile: "/home/alice/env", entry: "dist/src/claude/index.js" });
   assert.match(spaced, /^WorkingDirectory=\/home\/alice\/my tools\/100%%$/m);
   assert.match(spaced, /^ExecStart="\/usr\/bin\/node" "\/home\/alice\/my tools\/100%%\/dist\/src\/claude\/index\.js"$/m);

@@ -95,3 +95,15 @@ test("prompt cleaning keeps pasted content and tool summaries stay short and rel
   assert.equal(toolSummary("mcp__projtool__remote_exec", { command: "nvidia-smi" }, null), "nvidia-smi");
   assert.ok(toolSummary("Bash", { command: "x".repeat(500) }, null).length <= 120);
 });
+
+test("messages sent while Claude works are shown inside the running turn; other queued input is not", () => {
+  const queued = (attachment: Record<string, unknown>) => parseTranscriptLine(line({ type: "attachment", uuid: "q-1", timestamp: "2026-10-02T06:02:00.000Z", attachment }));
+  assert.deepEqual(queued({ type: "queued_command", commandMode: "prompt", origin: { kind: "human" }, humanTurn: true, prompt: "另外把日志也看一下", source_uuid: "u-9" }),
+    [{ kind: "note", key: "q-1:queued", at: "2026-10-02T06:02:00.000Z", text: "补充：另外把日志也看一下" }]);
+  assert.deepEqual(queued({ type: "queued_command", commandMode: "prompt", origin: { kind: "human" },
+    prompt: [{ type: "text", text: "<system-reminder>x</system-reminder>看这张图" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] }),
+    [{ kind: "note", key: "q-1:queued", at: "2026-10-02T06:02:00.000Z", text: "补充：看这张图（附件：图片）" }]);
+  assert.deepEqual(queued({ type: "queued_command", commandMode: "prompt", origin: { kind: "peer" }, prompt: "<agent-message>报告</agent-message>" }), []);
+  assert.deepEqual(queued({ type: "queued_command", commandMode: "task-notification", prompt: "<task-notification></task-notification>" }), []);
+  assert.deepEqual(queued({ type: "skill_listing", content: "..." }), []);
+});

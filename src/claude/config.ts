@@ -9,8 +9,12 @@ export interface ClaudeBridgeConfig {
   /** Claude Code configuration directory; transcripts live in `projects/`. */
   claudeHome: string;
   stateDir: string;
-  /** Working directories a later continuation phase may use; kept for parity with the Codex bridge. */
+  /** New sessions started from Feishu must work in this directory or below it. */
   allowedRoot: string;
+  /** The Claude Code executable that runs sessions continued from Feishu. */
+  claudeBin: string;
+  /** A Feishu-driven Claude Code process idle this long is stopped; the next message resumes the session. */
+  runnerIdleMs: number;
   /** Sessions active within this many days get a topic when the bridge first sees them. */
   historyDays: number;
   /** Only sessions working in one of these directories or below them are mirrored; empty mirrors all. */
@@ -62,6 +66,8 @@ export function loadClaudeConfig(env: NodeJS.ProcessEnv = process.env): ClaudeBr
     claudeHome: resolve(env.CLAUDE_HOME ?? `${home}/.claude`),
     stateDir: resolve(env.STATE_DIR ?? `${home}/.local/state/feishu-claude-bridge`),
     allowedRoot: resolve(env.ALLOWED_ROOT ?? home),
+    claudeBin: env.CLAUDE_BIN?.trim() || "claude",
+    runnerIdleMs: positiveInteger(env, "RUNNER_IDLE_MS", 10 * 60_000),
     historyDays: positiveInteger(env, "HISTORY_DAYS", 3),
     syncDirs: parseSyncDirs(env.SYNC_DIRS, home),
     scanIntervalMs: positiveInteger(env, "SCAN_INTERVAL_MS", 10_000),

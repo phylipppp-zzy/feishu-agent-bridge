@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { configureCardUi } from "../src/card-kit.js";
-import { CARD_TEXT_LIMIT, claudeRootCard, claudeTurnCard, formatDuration, presenceLabel, promptLine, transcriptMarkdown } from "../src/claude/cards.js";
+import { CARD_TEXT_LIMIT, claudeConflictCard, claudeInteractionDoneCard, claudeModeCard, claudeNewSessionCard, claudePermissionCard, claudePlanCard,
+  claudeQuestionCard, claudeRootCard, claudeTurnCard, formatDuration, presenceLabel, promptLine, transcriptMarkdown } from "../src/claude/cards.js";
+import type { Interaction } from "../src/claude/interactions.js";
 import type { TurnView } from "../src/claude/conversation.js";
 import type { ClaudeSession } from "../src/claude/db.js";
 
@@ -21,6 +23,7 @@ const session: ClaudeSession = {
   entrypoint: "claude-vscode", model: "claude-opus-5-5", permissionMode: "auto", gitBranch: "main", startedAtMs: 0, lastActivityMs: Date.parse("2026-10-02T06:01:00Z"),
   rootMessageId: null, rootAppLink: null, chatId: null, currentTurnId: null, presenceState: "waiting", presenceAtMs: 0, presencePid: null, presencePidStart: null,
   presenceMessage: "Claude needs your permission to use Bash", waitingNotifiedAtMs: 0, rootDirty: false, rootOutOfScope: false, readonlyNoticeAtMs: 0,
+  prefMode: null, prefModel: null, prefEffort: null, forkedFrom: null,
 };
 
 test("turn cards show progress, the folded tool log and the final duration", () => {
@@ -63,4 +66,49 @@ test("the root card shows where the session is open and how to continue it", () 
   assert.match(exported, /^# Fix login page/);
   assert.match(exported, /## 1\. VS Code 提问/);
   assert.match(exported, /<details><summary>执行记录（3 项）<\/summary>/);
+});
+
+const interaction = (overrides: Partial<Interaction> = {}): Interaction => ({
+  nonce: "n-1", sessionId: session.sessionId, kind: "permission", toolName: "Bash", input: { command: "npm test", description: "运行测试" }, suggestions: [],
+  allowAlways: true, title: "Claude wants to run npm test", reason: null, questions: [], answers: [], cardMessageId: null, resolve: () => undefined, ...overrides,
+});
+
+test("the root card offers Feishu controls while the bridge runs the session, and marks forks", () => {
+  const running = JSON.stringify(claudeRootCard(session, { live: "running", feishuMode: "acceptEdits", feishuModel: "sonnet", feishuEffort: "high" }));
+  assert.match(running, /飞书中运行中/);
+  assert.match(running, /飞书续聊：自动接受编辑　sonnet · high/);
+  assert.match(running, /"action":"stop_turn"/);
+  assert.doesNotMatch(JSON.stringify(claudeRootCard(session, { live: "idle" })), /"action":"stop_turn"/);
+  const fork = claudeRootCard(session, { forkedFrom: { title: "原会话", link: "https://example.test/root" } });
+  assert.equal((fork.header as { title: { content: string } }).title.content, "Fix login page（分叉）");
+  assert.match(JSON.stringify(fork), /分叉自：\[原会话\]\(https:\/\/example\.test\/root\)/);
+  assert.equal(presenceLabel({ presenceState: null, entrypoint: "feishu" }), "未在运行");
+});
+
+test("request cards show what Claude wants and every way to answer", () => {
+  const permission = JSON.stringify(claudePermissionCard(interaction()));
+  assert.match(permission, /Claude 请求使用 Bash/);
+  assert.match(permission, /npm test/);
+  assert.match(permission, /"action":"perm_always"/);
+  assert.doesNotMatch(JSON.stringify(claudePermissionCard(interaction({ allowAlways: false }))), /perm_always/);
+  const questions = [{ question: "用哪个？", header: "方案", multiSelect: false, options: [{ label: "甲", description: "简单" }, { label: "乙", description: "" }] },
+    { question: "测哪些？", header: "测试", multiSelect: true, options: [{ label: "单元", description: "" }] }];
+  const first = JSON.stringify(claudeQuestionCard(interaction({ kind: "question", toolName: "AskUserQuestion", questions }), 0));
+  assert.match(first, /Claude 提问 1\/2 · 方案/);
+  assert.match(first, /"action":"ask_answer"/);
+  const second = JSON.stringify(claudeQuestionCard(interaction({ kind: "question", toolName: "AskUserQuestion", questions }), 1));
+  assert.doesNotMatch(second, /ask_answer/);
+  assert.match(second, /用逗号分隔/);
+  const plan = JSON.stringify(claudePlanCard(interaction({ kind: "plan", toolName: "ExitPlanMode", input: { plan: "## 步骤\n1. 改代码" } })));
+  assert.match(plan, /1\. 改代码/);
+  assert.match(plan, /"action":"plan_edits"/);
+  assert.equal((claudeInteractionDoneCard(interaction(), "已允许", "green", "npm test").header as { title: { content: string } }).title.content, "使用 Bash · 已允许");
+  const conflict = JSON.stringify(claudeConflictCard(session, "n-2"));
+  assert.match(conflict, /VS Code 中等待你处理/);
+  assert.match(conflict, /"action":"conflict_fork"/);
+  const modes = JSON.stringify(claudeModeCard(session, "default", ["default", "acceptEdits", "plan", "auto"]));
+  assert.doesNotMatch(modes, /bypassPermissions/);
+  const picker = JSON.stringify(claudeNewSessionCard(["/srv/project"], "全部目录", { nonce: "d-1", preview: "整理 README" }));
+  assert.match(picker, /任务：整理 README/);
+  assert.match(picker, /"draft":"d-1"/);
 });

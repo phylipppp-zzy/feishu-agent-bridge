@@ -173,6 +173,22 @@ function assistantEvents(record: Record<string, unknown>, at: string): Transcrip
   return events;
 }
 
+/**
+ * A message the person sent while Claude was working. Claude Code hands it to Claude at the next
+ * step and records it as an attachment of the running turn, not as a prompt of its own.
+ */
+function attachmentEvents(record: Record<string, unknown>, at: string): TranscriptEvent[] {
+  const attachment = asRecord(record.attachment);
+  if (attachment.type !== "queued_command" || attachment.commandMode !== "prompt" || asRecord(attachment.origin).kind !== "human") return [];
+  const prompt = attachment.prompt;
+  const blocks = Array.isArray(prompt) ? prompt.filter(isRecord) : [];
+  const parts = typeof prompt === "string" ? [prompt] : blocks.filter((block) => block.type === "text").map((block) => str(block.text) ?? "");
+  const images = blocks.filter((block) => block.type === "image").length;
+  const text = [cleanPrompt(parts), images ? `（附件：${Array(images).fill("图片").join("、")}）` : ""].filter(Boolean).join("");
+  const uuid = str(record.uuid);
+  return text && uuid ? [{ kind: "note", key: `${uuid}:queued`, at, text: `补充：${text.slice(0, 2_000)}` }] : [];
+}
+
 function systemEvents(record: Record<string, unknown>, at: string): TranscriptEvent[] {
   const subtype = str(record.subtype);
   if (subtype === "turn_duration") return [{ kind: "turn_end", at, durationMs: typeof record.durationMs === "number" ? record.durationMs : null }];
@@ -189,6 +205,7 @@ export function transcriptEvents(record: Record<string, unknown>): TranscriptEve
     case "user": return userEvents(record, at);
     case "assistant": return assistantEvents(record, at);
     case "system": return systemEvents(record, at);
+    case "attachment": return attachmentEvents(record, at);
     case "custom-title": return metaEvent(at, { customTitle: str(record.customTitle) });
     case "ai-title": return metaEvent(at, { aiTitle: str(record.aiTitle) });
     case "summary": return metaEvent(at, { aiTitle: str(record.summary) });

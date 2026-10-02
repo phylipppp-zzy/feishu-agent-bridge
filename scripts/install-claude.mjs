@@ -102,7 +102,7 @@ const claudeBin = findExecutable("claude");
 if (!claudeBin) throw new Error(`未在 PATH 中找到 Claude Code CLI（claude）。${claudeRepair}`);
 execFileSync(claudeBin, ["--version"], { stdio: "inherit", timeout: 30_000 });
 if (!succeeds(claudeBin, ["auth", "status"])) {
-  console.warn("WARN  claude auth status 显示 Claude Code 尚未登录。只读镜像不调用模型，安装继续；在本机使用 Claude Code 前请先运行 claude 完成登录。");
+  console.warn("WARN  claude auth status 显示 Claude Code 尚未登录。安装继续，同步会话不需要登录；但从飞书继续或新建会话需要登录，请先在终端运行 claude 完成登录。");
 }
 
 await mkdir(configDir, { recursive: true, mode: 0o700 });
@@ -204,6 +204,8 @@ const environmentValues = {
   ALLOWED_ROOT: allowedRoot,
   HISTORY_DAYS: saved.HISTORY_DAYS ?? "3",
   SYNC_DIRS: syncDirs,
+  // Sessions continued from Feishu run their commands with this PATH, as in the installing shell.
+  ...(process.env.PATH ? { PATH: [...new Set(process.env.PATH.split(":").filter(Boolean))].join(":") } : {}),
 };
 if (needsFeishuConfiguration) {
   await writeFile(pendingEnvFile, renderEnvironment({ ...environmentValues, FEISHU_SETUP_VERSION: "0" }), { mode: 0o600 });
@@ -241,6 +243,7 @@ await writeFile(unitFile, renderSystemdUnit({
   environmentFile: envFile,
   description: "Feishu to Claude Code session bridge",
   entry: "dist/src/claude/index.js",
+  sessionUmask: process.umask(),
 }), { mode: 0o644 });
 execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "inherit" });
 execFileSync("systemctl", ["--user", "enable", "--now", serviceName], { stdio: "inherit" });
@@ -264,7 +267,7 @@ if (!process.exitCode) {
 提示：` : `\n安装完成。下一步：
 1. 在飞书中创建一个私密话题群，并把新机器人加入群。
 2. 在群中发送：@机器人 /bind ${bindToken}
-3. 绑定后，本机的 Claude Code 会话会以只读方式同步到群内话题。
+3. 绑定后，本机的 Claude Code 会话会同步到群内话题；在话题里回复即可继续对话。
 
 提示：
 ${runningInWsl() ? "- 当前运行在 WSL 中：WSL 停止后服务也随之停止，请保持 WSL 运行（例如保留一个 WSL 终端窗口）。\n" : ""}- systemd 用户服务在当前用户没有登录会话时会停止；如需常驻，可执行：sudo loginctl enable-linger $USER

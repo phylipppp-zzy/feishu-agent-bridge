@@ -72,7 +72,7 @@ export const CODEX_APP_PROFILE: FeishuAppProfile = {
 export const CLAUDE_APP_PROFILE: FeishuAppProfile = {
   source: "feishu-claude-bridge",
   presetName: "Claude Bridge - {user}",
-  presetDesc: "在飞书话题中查看本机 Claude Code 会话",
+  presetDesc: "在飞书话题中查看和继续本机 Claude Code 会话",
   botDescription: "发送 / 打开 Claude 操作面板",
   releaseRemark: "Initial installation by feishu-claude-bridge",
   releaseChangelog: "Enable the Claude bridge bot, WebSocket events and cards.",
@@ -191,7 +191,14 @@ export function parseEnvironment(content: string): Record<string, string> {
   return values;
 }
 
-export function renderSystemdUnit(input: { projectDir: string; nodeBin: string; environmentFile: string; description?: string; entry?: string }): string {
+/**
+ * `sessionUmask` is set for a service that runs the person's own Claude Code sessions: their
+ * commands then see the same /tmp and create files with the same permissions as in a terminal,
+ * so the service keeps the shared /tmp and uses the installing shell's umask.
+ */
+export function renderSystemdUnit(input: { projectDir: string; nodeBin: string; environmentFile: string; description?: string; entry?: string; sessionUmask?: number }): string {
+  const isolation = input.sessionUmask === undefined ? "UMask=0077\nNoNewPrivileges=true\nRestrictSUIDSGID=true\nPrivateTmp=true\nProtectSystem=full"
+    : `UMask=${(input.sessionUmask & 0o777).toString(8).padStart(4, "0")}\nNoNewPrivileges=true\nRestrictSUIDSGID=true\nProtectSystem=full`;
   return `[Unit]
 Description=${input.description ?? "Feishu to Codex session bridge"}
 After=network-online.target
@@ -207,11 +214,7 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 KillMode=mixed
-UMask=0077
-NoNewPrivileges=true
-RestrictSUIDSGID=true
-PrivateTmp=true
-ProtectSystem=full
+${isolation}
 
 [Install]
 WantedBy=default.target
