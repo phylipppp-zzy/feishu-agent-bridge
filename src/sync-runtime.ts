@@ -7,8 +7,8 @@ import { AppServerRpcError, CodexAppServer, notificationTurnId, type JsonRpcMess
 import { CodexCliProbe } from "./codex.js";
 import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
-import { resolveAllowedPath } from "./path-policy.js";
-import { approvalReasonText, remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
+import { resolveAllowedPath, resolveAllowedTarget } from "./path-policy.js";
+import { approvalReasonText, permissionEntries, remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { boundedPreview, cardContentBytes, serializedBytes } from "./text-limits.js";
 import { displayTime } from "./card-kit.js";
@@ -1068,14 +1068,11 @@ export class SyncRuntime implements FeishuRouterPort {
   private safeRequestPayload(type: RemoteRequestType, value: Record<string, unknown>, canonicalCwd?: string): Record<string, unknown> {
     const summary = remoteApprovalSummary(type, value, canonicalCwd ? { taskId: "", sessionId: "", collaborationMode: "default", executionMode: this.config.executionMode ?? "workspace-write", canonicalCwd, allowedMcpServers: new Set(this.config.allowedMcpServers ?? []) } : undefined);
     if (type === "permissions") {
-      const permissions = Array.isArray(value.permissions) ? value.permissions.flatMap((item) => {
-        if (!item || typeof item !== "object") return [];
-        const permission = item as Record<string, unknown>;
-        if (permission.type !== "fs_read" && permission.type !== "fs_write") return [];
-        const path = typeof permission.path === "string" && canonicalCwd ? relative(canonicalCwd, resolve(canonicalCwd, permission.path)) : undefined;
-        return [{ type: permission.type, ...(path ? { path: path.slice(0, 240) } : {}) }];
-      }).slice(0, 20) : [];
-      return { ...summary, permissions };
+      // Shown with paths relative to the project; the profile Codex asked for is kept to grant it back as is.
+      const permissions = permissionEntries(value).slice(0, 20).map(({ type, path }) =>
+        ({ type, ...(path ? { path: (canonicalCwd ? relative(canonicalCwd, resolve(canonicalCwd, path)) || "." : path).slice(0, 240) } : {}) }));
+      const profile = value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions : null;
+      return { ...summary, permissions, ...(profile ? { permissionProfile: profile } : {}) };
     }
     if (type !== "user_input") return summary as unknown as Record<string, unknown>;
     const questions = Array.isArray(value.questions) ? value.questions.flatMap((item) => {
@@ -1109,14 +1106,11 @@ export class SyncRuntime implements FeishuRouterPort {
       const grantRoot = typeof params.grantRoot === "string" ? params.grantRoot : typeof params.grant_root === "string" ? params.grant_root : canonicalCwd;
       await resolveAllowedPath(grantRoot, canonicalCwd);
       const paths = Array.isArray(params.changes) ? params.changes : Array.isArray(params.paths) ? params.paths : [];
-      for (const path of paths) if (typeof path === "string") await resolveAllowedPath(path, canonicalCwd);
+      for (const path of paths) if (typeof path === "string") await resolveAllowedTarget(path, canonicalCwd);
     }
-    if (type === "permissions" && Array.isArray(params.permissions)) {
-      for (const item of params.permissions) {
-        if (!item || typeof item !== "object") continue;
-        const path = (item as Record<string, unknown>).path;
-        if (typeof path === "string") await resolveAllowedPath(path, canonicalCwd);
-      }
+    if (type === "permissions") {
+      // Files to be written do not exist yet; a request outside the project is declined by the policy below, with a notice.
+      for (const { path } of permissionEntries(params)) if (path) await resolveAllowedTarget(path, canonicalCwd).catch(() => undefined);
     }
     const mode = session.collaborationMode === "plan" ? "plan" : "default";
     const policy = remoteApprovalAllowed(type, params, this.config.allowedMcpServers ?? [], { taskId: task.id, sessionId: session.sessionId, collaborationMode: mode, executionMode: this.config.executionMode ?? "workspace-write", canonicalCwd, allowedMcpServers: new Set(this.config.allowedMcpServers ?? []) });
@@ -1194,9 +1188,11 @@ export class SyncRuntime implements FeishuRouterPort {
       }
       result = { answers: answered };
     } else if (request.type === "permissions") {
+      // Granted exactly as requested (a GrantedPermissionProfile), or nothing.
+      const granted = params.permissionProfile && typeof params.permissionProfile === "object" ? params.permissionProfile : this.grantedProfile(permissionEntries(params));
       result = decision === "accept" || decision === "acceptForSession"
-        ? { permissions: Array.isArray(params.permissions) ? params.permissions : [], scope: decision === "acceptForSession" ? "session" : "turn" }
-        : { permissions: [], scope: "turn" };
+        ? { permissions: granted, scope: decision === "acceptForSession" ? "session" : "turn" }
+        : { permissions: { fileSystem: null, network: null }, scope: "turn" };
     } else if (request.type === "mcp_elicitation") {
       result = { action: decision === "accept" ? "accept" : decision === "cancel" ? "cancel" : "decline", content: null, _meta: null };
     } else {
@@ -1692,6 +1688,13 @@ export class SyncRuntime implements FeishuRouterPort {
     return questions.some((question) => this.asRecord(question).isSecret === true);
   }
 
+  /** The profile form of entries read from an older, list-shaped request. */
+  private grantedProfile(entries: ReadonlyArray<{ type: string; path?: string }>): Record<string, unknown> {
+    const read = entries.filter((entry) => entry.type === "fs_read" && entry.path).map((entry) => entry.path);
+    const write = entries.filter((entry) => entry.type === "fs_write" && entry.path).map((entry) => entry.path);
+    return { fileSystem: read.length || write.length ? { ...(read.length ? { read } : {}), ...(write.length ? { write } : {}) } : null, network: null };
+  }
+
   private remoteRequestTitle(type: RemoteRequestType): string {
     return ({ user_input: "Codex 等待你的输入", command_approval: "Codex 请求执行命令", file_approval: "Codex 请求修改文件", permissions: "Codex 请求额外权限", mcp_elicitation: "MCP 请求你的确认" } as const)[type];
   }
@@ -1699,7 +1702,12 @@ export class SyncRuntime implements FeishuRouterPort {
   private remoteRequestDetail(type: RemoteRequestType, params: Record<string, unknown>): string {
     if (type === "command_approval") return (this.stringAt(params, "commandSummary") ? "" : "命令：未提供\n") + "原因：" + (this.stringAt(params, "reason") ?? "未提供");
     if (type === "file_approval") return "原因：" + (this.stringAt(params, "reason") ?? "未提供") + "\n影响路径：" + (Array.isArray(params.relativePaths) ? params.relativePaths.join(", ") : "未提供");
-    if (type === "permissions") return "权限类型：" + (Array.isArray(params.permissionKinds) ? params.permissionKinds.join(", ") : "未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    if (type === "permissions") {
+      const labels = { fs_read: "读取", fs_write: "写入", network: "联网" } as Record<string, string>;
+      const lines = (Array.isArray(params.permissions) ? params.permissions : []).map((entry) => this.asRecord(entry))
+        .map((entry) => `${labels[this.stringAt(entry, "type") ?? ""] ?? this.stringAt(entry, "type") ?? "未知"}${this.stringAt(entry, "path") ? "：" + this.stringAt(entry, "path") : ""}`);
+      return (lines.length ? lines.join("\n") : "权限类型：未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    }
     if (type === "mcp_elicitation") return (this.stringAt(params, "mcpServer") ?? "MCP") + "\n需要确认";
     const questions = Array.isArray(params.questions) ? params.questions.map((q) => this.asRecord(q)).map((q) => (this.stringAt(q, "header") ?? "问题") + "：" + (this.stringAt(q, "question") ?? "")).join("\n") : "需要输入";
     return questions;

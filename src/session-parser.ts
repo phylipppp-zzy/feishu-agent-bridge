@@ -73,12 +73,14 @@ function stableMessageId(sessionId: string, timestamp: string, role: string, tex
 }
 
 // Context Codex and its host add to a user message (plugin lists, environment, AGENTS.md and
-// user instructions). The person did not type it, so it is not shown as their message.
+// user instructions, interruption notes). The person did not type it, so it is not shown as theirs.
 const HOST_BLOCKS: ReadonlyArray<{ open: string; block: RegExp }> = [
   { open: "<recommended_plugins>", block: /^<recommended_plugins>[\s\S]*?<\/recommended_plugins>/i },
   { open: "<environment_context>", block: /^<environment_context>[\s\S]*?<\/environment_context>/i },
   { open: "<user_instructions>", block: /^<user_instructions>[\s\S]*?<\/user_instructions>/i },
   { open: "# AGENTS.md instructions", block: /^# AGENTS\.md instructions[^\n]*\n+<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>/i },
+  // Written by Codex after an interrupted turn, as a user message.
+  { open: "<turn_aborted>", block: /^<turn_aborted>[\s\S]*?<\/turn_aborted>/i },
 ];
 
 /** The text without a host block at its start, or null when it does not start with one. */

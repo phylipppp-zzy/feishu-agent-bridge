@@ -36,6 +36,44 @@ const UPLOAD_COMMAND = /(?:curl|wget|http|ftp|nc|netcat|scp|rsync)(?:[\s;&|)]|$)
 const SOCKET_PATH = /(?:\/var\/run|\/run|\/proc\/1\/root|docker\.sock|podman|containerd)/i;
 const KNOWN_PERMISSION_TYPES = new Set(["fs_read", "fs_write", "network", "process", "clipboard", "mcp"]);
 
+export interface PermissionEntry { type: string; path?: string }
+/**
+ * What a permissions request asks for, one entry per path or capability. Codex 0.154 sends a
+ * RequestPermissionProfile ({ fileSystem: { entries | read | write }, network: { enabled } });
+ * the older list form ([{ type, path }]) is still read. A glob or special path has no single
+ * path to check, so it is kept as its own type, which the policy does not allow.
+ */
+export function permissionEntries(params: Record<string, unknown>): PermissionEntry[] {
+  const raw = params.permissions;
+  if (Array.isArray(raw)) {
+    return raw.flatMap((item) => {
+      if (!item || typeof item !== "object") return [{ type: "unknown" }];
+      const entry = item as Record<string, unknown>;
+      return [{ type: typeof entry.type === "string" ? entry.type : "unknown", ...(typeof entry.path === "string" ? { path: entry.path } : {}) }];
+    });
+  }
+  if (!raw || typeof raw !== "object") return [];
+  const profile = raw as Record<string, unknown>;
+  const entries: PermissionEntry[] = [];
+  const fs = profile.fileSystem && typeof profile.fileSystem === "object" ? profile.fileSystem as Record<string, unknown> : null;
+  if (fs) {
+    for (const item of Array.isArray(fs.entries) ? fs.entries : []) {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const access = entry.access === "read" ? "fs_read" : entry.access === "write" ? "fs_write" : entry.access === "deny" ? null : "unknown";
+      if (!access) continue;
+      const target = entry.path && typeof entry.path === "object" ? entry.path as Record<string, unknown> : {};
+      if (target.type === "path" && typeof target.path === "string") entries.push({ type: access, path: target.path });
+      else entries.push({ type: target.type === "glob_pattern" ? "fs_glob" : target.type === "special" ? "fs_special" : "unknown" });
+    }
+    for (const [field, type] of [["read", "fs_read"], ["write", "fs_write"]] as const) {
+      for (const path of Array.isArray(fs[field]) ? fs[field] as unknown[] : []) entries.push(typeof path === "string" ? { type, path } : { type: "unknown" });
+    }
+  }
+  const network = profile.network && typeof profile.network === "object" ? profile.network as Record<string, unknown> : null;
+  if (network?.enabled === true) entries.push({ type: "network" });
+  return entries;
+}
+
 function inside(root: string, candidate: string): boolean {
   const rel = relative(root, resolve(candidate));
   return rel === "" || (rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel));
@@ -94,8 +132,7 @@ export function remoteApprovalSummary(type: RemoteRequestType, params: Record<st
   const rawPaths = Array.isArray(params.changes) ? params.changes : Array.isArray(params.paths) ? params.paths : [];
   const paths = rawPaths.filter((v): v is string => typeof v === "string").slice(0, 50).map((p) => context ? relative(context.canonicalCwd, resolve(p)).slice(0, 240) : p.slice(0, 240));
   if (paths.length) summary.relativePaths = paths;
-  const permissions = Array.isArray(params.permissions) ? params.permissions : [];
-  const kinds = permissions.map((p) => typeof p === "object" && p ? (p as Record<string, unknown>).type : undefined).filter((v): v is string => typeof v === "string");
+  const kinds = permissionEntries(params).map((entry) => entry.type);
   if (kinds.length) summary.permissionKinds = [...new Set(kinds)].slice(0, 20);
   const mcp = typeof params.serverName === "string" ? params.serverName : typeof params.server_name === "string" ? params.server_name : undefined;
   if (mcp) summary.mcpServer = mcp.slice(0, 120);
@@ -113,7 +150,7 @@ const REASON_TEXT: Record<string, string> = {
   "command cannot be safely reviewed or may upload data": "命令含有嵌套 shell、重定向或网络传输工具（如 curl、wget、scp），不能从飞书批准",
   "writes outside the authorized workspace are forbidden": "要写入的位置在已授权的项目目录之外",
   "permission request shape is not recognized": "无法识别这个权限请求",
-  "permission type is not allowlisted": "这种权限不在允许列表中",
+  "permission type is not allowlisted": "这种权限（通配路径、特殊目录或进程类权限）不能从飞书授予",
   "filesystem access is outside the authorized workspace or sensitive": "要访问的路径在项目目录之外或属于敏感文件",
   "network, process, and clipboard escalation are forbidden": "联网、进程和剪贴板权限不能从飞书授予",
 };
@@ -146,13 +183,11 @@ export function remoteApprovalAllowed(type: RemoteRequestType, params: Record<st
     if (!inside(context.canonicalCwd, grantRoot)) return { allowed: false, reason: "writes outside the authorized workspace are forbidden", summary };
   }
   if (type === "permissions") {
-    const permissions = Array.isArray(params.permissions) ? params.permissions : null;
-    if (!permissions) return { allowed: false, reason: "permission request shape is not recognized", summary };
-    for (const permission of permissions) {
-      if (!permission || typeof permission !== "object") return { allowed: false, reason: "permission request shape is not recognized", summary };
-      const item = permission as Record<string, unknown>; const kind = typeof item.type === "string" ? item.type : "";
+    const entries = permissionEntries(params);
+    if (!entries.length) return { allowed: false, reason: "permission request shape is not recognized", summary };
+    for (const { type: kind, path } of entries) {
       if (!KNOWN_PERMISSION_TYPES.has(kind)) return { allowed: false, reason: "permission type is not allowlisted", summary };
-      if (kind === "fs_write" || kind === "fs_read") { const path = typeof item.path === "string" ? item.path : ""; if (!path || !inside(context.canonicalCwd, path) || SENSITIVE.test(path)) return { allowed: false, reason: "filesystem access is outside the authorized workspace or sensitive", summary }; }
+      if (kind === "fs_write" || kind === "fs_read") { if (!path || !inside(context.canonicalCwd, path) || SENSITIVE.test(path)) return { allowed: false, reason: "filesystem access is outside the authorized workspace or sensitive", summary }; }
       if (kind === "network" || kind === "process" || kind === "clipboard") return { allowed: false, reason: "network, process, and clipboard escalation are forbidden", summary };
     }
   }

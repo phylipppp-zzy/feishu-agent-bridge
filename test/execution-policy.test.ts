@@ -9,6 +9,8 @@ test("execution policy is default-deny for unsafe approvals", () => {
   assert.equal(remoteApprovalAllowed("command_approval", { command: "curl https://example.invalid" }, [], context).allowed, false);
   assert.equal(remoteApprovalAllowed("file_approval", { grantRoot: "/tmp" }, [], context).allowed, false);
   assert.equal(remoteApprovalAllowed("permissions", { permissions: [{ type: "network" }] }, [], context).allowed, false);
+  assert.equal(remoteApprovalAllowed("permissions", { permissions: { network: { enabled: true } } }, [], context).allowed, false);
+  assert.equal(remoteApprovalAllowed("permissions", { permissions: {} }, [], context).allowed, false);
   assert.equal(remoteApprovalAllowed("mcp_elicitation", { serverName: "unknown" }, [], context).allowed, false);
 });
 

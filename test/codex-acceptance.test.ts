@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { displayTime } from "../src/card-kit.js";
-import { approvalReasonText, remoteApprovalAllowed, unwrapShellCommand } from "../src/execution-policy.js";
+import { approvalReasonText, permissionEntries, remoteApprovalAllowed, unwrapShellCommand } from "../src/execution-policy.js";
+import { stripHostContext } from "../src/session-parser.js";
 import type { FeishuPort } from "../src/types.js";
 import { fakeAppServer, importedSession, inbound, SESSION_ID, shutdown, startTurn, title, waitFor } from "./codex-harness.js";
 
@@ -80,6 +81,53 @@ test("a request declined by the safety rules is reported in the topic instead of
   assert.equal(env.feishu.cards.some((item) => title(item.card) === "Codex 请求执行命令"), false);
   await shutdown(env);
 }));
+
+// Permission requests (Codex 0.154 RequestPermissionProfile) -------------------------------------
+
+const profile = (write: string) => ({ fileSystem: { entries: [{ access: "write", path: { type: "path", path: write } }] }, network: null });
+const permissionRequest = (id: number, permissions: unknown) => ({ jsonrpc: "2.0" as const, id, method: "item/permissions/requestApproval",
+  params: { threadId: SESSION_ID, turnId: "turn-1", itemId: `call-${id}`, cwd: "/work/project", permissions, reason: "需要写这个文件", startedAtMs: 0 } });
+
+test("a permission profile is read in its entries, legacy and network forms", () => {
+  assert.deepEqual(permissionEntries({ permissions: profile("/work/project/.git/x") }), [{ type: "fs_write", path: "/work/project/.git/x" }]);
+  assert.deepEqual(permissionEntries({ permissions: { fileSystem: { read: ["/work/project/a"], write: ["/work/project/b"] } } }),
+    [{ type: "fs_read", path: "/work/project/a" }, { type: "fs_write", path: "/work/project/b" }]);
+  assert.deepEqual(permissionEntries({ permissions: { fileSystem: { entries: [{ access: "write", path: { type: "glob_pattern", pattern: "**" } }] } } }), [{ type: "fs_glob" }]);
+  assert.deepEqual(permissionEntries({ permissions: { network: { enabled: true } } }), [{ type: "network" }]);
+  assert.equal(remoteApprovalAllowed("permissions", { permissions: profile("/work/project/.git/x") }, [], context).allowed, true);
+  assert.equal(remoteApprovalAllowed("permissions", { permissions: profile("/home/u/f06.txt") }, [], context).reason, "filesystem access is outside the authorized workspace or sensitive");
+  assert.equal(remoteApprovalAllowed("permissions", { permissions: { fileSystem: { entries: [{ access: "write", path: { type: "glob_pattern", pattern: "**" } }] } } }, [], context).allowed, false);
+});
+
+test("a permission request inside the project gets a card, and approving it grants the profile Codex asked for", { timeout: 10_000 }, () => withHome("codex-permission-card-", async (home) => {
+  const app = fakeAppServer(numberedTurns());
+  const env = await importedSession(home, app.server);
+  await startTurn(env);
+  const asked = profile(join(home, ".git", "f06-perm.txt"));
+  const result = env.internals.onAppServerRequest(permissionRequest(9, asked));
+  await waitFor(() => env.feishu.cards.some((card) => title(card.card) === "Codex 请求额外权限"));
+  const card = JSON.stringify(env.feishu.cards.find((item) => title(item.card) === "Codex 请求额外权限")!.card);
+  assert.match(card, /写入：\.git\/f06\-perm\.txt/);
+  const nonce = env.db.nextServerRequest(SESSION_ID, "permissions")!.nonce;
+  await env.service.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "remote_approve", value: { nonce, decision: "accept" }, formValues: {} });
+  assert.deepEqual(await result, { permissions: asked, scope: "turn" });
+  await shutdown(env);
+}));
+
+test("a permission request outside the project is declined with that reason", { timeout: 10_000 }, () => withHome("codex-permission-outside-", async (home) => {
+  const app = fakeAppServer(numberedTurns());
+  const env = await importedSession(home, app.server);
+  await startTurn(env);
+  await assert.rejects(env.internals.onAppServerRequest(permissionRequest(10, profile("/outside/f06.txt"))), /outside the authorized workspace/);
+  await waitFor(() => env.feishu.cards.some((card) => title(card.card) === "已自动拒绝：Codex 请求额外权限"));
+  assert.match(JSON.stringify(env.feishu.cards.at(-1)!.card), /项目目录之外/);
+  await shutdown(env);
+}));
+
+test("the note Codex writes after an interrupted turn is not shown as the person's message", () => {
+  assert.equal(stripHostContext("<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"), "");
+  assert.equal(stripHostContext("<turn_aborted>\nx\n</turn_aborted>\n继续刚才的任务"), "继续刚才的任务");
+});
 
 // Run status cards ------------------------------------------------------------------------------
 
