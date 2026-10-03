@@ -1,5 +1,5 @@
 import { basename, relative } from "node:path";
-import { actionRow, button, card, cardUiVersion, inputForm, markdown, nextElementId, note, plain, safeMarkdown, shorten } from "./card-kit.js";
+import { actionRow, button, card, cardUiVersion, codeBlock, displayTime, inputForm, markdown, nextElementId, note, plain, safeMarkdown, shorten } from "./card-kit.js";
 import type { CardDefinition, ChoiceOption, ChoiceQuestion, ChoiceRequest, ModelCapability, SessionMetadata } from "./types.js";
 
 export { configureCardUi } from "./card-kit.js";
@@ -294,12 +294,13 @@ export function choiceAcceptedCard(answer: string, complete: boolean): CardDefin
 
 export function rootGrantCard(nonce: string, cwd: string, taskSummary: string, expiresAt: number): CardDefinition {
   return card("确认本任务的 Root 无沙箱授权", "red", [
-    markdown("本次任务将在 `" + safeMarkdown(cwd) + "` 中以 **root、无 Codex 沙箱**执行。容器级风险：可读写容器中的可访问文件、启动进程；网络按容器策略提供。\n\n任务摘要：" + safeMarkdown(taskSummary) + "\n\n此授权仅能使用一次，且于 " + new Date(expiresAt).toLocaleString("zh-CN", { hour12: false }) + " 失效。"),
+    markdown("本次任务将在 `" + safeMarkdown(cwd) + "` 中以 **root、无 Codex 沙箱**执行。容器级风险：可读写容器中的可访问文件、启动进程；网络按容器策略提供。\n\n任务摘要：" + safeMarkdown(taskSummary) + "\n\n此授权仅能使用一次，且于 " + displayTime(expiresAt) + " 失效。"),
     actionRow([button("仅批准本任务", "root_grant_confirm", "danger", { nonce }), button("拒绝本任务", "root_grant_cancel", "default", { nonce })]),
   ]);
 }
 
-export function remoteRequestCard(request: { nonce: string; type: string; title: string; detail: string; decisions?: string[]; secret?: boolean }): CardDefinition {
+/** `code`: the command to approve, shown as it will run. */
+export function remoteRequestCard(request: { nonce: string; type: string; title: string; detail: string; code?: string; decisions?: string[]; secret?: boolean }): CardDefinition {
   const decisions = request.decisions ?? [];
   const allowed = (value: string) => !decisions.length || decisions.includes(value);
   const buttons = [
@@ -308,10 +309,20 @@ export function remoteRequestCard(request: { nonce: string; type: string; title:
     button("取消回合", "remote_approve", "default", { nonce: request.nonce, decision: "cancel" }),
   ];
   return card(request.title, "orange", [
+    ...(request.code ? [markdown(codeBlock(request.code, 2_000))] : []),
     markdown(safeMarkdown(request.detail)),
     ...(request.secret ? [note("敏感内容会经过飞书平台；提交值不会被桥接器写入数据库、日志或回复。 ")] : []),
     actionRow(buttons),
     ...(request.type === "command_approval" ? [actionRow([button("告诉 Codex 怎么做", "remote_guidance", "default", { nonce: request.nonce })])] : []),
+  ]);
+}
+
+/** A Codex request the bridge declined by itself, so the person knows why nothing was asked. */
+export function autoDeclinedCard(title: string, reason: string, code?: string): CardDefinition {
+  return card(`已自动拒绝：${title}`, "grey", [
+    ...(code ? [markdown(codeBlock(code, 2_000))] : []),
+    markdown(`原因：${safeMarkdown(reason)}`),
+    note("安全规则不允许从飞书批准这类请求，没有发出批准卡。Codex 已收到拒绝，会自行换一种做法；确实需要时请在终端里运行。"),
   ]);
 }
 

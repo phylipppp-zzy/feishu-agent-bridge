@@ -65,3 +65,14 @@ export function inputForm(options: {
 }
 export function safeMarkdown(value: string): string { return value.replace(/[\\`*_{}\[\]()#+.!|>-]/g, "\\$&"); }
 export function shorten(value: string, limit = 100): string { return [...value.replace(/\s+/g, " ").trim()].slice(0, limit).join(""); }
+
+/** A fenced code block that cannot be closed early by the text inside it. */
+export function codeBlock(text: string, limit: number): string {
+  const clipped = text.length > limit ? `${text.slice(0, limit)}\n…（已截断）` : text;
+  return `\`\`\`\n${clipped.replace(/\`\`\`/g, "ˋˋˋ")}\n\`\`\``;
+}
+
+/** Times shown in cards: the service may run in another time zone than the person reading them. */
+export function displayTime(ms: number): string {
+  return `${new Date(ms).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })}（北京时间）`;
+}
