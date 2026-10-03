@@ -106,8 +106,10 @@ test("a permission request inside the project gets a card, and approving it gran
   const asked = profile(join(home, ".git", "f06-perm.txt"));
   const result = env.internals.onAppServerRequest(permissionRequest(9, asked));
   await waitFor(() => env.feishu.cards.some((card) => title(card.card) === "Codex 请求额外权限"));
-  const card = JSON.stringify(env.feishu.cards.find((item) => title(item.card) === "Codex 请求额外权限")!.card);
-  assert.match(card, /写入：\.git\/f06\-perm\.txt/);
+  const card = env.feishu.cards.find((item) => title(item.card) === "Codex 请求额外权限")!.card as { elements: Array<{ tag: string; content?: string }> };
+  // The path is Markdown-escaped on the card; read it without the escapes.
+  const detail = card.elements.find((element) => element.tag === "markdown")!.content!.replace(/\\/g, "");
+  assert.match(detail, /^写入：\.git\/f06-perm\.txt\n原因：需要写这个文件/);
   const nonce = env.db.nextServerRequest(SESSION_ID, "permissions")!.nonce;
   await env.service.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "remote_approve", value: { nonce, decision: "accept" }, formValues: {} });
   assert.deepEqual(await result, { permissions: asked, scope: "turn" });
