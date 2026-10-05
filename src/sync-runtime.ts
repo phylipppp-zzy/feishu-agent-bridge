@@ -1,16 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { archivedSessionActionCard, assistantMarkdownCard, hostContextPreviewCard, hostContextResultCard, permissionDetailsCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
+import { archivedSessionActionCard, assistantMarkdownCard, hostContextPreviewCard, hostContextResultCard, permissionDetailsCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, autoDeclinedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { isExpiredFeishuMessage } from "./safe-log.js";
 import { AppServerRpcError, CodexAppServer, notificationTurnId, type JsonRpcMessage } from "./app-server.js";
 import { CodexCliProbe } from "./codex.js";
 import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
-import { resolveAllowedPath } from "./path-policy.js";
-import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
+import { resolveAllowedPath, resolveAllowedTarget } from "./path-policy.js";
+import { approvalReasonText, permissionEntries, remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { boundedPreview, cardContentBytes, serializedBytes } from "./text-limits.js";
+import { displayTime } from "./card-kit.js";
 import { parseJsonlChunk, userMessageText } from "./session-parser.js";
 import type { FeishuRouterPort } from "./bridge-contracts.js";
 import { jsonlFiles, SessionImporter } from "./session-importer.js";
@@ -147,6 +148,8 @@ export class SyncRuntime implements FeishuRouterPort {
   private appServerRestartTimer: NodeJS.Timeout | null = null;
   private readonly cancelTimers = new Map<string, NodeJS.Timeout>();
   private outputDelivery: Promise<void> | null = null;
+  /** Deliveries under way, by turn: one sender per turn output. */
+  private readonly outputsInFlight = new Map<string, Promise<TurnOutput | null>>();
   /** When an interrupt was last sent for a turn, so a repeated cancel only resends one that went unconfirmed. */
   private readonly cancelRequestedAt = new Map<string, number>();
   private modelRefresh: Promise<boolean> | null = null;
@@ -370,7 +373,7 @@ export class SyncRuntime implements FeishuRouterPort {
   /** Where the listed models come from, shown on model cards. */
   private catalogNote(): string {
     const meta = this.catalogMeta();
-    const when = meta.refreshedAtMs ? new Date(meta.refreshedAtMs).toLocaleString("zh-CN", { hour12: false }) : "未知时间";
+    const when = meta.refreshedAtMs ? displayTime(meta.refreshedAtMs) : "未知时间";
     const source = meta.codexVersion ? `（${meta.codexVersion}）` : "";
     return meta.lastError
       ? `模型目录最近一次刷新失败，下面是 ${when} 读取的目录${source}。可以发送 /retry 再试。`
@@ -1065,14 +1068,11 @@ export class SyncRuntime implements FeishuRouterPort {
   private safeRequestPayload(type: RemoteRequestType, value: Record<string, unknown>, canonicalCwd?: string): Record<string, unknown> {
     const summary = remoteApprovalSummary(type, value, canonicalCwd ? { taskId: "", sessionId: "", collaborationMode: "default", executionMode: this.config.executionMode ?? "workspace-write", canonicalCwd, allowedMcpServers: new Set(this.config.allowedMcpServers ?? []) } : undefined);
     if (type === "permissions") {
-      const permissions = Array.isArray(value.permissions) ? value.permissions.flatMap((item) => {
-        if (!item || typeof item !== "object") return [];
-        const permission = item as Record<string, unknown>;
-        if (permission.type !== "fs_read" && permission.type !== "fs_write") return [];
-        const path = typeof permission.path === "string" && canonicalCwd ? relative(canonicalCwd, resolve(canonicalCwd, permission.path)) : undefined;
-        return [{ type: permission.type, ...(path ? { path: path.slice(0, 240) } : {}) }];
-      }).slice(0, 20) : [];
-      return { ...summary, permissions };
+      // Shown with paths relative to the project; the profile Codex asked for is kept to grant it back as is.
+      const permissions = permissionEntries(value).slice(0, 20).map(({ type, path }) =>
+        ({ type, ...(path ? { path: (canonicalCwd ? relative(canonicalCwd, resolve(canonicalCwd, path)) || "." : path).slice(0, 240) } : {}) }));
+      const profile = value.permissions && typeof value.permissions === "object" && !Array.isArray(value.permissions) ? value.permissions : null;
+      return { ...summary, permissions, ...(profile ? { permissionProfile: profile } : {}) };
     }
     if (type !== "user_input") return summary as unknown as Record<string, unknown>;
     const questions = Array.isArray(value.questions) ? value.questions.flatMap((item) => {
@@ -1106,18 +1106,23 @@ export class SyncRuntime implements FeishuRouterPort {
       const grantRoot = typeof params.grantRoot === "string" ? params.grantRoot : typeof params.grant_root === "string" ? params.grant_root : canonicalCwd;
       await resolveAllowedPath(grantRoot, canonicalCwd);
       const paths = Array.isArray(params.changes) ? params.changes : Array.isArray(params.paths) ? params.paths : [];
-      for (const path of paths) if (typeof path === "string") await resolveAllowedPath(path, canonicalCwd);
+      for (const path of paths) if (typeof path === "string") await resolveAllowedTarget(path, canonicalCwd);
     }
-    if (type === "permissions" && Array.isArray(params.permissions)) {
-      for (const item of params.permissions) {
-        if (!item || typeof item !== "object") continue;
-        const path = (item as Record<string, unknown>).path;
-        if (typeof path === "string") await resolveAllowedPath(path, canonicalCwd);
-      }
+    if (type === "permissions") {
+      // Files to be written do not exist yet; a request outside the project is declined by the policy below, with a notice.
+      for (const { path } of permissionEntries(params)) if (path) await resolveAllowedTarget(path, canonicalCwd).catch(() => undefined);
     }
     const mode = session.collaborationMode === "plan" ? "plan" : "default";
     const policy = remoteApprovalAllowed(type, params, this.config.allowedMcpServers ?? [], { taskId: task.id, sessionId: session.sessionId, collaborationMode: mode, executionMode: this.config.executionMode ?? "workspace-write", canonicalCwd, allowedMcpServers: new Set(this.config.allowedMcpServers ?? []) });
-    if (!policy.allowed) throw new Error(policy.reason);
+    if (!policy.allowed) {
+      // Codex only learns that the request failed; the person is told what was declined and why.
+      if (session.rootMessageId) {
+        const command = type === "command_approval" ? policy.summary?.commandSummary : undefined;
+        void this.feishu.replyCard(session.rootMessageId, autoDeclinedCard(this.remoteRequestTitle(type), approvalReasonText(policy.reason), command))
+          .catch((error) => this.db.recordFailure("auto_declined_card", { sessionId: session.sessionId }, error));
+      }
+      throw new Error(policy.reason);
+    }
     const scopedSessionId = session.sessionId;
     const rootMessageId = session.rootMessageId;
     const nonce = randomUUID();
@@ -1139,7 +1144,7 @@ export class SyncRuntime implements FeishuRouterPort {
     if (secret) throw new Error("Secret input is never accepted through Feishu");
     const card = type === "user_input"
       ? remoteQuestionCard(nonce, this.userInputQuestions(pending), 0)
-      : remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(decisions ? { decisions } : {}), secret });
+      : remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(type === "command_approval" && typeof pending.payload.commandSummary === "string" ? { code: pending.payload.commandSummary } : {}), ...(decisions ? { decisions } : {}), secret });
     // Stored and awaited before the card exists: an answer may arrive as soon as it is shown.
     this.db.saveServerRequest(pending);
     const answered = this.approvalService.waitFor(nonce);
@@ -1183,9 +1188,11 @@ export class SyncRuntime implements FeishuRouterPort {
       }
       result = { answers: answered };
     } else if (request.type === "permissions") {
+      // Granted exactly as requested (a GrantedPermissionProfile), or nothing.
+      const granted = params.permissionProfile && typeof params.permissionProfile === "object" ? params.permissionProfile : this.grantedProfile(permissionEntries(params));
       result = decision === "accept" || decision === "acceptForSession"
-        ? { permissions: Array.isArray(params.permissions) ? params.permissions : [], scope: decision === "acceptForSession" ? "session" : "turn" }
-        : { permissions: [], scope: "turn" };
+        ? { permissions: granted, scope: decision === "acceptForSession" ? "session" : "turn" }
+        : { permissions: { fileSystem: null, network: null }, scope: "turn" };
     } else if (request.type === "mcp_elicitation") {
       result = { action: decision === "accept" ? "accept" : decision === "cancel" ? "cancel" : "decline", content: null, _meta: null };
     } else {
@@ -1350,7 +1357,17 @@ export class SyncRuntime implements FeishuRouterPort {
    * full Markdown file, each tried on its own. Nothing is run again. Repeats within an hour are
    * dropped by Feishu (same uuid); a lost response beyond that may still show the card twice.
    */
-  private async deliverTurnOutput(turnId: string, stream?: TurnState["stream"]): Promise<TurnOutput | null> {
+  private deliverTurnOutput(turnId: string, stream?: TurnState["stream"]): Promise<TurnOutput | null> {
+    // The periodic scan sees an output as soon as it is stored, while the finishing turn is still
+    // closing its streaming card; a second sender would post the same reply as a new card.
+    const running = this.outputsInFlight.get(turnId);
+    if (running) return running;
+    const attempt = this.sendTurnOutput(turnId, stream).finally(() => this.outputsInFlight.delete(turnId));
+    this.outputsInFlight.set(turnId, attempt);
+    return attempt;
+  }
+
+  private async sendTurnOutput(turnId: string, stream?: TurnState["stream"]): Promise<TurnOutput | null> {
     const output = this.db.getTurnOutput(turnId);
     if (!output) {
       // Nothing to say, but a streaming card that was opened still has to be closed.
@@ -1424,6 +1441,8 @@ export class SyncRuntime implements FeishuRouterPort {
 
   private async deliverOutputsOnce(includeFailed: boolean): Promise<void> {
     for (const pending of includeFailed ? this.db.undeliveredTurnOutputs(Date.now()) : this.db.pendingTurnOutputs()) {
+      // Whoever is sending it already reports the outcome.
+      if (this.outputsInFlight.has(pending.turnId)) continue;
       try {
         const output = await this.deliverTurnOutput(pending.turnId);
         const report = this.deliveryReport(output, this.executedLabel(pending.turnId), "本轮结果已补发。");
@@ -1477,8 +1496,9 @@ export class SyncRuntime implements FeishuRouterPort {
     return typeof value === "string" ? value.trim() : "";
   }
 
-  private async updateRunCard(sessionId: string, rootId: string, state: string, detail: string, cancellable = false, resendTurnId?: string): Promise<void> {
-    const previous = this.db.getRunStatus(sessionId);
+  /** `fresh`: post a new card for a new turn instead of updating the one of the last turn. */
+  private async updateRunCard(sessionId: string, rootId: string, state: string, detail: string, cancellable = false, resendTurnId?: string, fresh = false): Promise<void> {
+    const previous = fresh ? null : this.db.getRunStatus(sessionId);
     const card = runStatusCard(state, detail, cancellable, sessionId, resendTurnId);
     if (previous?.messageId && (["完成", "失败", "已取消", "结果发送失败", "取消失败"].includes(state) || Date.now() - previous.updatedAtMs >= 1_000)) {
       try { await this.feishu.updateCard(previous.messageId, card); this.db.setRunStatus(sessionId, state, detail); return; }
@@ -1668,14 +1688,26 @@ export class SyncRuntime implements FeishuRouterPort {
     return questions.some((question) => this.asRecord(question).isSecret === true);
   }
 
+  /** The profile form of entries read from an older, list-shaped request. */
+  private grantedProfile(entries: ReadonlyArray<{ type: string; path?: string }>): Record<string, unknown> {
+    const read = entries.filter((entry) => entry.type === "fs_read" && entry.path).map((entry) => entry.path);
+    const write = entries.filter((entry) => entry.type === "fs_write" && entry.path).map((entry) => entry.path);
+    return { fileSystem: read.length || write.length ? { ...(read.length ? { read } : {}), ...(write.length ? { write } : {}) } : null, network: null };
+  }
+
   private remoteRequestTitle(type: RemoteRequestType): string {
     return ({ user_input: "Codex 等待你的输入", command_approval: "Codex 请求执行命令", file_approval: "Codex 请求修改文件", permissions: "Codex 请求额外权限", mcp_elicitation: "MCP 请求你的确认" } as const)[type];
   }
 
   private remoteRequestDetail(type: RemoteRequestType, params: Record<string, unknown>): string {
-    if (type === "command_approval") return "命令：" + (this.stringAt(params, "commandSummary") ?? "未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    if (type === "command_approval") return (this.stringAt(params, "commandSummary") ? "" : "命令：未提供\n") + "原因：" + (this.stringAt(params, "reason") ?? "未提供");
     if (type === "file_approval") return "原因：" + (this.stringAt(params, "reason") ?? "未提供") + "\n影响路径：" + (Array.isArray(params.relativePaths) ? params.relativePaths.join(", ") : "未提供");
-    if (type === "permissions") return "权限类型：" + (Array.isArray(params.permissionKinds) ? params.permissionKinds.join(", ") : "未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    if (type === "permissions") {
+      const labels = { fs_read: "读取", fs_write: "写入", network: "联网" } as Record<string, string>;
+      const lines = (Array.isArray(params.permissions) ? params.permissions : []).map((entry) => this.asRecord(entry))
+        .map((entry) => `${labels[this.stringAt(entry, "type") ?? ""] ?? this.stringAt(entry, "type") ?? "未知"}${this.stringAt(entry, "path") ? "：" + this.stringAt(entry, "path") : ""}`);
+      return (lines.length ? lines.join("\n") : "权限类型：未提供") + "\n原因：" + (this.stringAt(params, "reason") ?? "未提供");
+    }
     if (type === "mcp_elicitation") return (this.stringAt(params, "mcpServer") ?? "MCP") + "\n需要确认";
     const questions = Array.isArray(params.questions) ? params.questions.map((q) => this.asRecord(q)).map((q) => (this.stringAt(q, "header") ?? "问题") + "：" + (this.stringAt(q, "question") ?? "")).join("\n") : "需要输入";
     return questions;
@@ -2516,7 +2548,10 @@ export class SyncRuntime implements FeishuRouterPort {
     };
     if (!this.db.enqueueTask(task)) return null;
     if (!session.rootMessageId) { this.db.updateTask(task.id, "failed", { error: "session root unavailable" }); return null; }
-    await this.updateRunCard(session.sessionId, session.rootMessageId, "已排队", "消息已进入会话队列。", true);
+    // A message sent while nothing else runs in the session starts a new turn: its status card goes
+    // to the end of the topic, so its cancel button is where the person is reading.
+    const fresh = !this.turnCoordinator.hasActiveTurn(session.sessionId) && this.db.openTaskCount(session.sessionId, task.id) === 0;
+    await this.updateRunCard(session.sessionId, session.rootMessageId, "已排队", "消息已进入会话队列。", true, undefined, fresh);
     const status = this.db.getRunStatus(session.sessionId);
     this.db.attachTaskRunCard(task.id, status?.messageId ?? null);
     if (session.lifecycle === "archived") { await this.placeTaskAwaitingUnarchive(this.db.getTask(task.id) ?? task, session.rootMessageId); return task.id; }

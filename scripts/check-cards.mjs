@@ -95,7 +95,8 @@ Object.assign(cards, {
   codexChoiceMany: x.choiceCard(codexRequest(5), 0),
   codexQuestion: x.remoteQuestionCard("n", codexQuestions, 0),
   codexRootGrant: x.rootGrantCard("n", "/work", "修复部署脚本", Date.now() + 60_000),
-  codexApproval: x.remoteRequestCard({ nonce: "n", type: "command_approval", title: "批准", detail: "ls -la", decisions: ["accept", "decline"] }),
+  codexApproval: x.remoteRequestCard({ nonce: "n", type: "command_approval", title: "批准", detail: "原因：需要列出目录", code: "ls -la\n```\necho done", decisions: ["accept", "decline"] }),
+  codexAutoDeclined: x.autoDeclinedCard("Codex 请求执行命令", "命令含有网络传输工具", "curl -L https://example.com"),
   codexArchived: x.archivedSessionActionCard("n", "旧会话"),
   codexError: x.errorCard("出错了"),
 });

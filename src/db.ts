@@ -840,6 +840,12 @@ export class BridgeDatabase {
   }
 
   /** `keepTurnIds`: turns still running in Codex, whose tasks end with the turn rather than here. */
+  /** Tasks of a session, other than `exceptTaskId`, that are queued, running or waiting. */
+  openTaskCount(sessionId: string, exceptTaskId: string): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM task_queue WHERE session_id=? AND id<>? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')").get(sessionId, exceptTaskId) as { count: number };
+    return Number(row.count);
+  }
+
   cancelTasks(rootMessageId: string | null, sessionId: string | null, reason: string, keepTurnIds: readonly string[] = []): QueuedTask[] {
     const query = sessionId
       ? "SELECT * FROM task_queue WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','interrupted','expired')"
