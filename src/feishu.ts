@@ -289,10 +289,10 @@ export class FeishuClient implements FeishuPort {
     })));
   }
 
-  async replyCard(rootMessageId: string, card: CardDefinition): Promise<string> {
+  async replyCard(rootMessageId: string, card: CardDefinition, options: { uuid?: string } = {}): Promise<string> {
     return this.limited(async () => this.ensureResponse(await this.client.im.message.reply({
       path: { message_id: rootMessageId },
-      data: { msg_type: "interactive", content: JSON.stringify(card), reply_in_thread: true },
+      data: { msg_type: "interactive", content: JSON.stringify(card), reply_in_thread: true, ...(options.uuid ? { uuid: options.uuid } : {}) },
     })));
   }
 
@@ -376,14 +376,14 @@ export class FeishuClient implements FeishuPort {
     return lastId;
   }
 
-  async replyFile(rootMessageId: string, fileName: string, data: Buffer): Promise<string> {
+  async replyFile(rootMessageId: string, fileName: string, data: Buffer, options: { uuid?: string } = {}): Promise<string> {
     const uploaded = await this.limited(() => this.client.im.file.create({
       data: { file_type: "stream", file_name: fileName, file: data },
     }));
     if (!uploaded?.file_key) throw new Error("Feishu file upload returned no file_key");
     return this.limited(async () => this.ensureResponse(await this.client.im.message.reply({
       path: { message_id: rootMessageId },
-      data: { msg_type: "file", content: JSON.stringify({ file_key: uploaded.file_key }), reply_in_thread: true },
+      data: { msg_type: "file", content: JSON.stringify({ file_key: uploaded.file_key }), reply_in_thread: true, ...(options.uuid ? { uuid: options.uuid } : {}) },
     })));
   }
 
