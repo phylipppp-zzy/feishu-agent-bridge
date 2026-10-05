@@ -20,6 +20,8 @@ export interface ClaudeSession {
   firstPrompt: string | null;
   entrypoint: string | null;
   model: string | null;
+  /** Reasoning effort of the latest reply, as Claude Code recorded it. */
+  effort: string | null;
   permissionMode: string | null;
   gitBranch: string | null;
   startedAtMs: number;
@@ -148,6 +150,7 @@ export class ClaudeBridgeDatabase {
     this.ensureColumn("sessions", "pref_model", "TEXT");
     this.ensureColumn("sessions", "pref_effort", "TEXT");
     this.ensureColumn("sessions", "forked_from", "TEXT");
+    this.ensureColumn("sessions", "effort", "TEXT");
     this.migrateTurnKey();
   }
 
@@ -206,7 +209,7 @@ export class ClaudeBridgeDatabase {
     const state = text(row.presence_state);
     return {
       sessionId: String(row.session_id), path: String(row.path), cwd: text(row.cwd), customTitle: text(row.custom_title), aiTitle: text(row.ai_title),
-      firstPrompt: text(row.first_prompt), entrypoint: text(row.entrypoint), model: text(row.model), permissionMode: text(row.permission_mode),
+      firstPrompt: text(row.first_prompt), entrypoint: text(row.entrypoint), model: text(row.model), effort: text(row.effort), permissionMode: text(row.permission_mode),
       gitBranch: text(row.git_branch), startedAtMs: Number(row.started_at_ms), lastActivityMs: Number(row.last_activity_ms),
       rootMessageId: text(row.root_message_id), rootAppLink: text(row.root_app_link), chatId: text(row.chat_id), currentTurnId: text(row.current_turn_id),
       presenceState: state === "idle" || state === "running" || state === "waiting" || state === "closed" ? state : null,
@@ -234,18 +237,18 @@ export class ClaudeBridgeDatabase {
   updateSession(update: SessionUpdate): boolean {
     const before = this.getSession(update.sessionId);
     const now = Date.now();
-    this.db.prepare(`INSERT INTO sessions(session_id,path,cwd,custom_title,ai_title,first_prompt,entrypoint,model,permission_mode,git_branch,started_at_ms,last_activity_ms,created_at_ms,updated_at_ms)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET path=excluded.path,
+    this.db.prepare(`INSERT INTO sessions(session_id,path,cwd,custom_title,ai_title,first_prompt,entrypoint,model,effort,permission_mode,git_branch,started_at_ms,last_activity_ms,created_at_ms,updated_at_ms)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET path=excluded.path,
       cwd=COALESCE(excluded.cwd,sessions.cwd), custom_title=COALESCE(excluded.custom_title,sessions.custom_title), ai_title=COALESCE(excluded.ai_title,sessions.ai_title),
-      first_prompt=COALESCE(sessions.first_prompt,excluded.first_prompt), entrypoint=CASE WHEN excluded.entrypoint LIKE 'sdk%' AND sessions.entrypoint IS NOT NULL THEN sessions.entrypoint ELSE COALESCE(excluded.entrypoint,sessions.entrypoint) END, model=COALESCE(excluded.model,sessions.model),
+      first_prompt=COALESCE(sessions.first_prompt,excluded.first_prompt), entrypoint=CASE WHEN excluded.entrypoint LIKE 'sdk%' AND sessions.entrypoint IS NOT NULL THEN sessions.entrypoint ELSE COALESCE(excluded.entrypoint,sessions.entrypoint) END, model=COALESCE(excluded.model,sessions.model), effort=COALESCE(excluded.effort,sessions.effort),
       permission_mode=COALESCE(excluded.permission_mode,sessions.permission_mode), git_branch=COALESCE(excluded.git_branch,sessions.git_branch),
       started_at_ms=CASE WHEN sessions.started_at_ms=0 THEN excluded.started_at_ms ELSE sessions.started_at_ms END,
       last_activity_ms=MAX(sessions.last_activity_ms,excluded.last_activity_ms), updated_at_ms=excluded.updated_at_ms`).run(
       update.sessionId, update.path, update.meta.cwd ?? null, update.meta.customTitle ?? null, update.meta.aiTitle ?? null, update.firstPrompt,
-      update.meta.entrypoint ?? null, update.meta.model ?? null, update.meta.permissionMode ?? null, update.meta.gitBranch ?? null,
+      update.meta.entrypoint ?? null, update.meta.model ?? null, update.meta.effort ?? null, update.meta.permissionMode ?? null, update.meta.gitBranch ?? null,
       update.startedAtMs ?? 0, update.lastActivityMs ?? 0, now, now);
     const after = this.getSession(update.sessionId)!;
-    const changed = !before || before.customTitle !== after.customTitle || before.aiTitle !== after.aiTitle || before.model !== after.model
+    const changed = !before || before.customTitle !== after.customTitle || before.aiTitle !== after.aiTitle || before.model !== after.model || before.effort !== after.effort
       || before.permissionMode !== after.permissionMode || before.cwd !== after.cwd || before.entrypoint !== after.entrypoint;
     if (changed && after.rootMessageId) this.markRootDirty(update.sessionId);
     return changed;

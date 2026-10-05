@@ -20,7 +20,7 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
-interface Reply { root: string; kind: "text" | "card" | "file"; id: string; text?: string; card?: CardDefinition; name?: string; data?: Buffer }
+interface Reply { root: string; kind: "text" | "card" | "file" | "image"; id: string; text?: string; card?: CardDefinition; name?: string; data?: Buffer }
 
 class FakeFeishu implements FeishuPort {
   roots: Array<{ id: string; card: CardDefinition | undefined }> = [];
@@ -38,6 +38,7 @@ class FakeFeishu implements FeishuPort {
   }
   async replyText(root: string, text: string): Promise<string> { const id = this.next("text"); this.replies.push({ root, kind: "text", id, text }); return id; }
   async replyFile(root: string, name: string, data: Buffer): Promise<string> { const id = this.next("file"); this.replies.push({ root, kind: "file", id, name, data }); return id; }
+  async replyImage(root: string, data: Buffer): Promise<string> { const id = this.next("image"); this.replies.push({ root, kind: "image", id, data }); return id; }
   async replyCard(root: string, card: CardDefinition): Promise<string> {
     if (this.rejectCard?.(card)) throw new Error("Feishu API 230099: card content is invalid");
     const id = this.next("card");
@@ -208,6 +209,76 @@ test("/export uploads the transcript, and plain words are commands only at the r
     assert.equal(env.feishu.sent.filter((item) => title(item.card) === "Claude 控制台").length, 2);
     await env.runtime.onFeishuMessage(env.message({ text: "随便说一句", mentionedBot: false }));
     assert.equal(env.feishu.sent.length, 3);
+  } finally { await env.cleanup(); }
+});
+
+test("/deliver sends files and images from the session's directory and leaves out what it must not send", async () => {
+  const env = await setup("claude-deliver-");
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "d-p1", now - HOUR, "写报告"), reply(RECENT, "d-a1", now - HOUR + MINUTE, "写好了")], env.project)));
+    await mkdir(join(env.project, "output"), { recursive: true });
+    await writeFile(join(env.project, "报告 终版.md"), "# 报告");
+    await writeFile(join(env.project, "output", "chart.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await writeFile(join(env.project, "output", "chart.svg"), "<svg/>");
+    await writeFile(join(env.project, "output", "metrics.json"), "{}");
+    await writeFile(join(env.project, "empty.txt"), "");
+    await writeFile(join(env.project, ".env"), "TOKEN=x");
+    await env.bind();
+    const root = env.db.getSession(RECENT)!.rootMessageId!;
+    const before = env.feishu.repliesTo(root).length;
+
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false,
+      text: '/deliver "报告 终版.md" output/*.png output empty.txt .env missing.txt /etc/hostname' }));
+    const replies = env.feishu.repliesTo(root).slice(before);
+    assert.equal(title(replies[0]?.card), "交付文件");
+    const listing = JSON.stringify(replies[0]?.card);
+    for (const text of ["空文件", "像密钥", "不存在", "不在允许的目录"]) assert.ok(listing.includes(text), text);
+    // The png is matched twice (glob and directory) but sent once, as an image; the rest go out as files.
+    assert.deepEqual(replies.slice(1).map((item) => item.kind === "file" ? item.name : item.kind),
+      ["报告 终版.md", "image", "chart.svg", "metrics.json"]);
+    assert.equal(env.queries.length, 0, "/deliver is the bridge's, not a prompt for Claude");
+
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "/deliver" }));
+    assert.match(env.feishu.repliesTo(root).at(-1)?.text ?? "", /^用法：\/deliver/);
+
+    // /ls lists the session's directory, directories first and dot files only with -a.
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "/ls" }));
+    const lsReply = env.feishu.repliesTo(root).at(-1)!;
+    assert.equal(title(lsReply.card), "目录内容");
+    const shown = JSON.stringify(lsReply.card);
+    assert.ok(shown.indexOf("output/") < shown.indexOf("报告 终版"), "directories come first");
+    assert.ok(!shown.includes(".env") && shown.includes("另有 1 个以 . 开头的项"));
+    await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "/ls -a" }));
+    assert.ok(JSON.stringify(env.feishu.repliesTo(root).at(-1)?.card).includes(".env"));
+    // The directory button opens it in place; outside ALLOWED_ROOT is refused.
+    const opened = await env.action("ls_dir", { sessionId: RECENT, path: join(env.project, "output") });
+    assert.ok(opened.delivery === "replace" && JSON.stringify(opened.card).includes("metrics"));
+    const outside = await env.action("ls_dir", { sessionId: RECENT, path: "/" });
+    assert.ok(outside.delivery === "replace" && JSON.stringify(outside.card).includes("只能查看允许的目录"));
+    // "Send the files of this directory" delivers them like /deliver <dir>.
+    const before2 = env.feishu.repliesTo(root).length;
+    await env.action("deliver_paths", { sessionId: RECENT, path: join(env.project, "output") });
+    await waitUntil(() => env.feishu.repliesTo(root).length >= before2 + 4);
+    assert.equal(title(env.feishu.repliesTo(root)[before2]?.card), "交付文件");
+  } finally { await env.cleanup(); }
+});
+
+test("a render that fails on a dropped connection is reported until a later render succeeds", async () => {
+  const env = await setup("claude-render-retry-");
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl([prompt(RECENT, "f-p1", now - HOUR, "问题"), reply(RECENT, "f-a1", now - HOUR + MINUTE, "回答")]));
+    await env.bind();
+    assert.equal(env.db.failureCount(), 0);
+    await appendFile(env.path(RECENT), jsonl([prompt(RECENT, "f-p2", now - 30 * MINUTE, "第二个问题")]));
+    env.feishu.rejectCard = () => true;
+    await env.runtime.syncAll();
+    await env.runtime.renderSession(RECENT);
+    assert.ok(env.db.failureCount() > 0);
+    env.feishu.rejectCard = null;
+    await env.runtime.renderSession(RECENT);
+    assert.equal(env.db.failureCount(), 0);
   } finally { await env.cleanup(); }
 });
 
