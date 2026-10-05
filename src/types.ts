@@ -122,7 +122,8 @@ export interface TurnState {
   turnId: string;
   epoch: number;
   mode: "default" | "plan";
-  state: "running" | "awaiting_input" | "awaiting_approval" | "completed" | "failed" | "interrupted";
+  /** `cancelling`: an interrupt was sent and the turn has not ended yet. */
+  state: "running" | "awaiting_input" | "awaiting_approval" | "cancelling" | "completed" | "failed" | "interrupted";
   text: string;
   plan: string;
   rootMessageId: string;

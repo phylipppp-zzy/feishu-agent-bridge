@@ -30,6 +30,13 @@ const MODEL_BACKFILL_MIGRATION_KEY = "migration.session_model_backfill.v1";
 const LOG_SYNC_ATTEMPTS = 10;
 const LOG_SYNC_RETRY_MS = 500;
 const STREAM_INTERVAL_MS = 500;
+/** How long a message sent into a running turn is remembered, so a retried delivery is not run again. */
+const STEER_RECORD_RETENTION_MS = 7 * 24 * 60 * 60_000;
+/** How long an accepted interrupt may take before the run card says the end is not yet confirmed. */
+const CANCEL_CONFIRM_WAIT_MS = 60_000;
+type CancelOutcome = { tasks: number; starting: number; turn: "none" | "requested" | "uncertain" | "failed" | "ended"; error: string | null };
+const TERMINAL_TURN_STATES: ReadonlySet<string> = new Set(["completed", "failed", "interrupted"]);
+const STEER_UNCERTAIN_TEXT = "没能确认这条消息是否已交给当前 Codex 回合。为避免重复执行，它不会被自动重新提交；如果稍后的回复里没有处理它，请重新发送。";
 const MAX_IMAGES_PER_TASK = 5;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -129,6 +136,9 @@ export class SyncRuntime implements FeishuRouterPort {
   private rootExecutionReady = false;
   private appServerRestartAttempts = 0;
   private appServerRestartTimer: NodeJS.Timeout | null = null;
+  private readonly cancelTimers = new Map<string, NodeJS.Timeout>();
+  /** When an interrupt was last sent for a turn, so a repeated cancel only resends one that went unconfirmed. */
+  private readonly cancelRequestedAt = new Map<string, number>();
   private threadStateTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -223,6 +233,7 @@ export class SyncRuntime implements FeishuRouterPort {
     }
     this.db.recoverStaleInboundEvents();
     this.db.pruneRetainedData();
+    this.pruneSteerRecords();
     await this.cleanupStaleTempFiles();
     await mkdir(this.sessionsDir, { recursive: true });
     await this.sessionImporter.startWatching();
@@ -250,6 +261,8 @@ export class SyncRuntime implements FeishuRouterPort {
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.appServerRestartTimer) clearTimeout(this.appServerRestartTimer);
     if (this.threadStateTimer) clearInterval(this.threadStateTimer);
+    for (const timer of this.cancelTimers.values()) clearTimeout(timer);
+    this.cancelTimers.clear();
     await this.sessionImporter.stopWatching();
     await this.appServer?.close();
     this.db.markRunningTasksInterrupted();
@@ -732,29 +745,82 @@ export class SyncRuntime implements FeishuRouterPort {
     this.db.deleteSetting(`turn.${turnId}.images`);
   }
 
-  private async cancelSessionWork(sessionId: string | null, rootMessageId: string | null, reason: string): Promise<number> {
-    const cancelled = sessionId ? this.db.cancelTasksBySession(sessionId, reason) : rootMessageId ? this.db.cancelTasksByRoot(rootMessageId, reason) : [];
+  /**
+   * Cancels a session's queued tasks at once and asks Codex to interrupt its running turn. The
+   * turn counts as cancelled only when Codex reports its end: until then it stays active (and
+   * keeps its images and output), and a refused interrupt leaves it running.
+   */
+  private async cancelSessionWork(sessionId: string | null, rootMessageId: string | null, reason: string): Promise<CancelOutcome> {
+    const activeTurnIds = this.turnCoordinator.states().map((turn) => turn.turnId);
+    const cancelled = sessionId ? this.db.cancelTasksBySession(sessionId, reason, activeTurnIds) : rootMessageId ? this.db.cancelTasksByRoot(rootMessageId, reason, activeTurnIds) : [];
     const targetIds = new Set<string>(cancelled.flatMap((task) => task.sessionId ? [task.sessionId] : []));
     if (sessionId) targetIds.add(sessionId);
+    if (rootMessageId) { const rooted = this.db.getSessionByRoot(rootMessageId); if (rooted) targetIds.add(rooted.sessionId); }
+    // Tasks taken from the queue but not yet started in Codex: their start checks for this and stops.
+    const starting = cancelled.filter((task) => task.status !== "pending").length;
+    const outcome: CancelOutcome = { tasks: cancelled.length, starting, turn: "none", error: null };
     for (const targetSessionId of targetIds) {
       const active = this.turnCoordinator.mutableTurn(targetSessionId);
-      if (active) {
-        this.turnCoordinator.deleteTurn(targetSessionId);
-        active.state = "interrupted"; this.db.saveTurn(active);
-        await this.cleanupTurnImages(active.turnId);
-        if (this.appServer) void this.appServer.request("turn/interrupt", { threadId: targetSessionId, turnId: active.turnId }).catch((error) => this.db.recordFailure("turn_interrupt", { sessionId: targetSessionId }, error));
+      if (!active) { await this.approvalService.cancelForSession(targetSessionId); continue; }
+      // The turn already ended and its result is being sent: there is nothing left to stop.
+      if (TERMINAL_TURN_STATES.has(active.state)) { outcome.turn = "ended"; continue; }
+      // A repeated cancel is answered from the first one; only an interrupt that has gone unconfirmed for a while is sent again.
+      if (active.state === "cancelling" && Date.now() - (this.cancelRequestedAt.get(active.turnId) ?? 0) < CANCEL_CONFIRM_WAIT_MS) { outcome.turn = "requested"; continue; }
+      if (!this.appServer) { outcome.turn = "failed"; outcome.error = "Codex app-server 不可用"; continue; }
+      const previous = active.state === "cancelling" ? "running" : active.state;
+      active.state = "cancelling"; this.db.saveTurn(active);
+      this.cancelRequestedAt.set(active.turnId, Date.now());
+      try {
+        await this.appServer.request("turn/interrupt", { threadId: targetSessionId, turnId: active.turnId }, 15_000);
+      } catch (error) {
+        this.db.recordFailure("turn_interrupt", { sessionId: targetSessionId }, error);
+        const still = this.turnCoordinator.mutableTurn(targetSessionId) === active && active.state === "cancelling";
+        if (!still) { outcome.turn = "ended"; continue; }
+        if (this.appServerOutcomeUncertain(error)) {
+          // No answer is not a refusal: the turn may be stopping, so it stays in cancelling until Codex says how it ended.
+          outcome.turn = "uncertain";
+          this.watchCancellation(active);
+          continue;
+        }
+        // Refused: the turn goes on and is still shown, and its requests stay answerable.
+        active.state = previous; this.db.saveTurn(active); this.cancelRequestedAt.delete(active.turnId);
+        outcome.turn = "failed"; outcome.error = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+        continue;
       }
+      // The turn may have ended while the interrupt was on its way; its completion already updated the card.
+      if (this.turnCoordinator.mutableTurn(targetSessionId) !== active) { outcome.turn = "ended"; continue; }
+      outcome.turn = "requested";
       await this.approvalService.cancelForSession(targetSessionId);
+      this.watchCancellation(active);
     }
-    return cancelled.length;
+    return outcome;
   }
 
-  private async cancelAllWork(reason: string): Promise<number> {
-    const cancelled = this.db.cancelAllTasks(reason);
-    const ids = new Set<string>(cancelled.flatMap((task) => task.sessionId ? [task.sessionId] : []));
-    for (const sessionId of this.turnCoordinator.sessionIds()) ids.add(sessionId);
-    for (const sessionId of ids) await this.cancelSessionWork(sessionId, null, reason);
-    return cancelled.length;
+  /** Says so on the run card when Codex accepted an interrupt but has not ended the turn after a while. */
+  private watchCancellation(turn: TurnState): void {
+    const existing = this.cancelTimers.get(turn.turnId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.cancelTimers.delete(turn.turnId);
+      const current = this.turnCoordinator.mutableTurn(turn.sessionId);
+      if (current?.turnId !== turn.turnId || current.state !== "cancelling") return;
+      void this.updateRunCard(turn.sessionId, turn.rootMessageId, "取消待确认", "已请求停止，但 Codex 尚未确认本轮结束；结束后这里会更新。", false)
+        .catch((error) => this.db.recordFailure("cancel_watch_card", { turnId: turn.turnId }, error));
+    }, CANCEL_CONFIRM_WAIT_MS);
+    timer.unref();
+    this.cancelTimers.set(turn.turnId, timer);
+  }
+
+  /** The run card and reply text for a cancellation. */
+  /** The run card and reply text for a cancellation; `update: false` when the card already shows how the turn ended. */
+  private cancelReport(outcome: CancelOutcome): { state: string; detail: string; update: boolean } | null {
+    if (outcome.turn === "failed") return { state: "取消失败", detail: `Codex 没有接受停止请求，本轮仍在运行${outcome.error ? `（${outcome.error}）` : ""}。可以稍后再试。`, update: true };
+    if (outcome.turn === "uncertain") return { state: "取消待确认", detail: "停止请求没有得到 Codex 答复，本轮可能仍在运行；结束后这里会更新，也可以稍后再次取消。", update: true };
+    if (outcome.turn === "requested") return { state: "正在取消", detail: "已请求 Codex 停止本轮，等待 Codex 确认。", update: true };
+    if (outcome.turn === "ended") return { state: "本轮已结束", detail: "本轮在取消前已经结束，状态卡显示的是实际结果。", update: false };
+    if (outcome.starting) return { state: "已取消", detail: "任务已取消。正在启动的任务如果已交给 Codex，会立即被停止。", update: true };
+    if (outcome.tasks) return { state: "已取消", detail: "排队中的任务已取消，未执行。", update: true };
+    return null;
   }
   private async handleAppServerExit(epoch: number, error?: Error): Promise<void> {
     if (this.stopping) return;
@@ -762,6 +828,12 @@ export class SyncRuntime implements FeishuRouterPort {
     for (const turn of this.turnCoordinator.states()) { turn.state = "interrupted"; this.db.saveTurn(turn); await this.cleanupTurnImages(turn.turnId); }
     this.turnCoordinator.clearTurns();
     this.approvalService.clear();
+    for (const timer of this.cancelTimers.values()) clearTimeout(timer);
+    this.cancelTimers.clear();
+    // Requests of the exited process can no longer be answered.
+    for (const request of this.db.expireServerRequests(epoch)) {
+      if (request.cardMessageId) void this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("请求已失效", "Codex app-server 已退出；请在话题中重新提交。", false)).catch(() => undefined);
+    }
     for (const task of interrupted) {
       if (task.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已中断", "Codex app-server 已退出；该任务不会自动重放。")).catch(() => undefined);
       if (task.rootMessageId && task.sessionId) void this.updateRunCard(task.sessionId, task.rootMessageId, "已中断", "Codex app-server 已退出；该任务不会自动重放。", false).catch(() => undefined);
@@ -797,9 +869,10 @@ export class SyncRuntime implements FeishuRouterPort {
     const expired = this.db.expireTaskRootGrants(this.appServer?.appServerEpoch);
     for (const grant of expired) {
       if (grant.sessionId) {
-        await this.cancelSessionWork(grant.sessionId, null, "Root authorization expired");
+        const outcome = await this.cancelSessionWork(grant.sessionId, null, "Root authorization expired");
         const session = this.db.getSession(grant.sessionId);
-        if (session?.rootMessageId) void this.updateRunCard(grant.sessionId, session.rootMessageId, "已取消", "Root 授权已过期，任务未执行。", false).catch(() => undefined);
+        const report = this.cancelReport(outcome) ?? { state: "已取消", detail: "Root 授权已过期，任务未执行。", update: true };
+        if (session?.rootMessageId && report.update) void this.updateRunCard(grant.sessionId, session.rootMessageId, report.state, outcome.turn === "none" ? "Root 授权已过期，任务未执行。" : report.detail, outcome.turn === "failed").catch(() => undefined);
       } else {
         const task = this.db.getTask(grant.taskId);
         if (task?.runCardMessageId) void this.feishu.updateCard(task.runCardMessageId, runStatusCard("已取消", "Root 授权已过期；未创建 Codex 会话。", false)).catch(() => undefined);
@@ -952,7 +1025,7 @@ export class SyncRuntime implements FeishuRouterPort {
       cardMessageId: null, payload: this.safeRequestPayload(type, params, canonicalCwd), status: "pending", expiresAt: expiry,
     };
     const state = this.turnCoordinator.mutableTurn(scopedSessionId);
-    if (state) {
+    if (state && state.state !== "cancelling") {
       state.state = type === "user_input" ? "awaiting_input" : "awaiting_approval"; this.db.saveTurn(state);
       const task = turnId ? this.db.taskForTurn(turnId) : null;
       if (task) this.db.transitionTask(task.id, state.state);
@@ -964,16 +1037,30 @@ export class SyncRuntime implements FeishuRouterPort {
     const card = type === "user_input"
       ? remoteQuestionCard(nonce, this.userInputQuestions(pending), 0)
       : remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(decisions ? { decisions } : {}), secret });
-    const cardMessageId = await this.feishu.replyCard(rootMessageId, card);
-    pending.cardMessageId = cardMessageId; this.db.saveServerRequest(pending);
-    await this.updateRunCard(scopedSessionId, rootMessageId, type === "user_input" ? "等待输入" : "等待批准", "Codex 正在等待你的选择。", true);
+    // Stored and awaited before the card exists: an answer may arrive as soon as it is shown.
+    this.db.saveServerRequest(pending);
+    const answered = this.approvalService.waitFor(nonce);
     const timeout = setTimeout(() => {
-      const live = this.db.claimServerRequest(nonce, openId, pending.chatId, this.appServer?.appServerEpoch ?? -1);
+      const live = this.db.timeOutServerRequest(nonce);
       if (!live) return;
       void this.resolveRemoteRequest(live, "decline").catch((error) => this.db.recordFailure("remote_request_timeout", { nonce }, error));
     }, Math.max(1, expiry - Date.now()));
     timeout.unref();
-    return this.approvalService.waitFor(nonce);
+    this.approvalService.setTimer(nonce, timeout);
+    try {
+      pending.cardMessageId = await this.feishu.replyCard(rootMessageId, card);
+    } catch (error) {
+      // Nobody can answer a request that is not shown; Codex is told so instead of waiting.
+      this.approvalService.take(nonce);
+      this.db.setServerRequestStatus(nonce, "expired");
+      if (state?.state === "awaiting_input" || state?.state === "awaiting_approval") { state.state = "running"; this.db.saveTurn(state); }
+      if (task) this.db.transitionTask(task.id, "running");
+      throw error;
+    }
+    this.db.setServerRequestCard(nonce, pending.cardMessageId);
+    await this.updateRunCard(scopedSessionId, rootMessageId, type === "user_input" ? "等待输入" : "等待批准", "Codex 正在等待你的选择。", true)
+      .catch((error) => this.db.recordFailure("status_card_request", { sessionId: scopedSessionId }, error));
+    return answered;
   }
 
   private async resolveRemoteRequest(request: PendingServerRequest, decision: string, answers: readonly string[] = []): Promise<void> {
@@ -1008,7 +1095,8 @@ export class SyncRuntime implements FeishuRouterPort {
     const detail = request.type === "user_input"
       ? accepted ? "回答已提交，Codex 在本轮内继续。" : "未回答，Codex 在本轮内继续。"
       : accepted ? "已批准。" : "已拒绝或取消。";
-    if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", detail, accepted));
+    const cardMessageId = this.db.getServerRequest(request.nonce)?.cardMessageId ?? request.cardMessageId;
+    if (cardMessageId) await this.feishu.updateCard(cardMessageId, remoteRequestResolvedCard("Codex 请求已提交", detail, accepted));
   }
 
   private userInputAnswersKey(nonce: string): string { return `remote_input.${nonce}.answers`; }
@@ -1095,17 +1183,27 @@ export class SyncRuntime implements FeishuRouterPort {
       return;
     }
     if (method === "serverRequest/resolved") {
-      const requestId = this.stringAt(params, "requestId", "request_id"); if (!requestId) return;
-      for (const request of this.db.resolveServerRequestsByRpcId(requestId, this.appServer?.appServerEpoch ?? -1)) if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已处理", "该请求已完成或已由 Codex 清理。"));
+      // JSON-RPC ids may be numbers or strings.
+      const rawId = params.requestId ?? params.request_id;
+      const requestId = typeof rawId === "string" || typeof rawId === "number" ? rawId : null; if (requestId === null) return;
+      for (const request of this.db.resolveServerRequestsByRpcId(requestId, this.appServer?.appServerEpoch ?? -1)) {
+        // Codex no longer waits for this request; its pending answer is settled so nothing is left waiting.
+        this.approvalService.take(request.nonce)?.({ action: "cancel", decision: "cancel" });
+        if (request.cardMessageId) await this.feishu.updateCard(request.cardMessageId, remoteRequestResolvedCard("Codex 请求已处理", "该请求已完成或已由 Codex 清理。"));
+      }
       return;
     }
     if (method === "turn/completed" && sessionId && turnId) {
       const state = this.turnCoordinator.mutableTurn(sessionId); if (!state || state.turnId !== turnId) return; const turn = this.asRecord(params.turn); const status = this.stringAt(turn, "status") ?? this.stringAt(params, "status") ?? "completed";
       state.state = status === "interrupted" ? "interrupted" : status === "failed" ? "failed" : "completed"; state.endedAtMs = Date.now(); state.finalOutputHash = textHash(state.plan || state.text); this.db.saveTurn(state);
+      const cancelTimer = this.cancelTimers.get(turnId); if (cancelTimer) { clearTimeout(cancelTimer); this.cancelTimers.delete(turnId); }
+      this.cancelRequestedAt.delete(turnId);
+      // How the turn ended, fixed before anything is awaited: a cancel arriving meanwhile must not change it.
+      const ended = state.state;
       const task = this.db.taskForTurn(turnId); if (task) this.db.transitionTask(task.id, state.state === "completed" ? "completed" : state.state === "interrupted" ? "interrupted" : "failed", { terminalReason: "turn " + state.state }); await this.cleanupTurnImages(turnId);
       try { const feishuMessageId = await this.finishTurnStream(state, state.state === "completed" ? "Codex 已完成" : "Codex " + state.state); const content = state.plan || state.text; if (content && feishuMessageId) { this.db.upsertAppServerDelivery({ sessionId, turnId, role: "assistant", startedAtMs: state.startedAtMs ?? null, endedAtMs: state.endedAtMs ?? null, contentHash: textHash(content), contentBytes: Buffer.byteLength(content, "utf8"), feishuMessageId }); this.db.setTurnAssistantDelivery(turnId, feishuMessageId); } } catch (error) { this.db.recordFailure("finish_turn_stream", { turnId }, error); }
       finally { this.turnCoordinator.deleteTurn(sessionId); }
-      void this.updateRunCard(sessionId, state.rootMessageId, state.state === "completed" ? "完成" : state.state === "interrupted" ? "已取消" : "失败", state.state === "completed" ? "本轮已完成。" : "本轮未完成。", false).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
+      void this.updateRunCard(sessionId, state.rootMessageId, ended === "completed" ? "完成" : ended === "interrupted" ? "已取消" : "失败", ended === "completed" ? "本轮已完成。" : "本轮未完成。", false).catch((error) => this.db.recordFailure("turn_completion_card", { turnId }, error));
       await this.releaseThreadSubscription(sessionId, "turn_completed"); void this.drainTaskQueue(sessionId);
     }
   }
@@ -1592,10 +1690,13 @@ export class SyncRuntime implements FeishuRouterPort {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
           const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
           if (!session) return errorCard("当前会话没有可取消的桥接任务。");
-          const cancelled = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
-          if (!this.turnCoordinator.hasActiveTurn(session.sessionId) && !cancelled) return errorCard("当前会话没有可取消的桥接任务。");
-          if (session.rootMessageId) void this.updateRunCard(session.sessionId, session.rootMessageId, "正在取消", "已向 Codex 发送取消信号。", false);
-          const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), "可继续") : runStatusCard("正在取消", "已向 Codex 发送取消信号。");
+          const outcome = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
+          const report = this.cancelReport(outcome);
+          if (!report) return errorCard("当前会话没有可取消的桥接任务。");
+          if (session.rootMessageId && report.update) void this.updateRunCard(session.sessionId, session.rootMessageId, report.state, report.detail, outcome.turn === "failed");
+          // The clicked card is replaced with what is true now, which may already be the turn's end.
+          const actual = report.update ? report : this.db.getRunStatus(session.sessionId) ?? report;
+          const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), this.turnCoordinator.hasActiveTurn(rootCardSession.sessionId) ? "运行中" : "可继续") : runStatusCard(actual.state, actual.detail, outcome.turn === "failed" || outcome.turn === "uncertain", session.sessionId);
           return rootCardSession && event.openMessageId === rootCardSession.rootMessageId
             ? { delivery: "replace", card }
             : session.rootMessageId ? { delivery: "reply", rootMessageId: session.rootMessageId, card } : { delivery: "send", card };
@@ -2360,6 +2461,46 @@ export class SyncRuntime implements FeishuRouterPort {
     }
   }
 
+  private steerKey(messageId: string): string { return `steer.${messageId}`; }
+
+  /** What happened to a Feishu message sent into a running turn: being sent, or accepted by Codex. */
+  private steerRecord(messageId: string): { turnId: string; state: "sending" | "accepted"; atMs: number } | null {
+    try {
+      const value = JSON.parse(this.db.getSetting(this.steerKey(messageId)) ?? "null") as { turnId?: unknown; state?: unknown; atMs?: unknown } | null;
+      if (!value || typeof value.turnId !== "string" || (value.state !== "sending" && value.state !== "accepted")) return null;
+      return { turnId: value.turnId, state: value.state, atMs: Number(value.atMs) || 0 };
+    } catch { return null; }
+  }
+
+  private saveSteerRecord(messageId: string, turnId: string, state: "sending" | "accepted"): void {
+    this.db.setSetting(this.steerKey(messageId), JSON.stringify({ turnId, state, atMs: Date.now() }));
+  }
+
+  private deleteSteerRecord(messageId: string): void { this.db.deleteSetting(this.steerKey(messageId)); }
+
+  /** Steer records outlive their turn so that a retried or replayed message is recognised; old ones are dropped. */
+  private pruneSteerRecords(now = Date.now()): void {
+    for (const { key } of this.db.listSettings("steer.")) {
+      const record = this.steerRecord(key.slice("steer.".length));
+      if (!record || now - record.atMs > STEER_RECORD_RETENTION_MS) this.db.deleteSetting(key);
+    }
+  }
+
+  /** A confirmation in the topic; if Feishu fails, the work it confirms has already happened, so only the failure is recorded. */
+  private async respondSafely(message: IncomingFeishuMessage, text: string): Promise<void> {
+    try { await this.respond(message, text); }
+    catch (error) { this.db.recordFailure("topic_confirmation", { messageId: message.messageId }, error); }
+  }
+
+  private forgetTurnImages(turnId: string, paths: readonly string[]): void {
+    if (!paths.length) return;
+    let existing: string[] = [];
+    try { existing = JSON.parse(this.db.getSetting(`turn.${turnId}.images`) ?? "[]") as string[]; } catch { return; }
+    const remaining = existing.filter((path) => !paths.includes(path));
+    if (remaining.length) this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(remaining));
+    else this.db.deleteSetting(`turn.${turnId}.images`);
+  }
+
   private rememberTurnImages(turnId: string, paths: string[]): void {
     if (!paths.length) return;
     let existing: string[] = [];
@@ -2385,6 +2526,8 @@ export class SyncRuntime implements FeishuRouterPort {
       ...(task.model ? { model: task.model } : {}), ...(task.reasoningEffort ? { effort: task.reasoningEffort } : {}),
       collaborationMode: { mode, settings: { model: task.model ?? null, reasoning_effort: task.reasoningEffort ?? null, developer_instructions: null } },
     };
+    // The task may have been cancelled while the thread was resumed or images downloaded.
+    if (this.db.getTask(task.id)?.status === "cancelled") { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); return; }
     this.db.updateTask(task.id, "starting_turn", { phase: "starting_turn" });
     // A topic reply is already visible in Feishu, so its JSONL copy must not be
     // posted again. A new-session prompt was typed outside the topic and stays.
@@ -2402,6 +2545,15 @@ export class SyncRuntime implements FeishuRouterPort {
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
     const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt) };
     this.turnCoordinator.setTurn(state); this.db.saveTurn(state);
+    if (this.db.getTask(task.id)?.status === "cancelled") {
+      // Cancelled while turn/start was on its way: the turn exists now, so it is stopped like a running one.
+      this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
+      void this.cancelSessionWork(session.sessionId, null, "cancelled while starting").then((outcome) => {
+        const report = this.cancelReport(outcome);
+        if (report?.update) return this.updateRunCard(session.sessionId, session.rootMessageId!, report.state, report.detail, outcome.turn === "failed");
+      }).catch((error) => this.db.recordFailure("cancel_started_turn", { turnId }, error));
+      return;
+    }
     this.db.upsertAppServerDelivery({ sessionId: session.sessionId, turnId, role: "user", startedAtMs: state.startedAtMs ?? null, contentHash: textHash(task.prompt), contentBytes: Buffer.byteLength(task.prompt, "utf8"), sourceMessageId: task.sourceMessageId });
     this.db.updateTask(task.id, "running", { sessionId: session.sessionId, turnId, phase: "running" });
     this.db.setSetting(`turn.${turnId}.images`, JSON.stringify(imagePaths));
@@ -2437,20 +2589,45 @@ export class SyncRuntime implements FeishuRouterPort {
     if (!userPrompt) { await this.respond(message, "消息中没有可提交的文本或图片。"); return; }
     try { await resolveAllowedPath(session.cwd, this.config.allowedRoot); }
     catch (error) { await this.respond(message, `会话目录被拒绝：${String(error)}`); return; }
+    // A message that already reached a running turn (this delivery may be a retry, or the
+    // service restarted after sending it) must never run a second time.
+    const steered = this.steerRecord(message.messageId);
+    if (steered) {
+      await this.respondSafely(message, steered.state === "accepted" ? "已发送给当前 Codex 回合。" : STEER_UNCERTAIN_TEXT);
+      return;
+    }
     const active = this.turnCoordinator.mutableTurn(session.sessionId);
-    if (active && this.appServer) {
+    // A turn being cancelled takes no more input; the message waits for the next turn.
+    if (active && active.state !== "cancelling" && this.appServer) {
       const paths = await this.downloadImages(message, message.imageKeys);
       this.queuePendingPrompt(session.sessionId, userPrompt, message.messageId);
+      this.saveSteerRecord(message.messageId, active.turnId, "sending");
+      // Codex may read the images as soon as it has the request, so they belong to the turn from now on.
+      this.rememberTurnImages(active.turnId, paths);
+      let accepted = false;
       try {
         await this.appServer.request("turn/steer", { threadId: session.sessionId, expectedTurnId: active.turnId,
           input: [{ type: "text", text: userPrompt }, ...paths.map((path) => ({ type: "localImage", path }))] });
-        this.rememberTurnImages(active.turnId, paths);
-        await this.respond(message, "已发送给当前 Codex 回合。");
-        return;
+        accepted = true;
       } catch (error) {
+        if (this.appServerOutcomeUncertain(error)) {
+          // No answer is not a refusal: the turn may have taken the message, so it is not queued again.
+          this.db.recordFailure("turn_steer_uncertain", { sessionId: session.sessionId }, error);
+          await this.respondSafely(message, STEER_UNCERTAIN_TEXT);
+          return;
+        }
+        // Codex refused the input (for example the turn just ended): it runs in the next turn instead.
+        this.deleteSteerRecord(message.messageId);
         this.dropPendingPrompt(session.sessionId, userPrompt, message.messageId);
+        this.forgetTurnImages(active.turnId, paths);
         await Promise.all(paths.map((path) => rm(path, { force: true })));
-        console.warn("turn/steer unavailable; queueing next turn", error);
+        console.warn("turn/steer refused; queueing next turn", error);
+      }
+      if (accepted) {
+        this.saveSteerRecord(message.messageId, active.turnId, "accepted");
+        // Codex has the message; failing to say so in Feishu must not send it again.
+        await this.respondSafely(message, "已发送给当前 Codex 回合。");
+        return;
       }
     }
     await this.enqueueResumeTask(session, message, userPrompt);
@@ -2491,11 +2668,13 @@ export class SyncRuntime implements FeishuRouterPort {
   private async cancel(message: IncomingFeishuMessage): Promise<void> {
     const session = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const key = session?.sessionId;
-    const cancelled = await this.cancelSessionWork(key ?? null, message.rootId ?? null, "cancelled by user");
-    if (!key || (!this.turnCoordinator.hasActiveTurn(key) && !cancelled)) {
+    const outcome = await this.cancelSessionWork(key ?? null, message.rootId ?? null, "cancelled by user");
+    const report = key ? this.cancelReport(outcome) : null;
+    if (!key || !report) {
       await this.respond(message, "当前话题没有由桥接服务启动的活动任务。");
       return;
     }
-    await this.respond(message, cancelled ? "已取消排队任务；正在运行的任务也会停止。" : "已发送取消信号。");
+    if (session?.rootMessageId && report.update) void this.updateRunCard(key, session.rootMessageId, report.state, report.detail, outcome.turn === "failed" || outcome.turn === "uncertain").catch((error) => this.db.recordFailure("cancel_card", { sessionId: key }, error));
+    await this.respond(message, `${report.state}：${report.detail}`);
   }
 }
