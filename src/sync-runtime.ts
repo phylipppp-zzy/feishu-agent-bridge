@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { archivedSessionActionCard, assistantMarkdownCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
+import { archivedSessionActionCard, assistantMarkdownCard, hostContextPreviewCard, hostContextResultCard, permissionDetailsCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { isExpiredFeishuMessage } from "./safe-log.js";
 import { AppServerRpcError, CodexAppServer, notificationTurnId, type JsonRpcMessage } from "./app-server.js";
 import { CodexCliProbe } from "./codex.js";
@@ -11,7 +11,7 @@ import { resolveAllowedPath } from "./path-policy.js";
 import { remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { boundedPreview, cardContentBytes, serializedBytes } from "./text-limits.js";
-import { parseJsonlChunk } from "./session-parser.js";
+import { parseJsonlChunk, userMessageText } from "./session-parser.js";
 import type { FeishuRouterPort } from "./bridge-contracts.js";
 import { jsonlFiles, SessionImporter } from "./session-importer.js";
 import { TaskScheduler } from "./task-scheduler.js";
@@ -36,6 +36,8 @@ const STREAM_INTERVAL_MS = 500;
 const STEER_RECORD_RETENTION_MS = 7 * 24 * 60 * 60_000;
 /** How long an accepted interrupt may take before the run card says the end is not yet confirmed. */
 const CANCEL_CONFIRM_WAIT_MS = 60_000;
+type HostContextMessage = { id: string; feishuMessageId: string; sessionId: string; title: string };
+const HOST_CONTEXT_CONFIRM_MS = 10 * 60_000;
 type CancelOutcome = { tasks: number; starting: number; turn: "none" | "requested" | "uncertain" | "failed" | "ended"; error: string | null };
 const TERMINAL_TURN_STATES: ReadonlySet<string> = new Set(["completed", "failed", "interrupted"]);
 const STEER_UNCERTAIN_TEXT = "没能确认这条消息是否已交给当前 Codex 回合。为避免重复执行，它不会被自动重新提交；如果稍后的回复里没有处理它，请重新发送。";
@@ -384,33 +386,6 @@ export class SyncRuntime implements FeishuRouterPort {
         const preview = batch.messages.find((message) => message.role === "user")?.text ?? session.firstUserText;
         const title = titles.get(session.sessionId) ?? session.title ?? preview;
         this.db.setSessionTitle(session.sessionId, title, preview);
-        for (const line of raw.split("\n")) {
-          let record: Record<string, unknown>;
-          try { record = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
-          if (record.type !== "response_item") continue;
-          const payload = record.payload as Record<string, unknown> | undefined;
-          if (payload?.type !== "message" || payload.role !== "user") continue;
-          const content = payload.content;
-          if (!Array.isArray(content)) continue;
-          const text = content.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
-            .filter((item) => item.type === "input_text" && typeof item.text === "string")
-            .map((item) => String(item.text)).join("\n");
-          const trimmed = text.trim();
-          const remaining = trimmed.replace(/<recommended_plugins>[\s\S]*?<\/recommended_plugins>/gi, "")
-            .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, "").trim();
-          const synthetic = Boolean(trimmed) && remaining === "";
-          if (!synthetic) continue;
-          const timestamp = typeof record.timestamp === "string" ? record.timestamp : new Date(0).toISOString();
-          const id = this.syntheticMessageId(session.sessionId, timestamp, text);
-          const message = this.db.getMessage(id);
-          if (!message?.feishuMessageId || message.recallState === "recalled") continue;
-          try {
-            await this.feishu.deleteMessage(message.feishuMessageId);
-            this.db.markMessageRecalled(id);
-          } catch (error) {
-            this.db.recordFailure("recall_synthetic_message", { sessionId: session.sessionId, id }, error);
-          }
-        }
         const refreshed = this.db.getSession(session.sessionId);
         if (refreshed?.rootMessageId) {
           await this.feishu.updateCard(refreshed.rootMessageId, sessionCard(this.sessionView(refreshed), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续"));
@@ -420,6 +395,53 @@ export class SyncRuntime implements FeishuRouterPort {
       }
     }
     this.db.setSetting("migration.history_cleanup_v1", "1");
+  }
+
+  /**
+   * Bot messages that show host context (plugin lists, environment, AGENTS.md) as if the person
+   * had typed it, from before the importer filtered it. Messages that also hold a real request
+   * are listed but kept, since withdrawing them would hide that request too.
+   */
+  private async hostContextMessages(): Promise<{ removable: HostContextMessage[]; kept: HostContextMessage[] }> {
+    const removable: HostContextMessage[] = []; const kept: HostContextMessage[] = [];
+    for (const session of this.db.listSessions()) {
+      let raw: string;
+      try { raw = await readFile(session.path, "utf8"); } catch { continue; }
+      for (const line of raw.split("\n")) {
+        let record: Record<string, unknown>;
+        try { record = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+        const payload = this.asRecord(record.payload);
+        if (record.type !== "response_item" || payload.type !== "message" || payload.role !== "user") continue;
+        const text = userMessageText(payload.content);
+        if (!text.raw || text.raw.trim() === text.visible) continue;
+        const timestamp = typeof record.timestamp === "string" ? record.timestamp : new Date(0).toISOString();
+        const id = this.syntheticMessageId(session.sessionId, timestamp, text.raw);
+        const message = this.db.getMessage(id);
+        if (message?.direction !== "outbound" || !message.feishuMessageId || message.recallState === "recalled") continue;
+        const item = { id, feishuMessageId: message.feishuMessageId, sessionId: session.sessionId, title: session.title || session.firstUserText || session.sessionId.slice(0, 8) };
+        (text.visible ? kept : removable).push(item);
+      }
+    }
+    return { removable, kept };
+  }
+
+  /** Withdraws the confirmed host-context messages one by one; failures stay listed for another try. */
+  private async withdrawHostContextMessages(ids: readonly string[]): Promise<void> {
+    let withdrawn = 0; const failed: Array<{ title: string; reason: string }> = [];
+    for (const id of ids) {
+      const message = this.db.getMessage(id);
+      if (!message?.feishuMessageId || message.recallState === "recalled") continue;
+      try { await this.feishu.deleteMessage(message.feishuMessageId); this.db.markMessageRecalled(id); withdrawn += 1; }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        // Already deleted (230110) or recalled (230011) in Feishu counts as done.
+        if (/\b(?:230110|230011)\b/.test(detail)) { this.db.markMessageRecalled(id); continue; }
+        this.db.recordFailure("recall_host_context", { id }, error);
+        failed.push({ title: this.db.getSession(message.sessionId)?.title ?? message.sessionId.slice(0, 8), reason: /\b230009\b/.test(detail) ? "超过飞书撤回时限" : detail.slice(0, 120) });
+      }
+    }
+    const chatId = this.boundChatId();
+    if (chatId) await this.feishu.sendCard(chatId, hostContextResultCard(withdrawn, failed));
   }
 
   private async reconcileSessionFiles(): Promise<void> {
@@ -964,10 +986,12 @@ export class SyncRuntime implements FeishuRouterPort {
     }
   }
 
-  private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { executionMode: BridgeConfig["executionMode"]; rootExecutionReady: boolean; rootPreflightReasons: string[]; hasActiveWork: boolean } {
+  private sessionView<T extends { sessionId: string; cwd: string }>(session: T): T & { executionMode: BridgeConfig["executionMode"]; rootExecutionReady: boolean; rootPreflightReasons: string[]; hasActiveWork: boolean; currentTurn: { mode: "default" | "plan"; rootMode: boolean } | null } {
     let reasons: string[] = [];
     try { reasons = JSON.parse(this.db.getSetting("codex.root_preflight") ?? "{}").reasons ?? []; } catch { /* invalid diagnostics are ignored */ }
-    return { ...session, executionMode: this.config.executionMode, rootExecutionReady: this.rootExecutionReady, rootPreflightReasons: reasons, hasActiveWork: this.turnCoordinator.hasActiveTurn(session.sessionId) };
+    const turn = this.turnCoordinator.mutableTurn(session.sessionId);
+    return { ...session, executionMode: this.config.executionMode, rootExecutionReady: this.rootExecutionReady, rootPreflightReasons: reasons,
+      hasActiveWork: Boolean(turn), currentTurn: turn ? { mode: turn.mode, rootMode: turn.rootMode === true } : null };
   }
 
   private requestKind(method: string): RemoteRequestType | null {
@@ -1672,7 +1696,7 @@ export class SyncRuntime implements FeishuRouterPort {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
-      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "remote_approve", "remote_answer", "remote_guidance", "unarchive_confirm", "unarchive_cancel"].includes(event.action)) {
+      if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "permission_details", "resend_result", "remote_approve", "remote_answer", "remote_guidance", "unarchive_confirm", "unarchive_cancel"].includes(event.action)) {
         return { delivery: "reply", rootMessageId: rootCardSession.rootMessageId,
           card: errorCard("此会话话题默认用于继续对话；新建、搜索和服务管理请在群主消息或控制台中操作。") };
       }
@@ -1789,7 +1813,7 @@ export class SyncRuntime implements FeishuRouterPort {
           if (!wizard || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) return errorCard("任务向导已过期，请重新开始。");
           wizard.awaitingChatTask = true;
           this.saveWizard(event.openId, wizard);
-          return { delivery: "send", card: homeCard(this.cardStatus(), "请在群主消息直接发送任务；当前向导将使用已选项目、模型和强度。") };
+          return { delivery: "send", card: homeCard(this.cardStatus(), "请在群主消息直接发送任务，不需要 @机器人；当前向导将使用已选项目、模型和强度，只接收你本人在本群发出的下一条消息。") };
         }
         case "submit_task": {
           if (this.paused()) return errorCard("同步当前已暂停；恢复同步后再创建会话。");
@@ -1827,6 +1851,31 @@ export class SyncRuntime implements FeishuRouterPort {
           const updated = this.db.getSession(session.sessionId)!;
           const card = sessionCard(this.sessionView(updated), this.turnCoordinator.hasActiveTurn(updated.sessionId) ? "运行中" : "可继续");
           return event.openMessageId === updated.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: updated.rootMessageId!, card };
+        }
+        case "context_cleanup_preview": {
+          // Reading every session log can take longer than a card callback may; the list follows as a new card.
+          void this.hostContextMessages().then(async ({ removable, kept }) => {
+            const nonce = randomUUID();
+            if (removable.length) this.db.setSetting("context_cleanup.pending", JSON.stringify({ nonce, ids: removable.map((item) => item.id), expiresAt: Date.now() + HOST_CONTEXT_CONFIRM_MS }));
+            await this.feishu.sendCard(event.chatId, hostContextPreviewCard(removable, kept, nonce));
+          }).catch((error) => this.db.recordFailure("host_context_preview", {}, error));
+          return { delivery: "replace", card: runStatusCard("正在检查", "正在查找显示了宿主上下文的历史消息，结果会单独发到群里。") };
+        }
+        case "context_cleanup_confirm": {
+          let pending: { nonce?: unknown; ids?: unknown; expiresAt?: unknown } = {};
+          try { pending = JSON.parse(this.db.getSetting("context_cleanup.pending") ?? "{}") as typeof pending; } catch { /* treated as expired */ }
+          if (pending.nonce !== event.value.nonce || typeof pending.expiresAt !== "number" || pending.expiresAt < Date.now() || !Array.isArray(pending.ids)) {
+            return errorCard("清理已过期，请在服务管理中重新检查。");
+          }
+          this.db.deleteSetting("context_cleanup.pending");
+          const ids = pending.ids.filter((id): id is string => typeof id === "string");
+          void this.withdrawHostContextMessages(ids).catch((error) => this.db.recordFailure("host_context_cleanup", {}, error));
+          return { delivery: "replace", card: runStatusCard("正在撤回", `正在撤回 ${ids.length} 条消息，完成后会发送结果。`) };
+        }
+        case "permission_details": {
+          const session = this.sessionFromCard(event) ?? this.db.getSessionByRoot(event.openMessageId);
+          if (!session) return errorCard("没有找到这个会话。");
+          return { delivery: "reply", rootMessageId: session.rootMessageId, card: permissionDetailsCard(session.cwd, session.collaborationMode === "plan", this.sessionView(session)) };
         }
         case "resend_result": {
           const turnId = typeof event.value.turnId === "string" ? event.value.turnId : "";
@@ -1937,11 +1986,11 @@ export class SyncRuntime implements FeishuRouterPort {
           return homeCard(this.cardStatus(), "已启动全量扫描");
         case "pause":
           this.db.setSetting("sync.paused", "1");
-          return homeCard(this.cardStatus(), "同步已暂停");
+          return homeCard(this.cardStatus(), "同步已暂停：不再同步本机会话，也不启动新的或排队中的任务；正在运行的任务不会因此停止，需要停止请在会话话题发送 /cancel。");
         case "resume":
           this.db.setSetting("sync.paused", "0");
           void this.syncAll();
-          return homeCard(this.cardStatus(), "同步已恢复");
+          return homeCard(this.cardStatus(), "同步已恢复：继续同步本机会话，排队中的任务会按顺序开始。");
         case "retry": {
           this.messageLinkPermissionDenied = false;
           const modelsReady = await this.refreshModels();
@@ -1953,7 +2002,7 @@ export class SyncRuntime implements FeishuRouterPort {
           void this.syncAll();
           void this.backfillSessionLinks();
           void this.deliverPendingOutputs(true);
-          return homeCard(this.cardStatus(), modelsReady && appServerReady ? "正在重试未完成任务，模型目录和 app-server 已恢复" : "基础设施仍不可用；请稍后再次 /retry");
+          return homeCard(this.cardStatus(), modelsReady && appServerReady ? "已重新连接：模型目录已刷新，app-server 正常，并开始重新同步。不会重新执行任何任务；结果没有发到飞书的回合会自动补发。" : "模型目录或 app-server 仍不可用，请稍后再发送 /retry。");
         }
         default: return errorCard(`未知卡片操作：${event.action}`);
       }
@@ -1999,6 +2048,11 @@ export class SyncRuntime implements FeishuRouterPort {
     const normalized = command.toLowerCase();
     const sessionInTopic = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
     const slashCommand = !sessionInTopic && command.startsWith("/");
+    // The new-session wizard asked for the task in the main timeline; that message needs no @.
+    // Only the main timeline: a reply inside any topic (also one that is not a session) is never taken as the task.
+    const pendingWizard = !message.rootId && !slashCommand && command ? this.getWizard(message.senderOpenId, "new") : null;
+    const wizardTask = pendingWizard?.awaitingChatTask === true && pendingWizard.chatId === message.chatId;
+    if (wizardTask && !message.mentionedBot) return this.submitWizardTask(message, pendingWizard!, command);
     if (message.chatType === "group" && !message.mentionedBot && !sessionInTopic && !slashCommand) return;
     // Plain-word shortcuts are bridge commands only in the group's main timeline.
     // Inside a mapped session topic every non-slash message belongs to Codex, as
@@ -2035,12 +2089,12 @@ export class SyncRuntime implements FeishuRouterPort {
     }
     if (isCommand(["/pause"], ["暂停"])) {
       this.db.setSetting("sync.paused", "1");
-      await this.respondCard(message, homeCard(this.cardStatus(), "同步已暂停"));
+      await this.respondCard(message, homeCard(this.cardStatus(), "同步已暂停：不再同步本机会话，也不启动新的或排队中的任务；正在运行的任务不会因此停止，需要停止请在会话话题发送 /cancel。"));
       return;
     }
     if (isCommand(["/resume-sync"], ["恢复"])) {
       this.db.setSetting("sync.paused", "0");
-      await this.respondCard(message, homeCard(this.cardStatus(), "同步已恢复"));
+      await this.respondCard(message, homeCard(this.cardStatus(), "同步已恢复：继续同步本机会话，排队中的任务会按顺序开始。"));
       void this.syncAll();
       return;
     }
@@ -2052,7 +2106,7 @@ export class SyncRuntime implements FeishuRouterPort {
         try { await this.appServer.restart("manual retry"); } catch (error) { appServerReady = false; this.db.recordFailure("app_server_retry", {}, error); }
       }
       if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
-      await this.respondCard(message, homeCard(this.cardStatus(), modelsReady && appServerReady ? "正在重试未完成任务，模型目录和 app-server 已恢复" : "基础设施仍不可用；请稍后再次 /retry"));
+      await this.respondCard(message, homeCard(this.cardStatus(), modelsReady && appServerReady ? "已重新连接：模型目录已刷新，app-server 正常，并开始重新同步。不会重新执行任何任务；结果没有发到飞书的回合会自动补发。" : "模型目录或 app-server 仍不可用，请稍后再发送 /retry。"));
       void this.syncAll();
       void this.backfillSessionLinks();
       void this.deliverPendingOutputs(true);
@@ -2096,14 +2150,7 @@ export class SyncRuntime implements FeishuRouterPort {
       return;
     }
     const wizard = this.getWizard(message.senderOpenId, "new");
-    if (!sessionInTopic && wizard?.awaitingChatTask && command) {
-      if (wizard.mode !== "new" || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) {
-        await this.respond(message, "请先完成项目、模型和思考强度选择，或发送 /cancel 取消当前向导。");
-        return;
-      }
-      this.db.deleteSetting(this.wizardKey(message.senderOpenId, "new"));
-      return this.runNewSession(message, wizard.cwd, command, wizard.model, wizard.reasoningEffort, message.imageKeys);
-    }
+    if (!sessionInTopic && wizard?.awaitingChatTask && wizard.chatId === message.chatId && command) return this.submitWizardTask(message, wizard, command);
     if (message.rootId) {
       const session = this.db.getSessionByRoot(message.rootId);
       const guidanceRequest = session ? this.db.nextServerRequest(session.sessionId, "command_approval") : null;
@@ -2187,6 +2234,16 @@ export class SyncRuntime implements FeishuRouterPort {
 
   private respondCard(message: IncomingFeishuMessage, card: CardDefinition): Promise<string> {
     return message.rootId ? this.feishu.replyCard(message.rootId, card) : this.feishu.sendCard(message.chatId, card);
+  }
+
+  /** The task typed in the main timeline for a wizard that chose project, model and effort. */
+  private async submitWizardTask(message: IncomingFeishuMessage, wizard: WizardState, command: string): Promise<void> {
+    if (wizard.mode !== "new" || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) {
+      await this.respond(message, "请先完成项目、模型和思考强度选择，或发送 /cancel 取消当前向导。");
+      return;
+    }
+    this.db.deleteSetting(this.wizardKey(message.senderOpenId, "new"));
+    return this.runNewSession(message, wizard.cwd, command, wizard.model, wizard.reasoningEffort, message.imageKeys);
   }
 
   private async newSession(message: IncomingFeishuMessage, command: string): Promise<void> {
@@ -2702,7 +2759,7 @@ export class SyncRuntime implements FeishuRouterPort {
     const turn = this.asRecord(response.turn);
     const turnId = this.stringAt(turn, "id") ?? this.stringAt(response, "turnId", "turn_id");
     if (!turnId) { await Promise.all(imagePaths.map((path) => rm(path, { force: true }))); throw new Error("Codex app-server turn/start returned no turn id"); }
-    const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt) };
+    const state: TurnState = { sessionId: session.sessionId, turnId, epoch: this.appServer.appServerEpoch, mode, state: "running", text: "", plan: "", rootMessageId: session.rootMessageId, startedAtMs: Date.now(), inputHash: textHash(task.prompt), rootMode: execution.rootMode };
     this.turnCoordinator.setTurn(state); this.db.saveTurn(state);
     if (this.db.getTask(task.id)?.status === "cancelled") {
       // Cancelled while turn/start was on its way: the turn exists now, so it is stopped like a running one.

@@ -27,14 +27,42 @@ export function homeCard(status: { paused: boolean; sessions: number; active: nu
 export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number; appServer?: string }): CardDefinition {
   return card("服务管理", status.paused ? "orange" : "blue", [
     markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**\n会话：${status.sessions}　运行中：${status.active}　排队：${status.queued ?? 0}　等待用户：${status.waiting ?? 0}　失败任务：${status.failedTasks ?? 0}　未解决失败类别：${status.failures}${status.appServer ? `\napp-server：${safeMarkdown(status.appServer)}` : ""}`),
-    actionRow([button("立即同步", "sync", "primary"), status.paused ? button("恢复 Bridge", "resume", "primary") : button("暂停 Bridge", "pause")]),
-    actionRow([button("重试失败", "retry"), button("使用帮助", "help"), button("返回控制台", "home")]),
+    actionRow([button("立即同步", "sync", "primary"), status.paused ? button("恢复同步", "resume", "primary") : button("暂停同步", "pause")]),
+    actionRow([button("重新连接", "retry"), button("使用帮助", "help"), button("返回控制台", "home")]),
+    actionRow([button("检查宿主上下文消息", "context_cleanup_preview")]),
+  ]);
+}
+
+/** Old bot messages that show host context as a user message; nothing is withdrawn until confirmed. */
+export function hostContextPreviewCard(removable: ReadonlyArray<{ title: string }>, kept: ReadonlyArray<{ title: string }>, nonce: string): CardDefinition {
+  const lines = (items: ReadonlyArray<{ title: string }>) => {
+    const counts = new Map<string, number>();
+    for (const item of items) counts.set(item.title, (counts.get(item.title) ?? 0) + 1);
+    const rows = [...counts].slice(0, 15).map(([title, count]) => `- ${safeMarkdown(shorten(title, 40))}：${count} 条`);
+    if (counts.size > 15) rows.push(`- …另有 ${counts.size - 15} 个会话`);
+    return rows.join("\n");
+  };
+  if (!removable.length && !kept.length) return card("没有需要清理的消息", "green", [markdown("历史话题里没有把插件列表、环境信息或 AGENTS.md 指令显示成用户消息的机器人消息。")]);
+  return card(`可撤回 ${removable.length} 条宿主上下文消息`, removable.length ? "orange" : "blue", [
+    ...(removable.length ? [markdown(`以下机器人消息只包含宿主附加的上下文（插件列表、环境信息、AGENTS.md 指令），不是你发的内容：\n${lines(removable)}`)] : []),
+    ...(kept.length ? [markdown(`另有 ${kept.length} 条消息里同时有你真正的提问，不会撤回：\n${lines(kept)}`)] : []),
+    note("确认后只撤回上面列出的机器人消息，不会删除你自己发的消息；超过飞书撤回时限的消息撤不掉，结果会单独列出，可再次检查后重试。"),
+    ...(removable.length ? [actionRow([button("确认撤回", "context_cleanup_confirm", "danger", { nonce }), button("取消", "service")])] : []),
+  ]);
+}
+
+export function hostContextResultCard(withdrawn: number, failed: ReadonlyArray<{ title: string; reason: string }>): CardDefinition {
+  const rows = failed.slice(0, 15).map((item) => `- ${safeMarkdown(shorten(item.title, 40))}：${safeMarkdown(item.reason)}`);
+  if (failed.length > 15) rows.push(`- …另有 ${failed.length - 15} 条`);
+  return card("宿主上下文消息清理完成", failed.length ? "orange" : "green", [
+    markdown(`已撤回：**${withdrawn}**　未能撤回：**${failed.length}**${rows.length ? `\n${rows.join("\n")}` : ""}`),
+    actionRow([...(failed.length ? [button("重新检查并重试", "context_cleanup_preview", "primary")] : []), button("服务管理", "service")]),
   ]);
 }
 
 export function helpCard(): CardDefinition {
   return card("Codex 使用帮助", "wathet", [
-    markdown("**快捷工作流**\n点击“新建会话”，依次选择项目、模型、强度，然后在卡片或聊天中输入任务。\n\n在任一会话话题中直接回复即可继续，且无需 @ 机器人。话题里只有 `/` 开头的命令由桥接处理，其他文字（包括“状态”“重试”这类单个词）都会发给 Codex。修改该会话后续续聊的模型时，优先点击会话根卡的“修改模型”；`/model` 与 `/model <模型> <思考强度>` 是文字兜底，同样无需 @。\n\n群主消息中发送单独的 `/` 后会返回命令菜单；在会话话题里发送单独的 `/`，会在话题最新处再发一张会话根卡，长话题不用翻回顶部。这些是发送后的操作面板，不是飞书输入框的实时命令补全。会话搜索支持目录、首条用户消息和短会话 ID，多关键词按 AND 匹配。\n\n示例：`/search example-project`、`/search GUI Agent`、`/search 1a2b3c4d`。\n\n文字入口：`/new <目录> <任务>`、`/sessions`、`/search <关键词>`、`/help`、`/status`、`/sync`、`/pause`、`/resume-sync`、`/retry`、`/cancel`。"),
+    markdown("**快捷工作流**\n点击“新建会话”，依次选择项目、模型、强度，然后在卡片或聊天中输入任务。\n\n在任一会话话题中直接回复即可继续，且无需 @ 机器人。话题里只有 `/` 开头的命令由桥接处理，其他文字（包括“状态”“重试”这类单个词）都会发给 Codex。修改该会话后续续聊的模型时，优先点击会话根卡的“修改模型”；`/model` 与 `/model <模型> <思考强度>` 是文字兜底，同样无需 @。\n\n群主消息中发送单独的 `/` 后会返回命令菜单；在会话话题里发送单独的 `/`，会在话题最新处再发一张会话根卡，长话题不用翻回顶部。这些是发送后的操作面板，不是飞书输入框的实时命令补全。会话搜索支持目录、首条用户消息和短会话 ID，多关键词按 AND 匹配。\n\n示例：`/search example-project`、`/search GUI Agent`、`/search 1a2b3c4d`。\n\n`/pause` 暂停同步和新任务，不会停止正在运行的任务；`/retry` 刷新模型目录、重新连接 app-server 并重新同步，不会重新执行任务；结果没发到飞书的回合会自动补发，也可以点提示上的“重发结果”。\n\n文字入口：`/new <目录> <任务>`、`/sessions`、`/search <关键词>`、`/help`、`/status`、`/sync`、`/pause`、`/resume-sync`、`/retry`、`/cancel`。"),
     actionRow([button("返回控制台", "home", "primary"), button("新建会话", "new")]),
   ]);
 }
@@ -125,32 +153,70 @@ export function recentSessionsCard(sessions: SessionView[], search = "", page = 
 }
 
 export interface SessionCardPresentation {
-  executionMode?: "workspace-write" | "root-danger-full-access";
-  rootExecutionReady?: boolean;
-  rootPreflightReasons?: string[];
-  hasActiveWork?: boolean;
+  executionMode?: "workspace-write" | "root-danger-full-access" | undefined;
+  rootExecutionReady?: boolean | undefined;
+  rootPreflightReasons?: string[] | undefined;
+  hasActiveWork?: boolean | undefined;
+  /** The turn running now and the permissions it was started with. */
+  currentTurn?: { mode: "default" | "plan"; rootMode: boolean } | null | undefined;
 }
 
-export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null; collaborationMode?: string | null; lifecycle?: string | null }, status = "可继续", presentation: SessionCardPresentation = {}): CardDefinition {
+/** One short line on what a turn in this mode may do; the full rules are on the permission card. */
+function permissionSummary(mode: "default" | "plan", rootMode: boolean): string {
+  if (mode === "plan") return "只读规划，不修改文件，不可联网";
+  return rootMode ? "专用 Root 容器：可读写容器、联网、启动进程（本任务已授权）" : "可修改当前项目文件，不可联网";
+}
+
+/** What the next turn will be allowed to do, given the mode and the service's Root configuration. */
+function nextTurnSummary(plan: boolean, presentation: SessionCardPresentation): string {
+  if (plan) return permissionSummary("plan", false);
+  if (presentation.executionMode !== "root-danger-full-access") return permissionSummary("default", false);
+  if (presentation.rootExecutionReady === false) return `Root 容器预检失败，执行已禁用：${(presentation.rootPreflightReasons ?? []).join("；") || "原因未知"}`;
+  return "每个任务需单独授权 Root；授权后可读写专用容器、联网并启动进程";
+}
+
+export function sessionCard(session: { cwd: string; firstUserText: string; title?: string | null; sessionId: string; model?: string | null; reasoningEffort?: string | null; collaborationMode?: string | null; lifecycle?: string | null } & SessionCardPresentation, status = "可继续", presentation: SessionCardPresentation = session): CardDefinition {
   const title = shorten(session.title || session.firstUserText) || "Codex 会话";
   const plan = session.collaborationMode === "plan";
   const lifecycle = session.lifecycle ?? "active";
   if (lifecycle !== "active") status = lifecycle === "archived" ? "已归档" : lifecycle === "deleted" ? "已删除" : "创建失败，未执行";
   const mode = plan ? "Plan（只读规划）" : "Default（执行）";
-  const root = presentation.executionMode === "root-danger-full-access";
-  const risk = root
-    ? (presentation.rootExecutionReady === false ? "Root 容器预检失败：" + ((presentation.rootPreflightReasons ?? []).join("；") || "执行已禁用") : "专用容器 Root 模式：本任务可读写容器、访问网络并启动进程；每次任务单独授权。")
-    : plan ? "Plan：只读沙箱、禁止网络，不会请求 Root。" : "Default：仅允许 canonical 工作目录写入，禁止网络。";
+  const id = { sessionId: session.sessionId };
   const controls = lifecycle === "active"
-    ? [button("修改模型", "session_model", "primary", { sessionId: session.sessionId }), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode", "default", { sessionId: session.sessionId }),
-      button("查看本轮审阅", "turn_review", "default", { sessionId: session.sessionId })]
-    : [button("查看本轮审阅", "turn_review", "default", { sessionId: session.sessionId })];
-  const tick = "\\x60";
+    ? [button("修改模型", "session_model", "primary", id), button(plan ? "切换 Default" : "切换 Plan", "session_toggle_mode", "default", id),
+      button("查看本轮审阅", "turn_review", "default", id), button("权限说明", "permission_details", "default", id)]
+    : [button("查看本轮审阅", "turn_review", "default", id)];
+  const current = presentation.currentTurn;
+  const next = nextTurnSummary(plan, presentation);
+  // A running turn keeps the permissions it started with; changes apply from the next turn.
+  const permissions = current
+    ? [`本轮权限：${safeMarkdown(permissionSummary(current.mode, current.rootMode))}`, ...(permissionSummary(current.mode, current.rootMode) !== next ? [`下一轮：${safeMarkdown(next)}`] : [])]
+    : [`权限：${safeMarkdown(next)}`];
   return card(title, status === "运行中" ? "orange" : lifecycle === "active" ? "green" : "grey", [
-    markdown("项目：" + tick + safeMarkdown(session.cwd) + tick + "\\n模型：" + tick + safeMarkdown(session.model ?? "继承全局配置") + tick + "　强度：" + tick + safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认") + tick + "\\n模式：**" + safeMarkdown(mode) + "**\\n状态：**" + safeMarkdown(status) + "**　ID：" + tick + session.sessionId.slice(0, 8) + tick),
+    markdown([
+      `项目：${safeMarkdown(session.cwd)}`,
+      `模型：${safeMarkdown(session.model ?? "继承全局配置")}　强度：${safeMarkdown(session.reasoningEffort ? effortLabel(session.reasoningEffort) : "默认")}`,
+      `模式：**${safeMarkdown(mode)}**　状态：**${safeMarkdown(status)}**　ID：${session.sessionId.slice(0, 8)}`,
+      ...permissions,
+    ].join("\n")),
     actionRow(controls),
-    note(risk + (presentation.hasActiveWork ? " 当前有任务运行中，设置只在下一轮生效。" : "")),
+    ...(presentation.hasActiveWork ? [note("当前有任务运行中，修改模型或模式从下一轮开始生效。")] : []),
   ]);
+}
+
+/** The full rules behind the one-line permission summary on the session card. */
+export function permissionDetailsCard(cwd: string, plan: boolean, presentation: SessionCardPresentation): CardDefinition {
+  const lines = [
+    "**Default（执行）**：Codex 可以读取文件，只能修改本会话项目目录内的文件，执行的命令不能联网。项目目录按真实路径判断（符号链接会解析到实际位置），目录之外的写入会被拒绝或交给你批准。",
+    "**Plan（只读规划）**：只读，不修改任何文件，不能联网，不会请求 Root。",
+    ...(presentation.executionMode === "root-danger-full-access" ? [
+      "**Root 模式**：本服务配置了专用 Root 容器。每个任务开始前都要你在卡片上单独授权，授权只对这一个任务有效。获得授权的任务可以读写整个容器、访问网络并启动进程，风险明显更高。",
+      ...(presentation.rootExecutionReady === false ? [`**Root 容器预检失败**：${safeMarkdown((presentation.rootPreflightReasons ?? []).join("；") || "原因未知")}；在修复之前不会执行 Root 任务。`] : []),
+    ] : []),
+    "“不可联网”只针对 Codex 执行的命令和工具；桥接服务与飞书、与模型服务之间的连接不受影响。",
+    `本会话项目目录：${safeMarkdown(cwd)}；当前模式：${plan ? "Plan" : "Default"}。`,
+  ];
+  return card("权限说明", "wathet", [markdown(lines.join("\n\n"))]);
 }
 export function archivedSessionActionCard(nonce: string, title: string): CardDefinition {
   return card("会话已归档", "orange", [

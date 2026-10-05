@@ -53,9 +53,16 @@ export class FakeFeishu implements FeishuPort {
   }
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
     if (this.updateGate) await this.updateGate;
+    const failure = this.failUpdate?.(messageId); if (failure) throw failure;
     this.updated.push({ messageId, card });
   }
-  async deleteMessage(): Promise<void> {}
+  deleted: string[] = [];
+  failDelete: ((messageId: string) => Error | null) | null = null;
+  failUpdate: ((messageId: string) => Error | null) | null = null;
+  async deleteMessage(messageId: string): Promise<void> {
+    const failure = this.failDelete?.(messageId); if (failure) throw failure;
+    this.deleted.push(messageId);
+  }
   async getMessageMetadata() { return { chatId: "chat-1", threadId: "thread-1", appLink: "https://example.test/root-1" }; }
   /** The latest version of a card, after updates. */
   latest(id: string): Record<string, unknown> | undefined {
