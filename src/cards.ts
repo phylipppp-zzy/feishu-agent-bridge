@@ -94,12 +94,14 @@ export function projectsCard(directories: Array<{ cwd: string; count: number; la
   ]);
 }
 
-export function modelCard(models: ModelCapability[], wizardId: string, currentModel?: string, cwd?: string, wizardMode: "new" | "session" = "new"): CardDefinition {
+/** `catalogNote`: where the model list comes from and how fresh it is. */
+export function modelCard(models: ModelCapability[], wizardId: string, currentModel?: string, cwd?: string, wizardMode: "new" | "session" = "new", catalogNote = ""): CardDefinition {
   const rows: Record<string, unknown>[] = [];
   for (let index = 0; index < models.length; index += 2) rows.push(actionRow(models.slice(index, index + 2).map((model) =>
     button(model.displayName, "select_model", model.slug === currentModel ? "primary" : "default", { wizardId, wizardMode, model: model.slug }))));
   const descriptions = models.map((model) => `**${safeMarkdown(model.displayName)}**  ${safeMarkdown(model.description || model.slug)}\n默认：${safeMarkdown(effortLabel(model.defaultReasoningEffort))}`);
   return card(wizardMode === "session" ? "设置会话模型" : "2/4 选择模型", "purple", [markdown(`${summary(cwd, currentModel)}\n\n${wizardMode === "session" ? "此设置仅影响当前话题之后的续聊；话题内无需 @ 机器人。\n\n" : ""}${descriptions.join("\n\n")}`), ...rows,
+    ...(catalogNote ? [note(safeMarkdown(catalogNote))] : []),
     actionRow([button("取消", "cancel_wizard", "danger", { wizardId, wizardMode }), ...(wizardMode === "new" ? [button("返回项目", "projects", "default", { wizardId, wizardMode })] : [])])]);
 }
 

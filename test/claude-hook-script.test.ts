@@ -140,7 +140,8 @@ test("hook exits quietly when stdin is never closed", async () => {
 test("hook identifies the Claude Code ancestor through sh -c and a parent whose name has spaces and parentheses", { skip: process.platform !== "linux" }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "bridge-claude-hook-proc-"));
   try {
-    // Executing node through a link named "claude" gives that process the comm "claude".
+    // A process started through a link named "claude" has that name as argv[0]. Its comm is "claude"
+    // on Node 22 but the main thread's name ("MainThread") on Node 24, so the hook must not need it.
     const fakeClaude = join(dir, "claude");
     const oddParent = join(dir, "we ird) (x");
     await symlink(process.execPath, fakeClaude);
@@ -155,15 +156,16 @@ test("hook identifies the Claude Code ancestor through sh -c and a parent whose 
       const stat = readFileSync("/proc/self/stat", "utf8");
       const startTime = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\\s+/)[19];
       const parent = spawnSync(process.env.ODD_PARENT, ["-e", process.env.PARENT_SCRIPT], { encoding: "utf8" });
-      process.stdout.write(JSON.stringify({ pid: process.pid, startTime, comm: readFileSync("/proc/self/comm", "utf8").trim(), hook: JSON.parse(parent.stdout) }));`;
+      const argv0 = readFileSync("/proc/self/cmdline", "utf8").split("\\0", 1)[0];
+      process.stdout.write(JSON.stringify({ pid: process.pid, startTime, argv0, hook: JSON.parse(parent.stdout) }));`;
     const run = spawnSync(fakeClaude, ["-e", claudeProcess], {
       encoding: "utf8",
       timeout: 15_000,
       env: hookEnv({ HOOK_COMMAND: command, HOOK_INPUT: event({ hook_event_name: "UserPromptSubmit" }), ODD_PARENT: oddParent, PARENT_SCRIPT: runHookViaShell }),
     });
     assert.equal(run.status, 0, run.stderr);
-    const observed = JSON.parse(run.stdout) as { pid: number; startTime: string; comm: string; hook: { status: number; output: string } };
-    assert.equal(observed.comm, "claude");
+    const observed = JSON.parse(run.stdout) as { pid: number; startTime: string; argv0: string; hook: { status: number; output: string } };
+    assert.equal(observed.argv0, fakeClaude);
     assert.deepEqual(observed.hook, { status: 0, output: "" });
     const record = await presence(stateDir);
     assert.equal(record?.state, "running");

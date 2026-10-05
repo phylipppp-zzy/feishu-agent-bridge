@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { parseEnvironment } from "../dist/src/installer.js";
 import { rootExecutionPreflight } from "../dist/src/execution-policy.js";
+import { parseModelCatalog } from "../dist/src/codex.js";
 import { installSafeLogging } from "../dist/src/safe-log.js";
 
 const execFileAsync = promisify(execFile);
@@ -81,6 +82,33 @@ try {
   await execFileAsync(codexBin, ["login", "status"]);
   result(true, "Codex login is available");
 } catch (error) { result(false, `Codex unavailable: ${error}`); }
+
+// The models the service can offer come from this Codex executable, not from the IDE's bundled one.
+try {
+  let resolved = codexBin;
+  if (codexBin.includes("/")) resolved = await realpath(codexBin);
+  else {
+    const { stdout } = await execFileAsync("sh", ["-c", 'command -v "$1"', "sh", codexBin], { timeout: 5_000 });
+    resolved = await realpath(stdout.trim()).catch(() => stdout.trim());
+  }
+  console.log(`INFO  Codex executable used by the bridge: ${resolved}`);
+  const env = values.CODEX_HOME ? { ...process.env, CODEX_HOME: values.CODEX_HOME } : process.env;
+  const { stdout } = await execFileAsync(codexBin, ["debug", "models"], { env, timeout: 30_000, maxBuffer: 1_000_000 });
+  const models = parseModelCatalog(stdout);
+  result(models.length > 0, `Codex model catalog lists ${models.length} models: ${models.map((model) => `${model.slug} (${model.supportedReasoningEfforts.join("/")})`).join(", ") || "none"}`);
+} catch (error) { result(false, `Codex model catalog unavailable: ${error instanceof Error ? error.message : error}`); }
+try {
+  const stateDir = values.STATE_DIR || join(homedir(), ".local/state/feishu-codex-bridge");
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(stateDir, "bridge.sqlite"), { readOnly: true });
+  try {
+    const read = (key) => db.prepare("SELECT value FROM settings WHERE key=?").get(key)?.value ?? null;
+    const meta = JSON.parse(read("codex.model_catalog.meta.v1") ?? "{}");
+    const cached = JSON.parse(read("codex.model_catalog.v1") ?? "[]");
+    const when = meta.refreshedAtMs ? new Date(meta.refreshedAtMs).toISOString() : "never";
+    console.log(`INFO  bridge model catalog: ${cached.length} models, read ${when}${meta.codexVersion ? ` from ${meta.codexVersion}` : ""}${meta.lastError ? `; last refresh failed: ${meta.lastError}` : ""}`);
+  } finally { db.close(); }
+} catch (error) { console.log(`INFO  bridge model catalog not readable: ${error instanceof Error ? error.message : error}`); }
 
 try {
   const { stdout: processList } = await execFileAsync("ps", ["-eo", "args="]);
