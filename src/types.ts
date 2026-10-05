@@ -204,6 +204,7 @@ export interface FeishuPort {
   createSessionRoot(chatId: string, title: string, detail: string, card?: CardDefinition): Promise<SentRootMessage>;
   replyText(rootMessageId: string, text: string): Promise<string>;
   replyFile(rootMessageId: string, fileName: string, data: Buffer): Promise<string>;
+  replyImage(rootMessageId: string, data: Buffer): Promise<string>;
   downloadImage(messageId: string, imageKey: string, maxBytes?: number): Promise<Buffer>;
   sendText(chatId: string, text: string): Promise<string>;
   sendCard(chatId: string, card: CardDefinition): Promise<string>;

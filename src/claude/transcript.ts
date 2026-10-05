@@ -16,6 +16,8 @@ export interface TranscriptMeta {
   aiTitle?: string;
   permissionMode?: string;
   model?: string;
+  /** Reasoning effort Claude Code used for the latest reply (low … max). */
+  effort?: string;
   cwd?: string;
   entrypoint?: string;
   gitBranch?: string;
@@ -155,7 +157,8 @@ function assistantEvents(record: Record<string, unknown>, at: string): Transcrip
   const recordId = str(record.uuid) ?? str(message.id) ?? at;
   const cwd = str(record.cwd) ?? null;
   const model = str(message.model);
-  const events: TranscriptEvent[] = model && model !== "<synthetic>" ? [{ kind: "meta", at, meta: { model } }] : [];
+  const effort = str(record.effort);
+  const events: TranscriptEvent[] = model && model !== "<synthetic>" ? [{ kind: "meta", at, meta: effort ? { model, effort } : { model } }] : [];
   const content = Array.isArray(message.content) ? message.content : [];
   content.forEach((value, index) => {
     const block = asRecord(value);

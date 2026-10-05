@@ -4,6 +4,7 @@ import { actionRow, button, card, inputForm, markdown, nextElementId, note, safe
 import type { CardDefinition } from "../types.js";
 import type { TurnBlock, TurnView } from "./conversation.js";
 import type { ClaudeSession } from "./db.js";
+import { formatBytes, type DeliverySelection, type DirectoryListing } from "./deliver.js";
 import type { Interaction } from "./interactions.js";
 
 /** Longest assistant text kept in a card; Feishu rejects card content above roughly 30 KB. */
@@ -186,9 +187,9 @@ export function claudeRootCard(session: ClaudeSession, options: RootCardOptions 
     markdown([
       `项目：${safeMarkdown(displayPath(session.cwd))}`,
       ...(fork ? [`分叉自：${fork.link ? `[${safeMarkdown(fork.title)}](${fork.link})` : safeMarkdown(fork.title)}`] : []),
-      `来源：${sourceLabel(session.entrypoint)}　模型：${safeMarkdown(session.model ?? "未知")}　最近的权限模式：${safeMarkdown(modeLabel(session.permissionMode))}`,
+      `来源：${sourceLabel(session.entrypoint)}　模型：${safeMarkdown(session.model ?? "未知")}${session.effort ? `　推理强度：${safeMarkdown(session.effort)}` : ""}　最近的权限模式：${safeMarkdown(modeLabel(session.permissionMode))}`,
       `状态：**${status}**　最后活动：${formatTime(session.lastActivityMs)}`,
-      `飞书续聊：${safeMarkdown(modeLabel(options.feishuMode ?? "default"))}　${safeMarkdown(options.feishuModel ?? "默认模型")}${options.feishuEffort ? ` · ${safeMarkdown(options.feishuEffort)}` : ""}`,
+      `飞书续聊：${safeMarkdown(modeLabel(options.feishuMode ?? "default"))}　${safeMarkdown(options.feishuModel ?? "默认模型")} · ${options.feishuEffort ? `推理强度 ${safeMarkdown(options.feishuEffort)}` : "默认推理强度"}`,
       `会话 ID：\`${session.sessionId}\``,
     ].join("\n")),
     note(`在本话题直接回复就会继续这个会话：Claude 在本机运行，执行记录和需要你确认的事项都会发到这里。发送 /stop 停止当前回合；以 >> 开头的消息排到本轮结束后再发；单独发送 / 会在话题最新处再发一张本卡片，不用翻回顶部。在手机上发消息会切换到手机侧控制（电脑上这一轮还在运行时，等它结束再发送）。电脑上继续：\`${resume}\`。${session.presenceState === "waiting" && session.presenceMessage && !live ? `\n等待处理：${safeMarkdown(session.presenceMessage)}` : ""}`),
@@ -385,7 +386,7 @@ export function claudeHelpCard(): CardDefinition {
     markdown([
       "本机 Claude Code（VS Code 或终端）的会话会同步到这个群：每个会话一个话题，每一轮对话一张卡片，执行记录折叠在卡片里。",
       "**继续对话**：在会话话题里直接回复即可。Claude 在本机运行，使用你本机的设置；需要你确认的权限、提问和计划会以卡片发到话题里。在手机上发消息会切换到手机侧控制；电脑上这一轮还在运行时，会等它结束后再发送。",
-      "**话题中的命令**：`/` 在话题最新处调出会话控制卡片（同根卡片）；`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
+      "**话题中的命令**：`/` 在话题最新处调出会话控制卡片（同根卡片）；`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录；`/ls [路径]` 查看会话目录（或指定目录）下的文件，加 `-a` 显示以 . 开头的项；`/deliver <路径…>` 把本机文件发到话题里（相对会话目录，可以是文件、目录或通配符，如 `/deliver output/*.png report.md`）。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
       "**新建会话**：控制台点“新建会话”，或在群主消息中发送 `/new <目录> <任务>`。",
       "最近几天有活动的会话会自动建话题；更早的会话可以在“最近会话”中搜索后打开。只想同步部分目录时，在环境文件中设置 `SYNC_DIRS`。",
       "",
@@ -421,6 +422,52 @@ export function claudeRecentCard(sessions: ClaudeSession[], search = "", page = 
       ...(page > 0 ? [button("上一页", "recent_page", "default", { page: page - 1, search })] : []),
       ...(hasMore ? [button("下一页", "recent_page", "default", { page: page + 1, search })] : []),
       button("返回控制台", "home"),
+    ]),
+  ]);
+}
+
+/** What `/deliver` is about to send to the topic, and what it leaves out. */
+export function claudeDeliverCard(cwd: string | null, selection: DeliverySelection): CardDefinition {
+  const sent = selection.files.map((file, index) =>
+    `${index + 1}. ${safeMarkdown(file.label)} · ${formatBytes(file.size)}${file.kind === "image" ? " · 图片" : ""}`);
+  const skipped = selection.skipped.slice(0, 20).map((item) => `- ${safeMarkdown(item.label)}：${safeMarkdown(item.reason)}`);
+  if (selection.skipped.length > 20) skipped.push(`- …另有 ${selection.skipped.length - 20} 项`);
+  const total = selection.files.reduce((sum, file) => sum + file.size, 0);
+  return card("交付文件", selection.files.length ? "green" : "orange", [
+    markdown(`目录：${safeMarkdown(displayPath(cwd))}`),
+    markdown(selection.files.length ? `**发送 ${selection.files.length} 个文件，共 ${formatBytes(total)}**，依次出现在下方：\n${sent.join("\n")}` : "**没有可以发送的文件。**"),
+    ...(skipped.length ? [markdown(`**未发送**：\n${skipped.join("\n")}`)] : []),
+  ]);
+}
+
+/** `/ls`: a directory's entries, with buttons to move between directories and send its files. */
+export function claudeListCard(session: ClaudeSession, listing: DirectoryListing, showHidden = false): CardDefinition {
+  const id = { sessionId: session.sessionId };
+  if (listing.kind === "error") return card("查看目录", "red", [markdown(safeMarkdown(listing.message))]);
+  if (listing.kind === "file") {
+    return card("文件信息", "wathet", [
+      markdown(`${safeMarkdown(displayPath(listing.path))}\n${formatBytes(listing.entry.size)} · 修改于 ${formatTime(listing.entry.mtimeMs)}`),
+      actionRow([button("发送这个文件", "deliver_paths", "primary", { ...id, path: listing.path })]),
+    ]);
+  }
+  const lines = listing.entries.map((entry) => entry.kind === "dir"
+    ? `- **${safeMarkdown(entry.name)}/**`
+    : `- ${safeMarkdown(entry.name)} · ${formatBytes(entry.size)} · ${formatTime(entry.mtimeMs)}`);
+  const more = listing.total - listing.entries.length;
+  const summary = [`共 ${listing.total} 项${more > 0 ? `，只列出前 ${listing.entries.length} 项` : ""}`,
+    ...(listing.hidden ? [`另有 ${listing.hidden} 个以 . 开头的项，发送 /ls -a 查看`] : [])].join("；");
+  const dirs = listing.entries.filter((entry) => entry.kind === "dir").slice(0, 12);
+  const hasFiles = listing.entries.some((entry) => entry.kind === "file");
+  const extra = showHidden ? { hidden: "1" } : {};
+  return card("目录内容", "wathet", [
+    markdown(`目录：**${safeMarkdown(displayPath(listing.path))}**`),
+    markdown(lines.length ? lines.join("\n") : "（空目录）"),
+    note(`${summary}。点目录名进入；发送 /deliver <文件名> 把文件发到话题里（路径相对会话目录）。`),
+    ...(dirs.length ? [actionRow(dirs.map((entry) => button(`${shorten(entry.name, 20)}/`, "ls_dir", "default", { ...id, ...extra, path: `${listing.path}/${entry.name}` })))] : []),
+    actionRow([
+      ...(listing.parent ? [button("上一级", "ls_dir", "default", { ...id, ...extra, path: listing.parent })] : []),
+      ...(session.cwd && listing.path !== session.cwd ? [button("会话目录", "ls_dir", "default", { ...id, ...extra, path: session.cwd })] : []),
+      ...(hasFiles ? [button("发送本目录的文件", "deliver_paths", "primary", { ...id, path: listing.path })] : []),
     ]),
   ]);
 }

@@ -31,6 +31,7 @@ class FakeFeishu implements FeishuPort {
   async replyFile(_root: string, name: string, data: Buffer): Promise<string> {
     this.files.push({ name, data }); return `file-${this.files.length}`;
   }
+  async replyImage(): Promise<string> { return "image-1"; }
   async downloadImage(): Promise<Buffer> { return Buffer.alloc(0); }
   async sendText(_chat: string, text: string): Promise<string> { this.texts.push(text); return `text-${this.texts.length}`; }
   async sendCard(_chat: string, card: Record<string, unknown>): Promise<string> { this.cards.push(card); return `card-${this.cards.length}`; }

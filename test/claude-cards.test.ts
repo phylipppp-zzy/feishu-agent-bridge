@@ -20,7 +20,7 @@ const turn = (overrides: Partial<TurnView> = {}): TurnView => ({
 
 const session: ClaudeSession = {
   sessionId: "aaaaaaaa-0000-4000-8000-000000000001", path: "/x.jsonl", cwd: "/srv/project", customTitle: null, aiTitle: "Fix login page", firstPrompt: "修复登录页",
-  entrypoint: "claude-vscode", model: "claude-opus-5-5", permissionMode: "auto", gitBranch: "main", startedAtMs: 0, lastActivityMs: Date.parse("2026-10-02T06:01:00Z"),
+  entrypoint: "claude-vscode", model: "claude-opus-5-5", effort: "xhigh", permissionMode: "auto", gitBranch: "main", startedAtMs: 0, lastActivityMs: Date.parse("2026-10-02T06:01:00Z"),
   rootMessageId: null, rootAppLink: null, chatId: null, currentTurnId: null, presenceState: "waiting", presenceAtMs: 0, presencePid: null, presencePidStart: null,
   presenceMessage: "Claude needs your permission to use Bash", waitingNotifiedAtMs: 0, rootDirty: false, rootOutOfScope: false, readonlyNoticeAtMs: 0,
   prefMode: null, prefModel: null, prefEffort: null, forkedFrom: null,
@@ -61,6 +61,8 @@ test("the root card shows where the session is open and how to continue it", () 
   assert.match(root, /VS Code 中等待你处理/);
   assert.match(root, /claude --resume aaaaaaaa-0000-4000-8000-000000000001/);
   assert.match(root, /"action":"export_session"/);
+  assert.match(root, /推理强度：xhigh/);
+  assert.match(root, /默认模型 · 默认推理强度/);
   assert.equal(presenceLabel({ presenceState: null, entrypoint: "cli" }), "未知（尚未收到 hook 状态）");
   const exported = transcriptMarkdown(session, [turn({ status: "done", durationMs: 1_000 })]);
   assert.match(exported, /^# Fix login page/);
@@ -76,7 +78,7 @@ const interaction = (overrides: Partial<Interaction> = {}): Interaction => ({
 test("the root card offers Feishu controls while the bridge runs the session, and marks forks", () => {
   const running = JSON.stringify(claudeRootCard(session, { live: "running", feishuMode: "acceptEdits", feishuModel: "sonnet", feishuEffort: "high" }));
   assert.match(running, /飞书中运行中/);
-  assert.match(running, /飞书续聊：自动接受编辑　sonnet · high/);
+  assert.match(running, /飞书续聊：自动接受编辑　sonnet · 推理强度 high/);
   assert.match(running, /"action":"stop_turn"/);
   // Button rows wrap on phones instead of shrinking the labels to "…".
   assert.match(running, /"tag":"column_set","flex_mode":"flow"/);

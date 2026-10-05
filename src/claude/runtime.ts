@@ -1,19 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, realpath, stat } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { CanUseTool, PermissionResult, PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
 import { shorten } from "../card-kit.js";
 import { isRetryableTransportError } from "../inbound-events.js";
 import { isExpiredFeishuMessage } from "../safe-log.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage } from "../types.js";
-import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeHelpCard, claudeHomeCard,
+import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeDeliverCard, claudeHelpCard, claudeListCard, claudeHomeCard,
   claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudePermissionCard, claudePlanCard,
   claudeQuestionCard, claudeRecentCard, claudeRootCard, claudeStartedCard, claudeTurnCard, displayPath, promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown,
   turnMarkdown, turnText, type LiveState } from "./cards.js";
 import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
 import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
+import { deliverArguments, listDirectory, selectDeliverables } from "./deliver.js";
 import { isTranscriptPath, projectFolderName, readTranscriptEvents, sessionProjectDir, TranscriptImporter, transcriptSessionId } from "./importer.js";
 import { askedQuestions, InteractionRegistry, planResult, questionResult, typedAnswer, type Interaction } from "./interactions.js";
 import { PresenceWatcher, processAlive, type PresenceRecord } from "./presence.js";
@@ -242,6 +243,11 @@ export class ClaudeRuntime {
     this.db.recordSentMessage(sessionId, id);
     return id;
   }
+  private async topicImage(sessionId: string, rootId: string, data: Buffer): Promise<string> {
+    const id = await this.feishu.replyImage(rootId, data);
+    this.db.recordSentMessage(sessionId, id);
+    return id;
+  }
 
   /** A short message in the session's topic, or in the main timeline while it has none; failures are only logged. */
   private async topicNotice(sessionId: string, text: string): Promise<void> {
@@ -404,7 +410,9 @@ export class ClaudeRuntime {
   }
 
   renderSession(sessionId: string): Promise<void> {
-    return this.serialized(sessionId, () => this.renderNow(sessionId)).catch((error) => this.fail("render_session", { sessionId }, error));
+    // A later successful render clears an earlier failure (usually a dropped connection), so it is not reported forever.
+    return this.serialized(sessionId, () => this.renderNow(sessionId))
+      .then(() => this.db.resolveFailure("render_session", { sessionId }), (error) => this.fail("render_session", { sessionId }, error));
   }
 
   private scheduleRender(sessionId: string, delayMs: number): void {
@@ -653,6 +661,8 @@ export class ClaudeRuntime {
   private onTurnEnd(sessionId: string, entry: RunnerEntry, result: { interrupted: boolean; error: string | null }): void {
     entry.liveText = "";
     if (result.error) void this.topicNotice(sessionId, `⚠️ 这一轮没有正常完成：${result.error.slice(0, 500)}`);
+    // A turn that completes shows the session runs again after an earlier crash.
+    else this.db.resolveFailure("claude_runner", { sessionId });
     if (!entry.runner.busy && entry.yieldWhenIdle) this.yieldToComputer(sessionId, entry);
     else if (!entry.runner.busy && entry.restartWhenIdle) this.retireRunner(sessionId, entry);
     else if (!entry.runner.busy) this.armIdle(sessionId, entry);
@@ -1020,6 +1030,34 @@ export class ClaudeRuntime {
     await this.topicFile(sessionId, session.rootMessageId, name, Buffer.from(transcriptMarkdown(session, turns)));
   }
 
+  /** `/deliver <paths…>`: a card listing the files, then each file as an image or file message in the topic. */
+  private async deliverFiles(session: ClaudeSession, paths: readonly string[]): Promise<void> {
+    const rootId = session.rootMessageId!;
+    if (!paths.length) {
+      await this.topicText(session.sessionId, rootId, [
+        "用法：/deliver <路径…>，把本机文件发到这个话题里。",
+        `路径相对会话目录（${displayPath(session.cwd)}），也可以写绝对路径或 ~/ 开头的路径；多个路径用空格分开，含空格的路径加双引号。`,
+        "可以是文件、目录（只发目录里的文件，不展开子目录）或通配符，例如：/deliver report.md output/*.png",
+        "png、jpg 等图片作为图片发送，其余作为文件发送；每次最多 20 个文件，单个文件不超过 30 MB；密钥、凭据类文件和 .git、.ssh 等目录不会发送。",
+      ].join("\n"));
+      return;
+    }
+    const selection = await selectDeliverables(paths, session.cwd, this.config.allowedRoot);
+    await this.topicCard(session.sessionId, rootId, claudeDeliverCard(session.cwd, selection));
+    const failed: string[] = [];
+    for (const file of selection.files) {
+      try {
+        const data = await readFile(file.path);
+        if (file.kind === "image") await this.topicImage(session.sessionId, rootId, data);
+        else await this.topicFile(session.sessionId, rootId, basename(file.path), data);
+      } catch (error) {
+        failed.push(`${file.label}：${errorText(error).slice(0, 120)}`);
+        this.fail("deliver_file", { sessionId: session.sessionId, path: file.path }, error);
+      }
+    }
+    if (failed.length) await this.topicText(session.sessionId, rootId, `有 ${failed.length} 个文件发送失败：\n${failed.join("\n")}`);
+  }
+
   async onFeishuMessage(message: IncomingFeishuMessage): Promise<void> {
     const eventId = `message:${message.messageId}`;
     if (!this.db.claimInboundEvent(eventId)) return;
@@ -1117,6 +1155,14 @@ export class ClaudeRuntime {
       return;
     }
     if (normalized === "/stop") { await reply(await this.stopTurn(session)); return; }
+    if (normalized === "/deliver" || normalized.startsWith("/deliver ")) { await this.deliverFiles(session, deliverArguments(command.slice(8).trim())); return; }
+    if (normalized === "/ls" || normalized.startsWith("/ls ")) {
+      const args = deliverArguments(command.slice(3).trim());
+      const showHidden = args.some((arg) => /^-[a-z]*a/i.test(arg));
+      const target = args.find((arg) => !arg.startsWith("-")) ?? "";
+      await this.topicCard(session.sessionId, rootId, claudeListCard(session, await listDirectory(target, session.cwd, this.config.allowedRoot, showHidden), showHidden));
+      return;
+    }
     if (!this.inScope(session.cwd)) { await reply(`这个会话的目录不在同步范围（${scopeLabel(this.config.syncDirs)}）内，不能从飞书继续。`); return; }
     if (this.paused()) { await reply("同步已暂停，恢复同步后才能从飞书继续对话（控制台“恢复同步”，或在群主消息中发送 /resume-sync）。"); return; }
     const interaction = this.interactions.forSession(session.sessionId);
@@ -1213,6 +1259,19 @@ export class ClaudeRuntime {
         const session = await this.openSession(sessionId);
         if (!session) return replace(claudeNoticeCard("无法打开", "没有找到这个会话。", "red"));
         return replace(this.recentCard());
+      }
+      case "ls_dir": {
+        const session = this.db.getSession(sessionId);
+        if (!session) return replace(claudeNoticeCard("无法查看", "没有找到这个会话。", "red"));
+        const showHidden = value("hidden") === "1";
+        return replace(claudeListCard(session, await listDirectory(value("path"), session.cwd, this.config.allowedRoot, showHidden), showHidden));
+      }
+      case "deliver_paths": {
+        const session = this.db.getSession(sessionId);
+        if (!session?.rootMessageId || !value("path")) return replace(claudeNoticeCard("无法发送", "没有找到这个会话的话题。", "red"));
+        // The listing card stays as it is; the files follow it in the topic.
+        void this.deliverFiles(session, [value("path")]).catch((error) => this.fail("deliver_file", { sessionId }, error));
+        return { delivery: "none" };
       }
       case "export_session": {
         const session = this.db.getSession(sessionId);

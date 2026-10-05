@@ -387,6 +387,17 @@ export class FeishuClient implements FeishuPort {
     })));
   }
 
+  async replyImage(rootMessageId: string, data: Buffer): Promise<string> {
+    const uploaded = await this.limited(() => this.client.im.image.create({
+      data: { image_type: "message", image: data },
+    }));
+    if (!uploaded?.image_key) throw new Error("Feishu image upload returned no image_key");
+    return this.limited(async () => this.ensureResponse(await this.client.im.message.reply({
+      path: { message_id: rootMessageId },
+      data: { msg_type: "image", content: JSON.stringify({ image_key: uploaded.image_key }), reply_in_thread: true },
+    })));
+  }
+
   async downloadImage(messageId: string, imageKey: string, maxBytes = 10 * 1024 * 1024): Promise<Buffer> {
     const response = await this.client.im.messageResource.get({
       params: { type: "image" }, path: { message_id: messageId, file_key: imageKey },

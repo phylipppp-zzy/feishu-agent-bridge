@@ -57,10 +57,11 @@ test("assistant records yield text, tool calls and the end of the turn", () => {
     message: { id: "msg_1", model: "claude-opus-5-5", role: "assistant", stop_reason: "tool_use",
       content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test\nnpm run build", description: "Run tests" } }] } }));
   assert.deepEqual(tool[1], { kind: "tool", id: "toolu_1", at: "t2", name: "Bash", summary: "npm test" });
-  const answer = parseTranscriptLine(line({ type: "assistant", uuid: "a2", timestamp: "t3",
+  const answer = parseTranscriptLine(line({ type: "assistant", uuid: "a2", timestamp: "t3", effort: "xhigh",
     message: { id: "msg_2", model: "claude-opus-5-5", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "测试全部通过。" }] } }));
   assert.deepEqual(kinds(answer), ["meta", "text", "turn_end"]);
   assert.equal((answer[1] as { key: string }).key, "a2:0");
+  assert.deepEqual(answer[0], { kind: "meta", at: "t3", meta: { model: "claude-opus-5-5", effort: "xhigh" } });
   const synthetic = parseTranscriptLine(line({ type: "assistant", uuid: "a3", timestamp: "t4",
     message: { model: "<synthetic>", role: "assistant", content: [{ type: "text", text: "No response requested." }] } }));
   assert.deepEqual(kinds(synthetic), ["text"]);
