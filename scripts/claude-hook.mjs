@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 // Claude Code hook for feishu-claude-bridge, registered in the user's Claude Code settings by
 // install-claude.mjs as `<node> <repo>/scripts/claude-hook.mjs --state-dir <STATE_DIR>`.
-// It only records each session's live state in <STATE_DIR>/presence/<session_id>.json.
+// It records each session's live state in <STATE_DIR>/presence/<session_id>.json, and stops a
+// prompt sent from a window that opened the session before it was continued from Feishu.
 //
 // The hook must stay invisible: plain stdout of SessionStart and UserPromptSubmit hooks is added
-// to Claude's context, so nothing is ever written to stdout or stderr, every error is swallowed and
-// the exit code is always 0. Only Node.js built-ins are used so the hook works without dist/.
-import { closeSync, fchmodSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+// to Claude's context, so nothing is written to stdout or stderr, every error is swallowed and the
+// exit code is always 0. The one exception is the JSON block decision for such a prompt, which
+// Claude Code shows to the person and does not add to the context. Only Node.js built-ins are
+// used so the hook works without dist/.
+import { createHash } from "node:crypto";
+import { closeSync, fchmodSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 
 const SESSION_ID = /^[A-Za-z0-9-]{8,80}$/;
@@ -16,6 +20,10 @@ const MAX_ANCESTORS = 8;
 const STDIN_LIMIT_BYTES = 32 * 1024 * 1024;
 // Claude Code closes stdin right after writing the event; this only guards manual runs from a TTY.
 const STDIN_TIMEOUT_MS = 2_000;
+/** SessionStart sources after which the window shows the session as it is in the transcript (compaction keeps what it had). */
+const LOADING_SOURCES = new Set(["startup", "resume", "clear", "fork"]);
+/** Clock ticks per second of /proc/<pid>/stat start times; 100 on every mainstream Linux build. */
+const CLOCK_TICKS = 100;
 
 function quit() { process.exit(0); }
 process.on("uncaughtException", quit);
@@ -102,6 +110,17 @@ function claudeProcess() {
   return null;
 }
 
+/** When the process started, in ms since the epoch: for windows opened before the hook recorded their SessionStart. */
+function processStartMs(startTime) {
+  if (!startTime) return null;
+  const btime = /^btime\s+(\d+)$/m.exec(readFileSync("/proc/stat", "utf8"))?.[1];
+  return btime ? Number(btime) * 1_000 + Number(startTime) * (1_000 / CLOCK_TICKS) : null;
+}
+
+function readJson(path) {
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+}
+
 /** Replaces the target atomically so the bridge never reads a partially written file. */
 function writeAtomically(target, content) {
   const temporary = `${target}.tmp-${process.pid}`;
@@ -118,6 +137,60 @@ function writeAtomically(target, content) {
   }
 }
 
+function windowKey(owner) { return `${owner.pid}:${owner.startTime ?? ""}`; }
+
+/** Windows (Claude Code processes) that opened the session, with when they loaded it; gone processes are dropped. */
+function readWindows(stateDir, sessionId) {
+  const stored = readJson(join(stateDir, "windows", `${sessionId}.json`));
+  const windows = stored && typeof stored.windows === "object" && stored.windows ? stored.windows : {};
+  for (const key of Object.keys(windows)) {
+    const [pid, startTime] = key.split(":");
+    let alive = false;
+    try { alive = statFields(Number(pid))[19] === startTime; } catch { /* gone */ }
+    if (!alive) delete windows[key];
+  }
+  return windows;
+}
+
+function writeWindows(stateDir, sessionId, windows) {
+  const directory = join(stateDir, "windows");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  writeAtomically(join(directory, `${sessionId}.json`), JSON.stringify({ version: 1, windows }));
+}
+
+function promptHash(prompt) { return createHash("sha256").update(prompt).digest("hex").slice(0, 32); }
+
+/**
+ * Why a prompt from this window must not go out, or null. The bridge records in
+ * <STATE_DIR>/feishu-activity/<session_id>.json when it last wrote into the session from Feishu;
+ * a window that loaded the session before that still has the older conversation in memory, and a
+ * prompt from it would continue from there, leaving the Feishu turns on a branch the window never
+ * shows again. Sending the same prompt twice continues in the window anyway.
+ */
+function staleWindow(stateDir, sessionId, owner, prompt) {
+  const activity = readJson(join(stateDir, "feishu-activity", `${sessionId}.json`));
+  if (!activity || typeof activity.at !== "number") return null;
+  const windows = readWindows(stateDir, sessionId);
+  const key = windowKey(owner);
+  const known = windows[key];
+  const loadedAt = typeof known?.loadedAt === "number" ? known.loadedAt : processStartMs(owner.startTime);
+  if (loadedAt === null || activity.at <= loadedAt) return null;
+  const hash = prompt ? promptHash(prompt) : null;
+  if (hash && known?.blockedPrompt === hash) {
+    // The person chose to continue here: the window counts as up to date until Feishu is used again.
+    windows[key] = { loadedAt: activity.at };
+    writeWindows(stateDir, sessionId, windows);
+    return null;
+  }
+  windows[key] = { loadedAt, ...(hash ? { blockedPrompt: hash } : {}) };
+  writeWindows(stateDir, sessionId, windows);
+  return [
+    "这个会话在飞书（手机）上继续过，当前窗口是在那之前打开的：看不到那几轮对话，这里的 Claude 也不知道。为了不让对话分成两条，这条消息没有发出。",
+    `请关闭这个会话，从历史会话中重新打开它（终端里：claude --resume ${sessionId}），再发送。`,
+    "如果确实要在这个窗口里接着说（飞书上那几轮将不在这里的对话中），把同样的内容再发送一次即可。",
+  ].join("\n");
+}
+
 async function main() {
   // Sessions the bridge starts itself through the SDK must not report presence.
   if (process.env.FEISHU_CLAUDE_BRIDGE === "1") return;
@@ -131,6 +204,16 @@ async function main() {
   const state = presenceState(input);
   if (!state) return;
   const owner = claudeProcess();
+  if (owner && input.hook_event_name === "SessionStart" && LOADING_SOURCES.has(input.source)) {
+    const windows = readWindows(stateDir, sessionId);
+    windows[windowKey(owner)] = { loadedAt: Date.now() };
+    writeWindows(stateDir, sessionId, windows);
+  }
+  if (owner && input.hook_event_name === "UserPromptSubmit") {
+    const reason = staleWindow(stateDir, sessionId, owner, text(input.prompt) ?? "");
+    // The prompt does not run, so the session's state does not change either.
+    if (reason) { writeSync(1, JSON.stringify({ decision: "block", reason })); return; }
+  }
   const notification = input.hook_event_name === "Notification";
   const record = {
     version: 1,

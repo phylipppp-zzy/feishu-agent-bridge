@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, stat, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -182,4 +182,55 @@ test("compaction does not reset a running session to idle", async () => {
     runHook(stateDir, event({ hook_event_name: "SessionStart", source: "resume" }));
     assert.equal((await presence(stateDir))?.state, "idle");
   });
+});
+
+test("a window that opened the session before it was continued from Feishu cannot send until it reopens it or insists", { skip: process.platform !== "linux" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bridge-claude-hook-stale-"));
+  try {
+    const stateDir = join(dir, "state");
+    const activityFile = join(stateDir, "feishu-activity", `${sessionId}.json`);
+    await mkdir(join(stateDir, "feishu-activity"), { recursive: true });
+    // Feishu used the session an hour ago, before this window started: the window shows it.
+    await writeFile(activityFile, JSON.stringify({ version: 1, sessionId, at: Date.now() - 3_600_000 }));
+    // One process named "claude" plays the window; it runs the hook for each step in order.
+    const fakeClaude = join(dir, "claude");
+    await symlink(process.execPath, fakeClaude);
+    const prompt = (text: string) => ({ hook: event({ hook_event_name: "UserPromptSubmit", prompt: text }) });
+    const steps = [
+      prompt("p0"),
+      { feishu: true }, prompt("p1"), prompt("p1"), prompt("p2"),
+      { feishu: true }, prompt("p3"), { hook: event({ hook_event_name: "SessionStart", source: "resume" }) }, prompt("p3"),
+      { feishu: true }, { hook: event({ hook_event_name: "SessionStart", source: "compact" }) }, prompt("p4"),
+    ];
+    const window = `const { spawnSync } = require("node:child_process");
+      const { writeFileSync } = require("node:fs");
+      const pause = () => { const until = Date.now() + 30; while (Date.now() < until); };
+      const results = [];
+      for (const step of JSON.parse(process.env.STEPS)) {
+        if (step.feishu) { pause(); writeFileSync(process.env.ACTIVITY, JSON.stringify({ version: 1, sessionId: "x", at: Date.now() })); pause(); continue; }
+        const run = spawnSync(process.env.NODE_BIN, [process.env.HOOK, "--state-dir", process.env.STATE], { input: step.hook, encoding: "utf8" });
+        results.push({ status: run.status, stdout: run.stdout, stderr: run.stderr });
+      }
+      process.stdout.write(JSON.stringify(results));`;
+    const run = spawnSync(fakeClaude, ["-e", window], { encoding: "utf8", timeout: 30_000,
+      env: hookEnv({ STEPS: JSON.stringify(steps), ACTIVITY: activityFile, NODE_BIN: process.execPath, HOOK: hookScript, STATE: stateDir }) });
+    assert.equal(run.status, 0, run.stderr);
+    const results = JSON.parse(run.stdout) as Array<{ status: number; stdout: string; stderr: string }>;
+    for (const result of results) { assert.equal(result.status, 0); assert.equal(result.stderr, ""); }
+    const blocked = results.map((result) => {
+      if (!result.stdout) return false;
+      const output = JSON.parse(result.stdout) as { decision?: string; reason?: string };
+      assert.equal(output.decision, "block");
+      assert.match(output.reason ?? "", /重新打开/);
+      return true;
+    });
+    assert.deepEqual(blocked, [
+      false, // p0: opened after the last Feishu turn (known from the process start time)
+      true, false, false, // p1 after a Feishu turn is stopped; sending it again continues here, and so does p2
+      true, false, false, // p3 is stopped, the session is reopened (SessionStart resume), p3 goes out
+      false, true, // compaction does not reload the transcript, so p4 is still stopped
+    ]);
+    assert.equal((await presence(stateDir))?.event, "UserPromptSubmit");
+    assert.ok(((await presence(stateDir))?.at as number) < JSON.parse(await readFile(activityFile, "utf8")).at, "a stopped prompt leaves the state as it was");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

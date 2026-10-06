@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -490,6 +490,9 @@ test("a reply in a topic resumes the session, streams the reply and asks for per
     const sent = await query.nextMessage(1);
     assert.equal(sent.message.content, "帮我跑测试");
     assert.equal(sent.priority, "next");
+    // Windows on this computer that opened the session earlier learn that it moved on (claude-hook.mjs reads this).
+    const activity = JSON.parse(await readFile(join(env.config.stateDir, "feishu-activity", `${RECENT}.json`), "utf8")) as { at: number };
+    assert.ok(activity.at >= now && activity.at <= Date.now());
     await waitUntil(() => rootCardOf(env, root).includes("飞书中运行中"));
 
     // Claude Code records the prompt like any other; the person's message already shows it.

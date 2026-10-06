@@ -16,6 +16,7 @@ import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
 import { deliverArguments, listDirectory, selectDeliverables } from "./deliver.js";
 import { SlowCardActions } from "../card-actions.js";
+import { markFeishuActivity } from "./feishu-activity.js";
 import { isTranscriptPath, projectFolderName, readTranscriptEvents, sessionProjectDir, TranscriptImporter, transcriptSessionId } from "./importer.js";
 import { askedQuestions, InteractionRegistry, planResult, questionResult, typedAnswer, type Interaction } from "./interactions.js";
 import { PresenceWatcher, processAlive, type PresenceRecord } from "./presence.js";
@@ -667,8 +668,14 @@ export class ClaudeRuntime {
     entry.idleTimer = null;
   }
 
+  /** Tells windows on this computer that opened the session earlier that they no longer show all of it (see feishu-activity.ts). */
+  private markActivity(sessionId: string): void {
+    try { markFeishuActivity(this.config.stateDir, sessionId); } catch (error) { this.fail("feishu_activity", { sessionId }, error); }
+  }
+
   private onTurnEnd(sessionId: string, entry: RunnerEntry, result: { interrupted: boolean; error: string | null }): void {
     entry.liveText = "";
+    this.markActivity(sessionId);
     if (result.error) void this.topicNotice(sessionId, `⚠️ 这一轮没有正常完成：${result.error.slice(0, 500)}`);
     // A turn that completes shows the session runs again after an earlier crash.
     else this.db.resolveFailure("claude_runner", { sessionId });
@@ -755,6 +762,7 @@ export class ClaudeRuntime {
     const uuid = randomUUID();
     this.db.recordFeishuPrompt(sessionId, uuid, input.shownMessageId);
     this.clearIdle(entry);
+    this.markActivity(sessionId);
     entry.runner.send(input.text, images, priority, uuid);
     this.refreshRoot(sessionId);
   }
