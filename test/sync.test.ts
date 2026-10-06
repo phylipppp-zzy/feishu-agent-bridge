@@ -8,7 +8,13 @@ import { CodexCliProbe } from "../src/codex.js";
 import { BridgeDatabase } from "../src/db.js";
 import { parseJsonlChunk } from "../src/session-parser.js";
 import { forbiddenRemoteQuestion, SyncService } from "../src/sync.js";
-import type { BridgeConfig, FeishuPort, IncomingFeishuMessage, ModelCapability } from "../src/types.js";
+import type { BridgeConfig, CardActionOutcome, FeishuPort, IncomingFeishuMessage, ModelCapability } from "../src/types.js";
+
+/** The card a callback puts in place of the tapped one; any other delivery fails the test. */
+function cardOf(outcome: CardActionOutcome): Record<string, unknown> {
+  if (outcome.delivery !== "replace" && outcome.delivery !== "reply" && outcome.delivery !== "send") assert.fail(`expected a card, got ${JSON.stringify(outcome)}`);
+  return outcome.card;
+}
 
 const catalog: ModelCapability[] = [
   { slug: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "coding", defaultReasoningEffort: "low", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"] },
@@ -108,30 +114,37 @@ test("full sync creates one topic, visible messages, and exact archive without d
     await service.syncAll();
     assert.deepEqual({ roots: feishu.roots.length, texts: feishu.texts.length, files: feishu.files.length }, counts);
     const projects = await service.onCardAction(cardAction("projects"));
-    assert.equal(((projects.card ?? projects).header as { title: { content: string } }).title.content, "1/4 选择项目");
+    assert.equal((cardOf(projects).header as { title: { content: string } }).title.content, "1/4 选择项目");
     const wizard = JSON.parse(db.getSetting("wizard.new.user-1") ?? "{}") as { id: string };
     const selected = await service.onCardAction(cardAction("select_project", { cwd: home, wizardId: wizard.id }));
-    assert.equal(((selected.card ?? selected).header as { title: { content: string } }).title.content, "2/4 选择模型");
+    assert.equal((cardOf(selected).header as { title: { content: string } }).title.content, "2/4 选择模型");
     assert.match(db.getSetting("wizard.new.user-1") ?? "", new RegExp(home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     const modelCard = await service.onCardAction(cardAction("select_model", { model: "gpt-5.6-sol", wizardId: wizard.id }));
-    assert.equal(((modelCard.card ?? modelCard).header as { title: { content: string } }).title.content, "3/4 选择思考强度");
+    assert.equal((cardOf(modelCard).header as { title: { content: string } }).title.content, "3/4 选择思考强度");
     const ready = await service.onCardAction(cardAction("select_reasoning_effort", { effort: "high", wizardId: wizard.id }));
-    assert.equal(((ready.card ?? ready).header as { title: { content: string } }).title.content, "4/4 输入任务");
+    assert.equal((cardOf(ready).header as { title: { content: string } }).title.content, "4/4 输入任务");
     assert.match(db.getSetting("wizard.new.user-1") ?? "", /"reasoningEffort":"high"/);
+    // An empty task leaves the task card usable: the reason shows over it instead of replacing it.
     const emptyTask = await service.onCardAction(cardAction("submit_task", { wizardId: wizard.id }));
-    assert.equal(((emptyTask.card ?? emptyTask).header as { title: { content: string } }).title.content, "操作失败");
+    assert.deepEqual(emptyTask, { delivery: "toast", text: "任务不能为空。请填写任务，或使用“在聊天中输入”。" });
     assert.ok(db.getSetting("wizard.new.user-1"));
     let submissions = 0;
     (service as unknown as { runNewSessionFromWizard: (_wizard: unknown) => Promise<void> }).runNewSessionFromWizard = async () => { submissions += 1; };
     const submitted = await service.onCardAction(cardAction("submit_task", { wizardId: wizard.id }, { task_prompt: "card task" }));
-    assert.equal(((submitted.card ?? submitted).header as { title: { content: string } }).title.content, "Codex 运行状态");
+    assert.equal((cardOf(submitted).header as { title: { content: string } }).title.content, "Codex 运行状态");
     assert.equal(db.getSetting("wizard.new.user-1"), null);
     assert.equal(submissions, 1);
     const duplicate = await service.onCardAction(cardAction("submit_task", { wizardId: wizard.id }, { task_prompt: "card task" }));
-    assert.equal(((duplicate.card ?? duplicate).header as { title: { content: string } }).title.content, "操作失败");
+    assert.equal((cardOf(duplicate).header as { title: { content: string } }).title.content, "操作失败");
     assert.equal(submissions, 1);
     const stale = await service.onCardAction(cardAction("select_model", { model: "gpt-5.6-luna", wizardId: "old" }));
-    assert.equal(((stale.card ?? stale).header as { title: { content: string } }).title.content, "操作失败");
+    assert.equal((cardOf(stale).header as { title: { content: string } }).title.content, "操作失败");
+    // Service buttons update the service card itself, so "pause" turns into "resume" where it was tapped.
+    const paused = await service.onCardAction(cardAction("pause"));
+    assert.equal(paused.delivery, "replace");
+    assert.match(JSON.stringify(cardOf(paused)), /"action":"resume"/);
+    // Resumed directly: the resume button would also start a background scan that outlives the test.
+    db.setSetting("sync.paused", "0");
     await service.onFeishuMessage(inbound({ messageId: "help-1" }));
     assert.equal((feishu.cards.at(-1)?.header as { title: { content: string } }).title.content, "Codex 使用帮助");
     const cardCount = feishu.cards.length;
@@ -165,7 +178,7 @@ test("full sync creates one topic, visible messages, and exact archive without d
     await service.onFeishuMessage(inbound({ messageId: "topic-free-text", rootId: "root-1", mentionedBot: false, text: "直接展示文件内容" }));
     assert.equal(continued, 1);
     const rootAction = await service.onCardAction({ ...cardAction("new"), openMessageId: "root-1" });
-    assert.equal(((rootAction.card ?? rootAction).header as { title: { content: string } }).title.content, "操作失败");
+    assert.equal((cardOf(rootAction).header as { title: { content: string } }).title.content, "操作失败");
     assert.equal(rootAction.delivery, "reply");
     const foreignCard = await service.onCardAction({ ...cardAction("new"), chatId: "other-chat" });
     assert.equal(foreignCard.delivery, "none");

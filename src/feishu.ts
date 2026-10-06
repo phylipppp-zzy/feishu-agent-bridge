@@ -192,11 +192,14 @@ export class FeishuClient implements FeishuPort {
           // A replace callback must be acknowledged with the Card 2.0 raw-card
           // envelope. Updating the same message asynchronously as well causes
           // duplicate races and can exceed Feishu's three-second callback SLA.
-          if (outcome.delivery !== "replace") void this.deliverCardActionOutcome(action, outcome);
+          if (outcome.delivery !== "replace" && outcome.delivery !== "toast") {
+            void this.deliverCardActionOutcome(action, outcome).catch((error) =>
+              console.error(`Feishu card outcome delivery failed: ${metadata}; error=${error instanceof Error ? error.message : String(error)}`));
+          }
           console.info(`Feishu card callback completed: ${metadata}`);
-          return outcome.delivery === "replace"
-            ? ({ card: { type: "raw", data: outcome.card ?? outcome } } as unknown as CardDefinition)
-            : undefined;
+          if (outcome.delivery === "toast") return { toast: { type: outcome.level ?? "error", content: outcome.text } } as unknown as CardDefinition;
+          if (outcome.delivery !== "replace") return undefined;
+          return { card: { type: "raw", data: outcome.card }, ...(outcome.toast ? { toast: { type: "info", content: outcome.toast } } : {}) } as unknown as CardDefinition;
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           console.error(`Feishu card callback failed: ${metadata}; error=${detail}`);
@@ -277,18 +280,12 @@ export class FeishuClient implements FeishuPort {
   }
 
   private async deliverCardActionOutcome(action: IncomingCardAction, outcome: CardActionOutcome): Promise<void> {
-    const delivery = outcome.delivery ?? "send";
-    const card = outcome.card ?? outcome;
-    if (delivery === "none") return;
-    if (!card) return;
-    if (delivery === "replace") return this.replaceCardAfterAction(action, card);
-    if (delivery === "reply") {
-      const rootMessageId = outcome.rootMessageId;
-      if (!rootMessageId) return;
-      await this.replyCard(rootMessageId, card);
-      return;
+    switch (outcome.delivery) {
+      case "none": case "toast": return;
+      case "replace": return this.replaceCardAfterAction(action, outcome.card);
+      case "reply": await this.replyCard(outcome.rootMessageId, outcome.card); return;
+      case "send": await this.sendCard(action.chatId, outcome.card); return;
     }
-    await this.sendCard(action.chatId, card);
   }
 
   async createSessionRoot(chatId: string, title: string, detail: string, card?: CardDefinition): Promise<SentRootMessage> {

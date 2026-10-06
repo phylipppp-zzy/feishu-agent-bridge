@@ -482,6 +482,15 @@ export function claudeStartedCard(cwd: string, link: string | null): CardDefinit
   ]);
 }
 
+/** “打开” on the recent sessions card: where the session's topic now is. */
+export function claudeOpenedCard(session: ClaudeSession): CardDefinition {
+  return card("已打开会话", "green", [
+    markdown(`**${safeMarkdown(sessionTitle(session))}**\n目录：${safeMarkdown(displayPath(session.cwd))}`),
+    session.rootAppLink ? markdown(`[打开话题](${session.rootAppLink})`) : note("话题已在群里创建，显示最后一轮对话。"),
+    actionRow([button("返回最近会话", "recent"), button("返回控制台", "home")]),
+  ]);
+}
+
 /** A readable Markdown transcript of every turn, for the export button and over-long replies. */
 export function transcriptMarkdown(session: ClaudeSession, turns: readonly TurnView[]): string {
   const sections = turns.map((turn, index) => {

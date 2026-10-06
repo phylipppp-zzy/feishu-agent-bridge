@@ -8,13 +8,14 @@ import { isRetryableTransportError } from "../inbound-events.js";
 import { isExpiredFeishuMessage } from "../safe-log.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage } from "../types.js";
 import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeDeliverCard, claudeHelpCard, claudeListCard, claudeHomeCard,
-  claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudePermissionCard, claudePlanCard,
+  claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudeOpenedCard, claudePermissionCard, claudePlanCard,
   claudeQuestionCard, claudeRecentCard, claudeRootCard, claudeStartedCard, claudeTurnCard, displayPath, promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown,
   turnMarkdown, turnText, type LiveState } from "./cards.js";
 import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
 import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
 import { deliverArguments, listDirectory, selectDeliverables } from "./deliver.js";
+import { SlowCardActions } from "../card-actions.js";
 import { isTranscriptPath, projectFolderName, readTranscriptEvents, sessionProjectDir, TranscriptImporter, transcriptSessionId } from "./importer.js";
 import { askedQuestions, InteractionRegistry, planResult, questionResult, typedAnswer, type Interaction } from "./interactions.js";
 import { PresenceWatcher, processAlive, type PresenceRecord } from "./presence.js";
@@ -130,6 +131,8 @@ export class ClaudeRuntime {
   private readonly localWaits = new Map<string, { sessionId: string; inputs: FeishuInput[]; expiresAt: number; cardMessageId: string | null }>();
   /** Exports and deliveries in progress, so a repeated tap does not send everything twice. */
   private readonly busy = new Set<string>();
+  /** Card taps whose work may outlast Feishu's three-second callback window. */
+  private readonly slowActions: SlowCardActions;
   private readonly drafts = new Map<string, { input: FeishuInput; expiresAt: number }>();
   private scanTimer: NodeJS.Timeout | null = null;
   private livenessTimer: NodeJS.Timeout | null = null;
@@ -146,6 +149,7 @@ export class ClaudeRuntime {
     private readonly queryFactory?: QueryFactory,
   ) {
     this.projectsDir = join(config.claudeHome, "projects");
+    this.slowActions = new SlowCardActions(feishu, (key, error) => this.fail("slow_card_action", { key }, error), config.cardSettleMs);
     this.importer = new TranscriptImporter({
       projectsDir: this.projectsDir,
       isEnabled: () => Boolean(this.boundChatId()) && !this.paused(),
@@ -1292,9 +1296,13 @@ export class ClaudeRuntime {
         return replace(claudeNoticeCard("正在清理", `正在撤回 ${ids.length} 个话题中的消息，完成后会在群里发送结果。`, "orange"));
       }
       case "open_session": {
-        const session = await this.openSession(sessionId);
-        if (!session) return replace(claudeNoticeCard("无法打开", "没有找到这个会话。", "red"));
-        return replace(this.recentCard());
+        // Creating the topic reads the whole transcript and posts several messages; the link follows on this card.
+        return this.slowActions.run(event.openMessageId, `open:${sessionId}`, claudeNoticeCard("正在打开", "正在为这个会话建话题，完成后这里会给出链接。", "blue"), async () => {
+          const session = await this.openSession(sessionId);
+          if (!session) return claudeNoticeCard("无法打开", "没有找到这个会话，或它的目录不在同步范围内。", "red");
+          if (!session.rootMessageId) return claudeNoticeCard("无法打开", "这个会话还没有可以显示的对话。", "orange");
+          return claudeOpenedCard(session);
+        }, (error) => claudeNoticeCard("无法打开", errorText(error), "red"));
       }
       case "ls_dir": {
         const session = this.db.getSession(sessionId);
@@ -1306,15 +1314,12 @@ export class ClaudeRuntime {
         const session = this.db.getSession(sessionId);
         if (!session?.rootMessageId || !value("path")) return replace(claudeNoticeCard("无法发送", "没有找到这个会话的话题。", "red"));
         const path = value("path");
-        const key = `deliver:${sessionId}:${path}`;
-        const started = !this.busy.has(key);
-        if (started) {
-          this.busy.add(key);
-          void this.deliverFiles(session, [path]).catch((error) => this.fail("deliver_file", { sessionId }, error)).finally(() => this.busy.delete(key));
-        }
-        // The listing stays usable; a line on it says the files are on their way, so a second tap is not needed.
-        return replace(claudeListCard(session, await listDirectory(path, session.cwd, this.config.allowedRoot),
-          false, started ? "已开始发送，文件会依次出现在话题末尾。" : "这些文件正在发送中，请稍候。"));
+        // The listing stays usable; a line on it says the files are on their way, then that they have arrived.
+        const listing = async (notice: string) => claudeListCard(session, await listDirectory(path, session.cwd, this.config.allowedRoot), false, notice);
+        return this.slowActions.run(event.openMessageId, `deliver:${sessionId}:${path}`, await listing("正在发送，文件会依次出现在话题末尾。"), async () => {
+          await this.deliverFiles(session, [path]);
+          return listing("已发送，文件在话题末尾。");
+        }, () => claudeListCard(session, { kind: "error", message: "发送失败，详见话题里的提示。" }));
       }
       case "export_session": {
         const session = this.db.getSession(sessionId);
@@ -1464,26 +1469,31 @@ export class ClaudeRuntime {
           return replace(this.newSessionCard(draft ? { nonce: draftNonce, preview: draft.input.text } : undefined, resolved.error));
         }
         if (!draftNonce) return replace(claudeNewTaskCard(resolved.cwd));
+        // Refused before the draft is used up, so the task can still be started after resuming.
+        if (this.paused()) return replace(this.homeCard("同步已暂停，恢复同步后才能新建会话"));
         const draft = this.drafts.get(draftNonce);
         this.drafts.delete(draftNonce);
         if (!draft || draft.expiresAt < Date.now()) return replace(claudeNewTaskCard(resolved.cwd, "原来的消息已过期，请重新输入任务"));
-        return this.startFromCard(resolved.cwd, draft.input);
+        return this.startFromCard(event.openMessageId, resolved.cwd, draft.input);
       }
       case "new_submit": {
         const resolved = await this.resolveDirectory(value("cwd"));
         if ("error" in resolved) return replace(this.newSessionCard(undefined, resolved.error));
         const task = form("new_task");
         if (!task) return replace(claudeNewTaskCard(resolved.cwd, "请填写要 Claude 做什么"));
-        return this.startFromCard(resolved.cwd, { text: task, imageKeys: [], sourceMessageId: event.openMessageId, shownMessageId: null });
+        return this.startFromCard(event.openMessageId, resolved.cwd, { text: task, imageKeys: [], sourceMessageId: event.openMessageId, shownMessageId: null });
       }
       default: return replace(claudeNoticeCard("未知操作", `这个按钮在当前版本中不可用：${event.action}`, "red"));
     }
   }
 
-  private async startFromCard(cwd: string, input: FeishuInput): Promise<CardActionOutcome> {
+  /** Creating the topic posts to Feishu several times; the card says so at once and shows the link when it exists. */
+  private startFromCard(messageId: string, cwd: string, input: FeishuInput): CardActionOutcome {
     if (this.paused()) return { delivery: "replace", card: this.homeCard("同步已暂停，恢复同步后才能新建会话") };
-    const session = await this.startNewSession(cwd, input);
-    return { delivery: "replace", card: claudeStartedCard(cwd, session.rootAppLink) };
+    return this.slowActions.run(messageId, `new:${messageId}`, claudeNoticeCard("正在新建会话", `目录：${displayPath(cwd)}。话题建好后这里会给出链接。`, "blue"), async () => {
+      const session = await this.startNewSession(cwd, input);
+      return claudeStartedCard(cwd, session.rootAppLink);
+    }, (error) => claudeNoticeCard("新建失败", errorText(error), "red"));
   }
 
   async onBotMenuAction(action: IncomingBotMenuAction): Promise<void> {

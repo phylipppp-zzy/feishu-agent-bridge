@@ -4,6 +4,8 @@ import { join, resolve } from "node:path";
 
 export interface ClaudeBridgeConfig {
   appId: string;
+  /** How long a slow card action's result waits behind its "working on it" card; tests set 0. */
+  cardSettleMs?: number;
   appSecret: string;
   bindToken: string;
   /** Claude Code configuration directory; transcripts live in `projects/`. */
