@@ -1,10 +1,10 @@
-# Feishu-Codex Full Sync Bridge
+# Feishu Agent Bridge (feishu-agent-bridge)
 
 [中文说明](README.md)
 
 Maintainer design: [docs/design.md](docs/design.md)
 
-The repository also contains a Feishu bridge for Claude Code sessions, which mirrors them into a private Feishu group and can continue them from there, with its own Feishu app, private group and service; see [docs/claude.md](docs/claude.md) (Chinese).
+The repository contains two independent bridges, each with its own Feishu app, private group and service. This README covers the **Codex bridge**; the **Claude Code bridge**, which mirrors Claude Code sessions into a private Feishu group and continues them from there, is described in [docs/claude.md](docs/claude.md) (Chinese). The repository was formerly named `feishu-codex-bridge`; the Codex bridge keeps that name for its service, configuration and state directories, so existing installations are unaffected.
 
 This service mirrors local Codex conversations from `~/.codex/sessions` into a private Feishu topic group and lets you continue each conversation from its corresponding topic. It is a Feishu front end for the local Codex CLI: it does not install a Feishu desktop client, open an HTTP port, or require a public callback URL. Messages and card actions arrive over a Feishu WebSocket long connection.
 
