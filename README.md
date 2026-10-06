@@ -1,10 +1,10 @@
-# 飞书-Codex 全量同步桥接
+# 飞书 Agent 桥接（feishu-agent-bridge）
 
 [English README](README.en.md)
 
 维护者设计文档：[docs/design.md](docs/design.md)
 
-同一仓库还包含 Claude Code 会话的飞书镜像与续聊（独立的飞书应用、私密群和服务）：见 [docs/claude.md](docs/claude.md)。
+本仓库包含两个互相独立的桥接，各用一个飞书应用、私密群和服务：本文介绍 **Codex 桥接**；**Claude Code 桥接**（会话镜像与续聊）见 [docs/claude.md](docs/claude.md)。仓库原名 `feishu-codex-bridge`，Codex 桥接的服务名、配置和状态目录沿用原名，不受改名影响。
 
 该服务把本机 `~/.codex/sessions` 中的 Codex 会话同步到飞书私密话题群，并允许从对应话题继续会话。它是本机 Codex CLI 的飞书前端，不安装飞书桌面客户端；消息事件和卡片按钮均由飞书 WebSocket 长连接接收，不需要公网回调地址。
 

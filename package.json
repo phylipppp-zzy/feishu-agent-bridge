@@ -1,8 +1,8 @@
 {
-  "name": "feishu-codex-bridge",
+  "name": "feishu-agent-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Mirror Codex sessions to Feishu and continue them from Feishu topics.",
+  "description": "Mirror Codex and Claude Code sessions to Feishu and continue them from Feishu topics.",
   "type": "module",
   "engines": {
     "node": ">=22"

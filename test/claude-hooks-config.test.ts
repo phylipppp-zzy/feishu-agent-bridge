@@ -10,14 +10,14 @@ import {
 } from "../src/claude/hooks-config.js";
 import { backupTimestamp, readClaudeSettings, writeClaudeSettings } from "../src/claude/settings-file.js";
 
-const command = bridgeHookCommand("/usr/bin/node", "/home/alice/feishu-codex-bridge/scripts/claude-hook.mjs", "/home/alice/.local/state/feishu-claude-bridge");
+const command = bridgeHookCommand("/usr/bin/node", "/home/alice/feishu-agent-bridge/scripts/claude-hook.mjs", "/home/alice/.local/state/feishu-claude-bridge");
 const oldCommand = bridgeHookCommand("/usr/bin/node", "/home/alice/old-checkout/scripts/claude-hook.mjs", "/home/alice/.local/state/feishu-claude-bridge");
 const bridgeGroup = (hookCommand: string) => ({ hooks: [{ type: "command", command: hookCommand, timeout: BRIDGE_HOOK_TIMEOUT_SECONDS }] });
 const userStop = { hooks: [{ type: "command", command: "notify-send done" }] };
 const userBash = { matcher: "Bash", hooks: [{ type: "command", command: "/home/alice/bin/check-bash.sh", timeout: 5 }] };
 
 test("bridge hook commands quote every path for sh -c and round-trip", () => {
-  assert.equal(command, "'/usr/bin/node' '/home/alice/feishu-codex-bridge/scripts/claude-hook.mjs' --state-dir '/home/alice/.local/state/feishu-claude-bridge'");
+  assert.equal(command, "'/usr/bin/node' '/home/alice/feishu-agent-bridge/scripts/claude-hook.mjs' --state-dir '/home/alice/.local/state/feishu-claude-bridge'");
   const tricky = ["/opt/my node/bin/node", "/home/o'brien/$(rm -rf ~)/`x`/scripts/claude-hook.mjs", "/state dir/'quoted' \"double\" $HOME;|&*"];
   const words = execFileSync("sh", ["-c", `printf '%s\\0' ${tricky.map(shellQuote).join(" ")}`]).toString().split("\0").slice(0, -1);
   assert.deepEqual(words, tricky);
