@@ -24,8 +24,9 @@ export function homeCard(status: { paused: boolean; sessions: number; active: nu
   ]);
 }
 
-export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number; appServer?: string }): CardDefinition {
+export function serviceCard(status: { paused: boolean; sessions: number; active: number; failures: number; queued?: number; waiting?: number; failedTasks?: number; appServer?: string }, notice = ""): CardDefinition {
   return card("服务管理", status.paused ? "orange" : "blue", [
+    ...(notice ? [markdown(`**${safeMarkdown(notice)}**`)] : []),
     markdown(`服务：**${status.paused ? "已暂停" : "运行中"}**\n会话：${status.sessions}　运行中：${status.active}　排队：${status.queued ?? 0}　等待用户：${status.waiting ?? 0}　失败任务：${status.failedTasks ?? 0}　未解决失败类别：${status.failures}${status.appServer ? `\napp-server：${safeMarkdown(status.appServer)}` : ""}`),
     actionRow([button("立即同步", "sync", "primary"), status.paused ? button("恢复同步", "resume", "primary") : button("暂停同步", "pause")]),
     actionRow([button("重新连接", "retry"), button("使用帮助", "help"), button("返回控制台", "home")]),

@@ -8,7 +8,10 @@ import type { ClaudeBridgeConfig } from "../src/claude/config.js";
 import { ClaudeBridgeDatabase } from "../src/claude/db.js";
 import { projectFolderName } from "../src/claude/importer.js";
 import { ClaudeRuntime } from "../src/claude/runtime.js";
-import type { CardDefinition, FeishuPort, IncomingFeishuMessage } from "../src/types.js";
+import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingFeishuMessage } from "../src/types.js";
+
+/** A callback outcome whose card, if any, can be read without narrowing first. */
+type Outcome = CardActionOutcome & { card?: CardDefinition };
 import { fakeQueries } from "./claude-fake-query.js";
 
 configureCardUi(2);
@@ -90,7 +93,7 @@ async function setup(prefix: string, syncDirs: string[] = [], overrides: Partial
   const project = join(home, "project");
   await mkdir(project, { recursive: true });
   const config: ClaudeBridgeConfig = { appId: "app", appSecret: "secret", bindToken: "token", claudeHome: join(home, ".claude"), stateDir: join(home, "state"),
-    allowedRoot: home, claudeBin: "claude", runnerIdleMs: 60_000, historyDays: 3, syncDirs, scanIntervalMs: 60_000, livenessIntervalMs: 60_000, ...overrides };
+    allowedRoot: home, cardSettleMs: 0, claudeBin: "claude", runnerIdleMs: 60_000, historyDays: 3, syncDirs, scanIntervalMs: 60_000, livenessIntervalMs: 60_000, ...overrides };
   const db = new ClaudeBridgeDatabase(config.stateDir);
   const feishu = new FakeFeishu();
   const { factory, queries } = fakeQueries();
@@ -105,8 +108,8 @@ async function setup(prefix: string, syncDirs: string[] = [], overrides: Partial
   /** A restarted service over the same state, for example with a different SYNC_DIRS. */
   type Restarted = Pick<ClaudeRuntime, "syncAll" | "renderSession" | "onCardAction" | "onFeishuMessage"> & { bootstrap(): Promise<void> };
   const restart = (overrides: Partial<ClaudeBridgeConfig>) => new ClaudeRuntime({ ...config, ...overrides }, db, feishu) as unknown as Restarted;
-  const action = (name: string, value: Record<string, unknown> = {}, formValues: Record<string, unknown> = {}, openMessageId = "card-x") =>
-    runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId, action: name, value, formValues });
+  const action = async (name: string, value: Record<string, unknown> = {}, formValues: Record<string, unknown> = {}, openMessageId = "card-x") =>
+    await runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId, action: name, value, formValues }) as Outcome;
   return { home, project, projects, config, db, feishu, runtime, queries, path, internals, message, bind, restart, action,
     cleanup: async () => { await runtime.stop(); db.close(); await rm(home, { recursive: true, force: true }); } };
 }
@@ -259,8 +262,9 @@ test("/deliver sends files and images from the session's directory and leaves ou
     // "Send the files of this directory" delivers them like /deliver <dir>.
     const before2 = env.feishu.repliesTo(root).length;
     const sending = await env.action("deliver_paths", { sessionId: RECENT, path: join(env.project, "output") });
-    assert.ok(sending.delivery === "replace" && JSON.stringify(sending.card).includes("已开始发送"), "the tap is acknowledged on the card");
-    await waitUntil(() => env.feishu.repliesTo(root).length >= before2 + 4);
+    assert.ok(sending.delivery === "replace" && JSON.stringify(sending.card).includes("正在发送"), "the tap is acknowledged on the card");
+    await waitUntil(() => env.feishu.updated.some((update) => JSON.stringify(update.card).includes("已发送，文件在话题末尾")));
+    assert.ok(env.feishu.repliesTo(root).length >= before2 + 4);
     assert.equal(title(env.feishu.repliesTo(root)[before2]?.card), "交付文件");
     assert.equal(env.queries.length, 0);
   } finally { await env.cleanup(); }
@@ -319,10 +323,14 @@ test("opening an indexed session creates its topic with the latest turn", async 
       prompt(OLD, "o-p2", now - 9 * DAY, "旧问题二"), reply(OLD, "o-a2", now - 9 * DAY + MINUTE, "旧回答二")]));
     await env.bind();
     assert.equal(env.feishu.roots.length, 0);
-    const recent = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "recent", value: {}, formValues: {} });
+    const recent = await env.action("recent");
     assert.match(JSON.stringify(recent.card), /"action":"open_session"/);
-    await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "open_session", value: { sessionId: OLD }, formValues: {} });
+    // Answered at once; the topic is created afterwards and the tapped card then links to it.
+    const opening = await env.action("open_session", { sessionId: OLD });
+    assert.equal(title(opening.card), "正在打开");
+    await waitUntil(() => env.feishu.updated.some((update) => update.id === "card-x" && title(update.card) === "已打开会话"));
     const root = env.db.getSession(OLD)!.rootMessageId!;
+    assert.match(JSON.stringify(env.feishu.updated.at(-1)!.card), /打开话题/);
     assert.deepEqual(env.feishu.repliesTo(root).map((item) => item.kind === "text" ? item.text : title(item.card)), ["VS Code：旧问题二", "Claude · 已完成 · 用时 1分"]);
   } finally { await env.cleanup(); }
 });
@@ -354,10 +362,10 @@ test("SYNC_DIRS limits topics, lists and notices to sessions working in those di
     await env.bind();
     assert.deepEqual(env.feishu.roots.map((root) => title(root.card)), ["项目内的问题"]);
     assert.equal(env.db.getSession(OLD)?.rootMessageId, null);
-    const recent = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "recent", value: {}, formValues: {} });
+    const recent = await env.action("recent");
     assert.match(JSON.stringify(recent.card), /项目内的问题/);
     assert.doesNotMatch(JSON.stringify(recent.card), /别处的问题/);
-    const home = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "home", value: {}, formValues: {} });
+    const home = await env.action("home");
     assert.match(JSON.stringify(home.card), /同步范围：\/home\/tester\/project/);
     assert.match(JSON.stringify(home.card), /已索引会话：\*\*1\*\*/);
 
@@ -431,7 +439,7 @@ test("cleanup withdraws the bridge's messages in out-of-scope topics after confi
 
     const narrowed = env.restart({ syncDirs: ["/home/tester/project"] });
     await narrowed.bootstrap();
-    const action = (name: string, value: Record<string, unknown> = {}) => narrowed.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: name, value, formValues: {} });
+    const action = async (name: string, value: Record<string, unknown> = {}) => await narrowed.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: name, value, formValues: {} }) as Outcome;
     assert.match(JSON.stringify((await action("home")).card), /清理范围外话题（2）/);
     const preview = (await action("cleanup_preview")).card;
     assert.equal(title(preview), "清理 2 个范围外话题");
@@ -769,8 +777,9 @@ test("new sessions start from /new, from a message in the main timeline, or from
     assert.ok(draft);
     assert.match(JSON.stringify(picker), new RegExp(`"cwd":"${env.project}"`));
     const started = await env.action("new_pick", { cwd: env.project, draft });
-    assert.equal(title(started.card), "已新建会话");
+    assert.equal(title(started.card), "正在新建会话", "answered before the topic exists, within Feishu's callback time");
     await waitUntil(() => env.queries.length === 2);
+    await waitUntil(() => env.feishu.updated.some((update) => update.id === "card-x" && title(update.card) === "已新建会话"));
     assert.equal((await env.queries[1]!.nextMessage(1)).message.content, "整理一下 README");
 
     // The card form: pick a directory, then type the task.
@@ -778,9 +787,11 @@ test("new sessions start from /new, from a message in the main timeline, or from
     assert.equal(title(taskCard.card), "新建 Claude 会话");
     assert.match(JSON.stringify(taskCard.card), /"action":"new_submit"/);
     assert.match(JSON.stringify((await env.action("new_submit", { cwd: env.project }, { new_task: "" })).card), /请填写要 Claude 做什么/);
-    await env.action("new_submit", { cwd: env.project }, { new_task: "加个单元测试" });
+    const first = await env.action("new_submit", { cwd: env.project }, { new_task: "加个单元测试" }, "task-card");
+    assert.equal(title(first.card), "正在新建会话");
     await waitUntil(() => env.queries.length === 3);
     assert.equal((await env.queries[2]!.nextMessage(1)).message.content, "加个单元测试");
+    await waitUntil(() => env.feishu.updated.some((update) => update.id === "task-card"));
   } finally { await env.cleanup(); }
 });
 

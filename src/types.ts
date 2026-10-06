@@ -1,5 +1,7 @@
 export interface BridgeConfig {
   appId: string;
+  /** How long a slow card action's result waits behind its "working on it" card; tests set 0. */
+  cardSettleMs?: number;
   appSecret: string;
   allowedRoot: string;
   codexHome: string;
@@ -180,13 +182,21 @@ export interface IncomingFeishuMessage {
 
 export type CardDefinition = Record<string, unknown>;
 
-export type CardDelivery = "replace" | "reply" | "send" | "none";
+export type CardDelivery = "replace" | "reply" | "send" | "toast" | "none";
 
-export type CardActionOutcome = CardDefinition & {
-  delivery?: CardDelivery;
-  card?: CardDefinition;
-  rootMessageId?: string;
-};
+/**
+ * What a card callback does with its result. The delivery is always spelled out: a card that
+ * silently became a new message in the main timeline (the old default) left the tapped card
+ * unchanged, so every handler now says whether it replaces that card, replies in a topic or sends.
+ */
+export type CardActionOutcome =
+  /** The tapped card becomes `card`; `toast` is a short notice shown over it. */
+  | { delivery: "replace"; card: CardDefinition; toast?: string }
+  | { delivery: "reply"; rootMessageId: string; card: CardDefinition }
+  | { delivery: "send"; card: CardDefinition }
+  /** The tapped card stays as it is, with a short notice over it: for a refusal that leaves the card usable. */
+  | { delivery: "toast"; text: string; level?: "info" | "success" | "warning" | "error" }
+  | { delivery: "none" };
 
 export interface IncomingCardAction {
   eventId?: string;

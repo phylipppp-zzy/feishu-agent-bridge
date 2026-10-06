@@ -8,6 +8,7 @@ import { CodexCliProbe } from "./codex.js";
 import { BridgeDatabase } from "./db.js";
 import { messageAppLink } from "./feishu.js";
 import { resolveAllowedPath, resolveAllowedTarget } from "./path-policy.js";
+import { SlowCardActions } from "./card-actions.js";
 import { approvalReasonText, permissionEntries, remoteApprovalAllowed, remoteApprovalSummary, rootExecutionPreflight, threadSandboxMode } from "./execution-policy.js";
 import { isRetryableTransportError } from "./inbound-events.js";
 import { boundedPreview, cardContentBytes, serializedBytes } from "./text-limits.js";
@@ -137,6 +138,7 @@ export class SyncRuntime implements FeishuRouterPort {
   private readonly sessionImporter: SessionImporter;
   private readonly turnCoordinator: TurnCoordinator;
   private readonly approvalService: ApprovalService;
+  private readonly slowActions: SlowCardActions;
   private readonly taskScheduler: TaskScheduler;
   private scanTimer: NodeJS.Timeout | null = null;
   private stopping = false;
@@ -163,6 +165,7 @@ export class SyncRuntime implements FeishuRouterPort {
     private readonly codex: CodexCliProbe,
     private readonly appServer?: CodexAppServer,
   ) {
+    this.slowActions = new SlowCardActions(feishu, (key, error) => this.db.recordFailure("slow_card_action", { key }, error), config.cardSettleMs);
     this.sessionsDir = join(config.codexHome, "sessions");
     this.sessionImporter = new SessionImporter({
       sessionsDir: this.sessionsDir,
@@ -334,6 +337,21 @@ export class SyncRuntime implements FeishuRouterPort {
    * Reads the model catalog from the configured Codex. Concurrent callers share one read; a failed
    * or empty read keeps the last good catalog (marked as stale) instead of replacing it.
    */
+  /** `/retry` and the “重新连接” button: refresh the model catalog, restart an unhealthy app-server, then catch up. */
+  private async reconnect(): Promise<boolean> {
+    this.messageLinkPermissionDenied = false;
+    const modelsReady = await this.refreshModels();
+    let appServerReady = true;
+    if (this.appServer && this.appServer.getHealth().state === "unhealthy") {
+      try { await this.appServer.restart("manual retry"); } catch (error) { appServerReady = false; this.db.recordFailure("app_server_retry", {}, error); }
+    }
+    if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
+    void this.syncAll();
+    void this.backfillSessionLinks();
+    void this.deliverPendingOutputs(true);
+    return modelsReady && appServerReady;
+  }
+
   private refreshModels(): Promise<boolean> {
     this.modelRefresh ??= this.readModelCatalog().finally(() => { this.modelRefresh = null; });
     return this.modelRefresh;
@@ -1785,6 +1803,11 @@ export class SyncRuntime implements FeishuRouterPort {
 
   async handleCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
+    const replace = (card: CardDefinition): CardActionOutcome => ({ delivery: "replace", card });
+    /** The tapped card no longer applies: it is replaced, so its buttons go away. */
+    const expired = (text: string): CardActionOutcome => replace(errorCard(text));
+    /** The tapped card is still usable: it stays, and the reason shows over it. */
+    const refuse = (text: string): CardActionOutcome => ({ delivery: "toast", text });
     try {
       const rootCardSession = this.db.getSessionByRoot(event.openMessageId);
       if (rootCardSession && !["session_model", "session_status", "session_toggle_mode", "cancel_run", "root_grant", "root_grant_confirm", "root_grant_cancel", "root_revoke", "turn_review", "permission_details", "resend_result", "remote_approve", "remote_answer", "remote_guidance", "unarchive_confirm", "unarchive_cancel"].includes(event.action)) {
@@ -1796,20 +1819,20 @@ export class SyncRuntime implements FeishuRouterPort {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
           const requestId = typeof event.value.requestId === "string" ? event.value.requestId : "";
           const state = this.getPendingChoice(sessionId);
-          if (!state || state.request.id !== requestId) return errorCard("该选择已过期或已关闭。");
+          if (!state || state.request.id !== requestId) return expired("该选择已过期或已关闭。");
           this.db.deleteChoice(requestId);
           this.db.deleteSetting(this.choiceKey(sessionId));
           return { delivery: "replace", card: choiceCancelledCard() };
         }
         case "choice_answer": {
-          if (this.paused()) return errorCard("同步当前已暂停；恢复同步后再提交选择。");
+          if (this.paused()) return refuse("同步当前已暂停；恢复同步后再提交选择。");
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
           const requestId = typeof event.value.requestId === "string" ? event.value.requestId : "";
           const state = this.getPendingChoice(sessionId);
-          if (!state || state.request.id !== requestId) return errorCard("该选择已过期，请在话题内重新询问 Codex。");
-          if (Number(event.value.questionIndex) !== state.questionIndex) return errorCard("该问题已经回答，请使用最新选择卡片。");
+          if (!state || state.request.id !== requestId) return expired("该选择已过期，请在话题内重新询问 Codex。");
+          if (Number(event.value.questionIndex) !== state.questionIndex) return expired("该问题已经回答，请使用最新选择卡片。");
           const answer = this.optionAnswer(state, event.value.optionIndex ?? event.option);
-          if (!answer) return errorCard("选项无效，请使用最新选择卡片。");
+          if (!answer) return expired("选项无效，请使用最新选择卡片。");
           const result = this.answerPendingChoice(state, answer);
           if (!result.complete) return { delivery: "replace", card: choiceCard(state.request, state.questionIndex) };
           void this.resumeFromChoice(state, result.prompt!, event.openMessageId);
@@ -1821,11 +1844,11 @@ export class SyncRuntime implements FeishuRouterPort {
         case "command_menu": return { delivery: "replace", card: commandMenuCard() };
         case "search_open": return { delivery: "replace", card: this.recentCard() };
         case "new":
-          if (this.paused()) return errorCard("同步当前已暂停；恢复同步后再新建会话。");
-          if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后再新建会话。");
+          if (this.paused()) return refuse("同步当前已暂停；恢复同步后再新建会话。");
+          if (!this.models.length) return refuse("模型目录暂不可用。请使用 /retry 刷新后再新建会话。");
           return { delivery: "replace", card: this.projectCard(this.beginNewWizard(event.openId, event.chatId)) };
         case "projects": {
-          if (this.paused()) return errorCard("同步当前已暂停；恢复同步后再新建会话。");
+          if (this.paused()) return refuse("同步当前已暂停；恢复同步后再新建会话。");
           const wizard = this.getWizard(event.openId) ?? this.beginNewWizard(event.openId, event.chatId);
           return { delivery: "replace", card: this.projectCard(wizard) };
         }
@@ -1834,14 +1857,14 @@ export class SyncRuntime implements FeishuRouterPort {
         case "recent_page": return { delivery: "replace", card: this.recentCard(typeof event.value.search === "string" ? event.value.search : "", Math.max(0, Number(event.value.page) || 0)) };
         case "search_projects": {
           const wizard = this.validWizard(event.openId, event, "new");
-          if (!wizard) return errorCard("项目选择已过期，请重新开始新建会话。");
+          if (!wizard) return expired("项目选择已过期，请重新开始新建会话。");
           return { delivery: "replace", card: this.projectCard(this.saveWizard(event.openId, wizard), this.formValue(event, "project_path")) };
         }
         case "submit_project_path": {
           const wizard = this.validWizard(event.openId, event, "new");
-          if (!wizard) return errorCard("项目选择已过期，请重新开始新建会话。");
+          if (!wizard) return expired("项目选择已过期，请重新开始新建会话。");
           const entered = this.formValue(event, "project_path");
-          if (!entered) return errorCard("请输入项目目录，或选择一个历史项目。");
+          if (!entered) return refuse("请输入项目目录，或选择一个历史项目。");
           const cwd = await resolveAllowedPath(entered, this.config.allowedRoot);
           wizard.cwd = cwd; delete wizard.model; delete wizard.reasoningEffort;
           Object.assign(wizard, this.newModelDefaults());
@@ -1849,27 +1872,27 @@ export class SyncRuntime implements FeishuRouterPort {
         }
         case "select_project": {
           const wizard = this.validWizard(event.openId, event, "new");
-          if (!wizard) return errorCard("该项目选择卡片已过期，请重新开始新建会话。");
+          if (!wizard) return expired("该项目选择卡片已过期，请重新开始新建会话。");
           const cwd = typeof event.value.cwd === "string" ? event.value.cwd : "";
           wizard.cwd = await resolveAllowedPath(cwd, this.config.allowedRoot);
           delete wizard.model;
           delete wizard.reasoningEffort;
           Object.assign(wizard, this.newModelDefaults());
           const current = this.saveWizard(event.openId, wizard);
-          if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重新开始。 ");
+          if (!this.models.length) return refuse("模型目录暂不可用。请使用 /retry 刷新后重新开始。 ");
           return { delivery: "replace", card: this.modelChoiceCard(current.id, current.model, current.cwd, "new") };
         }
         case "show_models": {
           const wizard = this.validWizard(event.openId, event);
-          if (!wizard) return errorCard("该模型设置卡片已过期，请重新开始。 ");
-          if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重试。");
+          if (!wizard) return expired("该模型设置卡片已过期，请重新开始。 ");
+          if (!this.models.length) return refuse("模型目录暂不可用。请使用 /retry 刷新后重试。");
           return { delivery: "replace", card: this.modelChoiceCard(this.saveWizard(event.openId, wizard).id, wizard.model, wizard.cwd, wizard.mode) };
         }
         case "select_model": {
           const wizard = this.validWizard(event.openId, event);
-          if (!wizard) return errorCard("该模型选择卡片已过期，请重新开始。 ");
+          if (!wizard) return expired("该模型选择卡片已过期，请重新开始。 ");
           const model = this.modelBySlug(typeof event.value.model === "string" ? event.value.model : "");
-          if (!model) return errorCard("该模型已不可用，请使用最新模型卡片重新选择。");
+          if (!model) return expired("该模型已不可用，请使用最新模型卡片重新选择。");
           wizard.model = model.slug;
           delete wizard.reasoningEffort;
           const defaults = wizard.mode === "new" ? this.newModelDefaults() : {};
@@ -1879,47 +1902,52 @@ export class SyncRuntime implements FeishuRouterPort {
         }
         case "select_reasoning_effort": {
           const wizard = this.validWizard(event.openId, event);
-          if (!wizard) return errorCard("该思考强度卡片已过期，请重新开始。 ");
+          if (!wizard) return expired("该思考强度卡片已过期，请重新开始。 ");
           const model = this.modelBySlug(wizard.model);
           const effort = typeof event.value.effort === "string" ? event.value.effort : "";
-          if (!model || !model.supportedReasoningEfforts.includes(effort)) return errorCard("模型或思考强度已不可用，请重新选择模型。");
+          if (!model || !model.supportedReasoningEfforts.includes(effort)) return expired("模型或思考强度已不可用，请重新选择模型。");
           wizard.reasoningEffort = effort;
           const current = this.saveWizard(event.openId, wizard);
           if (current.mode === "session") {
-            if (!current.sessionId) return errorCard("会话模型设置已失效。");
+            if (!current.sessionId) return expired("会话模型设置已失效。");
             this.db.setSessionModel(current.sessionId, model.slug, effort);
             this.db.deleteSetting(this.wizardKey(event.openId, current.mode));
-            return sessionCard(this.sessionView({ ...this.db.getSession(current.sessionId)! }), "可继续");
+            const updated = this.db.getSession(current.sessionId)!;
+            const card = sessionCard(this.sessionView(updated), this.turnCoordinator.hasActiveTurn(updated.sessionId) ? "运行中" : "可继续");
+            if (updated.rootMessageId && updated.rootMessageId !== event.openMessageId) {
+              void this.feishu.updateCard(updated.rootMessageId, card).catch((error) => this.db.recordFailure("root_card_model", { sessionId: updated.sessionId }, error));
+            }
+            return { delivery: "replace", card, toast: `已改为 ${model.displayName} / ${effort}，从下一轮开始生效` };
           }
-          if (!current.cwd) return errorCard("项目目录尚未选择，请重新开始。 ");
+          if (!current.cwd) return expired("项目目录尚未选择，请重新开始。 ");
           if (current.prompt) {
             this.db.deleteSetting(this.wizardKey(event.openId, current.mode));
             void this.runNewSessionFromWizard(current);
-            return homeCard(this.cardStatus(), `已提交新会话：${model.displayName} / ${effort}`);
+            return replace(runStatusCard("已提交", `正在创建 Codex 会话：${model.displayName} / ${effort}。`));
           }
           return { delivery: "replace", card: wizardReadyCard(current.cwd, model, effort, current.id) };
         }
         case "await_chat_task": {
           const wizard = this.validWizard(event.openId, event, "new");
-          if (!wizard || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) return errorCard("任务向导已过期，请重新开始。");
+          if (!wizard || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) return expired("任务向导已过期，请重新开始。");
           wizard.awaitingChatTask = true;
           this.saveWizard(event.openId, wizard);
           return { delivery: "send", card: homeCard(this.cardStatus(), "请在群主消息直接发送任务，不需要 @机器人；当前向导将使用已选项目、模型和强度，只接收你本人在本群发出的下一条消息。") };
         }
         case "submit_task": {
-          if (this.paused()) return errorCard("同步当前已暂停；恢复同步后再创建会话。");
+          if (this.paused()) return refuse("同步当前已暂停；恢复同步后再创建会话。");
           const wizard = this.validWizard(event.openId, event, "new");
-          if (!wizard || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) return errorCard("任务向导已过期，请重新开始。");
+          if (!wizard || !wizard.cwd || !wizard.model || !wizard.reasoningEffort) return expired("任务向导已过期，请重新开始。");
           const prompt = this.formValue(event, "task_prompt");
-          if (!prompt) return errorCard("任务不能为空。请填写任务，或使用“在聊天中输入”。");
+          if (!prompt) return refuse("任务不能为空。请填写任务，或使用“在聊天中输入”。");
           this.db.deleteSetting(this.wizardKey(event.openId, wizard.mode));
           void this.runNewSessionFromWizard({ ...wizard, prompt, sourceMessageId: `card-${event.openMessageId}` });
           return { delivery: "replace", card: runStatusCard("已提交", "正在创建 Codex 会话。") };
         }
         case "session_model": {
           const root = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
-          if (!root) return errorCard("请在对应会话话题内使用“修改模型”。");
-          if (!this.models.length) return errorCard("模型目录暂不可用。请使用 /retry 刷新后重试。");
+          if (!root) return refuse("请在对应会话话题内使用“修改模型”。");
+          if (!this.models.length) return refuse("模型目录暂不可用。请使用 /retry 刷新后重试。");
           const wizard = this.saveWizard(event.openId, { id: randomUUID(), mode: "session", chatId: event.chatId, rootId: root.rootMessageId, sessionId: root.sessionId, expiresAt: 0 });
           const card = this.modelChoiceCard(wizard.id, root.model ?? undefined, root.cwd, "session");
           if (root.rootMessageId === event.openMessageId) {
@@ -1929,14 +1957,14 @@ export class SyncRuntime implements FeishuRouterPort {
         }
         case "session_status": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
-          if (!session) return errorCard("请在对应会话话题内刷新状态。");
+          if (!session) return refuse("请在对应会话话题内刷新状态。");
           const card = sessionCard(this.sessionView(session), this.turnCoordinator.hasActiveTurn(session.sessionId) ? "运行中" : "可继续");
           return event.openMessageId === session.rootMessageId ? { delivery: "replace", card } : { delivery: "reply", rootMessageId: session.rootMessageId, card };
         }
         case "session_toggle_mode": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
-          if (!session) return errorCard("请在对应会话话题内切换模式。");
-          if (this.turnCoordinator.hasActiveTurn(session.sessionId) || (session.rootMessageId && this.db.runningTaskForRoot(session.rootMessageId))) return errorCard("当前回合正在运行；请完成或取消后再切换模式。");
+          if (!session) return refuse("请在对应会话话题内切换模式。");
+          if (this.turnCoordinator.hasActiveTurn(session.sessionId) || (session.rootMessageId && this.db.runningTaskForRoot(session.rootMessageId))) return refuse("当前回合正在运行；请完成或取消后再切换模式。");
           const mode = session.collaborationMode === "plan" ? "default" : "plan";
           this.db.setCollaborationMode(session.sessionId, mode);
           const updated = this.db.getSession(session.sessionId)!;
@@ -1956,7 +1984,7 @@ export class SyncRuntime implements FeishuRouterPort {
           let pending: { nonce?: unknown; ids?: unknown; expiresAt?: unknown } = {};
           try { pending = JSON.parse(this.db.getSetting("context_cleanup.pending") ?? "{}") as typeof pending; } catch { /* treated as expired */ }
           if (pending.nonce !== event.value.nonce || typeof pending.expiresAt !== "number" || pending.expiresAt < Date.now() || !Array.isArray(pending.ids)) {
-            return errorCard("清理已过期，请在服务管理中重新检查。");
+            return expired("清理已过期，请在服务管理中重新检查。");
           }
           this.db.deleteSetting("context_cleanup.pending");
           const ids = pending.ids.filter((id): id is string => typeof id === "string");
@@ -1965,13 +1993,13 @@ export class SyncRuntime implements FeishuRouterPort {
         }
         case "permission_details": {
           const session = this.sessionFromCard(event) ?? this.db.getSessionByRoot(event.openMessageId);
-          if (!session) return errorCard("没有找到这个会话。");
+          if (!session) return refuse("没有找到这个会话。");
           return { delivery: "reply", rootMessageId: session.rootMessageId, card: permissionDetailsCard(session.cwd, session.collaborationMode === "plan", this.sessionView(session)) };
         }
         case "resend_result": {
           const turnId = typeof event.value.turnId === "string" ? event.value.turnId : "";
           const stored = this.db.getTurnOutput(turnId);
-          if (!stored) return errorCard("没有找到这一轮的结果，可能已超过保留期限（30 天）。");
+          if (!stored) return expired("没有找到这一轮的结果，可能已超过保留期限（30 天）。");
           const executed = this.executedLabel(turnId);
           if (stored.cardStatus === "sent" && (stored.fileStatus === "sent" || stored.fileStatus === "none")) return { delivery: "replace", card: runStatusCard(executed, "本轮结果已在话题中。") };
           // Uploads can take longer than a card callback may; the card is updated when they are done.
@@ -1986,58 +2014,63 @@ export class SyncRuntime implements FeishuRouterPort {
         case "cancel_run": {
           const sessionId = typeof event.value.sessionId === "string" ? event.value.sessionId : "";
           const session = this.db.getSession(sessionId) ?? this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
-          if (!session) return errorCard("当前会话没有可取消的桥接任务。");
-          const outcome = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
-          const report = this.cancelReport(outcome);
-          if (!report) return errorCard("当前会话没有可取消的桥接任务。");
-          if (session.rootMessageId && report.update) void this.updateRunCard(session.sessionId, session.rootMessageId, report.state, report.detail, outcome.turn === "failed");
-          // The clicked card is replaced with what is true now, which may already be the turn's end.
-          const actual = report.update ? report : this.db.getRunStatus(session.sessionId) ?? report;
-          const card = rootCardSession ? sessionCard(this.sessionView(rootCardSession), this.turnCoordinator.hasActiveTurn(rootCardSession.sessionId) ? "运行中" : "可继续") : runStatusCard(actual.state, actual.detail, outcome.turn === "failed" || outcome.turn === "uncertain", session.sessionId);
-          return rootCardSession && event.openMessageId === rootCardSession.rootMessageId
-            ? { delivery: "replace", card }
-            : session.rootMessageId ? { delivery: "reply", rootMessageId: session.rootMessageId, card } : { delivery: "send", card };
+          if (!session) return refuse("当前会话没有可取消的桥接任务。");
+          // Interrupting can take up to 15 s; the tapped card says so at once and shows the result when it is known.
+          return this.slowActions.run(event.openMessageId, `cancel:${session.sessionId}`, runStatusCard("正在取消", "已请求 Codex 停止，结果会显示在这张卡片上。"), async () => {
+            const outcome = await this.cancelSessionWork(session.sessionId, session.rootMessageId, "cancelled from card");
+            const report = this.cancelReport(outcome);
+            if (!report) return runStatusCard("没有可取消的任务", "这个会话现在没有运行或排队的桥接任务。");
+            if (session.rootMessageId && report.update) void this.updateRunCard(session.sessionId, session.rootMessageId, report.state, report.detail, outcome.turn === "failed");
+            // What is true now, which may already be the turn's end.
+            const actual = report.update ? report : this.db.getRunStatus(session.sessionId) ?? report;
+            return rootCardSession ? sessionCard(this.sessionView(rootCardSession), this.turnCoordinator.hasActiveTurn(rootCardSession.sessionId) ? "运行中" : "可继续")
+              : runStatusCard(actual.state, actual.detail, outcome.turn === "failed" || outcome.turn === "uncertain", session.sessionId);
+          }, (error) => errorCard(`取消失败：${error instanceof Error ? error.message : String(error)}`));
         }
         case "unarchive_confirm": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const task = this.db.getTaskByActionNonce(nonce);
           const epoch = Number(this.db.getSetting(`unarchive.${nonce}.epoch`) ?? -1);
-          if (!task || !task.sessionId || task.chatId !== event.chatId || task.rootMessageId === null || this.db.getSetting(`unarchive.${nonce}.message`) !== event.openMessageId || task.status !== "awaiting_unarchive" || task.unarchiveApproved || epoch !== this.appServer?.appServerEpoch) return errorCard("该取消归档请求已过期、已处理或不属于当前会话。");
+          if (!task || !task.sessionId || task.chatId !== event.chatId || task.rootMessageId === null || this.db.getSetting(`unarchive.${nonce}.message`) !== event.openMessageId || task.status !== "awaiting_unarchive" || task.unarchiveApproved || epoch !== this.appServer?.appServerEpoch) return expired("该取消归档请求已过期、已处理或不属于当前会话。");
           const approved = this.db.approveUnarchive(nonce);
-          if (!approved) return errorCard("该取消归档请求已被处理。");
-          const completed = await this.finishApprovedUnarchive(approved);
-          if (completed) { this.db.deleteSetting(`unarchive.${nonce}.epoch`); this.db.deleteSetting(`unarchive.${nonce}.message`); }
-          return { delivery: "replace", card: remoteRequestResolvedCard(completed ? "已取消归档" : "已确认，等待重试", completed ? "原消息已重新排队。" : "app-server 暂时不可用；服务会继续恢复该请求。", completed) };
+          if (!approved) return expired("该取消归档请求已被处理。");
+          return this.slowActions.run(event.openMessageId, `unarchive:${nonce}`, remoteRequestResolvedCard("正在取消归档", "正在请 Codex 恢复这个会话。"), async () => {
+            const completed = await this.finishApprovedUnarchive(approved);
+            if (completed) { this.db.deleteSetting(`unarchive.${nonce}.epoch`); this.db.deleteSetting(`unarchive.${nonce}.message`); }
+            return remoteRequestResolvedCard(completed ? "已取消归档" : "已确认，等待重试", completed ? "原消息已重新排队。" : "app-server 暂时不可用；服务会继续恢复该请求。", completed);
+          }, (error) => errorCard(`取消归档失败：${error instanceof Error ? error.message : String(error)}`));
         }
         case "unarchive_cancel": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const task = this.db.getTaskByActionNonce(nonce);
           const epoch = Number(this.db.getSetting(`unarchive.${nonce}.epoch`) ?? -1);
-          if (!task || task.chatId !== event.chatId || task.rootMessageId === null || this.db.getSetting(`unarchive.${nonce}.message`) !== event.openMessageId || epoch !== this.appServer?.appServerEpoch || !this.db.cancelUnarchive(nonce)) return errorCard("该取消归档请求已过期或已处理。");
+          if (!task || task.chatId !== event.chatId || task.rootMessageId === null || this.db.getSetting(`unarchive.${nonce}.message`) !== event.openMessageId || epoch !== this.appServer?.appServerEpoch || !this.db.cancelUnarchive(nonce)) return expired("该取消归档请求已过期或已处理。");
           this.db.deleteSetting(`unarchive.${nonce}.epoch`); this.db.deleteSetting(`unarchive.${nonce}.message`);
           return { delivery: "replace", card: remoteRequestResolvedCard("保持归档", "原消息已取消，不会执行。", false) };
         }
-        case "root_grant": return errorCard("普通 workspace-write 回合不需要 Root 授权；Root 任务会单独显示一次性授权卡。");
+        case "root_grant": return refuse("普通 workspace-write 回合不需要 Root 授权；Root 任务会单独显示一次性授权卡。");
         case "root_grant_confirm": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const grant = this.appServer ? this.db.approveTaskRootGrant(nonce, event.openId, event.chatId, this.appServer.appServerEpoch) : null;
-          if (!grant) return errorCard("该 Root 授权已过期、已处理或不属于当前用户/会话。");
+          if (!grant) return expired("该 Root 授权已过期、已处理或不属于当前用户/会话。");
           void this.drainTaskQueue(grant.sessionId);
           return { delivery: "replace", card: remoteRequestResolvedCard("已批准本任务", "授权已消费为下一次启动准备；不会保留为会话权限。") };
         }
         case "root_grant_cancel": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const grant = this.appServer ? this.db.denyTaskRootGrant(nonce, event.openId, event.chatId, this.appServer.appServerEpoch) : null;
-          if (!grant) return errorCard("该 Root 授权已过期、已处理或不属于当前用户/会话。");
-          if (grant.sessionId) await this.cancelSessionWork(grant.sessionId, null, "Root authorization was declined");
-          else await this.taskScheduler.cancel({ kind: "task", taskId: grant.taskId }, "Root authorization was declined");
-          return { delivery: "replace", card: remoteRequestResolvedCard("Root 授权已拒绝", "该任务已取消；不会影响其他任务。", false) };
+          if (!grant) return expired("该 Root 授权已过期、已处理或不属于当前用户/会话。");
+          return this.slowActions.run(event.openMessageId, `root_grant:${nonce}`, remoteRequestResolvedCard("Root 授权已拒绝", "正在取消该任务。", false), async () => {
+            if (grant.sessionId) await this.cancelSessionWork(grant.sessionId, null, "Root authorization was declined");
+            else await this.taskScheduler.cancel({ kind: "task", taskId: grant.taskId }, "Root authorization was declined");
+            return remoteRequestResolvedCard("Root 授权已拒绝", "该任务已取消；不会影响其他任务。", false);
+          }, (error) => errorCard(`取消任务失败：${error instanceof Error ? error.message : String(error)}`));
         }
-        case "root_revoke": return errorCard("Root 授权是一次性任务授权，无会话级权限可撤销。");
+        case "root_revoke": return refuse("Root 授权是一次性任务授权，无会话级权限可撤销。");
 
         case "turn_review": {
           const session = this.db.getSessionByRoot(event.openMessageId) ?? this.db.getSessionByCardMessage(event.openMessageId) ?? this.sessionFromCard(event);
-          if (!session) return errorCard("当前会话不可用。");
+          if (!session) return refuse("当前会话不可用。");
           const turn = this.db.activeTurn(session.sessionId);
           const latest = turn ?? this.db.latestTurn(session.sessionId) ?? (this.turnCoordinator.mutableTurn(session.sessionId) ?? null);
           return { delivery: "reply", rootMessageId: session.rootMessageId, card: reviewCard(latest ? this.db.listTurnItems(latest.turnId) : []) };
@@ -2054,60 +2087,53 @@ export class SyncRuntime implements FeishuRouterPort {
             return { delivery: "replace", card: networkConfirmCard(nonce, network, code, decision) };
           }
           const request = this.db.claimServerRequest(nonce, event.openId, event.chatId, this.appServer?.appServerEpoch ?? -1);
-          if (!request) return errorCard("该 Codex 请求已过期、已处理或不属于当前用户。 ");
+          if (!request) return expired("该 Codex 请求已过期、已处理或不属于当前用户。 ");
           void this.resolveRemoteRequest(request, decision).catch((error) => this.db.recordFailure("remote_request_response", { nonce }, error));
           return { delivery: "replace", card: remoteRequestResolvedCard("正在提交", "已向 Codex 提交你的决定。") };
         }
         case "remote_answer": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const request = this.liveUserInputRequest(nonce, event.openId, event.chatId);
-          if (!request) return errorCard("该 Codex 问题已过期、已回答或不属于当前用户。");
+          if (!request) return expired("该 Codex 问题已过期、已回答或不属于当前用户。");
           const answers = this.userInputAnswers(nonce);
-          if (Number(event.value.questionIndex) !== answers.length) return errorCard("该问题已经回答，请使用最新的问题卡片。");
+          if (Number(event.value.questionIndex) !== answers.length) return expired("该问题已经回答，请使用最新的问题卡片。");
           const option = this.userInputQuestions(request)[answers.length]?.options[Number(event.value.optionIndex ?? event.option)];
-          if (!option) return errorCard("选项无效，请使用最新的问题卡片。");
+          if (!option) return expired("选项无效，请使用最新的问题卡片。");
           return { delivery: "replace", card: this.answerUserInput(request, [...answers, option.label], event.openId, event.chatId) };
         }
         case "remote_guidance": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const request = this.db.getServerRequest(nonce);
-          if (!request || request.status !== "pending" || request.openId !== event.openId || request.chatId !== event.chatId || request.epoch !== this.appServer?.appServerEpoch) return errorCard("该命令请求已过期。 ");
+          if (!request || request.status !== "pending" || request.openId !== event.openId || request.chatId !== event.chatId || request.epoch !== this.appServer?.appServerEpoch) return expired("该命令请求已过期。 ");
           this.db.setSetting(`guidance.${nonce}`, JSON.stringify({ sessionId: request.sessionId, expiresAt: request.expiresAt }));
           return { delivery: "replace", card: remoteRequestResolvedCard("告诉 Codex 怎么做", "请直接在当前话题回复替代做法；桥接器会先拒绝原命令，再将你的说明注入当前回合。") };
         }
         case "cancel_wizard":
           const wizard = this.validWizard(event.openId, event);
-          if (!wizard) return errorCard("该向导已过期或已被替换。");
+          if (!wizard) return expired("该向导已过期或已被替换。");
           this.db.deleteSetting(this.wizardKey(event.openId, wizard.mode));
-          return homeCard(this.cardStatus(), "已取消新建向导");
+          return replace(homeCard(this.cardStatus(), "已取消新建向导"));
         case "sync":
           void this.syncAll();
-          return homeCard(this.cardStatus(), "已启动全量扫描");
+          return { delivery: "replace", card: serviceCard(this.cardStatus(), "已启动全量扫描"), toast: "已启动全量扫描" };
         case "pause":
           this.db.setSetting("sync.paused", "1");
-          return homeCard(this.cardStatus(), "同步已暂停：不再同步本机会话，也不启动新的或排队中的任务；正在运行的任务不会因此停止，需要停止请在会话话题发送 /cancel。");
+          return replace(serviceCard(this.cardStatus(), "同步已暂停：不再同步本机会话，也不启动新的或排队中的任务；正在运行的任务不会因此停止，需要停止请在会话话题发送 /cancel。"));
         case "resume":
           this.db.setSetting("sync.paused", "0");
           void this.syncAll();
-          return homeCard(this.cardStatus(), "同步已恢复：继续同步本机会话，排队中的任务会按顺序开始。");
-        case "retry": {
-          this.messageLinkPermissionDenied = false;
-          const modelsReady = await this.refreshModels();
-          let appServerReady = true;
-          if (this.appServer && this.appServer.getHealth().state === "unhealthy") {
-            try { await this.appServer.restart("manual retry"); } catch (error) { appServerReady = false; this.db.recordFailure("app_server_retry", {}, error); }
-          }
-          if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
-          void this.syncAll();
-          void this.backfillSessionLinks();
-          void this.deliverPendingOutputs(true);
-          return homeCard(this.cardStatus(), modelsReady && appServerReady ? "已重新连接：模型目录已刷新，app-server 正常，并开始重新同步。不会重新执行任何任务；结果没有发到飞书的回合会自动补发。" : "模型目录或 app-server 仍不可用，请稍后再发送 /retry。");
-        }
-        default: return errorCard(`未知卡片操作：${event.action}`);
+          return replace(serviceCard(this.cardStatus(), "同步已恢复：继续同步本机会话，排队中的任务会按顺序开始。"));
+        case "retry":
+          // Refreshing the model catalog alone may take 45 s; the service card says so and shows the result.
+          return this.slowActions.run(event.openMessageId, "retry", serviceCard(this.cardStatus(), "正在重新连接：刷新模型目录，必要时重启 app-server……"), async () => {
+            const ready = await this.reconnect();
+            return serviceCard(this.cardStatus(), ready ? "已重新连接：模型目录已刷新，app-server 正常，并开始重新同步。不会重新执行任何任务；结果没有发到飞书的回合会自动补发。" : "模型目录或 app-server 仍不可用，请稍后再点“重新连接”。");
+          }, (error) => serviceCard(this.cardStatus(), `重新连接失败：${error instanceof Error ? error.message : String(error)}`));
+        default: return refuse(`未知卡片操作：${event.action}`);
       }
     } catch (error) {
       this.db.recordFailure("card_action", { action: event.action, openMessageId: event.openMessageId }, error);
-      return errorCard(error instanceof Error ? error.message : String(error));
+      return refuse(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -2198,17 +2224,8 @@ export class SyncRuntime implements FeishuRouterPort {
       return;
     }
     if (isCommand(["/retry"], ["重试"])) {
-      this.messageLinkPermissionDenied = false;
-      const modelsReady = await this.refreshModels();
-      let appServerReady = true;
-      if (this.appServer && this.appServer.getHealth().state === "unhealthy") {
-        try { await this.appServer.restart("manual retry"); } catch (error) { appServerReady = false; this.db.recordFailure("app_server_retry", {}, error); }
-      }
-      if (modelsReady && appServerReady) this.db.resolveInfrastructureFailures();
-      await this.respondCard(message, homeCard(this.cardStatus(), modelsReady && appServerReady ? "已重新连接：模型目录已刷新，app-server 正常，并开始重新同步。不会重新执行任何任务；结果没有发到飞书的回合会自动补发。" : "模型目录或 app-server 仍不可用，请稍后再发送 /retry。"));
-      void this.syncAll();
-      void this.backfillSessionLinks();
-      void this.deliverPendingOutputs(true);
+      const ready = await this.reconnect();
+      await this.respondCard(message, homeCard(this.cardStatus(), ready ? "已重新连接：模型目录已刷新，app-server 正常，并开始重新同步。不会重新执行任何任务；结果没有发到飞书的回合会自动补发。" : "模型目录或 app-server 仍不可用，请稍后再发送 /retry。"));
       return;
     }
     if (isCommand(["/cancel"], ["取消"])) {
