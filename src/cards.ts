@@ -300,20 +300,35 @@ export function rootGrantCard(nonce: string, cwd: string, taskSummary: string, e
 }
 
 /** `code`: the command to approve, shown as it will run. */
-export function remoteRequestCard(request: { nonce: string; type: string; title: string; detail: string; code?: string; decisions?: string[]; secret?: boolean }): CardDefinition {
+export function remoteRequestCard(request: { nonce: string; type: string; title: string; detail: string; code?: string; decisions?: string[]; secret?: boolean; network?: string }): CardDefinition {
   const decisions = request.decisions ?? [];
   const allowed = (value: string) => !decisions.length || decisions.includes(value);
   const buttons = [
-    ...(allowed("accept") ? [button("批准一次", "remote_approve", "primary", { nonce: request.nonce, decision: "accept" })] : []),
+    ...(allowed("accept") ? [button(request.network ? "批准一次（需二次确认）" : "批准一次", "remote_approve", "primary", { nonce: request.nonce, decision: "accept" })] : []),
     button("拒绝", "remote_approve", "danger", { nonce: request.nonce, decision: "decline" }),
     button("取消回合", "remote_approve", "default", { nonce: request.nonce, decision: "cancel" }),
   ];
   return card(request.title, "orange", [
     ...(request.code ? [markdown(codeBlock(request.code, 2_000))] : []),
     markdown(safeMarkdown(request.detail)),
+    ...(request.network ? [markdown(`**这条命令会联网：${safeMarkdown(request.network)}。** 批准时需要再确认一次。`)] : []),
     ...(request.secret ? [note("敏感内容会经过飞书平台；提交值不会被桥接器写入数据库、日志或回复。 ")] : []),
     actionRow(buttons),
     ...(request.type === "command_approval" ? [actionRow([button("告诉 Codex 怎么做", "remote_guidance", "default", { nonce: request.nonce })])] : []),
+  ]);
+}
+
+/** Second step for a command that reaches the network: says what approving it allows before it is sent to Codex. */
+export function networkConfirmCard(nonce: string, label: string, code: string, decision: string): CardDefinition {
+  return card("确认联网执行", "red", [
+    ...(code ? [markdown(codeBlock(code, 2_000))] : []),
+    markdown(`这条命令会联网（${safeMarkdown(label)}）。批准后 Codex 会在沙箱之外运行它：可能把代码推送到远程仓库，或下载第三方包并执行其安装脚本。`),
+    note("确认无误再点“确认联网执行”；只批准这一次，下次同类命令仍会再问。"),
+    actionRow([
+      button("确认联网执行", "remote_approve", "danger", { nonce, decision, confirmed: "1" }),
+      button("拒绝", "remote_approve", "default", { nonce, decision: "decline" }),
+      button("取消回合", "remote_approve", "default", { nonce, decision: "cancel" }),
+    ]),
   ]);
 }
 

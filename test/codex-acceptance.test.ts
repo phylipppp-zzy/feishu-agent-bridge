@@ -69,6 +69,34 @@ test("an approvable command is shown as a code block on its card", { timeout: 10
   await shutdown(env);
 }));
 
+test("network commands need a second confirmation, and whole-word rules no longer catch async or ./run.sh", { timeout: 10_000 }, () => withHome("codex-network-confirm-", async (home) => {
+  const policy = (command: string) => remoteApprovalAllowed("command_approval", { command }, [], context);
+  assert.match(policy("git push origin main").network ?? "", /git/);
+  assert.match(policy("pip install torch").network ?? "", /pip/);
+  assert.equal(policy("npm test").network, undefined);
+  assert.equal(policy('grep -rn "async " src').allowed, true, "the nc rule matches whole words only");
+  assert.equal(policy("./run.sh").allowed, true, "the /run rule matches the directory only");
+  assert.equal(policy("curl https://example.com").allowed, false, "upload tools stay forbidden");
+
+  const app = fakeAppServer(numberedTurns());
+  const env = await importedSession(home, app.server);
+  await startTurn(env);
+  let settled = false;
+  const result = env.internals.onAppServerRequest(commandRequest(11, "git push origin main")).finally(() => { settled = true; });
+  await waitFor(() => env.feishu.cards.some((card) => title(card.card) === "Codex 请求执行命令"));
+  assert.match(JSON.stringify(env.feishu.cards.find((item) => title(item.card) === "Codex 请求执行命令")!.card), /需二次确认/);
+  const nonce = env.db.nextServerRequest(SESSION_ID, "command_approval")!.nonce;
+  const tap = (value: Record<string, unknown>) => env.service.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: "card-x", action: "remote_approve", value: { nonce, ...value }, formValues: {} });
+  const first = await tap({ decision: "accept" }) as { delivery?: string; card?: unknown };
+  assert.equal(first.delivery, "replace");
+  assert.equal(title(first.card as never), "确认联网执行");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(settled, false, "the first tap does not approve");
+  await tap({ decision: "accept", confirmed: "1" });
+  assert.match(JSON.stringify(await result), /accept/);
+  await shutdown(env);
+}));
+
 test("a request declined by the safety rules is reported in the topic instead of disappearing", { timeout: 10_000 }, () => withHome("codex-approval-declined-", async (home) => {
   const app = fakeAppServer(numberedTurns());
   const env = await importedSession(home, app.server);
