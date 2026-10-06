@@ -32,8 +32,23 @@ export async function rootExecutionPreflight(config: BridgeConfig): Promise<Root
 
 const SENSITIVE = /(?:\.ssh|id_rsa|known_hosts|\.aws|\.azure|\.config\/gcloud|kubeconfig|shadow|passwd|credentials?|secret|token|api[_-]?key|password|cookie|authorization|private[_-]?key)/i;
 const FORBIDDEN_COMMAND = /(?:^|[\s;&|])(sudo|su|doas|setcap|capsh|unshare|nsenter|mount|umount|docker|podman|containerd|crictl)(?:$|[\s;&|])/i;
-const UPLOAD_COMMAND = /(?:curl|wget|http|ftp|nc|netcat|scp|rsync)(?:[\s;&|)]|$)/i;
-const SOCKET_PATH = /(?:\/var\/run|\/run|\/proc\/1\/root|docker\.sock|podman|containerd)/i;
+// Whole words only: "async " is not nc, and ./run.sh is not /run.
+const UPLOAD_COMMAND = /(?:^|[\s;&|(=])(?:curl|wget|http|ftp|nc|netcat|scp|rsync)(?:[\s;&|)]|$)/i;
+const SOCKET_PATH = /(?:^|[\s"'=:(])(?:\/var\/run|\/run)(?:\/|[\s"']|$)|\/proc\/1\/root|docker\.sock|podman|containerd/i;
+/** Commands that reach the network in ordinary use; approving them from Feishu needs a second, explicit confirmation. */
+const NETWORK_COMMANDS: Array<[RegExp, string]> = [
+  [/(?:^|[\s;&|(])git\s+(?:-\S+\s+)*(?:push|pull|fetch|clone|ls-remote|submodule\s+update)\b/i, "git 远程操作（push、pull、fetch、clone 等）"],
+  [/(?:^|[\s;&|(])(?:pip3?|python3?\s+-m\s+pip|uv\s+pip)\s+(?:install|download|upload)\b/i, "pip 安装或下载包"],
+  [/(?:^|[\s;&|(])uv\s+(?:sync|add|lock|tool\s+install)\b|(?:^|[\s;&|(])(?:conda|mamba|micromamba)\s+(?:install|create|update)\b/i, "uv、conda 安装依赖"],
+  [/(?:^|[\s;&|(])(?:npm|pnpm|yarn|bun)\s+(?:install|i|ci|add|update|publish)\b|(?:^|[\s;&|(])(?:npx|pnpx|bunx)\s/i, "npm 等安装或发布包"],
+  [/(?:^|[\s;&|(])(?:cargo\s+(?:install|publish|fetch)|go\s+(?:get|install|mod\s+download))\b/i, "cargo、go 下载依赖"],
+  [/(?:^|[\s;&|(])(?:ssh|sftp|huggingface-cli|hf)\s/i, "ssh 或模型下载"],
+];
+/** Why a command needs the second confirmation, or null when it does not touch the network. */
+export function networkCommandLabel(command: string): string | null {
+  const words = command.replace(/\\\n/g, "").replace(/['"\\]/g, "");
+  return NETWORK_COMMANDS.find(([pattern]) => pattern.test(words))?.[1] ?? null;
+}
 const KNOWN_PERMISSION_TYPES = new Set(["fs_read", "fs_write", "network", "process", "clipboard", "mcp"]);
 
 export interface PermissionEntry { type: string; path?: string }
@@ -156,7 +171,7 @@ const REASON_TEXT: Record<string, string> = {
 };
 export function approvalReasonText(reason: string | undefined): string { return (reason && REASON_TEXT[reason]) ?? reason ?? "安全规则不允许"; }
 
-export function remoteApprovalAllowed(type: RemoteRequestType, params: Record<string, unknown>, allowedMcpServers: readonly string[], context?: ApprovalContext): { allowed: boolean; reason?: string; summary?: SafeApprovalSummary } {
+export function remoteApprovalAllowed(type: RemoteRequestType, params: Record<string, unknown>, allowedMcpServers: readonly string[], context?: ApprovalContext): { allowed: boolean; reason?: string; summary?: SafeApprovalSummary; network?: string } {
   const summary = remoteApprovalSummary(type, params, context);
   const encoded = JSON.stringify(params);
   if (type === "user_input") {
@@ -177,6 +192,10 @@ export function remoteApprovalAllowed(type: RemoteRequestType, params: Record<st
     const words = command.replace(/\\\n/g, "").replace(/['"\\]/g, "");
     if (FORBIDDEN_COMMAND.test(words) || SENSITIVE.test(words)) return { allowed: false, reason: "privilege escalation, sensitive data, or runtime socket access is forbidden", summary };
     if (!command || /\$['"]/.test(command) || UPLOAD_COMMAND.test(words) || /[<>\x60]|(?:^|[\s;&|(])(?:sh|bash|zsh|fish|env|xargs|eval|exec)(?:[\s;&|)]|$)/i.test(words)) return { allowed: false, reason: "command cannot be safely reviewed or may upload data", summary };
+  }
+  if (type === "command_approval") {
+    const network = networkCommandLabel(commandText(params));
+    if (network) return { allowed: true, summary, network };
   }
   if (type === "file_approval") {
     const grantRoot = typeof params.grantRoot === "string" ? params.grantRoot : typeof params.grant_root === "string" ? params.grant_root : context.canonicalCwd;

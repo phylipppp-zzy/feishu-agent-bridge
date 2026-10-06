@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { archivedSessionActionCard, assistantMarkdownCard, hostContextPreviewCard, hostContextResultCard, permissionDetailsCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, autoDeclinedCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
+import { archivedSessionActionCard, assistantMarkdownCard, hostContextPreviewCard, hostContextResultCard, permissionDetailsCard, choiceAcceptedCard, choiceCancelledCard, choiceCard, choiceResolvedElsewhereCard, commandMenuCard, errorCard, helpCard, homeCard, modelCard, projectsCard, reasoningEffortCard, recentSessionsCard, remoteQuestionCard, remoteRequestCard, remoteRequestResolvedCard, autoDeclinedCard, networkConfirmCard, reviewCard, rootGrantCard, runStatusCard, serviceCard, sessionCard, wizardReadyCard } from "./cards.js";
 import { isExpiredFeishuMessage } from "./safe-log.js";
 import { AppServerRpcError, CodexAppServer, notificationTurnId, type JsonRpcMessage } from "./app-server.js";
 import { CodexCliProbe } from "./codex.js";
@@ -1130,7 +1130,7 @@ export class SyncRuntime implements FeishuRouterPort {
     const pending: PendingServerRequest = {
       nonce, rpcId: request.id, epoch: this.appServer.appServerEpoch, type, sessionId: scopedSessionId, turnId, itemId,
       openId, chatId: session.chatId ?? this.boundChatId() ?? "", rootMessageId,
-      cardMessageId: null, payload: this.safeRequestPayload(type, params, canonicalCwd), status: "pending", expiresAt: expiry,
+      cardMessageId: null, payload: { ...this.safeRequestPayload(type, params, canonicalCwd), ...(policy.network ? { network: policy.network } : {}) }, status: "pending", expiresAt: expiry,
     };
     const state = this.turnCoordinator.mutableTurn(scopedSessionId);
     if (state && state.state !== "cancelling") {
@@ -1144,7 +1144,7 @@ export class SyncRuntime implements FeishuRouterPort {
     if (secret) throw new Error("Secret input is never accepted through Feishu");
     const card = type === "user_input"
       ? remoteQuestionCard(nonce, this.userInputQuestions(pending), 0)
-      : remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(type === "command_approval" && typeof pending.payload.commandSummary === "string" ? { code: pending.payload.commandSummary } : {}), ...(decisions ? { decisions } : {}), secret });
+      : remoteRequestCard({ nonce, type, title: this.remoteRequestTitle(type), detail, ...(type === "command_approval" && typeof pending.payload.commandSummary === "string" ? { code: pending.payload.commandSummary } : {}), ...(decisions ? { decisions } : {}), ...(typeof pending.payload.network === "string" ? { network: pending.payload.network } : {}), secret });
     // Stored and awaited before the card exists: an answer may arrive as soon as it is shown.
     this.db.saveServerRequest(pending);
     const answered = this.approvalService.waitFor(nonce);
@@ -2045,6 +2045,14 @@ export class SyncRuntime implements FeishuRouterPort {
         case "remote_approve": {
           const nonce = typeof event.value.nonce === "string" ? event.value.nonce : "";
           const decision = typeof event.value.decision === "string" ? event.value.decision : "decline";
+          // A command that reaches the network is approved in two steps: the first tap only shows what that means.
+          const unclaimed = this.db.getServerRequest(nonce);
+          const network = typeof unclaimed?.payload.network === "string" ? unclaimed.payload.network : "";
+          if (decision.startsWith("accept") && network && event.value.confirmed !== "1" && unclaimed?.status === "pending"
+            && unclaimed.openId === event.openId && unclaimed.chatId === event.chatId) {
+            const code = typeof unclaimed.payload.commandSummary === "string" ? unclaimed.payload.commandSummary : "";
+            return { delivery: "replace", card: networkConfirmCard(nonce, network, code, decision) };
+          }
           const request = this.db.claimServerRequest(nonce, event.openId, event.chatId, this.appServer?.appServerEpoch ?? -1);
           if (!request) return errorCard("该 Codex 请求已过期、已处理或不属于当前用户。 ");
           void this.resolveRemoteRequest(request, decision).catch((error) => this.db.recordFailure("remote_request_response", { nonce }, error));
