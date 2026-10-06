@@ -29,8 +29,8 @@ export function parseModelCatalog(raw: string): ModelCapability[] {
 export class CodexCliProbe {
   constructor(private readonly bin: string, private readonly codexHome: string) {}
 
-  async version(): Promise<string> {
-    const { stdout } = await execFileAsync(this.bin, ["--version"], { env: { ...process.env, CODEX_HOME: this.codexHome } });
+  async version(timeoutMs = 15_000): Promise<string> {
+    const { stdout } = await execFileAsync(this.bin, ["--version"], { env: { ...process.env, CODEX_HOME: this.codexHome }, timeout: timeoutMs });
     return stdout.trim();
   }
 
@@ -41,9 +41,9 @@ export class CodexCliProbe {
     } catch { return false; }
   }
 
-  async listModels(): Promise<ModelCapability[]> {
+  async listModels(timeoutMs = 30_000): Promise<ModelCapability[]> {
     const { stdout } = await execFileAsync(this.bin, ["debug", "models"], {
-      env: { ...process.env, CODEX_HOME: this.codexHome }, maxBuffer: 1_000_000,
+      env: { ...process.env, CODEX_HOME: this.codexHome }, maxBuffer: 1_000_000, timeout: timeoutMs,
     });
     return parseModelCatalog(stdout);
   }

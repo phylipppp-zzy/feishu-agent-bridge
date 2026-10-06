@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { basename } from "node:path";
-import { actionRow, button, card, inputForm, markdown, nextElementId, note, safeMarkdown, shorten } from "../card-kit.js";
+import { actionRow, button, card, codeBlock, inputForm, markdown, nextElementId, note, safeMarkdown, shorten } from "../card-kit.js";
 import type { CardDefinition } from "../types.js";
 import type { TurnBlock, TurnView } from "./conversation.js";
 import type { ClaudeSession } from "./db.js";
@@ -201,11 +201,6 @@ export function claudeRootCard(session: ClaudeSession, options: RootCardOptions 
       button("刷新", "refresh_session", "default", id),
     ]),
   ]);
-}
-
-function codeBlock(text: string, limit: number): string {
-  const clipped = text.length > limit ? `${text.slice(0, limit)}\n…（已截断）` : text;
-  return `\`\`\`\n${clipped.replace(/\`\`\`/g, "ˋˋˋ")}\n\`\`\``;
 }
 
 /** What a tool call would do, in a form readable on a phone. */

@@ -132,6 +132,28 @@ export interface TurnState {
   inputHash?: string;
   finalOutputHash?: string;
   stream?: { cardId: string; messageId: string; elementId: string; sequence: number; lastSentAt: number };
+  /** Whether this turn was started with Root (danger-full-access) permissions. */
+  rootMode?: boolean;
+}
+
+/** What part of a finished turn's output reached Feishu; `uncertain` means the request may or may not have arrived. */
+export type DeliveryPartStatus = "pending" | "sent" | "failed" | "uncertain";
+
+/** A finished bridge turn's output, kept until it is in Feishu so it can be sent again without running anything. */
+export interface TurnOutput {
+  turnId: string;
+  sessionId: string;
+  rootMessageId: string;
+  title: string;
+  summary: string;
+  content: string;
+  cardStatus: DeliveryPartStatus;
+  cardMessageId: string | null;
+  /** `none` when the text fits in the card. */
+  fileStatus: DeliveryPartStatus | "none";
+  fileMessageId: string | null;
+  attempts: number;
+  lastError: string | null;
 }
 
 export interface FileCursor {
@@ -204,12 +226,13 @@ export interface FeishuPort {
   ): Promise<void>;
   createSessionRoot(chatId: string, title: string, detail: string, card?: CardDefinition): Promise<SentRootMessage>;
   replyText(rootMessageId: string, text: string): Promise<string>;
-  replyFile(rootMessageId: string, fileName: string, data: Buffer): Promise<string>;
+  /** `uuid` makes Feishu drop a repeat of the same request within an hour. */
+  replyFile(rootMessageId: string, fileName: string, data: Buffer, options?: { uuid?: string }): Promise<string>;
   replyImage(rootMessageId: string, data: Buffer): Promise<string>;
   downloadImage(messageId: string, imageKey: string, maxBytes?: number): Promise<Buffer>;
   sendText(chatId: string, text: string): Promise<string>;
   sendCard(chatId: string, card: CardDefinition): Promise<string>;
-  replyCard(rootMessageId: string, card: CardDefinition): Promise<string>;
+  replyCard(rootMessageId: string, card: CardDefinition, options?: { uuid?: string }): Promise<string>;
   updateCard(messageId: string, card: CardDefinition): Promise<void>;
   deleteMessage(messageId: string): Promise<void>;
   getMessageMetadata(messageId: string): Promise<FeishuMessageMetadata | null>;

@@ -37,19 +37,49 @@ export function utf8Chunks(text: string, maxBytes = MESSAGE_BYTES): string[] {
   return result;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Picks one language version of a post body: single-language bodies (top-level title/content) as-is, otherwise zh_cn, en_us, then the first with a content array. */
+function postLocale(body: Record<string, unknown>): Record<string, unknown> | null {
+  if ("title" in body || "content" in body) return body;
+  const candidates = [body.zh_cn, body.en_us, ...Object.values(body)].filter(isRecord);
+  return candidates.find((value) => Array.isArray(value.content))
+    ?? candidates.find((value) => typeof value.title === "string") ?? null;
+}
+
+/** Renders one post element as plain text; at mentions, emotions, images, media, hr and unknown tags yield "". */
+function postElementText(element: Record<string, unknown>): string {
+  const text = typeof element.text === "string" ? element.text : "";
+  switch (element.tag) {
+    case "text": case "md": case "code_block": return text;
+    case "a": {
+      const href = typeof element.href === "string" ? element.href.trim() : "";
+      if (!href) return text;
+      return !text.trim() || text.trim() === href ? href : `${text} (${href})`;
+    }
+    default: return "";
+  }
+}
+
 function postContent(body: Record<string, unknown>): { text: string; imageKeys: string[] } {
-  const text: string[] = [];
   const imageKeys: string[] = [];
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) { for (const item of value) visit(item); return; }
-    if (!value || typeof value !== "object") return;
-    const item = value as Record<string, unknown>;
-    if (item.tag === "text" && typeof item.text === "string") text.push(item.text);
-    if (item.tag === "img" && typeof item.image_key === "string") imageKeys.push(item.image_key);
-    for (const child of Object.values(item)) visit(child);
-  };
-  visit(body);
-  return { text: text.join("\n"), imageKeys };
+  const locale = postLocale(body);
+  if (!locale) return { text: "", imageKeys };
+  const lines: string[] = [];
+  if (typeof locale.title === "string" && locale.title.trim()) lines.push(locale.title.trim());
+  for (const paragraph of Array.isArray(locale.content) ? locale.content : []) {
+    if (!Array.isArray(paragraph)) continue;
+    let line = "";
+    for (const element of paragraph) {
+      if (!isRecord(element)) continue;
+      if (element.tag === "img" && typeof element.image_key === "string") imageKeys.push(element.image_key);
+      line += postElementText(element);
+    }
+    if (line.trim()) lines.push(line);
+  }
+  return { text: lines.join("\n"), imageKeys };
 }
 
 async function streamToBuffer(stream: Readable, maxBytes = Number.MAX_SAFE_INTEGER): Promise<Buffer> {
@@ -289,10 +319,10 @@ export class FeishuClient implements FeishuPort {
     })));
   }
 
-  async replyCard(rootMessageId: string, card: CardDefinition): Promise<string> {
+  async replyCard(rootMessageId: string, card: CardDefinition, options: { uuid?: string } = {}): Promise<string> {
     return this.limited(async () => this.ensureResponse(await this.client.im.message.reply({
       path: { message_id: rootMessageId },
-      data: { msg_type: "interactive", content: JSON.stringify(card), reply_in_thread: true },
+      data: { msg_type: "interactive", content: JSON.stringify(card), reply_in_thread: true, ...(options.uuid ? { uuid: options.uuid } : {}) },
     })));
   }
 
@@ -376,14 +406,14 @@ export class FeishuClient implements FeishuPort {
     return lastId;
   }
 
-  async replyFile(rootMessageId: string, fileName: string, data: Buffer): Promise<string> {
+  async replyFile(rootMessageId: string, fileName: string, data: Buffer, options: { uuid?: string } = {}): Promise<string> {
     const uploaded = await this.limited(() => this.client.im.file.create({
       data: { file_type: "stream", file_name: fileName, file: data },
     }));
     if (!uploaded?.file_key) throw new Error("Feishu file upload returned no file_key");
     return this.limited(async () => this.ensureResponse(await this.client.im.message.reply({
       path: { message_id: rootMessageId },
-      data: { msg_type: "file", content: JSON.stringify({ file_key: uploaded.file_key }), reply_in_thread: true },
+      data: { msg_type: "file", content: JSON.stringify({ file_key: uploaded.file_key }), reply_in_thread: true, ...(options.uuid ? { uuid: options.uuid } : {}) },
     })));
   }
 

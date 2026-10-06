@@ -202,6 +202,8 @@ Cards may ask for confirmation to:
 
 Cards only express business intent. They never bypass path validation or the sandbox policy. The bridge never offers remote approval for sudo, privilege escalation, passwords, keys, tokens, verification codes, CAPTCHA, authentication, sandbox bypass, runtime sockets, writes outside the allowed root, or private-data export to external services. Secret input in Feishu is always rejected.
 
+Command approval cards show the command to run in a code block, without the `/bin/bash -lc` wrapper Codex adds. Commands that use network transfer tools (curl, wget, scp, …), nested shells, redirection, privilege escalation, or sensitive paths cannot be approved from Feishu: the bridge declines them and posts an “auto-declined” card in the topic explaining why, and Codex receives the refusal and tries another way.
+
 ## Synchronization and Privacy
 
 Feishu receives readable conversation content only: user messages, assistant text, and progress updates. System and developer instructions, internal events, tool parameters, and tool output stay in local JSONL.
