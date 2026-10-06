@@ -157,6 +157,15 @@ npm run uninstall:claude-hooks
 - `/stop`：停止当前回合；`/export`：导出完整记录。
 - `/ls [路径]`：查看会话目录（或指定目录）下的文件；`/ls -a` 同时列出以 `.` 开头的项。
 - `/deliver <路径…>`：把本机文件发到话题里，例如 `/deliver report.md output/*.png`。
+- `/status`：同 `/`；`/model`：模型和推理强度卡片；`/mode`：权限模式卡片；`/help`：帮助卡片。这几个命令由桥接回卡片，不会交给 Claude，也不会切换控制权。
+- 只能在终端里使用的 Claude Code 命令（如 `/config`、`/login`、`/mcp`、`/permissions`）：桥接直接回复“只能在电脑上使用”。
+- 以 `>>` 开头的消息：排队，等这一轮结束后再发给 Claude。
+- 其它所有内容（包括 `/compact` 等以 `/` 开头的内容）都原样交给 Claude。
+- 话题里的命令处理出错时，话题里会收到“处理失败”和原因。
+
+### 机器人菜单
+
+安装器不会自动配置机器人菜单。需要时在飞书开发者后台的“机器人 → 自定义菜单”里手工添加，菜单项类型选“事件”，事件键用：`claude.home`（控制台）、`claude.new`（新建会话）、`claude.sessions`（最近会话）、`claude.search`（搜索会话）、`claude.service`（控制台）。改完后重新发布应用版本。不配置菜单不影响其他功能，发送 `/` 同样能打开命令菜单。
 
 ### 查看和发送本机文件
 
@@ -173,8 +182,6 @@ npm run uninstall:claude-hooks
 - PNG、JPEG、GIF、WebP、BMP 图片（不超过 10 MB）作为图片消息发送，其余作为文件消息发送。手机上实测，Markdown、CSV、JSON、代码、HTML、PDF 文件都能直接预览；SVG 不能作为图片发送，作为文件发送时手机上也不能预览，需要先另存为 PNG。
 - 每次最多 20 个文件，单个文件不超过 30 MB（飞书的上限）。空文件、`ALLOWED_ROOT` 以外的文件、文件名像密钥或凭据的文件（如 `.env`、`*.pem`、`id_rsa`），以及 `.git`、`.ssh`、`.config`、`.claude` 等目录里的文件都不会发送，卡片里会说明原因。
 - 不需要新增飞书权限，用的是已有的 `im:resource`。
-- 以 `>>` 开头的消息：排队，等这一轮结束后再发给 Claude。
-- 其它所有内容（包括 `/compact` 等以 `/` 开头的内容）都原样交给 Claude。
 
 中文快捷词只在群主消息中生效。
 

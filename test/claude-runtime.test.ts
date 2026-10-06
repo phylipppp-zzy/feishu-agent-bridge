@@ -258,9 +258,38 @@ test("/deliver sends files and images from the session's directory and leaves ou
     assert.ok(outside.delivery === "replace" && JSON.stringify(outside.card).includes("只能查看允许的目录"));
     // "Send the files of this directory" delivers them like /deliver <dir>.
     const before2 = env.feishu.repliesTo(root).length;
-    await env.action("deliver_paths", { sessionId: RECENT, path: join(env.project, "output") });
+    const sending = await env.action("deliver_paths", { sessionId: RECENT, path: join(env.project, "output") });
+    assert.ok(sending.delivery === "replace" && JSON.stringify(sending.card).includes("已开始发送"), "the tap is acknowledged on the card");
     await waitUntil(() => env.feishu.repliesTo(root).length >= before2 + 4);
     assert.equal(title(env.feishu.repliesTo(root)[before2]?.card), "交付文件");
+    assert.equal(env.queries.length, 0);
+  } finally { await env.cleanup(); }
+});
+
+test("in a topic /help, /status, /model and /mode answer with cards, terminal-only commands are refused, and errors are reported", async () => {
+  const env = await setup("claude-topic-commands-");
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "t-p1", now - HOUR, "问题"), reply(RECENT, "t-a1", now - HOUR + MINUTE, "回答")], env.project)));
+    await env.bind();
+    const root = env.db.getSession(RECENT)!.rootMessageId!;
+    const send = (text: string) => env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text }));
+    await send("/help");
+    assert.equal(title(env.feishu.repliesTo(root).at(-1)?.card), "Claude 桥接帮助");
+    await send("/model");
+    assert.match(JSON.stringify(env.feishu.repliesTo(root).at(-1)?.card), /set_effort/);
+    await send("/mode");
+    assert.match(JSON.stringify(env.feishu.repliesTo(root).at(-1)?.card), /set_mode/);
+    await send("/status");
+    assert.match(JSON.stringify(env.feishu.repliesTo(root).at(-1)?.card), /claude --resume/);
+    await send("/config");
+    assert.match(env.feishu.repliesTo(root).at(-1)?.text ?? "", /只能在电脑上/);
+    assert.equal(env.queries.length, 0, "none of these starts Claude Code or takes control");
+
+    env.feishu.rejectCard = () => true;
+    await assert.rejects(send("/ls"));
+    env.feishu.rejectCard = null;
+    assert.match(env.feishu.repliesTo(root).at(-1)?.text ?? "", /^处理失败/);
   } finally { await env.cleanup(); }
 });
 

@@ -386,8 +386,8 @@ export function claudeHelpCard(): CardDefinition {
     markdown([
       "本机 Claude Code（VS Code 或终端）的会话会同步到这个群：每个会话一个话题，每一轮对话一张卡片，执行记录折叠在卡片里。",
       "**继续对话**：在会话话题里直接回复即可。Claude 在本机运行，使用你本机的设置；需要你确认的权限、提问和计划会以卡片发到话题里。在手机上发消息会切换到手机侧控制；电脑上这一轮还在运行时，会等它结束后再发送。",
-      "**话题中的命令**：`/` 在话题最新处调出会话控制卡片（同根卡片）；`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录；`/ls [路径]` 查看会话目录（或指定目录）下的文件，加 `-a` 显示以 . 开头的项；`/deliver <路径…>` 把本机文件发到话题里（相对会话目录，可以是文件、目录或通配符，如 `/deliver output/*.png report.md`）。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
-      "**新建会话**：控制台点“新建会话”，或在群主消息中发送 `/new <目录> <任务>`。",
+      "**话题中的命令**：`/` 在话题最新处调出会话控制卡片（同根卡片）；`/status` 同上；`/model` 模型和推理强度；`/mode` 权限模式；`/help` 本帮助；`/stop` 停止当前回合；以 `>>` 开头的消息排到本轮结束后再发；`/export` 导出完整记录；`/ls [路径]` 查看会话目录（或指定目录）下的文件，加 `-a` 显示以 . 开头的项；`/deliver <路径…>` 把本机文件发到话题里（相对会话目录，可以是文件、目录或通配符，如 `/deliver output/*.png report.md`）。其它以 `/` 开头的内容（如 `/compact`）会直接交给 Claude。",
+      "**新建会话**：控制台点“新建会话”；在群主消息中 @我 直接写任务，再选目录；或发送 `/new <目录> <任务>`。",
       "最近几天有活动的会话会自动建话题；更早的会话可以在“最近会话”中搜索后打开。只想同步部分目录时，在环境文件中设置 `SYNC_DIRS`。",
       "",
       "**群主消息中的命令**：`/` 命令菜单、`/help` 帮助、`/status` 控制台、`/new` 新建会话、`/sessions` 最近会话、`/search <关键词>` 搜索、`/sync` 立即同步、`/pause` 与 `/resume-sync` 暂停或恢复同步。",
@@ -441,11 +441,13 @@ export function claudeDeliverCard(cwd: string | null, selection: DeliverySelecti
 }
 
 /** `/ls`: a directory's entries, with buttons to move between directories and send its files. */
-export function claudeListCard(session: ClaudeSession, listing: DirectoryListing, showHidden = false): CardDefinition {
+export function claudeListCard(session: ClaudeSession, listing: DirectoryListing, showHidden = false, notice = ""): CardDefinition {
   const id = { sessionId: session.sessionId };
+  const noticeLine = notice ? [markdown(`**${safeMarkdown(notice)}**`)] : [];
   if (listing.kind === "error") return card("查看目录", "red", [markdown(safeMarkdown(listing.message))]);
   if (listing.kind === "file") {
     return card("文件信息", "wathet", [
+      ...noticeLine,
       markdown(`${safeMarkdown(displayPath(listing.path))}\n${formatBytes(listing.entry.size)} · 修改于 ${formatTime(listing.entry.mtimeMs)}`),
       actionRow([button("发送这个文件", "deliver_paths", "primary", { ...id, path: listing.path })]),
     ]);
@@ -460,6 +462,7 @@ export function claudeListCard(session: ClaudeSession, listing: DirectoryListing
   const hasFiles = listing.entries.some((entry) => entry.kind === "file");
   const extra = showHidden ? { hidden: "1" } : {};
   return card("目录内容", "wathet", [
+    ...noticeLine,
     markdown(`目录：**${safeMarkdown(displayPath(listing.path))}**`),
     markdown(lines.length ? lines.join("\n") : "（空目录）"),
     note(`${summary}。点目录名进入；发送 /deliver <文件名> 把文件发到话题里（路径相对会话目录）。`),

@@ -23,6 +23,9 @@ import { EFFORT_LEVELS, FEISHU_PERMISSION_MODES, imageMediaType, SessionRunner, 
 import { toolSummary } from "./transcript.js";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+/** Claude Code commands that only work in its own terminal UI; sending them from Feishu would only take control away from the computer. */
+const TERMINAL_ONLY_COMMANDS = new Set(["/config", "/login", "/logout", "/doctor", "/ide", "/terminal-setup", "/vim", "/theme", "/resume", "/exit", "/quit",
+  "/permissions", "/hooks", "/agents", "/mcp", "/memory", "/plugin", "/status-line", "/statusline", "/upgrade", "/bug", "/feedback"]);
 /** Minimum time between two updates of one running turn card; Feishu limits message edits. */
 const CARD_UPDATE_INTERVAL_MS = 1_500;
 /** A session started this long before the bridge (re)started is still shown from its first turn. */
@@ -125,6 +128,8 @@ export class ClaudeRuntime {
   private readonly interactions = new InteractionRegistry();
   /** Messages waiting for a turn running in VS Code or a terminal to end, by nonce. */
   private readonly localWaits = new Map<string, { sessionId: string; inputs: FeishuInput[]; expiresAt: number; cardMessageId: string | null }>();
+  /** Exports and deliveries in progress, so a repeated tap does not send everything twice. */
+  private readonly busy = new Set<string>();
   private readonly drafts = new Map<string, { input: FeishuInput; expiresAt: number }>();
   private scanTimer: NodeJS.Timeout | null = null;
   private livenessTimer: NodeJS.Timeout | null = null;
@@ -1021,6 +1026,17 @@ export class ClaudeRuntime {
     return this.db.getSession(sessionId);
   }
 
+  /** `/export` and the export button: one export per session at a time, announced in the topic. */
+  private async exportOnce(sessionId: string): Promise<void> {
+    const key = `export:${sessionId}`;
+    if (this.busy.has(key)) { await this.topicNotice(sessionId, "完整记录正在导出，请稍候。"); return; }
+    this.busy.add(key);
+    try {
+      await this.topicNotice(sessionId, "正在导出完整记录…");
+      await this.exportSession(sessionId);
+    } finally { this.busy.delete(key); }
+  }
+
   private async exportSession(sessionId: string): Promise<void> {
     const session = await this.openSession(sessionId);
     if (!session?.rootMessageId) return;
@@ -1095,7 +1111,14 @@ export class ClaudeRuntime {
     if (message.chatId !== chatId || message.senderOpenId !== this.boundOpenId()) return;
     const command = message.text.trim();
     const session = message.rootId ? this.db.getSessionByRoot(message.rootId) : null;
-    if (session?.rootMessageId) { await this.handleTopicMessage(message, session, command); return; }
+    if (session?.rootMessageId) {
+      try { await this.handleTopicMessage(message, session, command); } catch (error) {
+        // Without this the person only sees silence; a dropped connection is retried by Feishu instead.
+        if (!isRetryableTransportError(error)) await this.topicNotice(session.sessionId, `处理失败：${errorText(error).slice(0, 200)}`);
+        throw error;
+      }
+      return;
+    }
     if (message.chatType === "group" && !message.mentionedBot && !command.startsWith("/")) return;
     const normalized = command.toLowerCase();
     const replyCard = (card: CardDefinition) => this.respondCard(message, card);
@@ -1150,8 +1173,21 @@ export class ClaudeRuntime {
       return;
     }
     if (normalized === "/export") {
-      await reply("正在导出完整记录…");
-      await this.exportSession(session.sessionId);
+      if (!this.inScope(session.cwd)) { await reply(`这个会话的目录不在同步范围（${scopeLabel(this.config.syncDirs)}）内，不能导出。`); return; }
+      await this.exportOnce(session.sessionId);
+      return;
+    }
+    // The bridge's own cards for what Claude Code would only answer in its terminal UI.
+    if (normalized === "/help") { await this.topicCard(session.sessionId, rootId, claudeHelpCard()); return; }
+    if (normalized === "/status") { await this.topicCard(session.sessionId, rootId, this.rootCard(session)); return; }
+    if (normalized === "/model") {
+      await this.topicCard(session.sessionId, rootId, claudeModelCard(session, this.models(), EFFORT_LEVELS, { model: session.prefModel, effort: session.prefEffort }));
+      return;
+    }
+    if (normalized === "/mode") { await this.topicCard(session.sessionId, rootId, claudeModeCard(session, this.feishuMode(session), FEISHU_PERMISSION_MODES)); return; }
+    const slash = normalized.split(/\s/)[0] ?? "";
+    if (TERMINAL_ONLY_COMMANDS.has(slash)) {
+      await reply(`${slash} 只能在电脑上的 Claude Code 里使用。飞书里可用：/model 模型和推理强度，/mode 权限模式，/status 会话状态，/help 帮助。`);
       return;
     }
     if (normalized === "/stop") { await reply(await this.stopTurn(session)); return; }
@@ -1269,14 +1305,21 @@ export class ClaudeRuntime {
       case "deliver_paths": {
         const session = this.db.getSession(sessionId);
         if (!session?.rootMessageId || !value("path")) return replace(claudeNoticeCard("无法发送", "没有找到这个会话的话题。", "red"));
-        // The listing card stays as it is; the files follow it in the topic.
-        void this.deliverFiles(session, [value("path")]).catch((error) => this.fail("deliver_file", { sessionId }, error));
-        return { delivery: "none" };
+        const path = value("path");
+        const key = `deliver:${sessionId}:${path}`;
+        const started = !this.busy.has(key);
+        if (started) {
+          this.busy.add(key);
+          void this.deliverFiles(session, [path]).catch((error) => this.fail("deliver_file", { sessionId }, error)).finally(() => this.busy.delete(key));
+        }
+        // The listing stays usable; a line on it says the files are on their way, so a second tap is not needed.
+        return replace(claudeListCard(session, await listDirectory(path, session.cwd, this.config.allowedRoot),
+          false, started ? "已开始发送，文件会依次出现在话题末尾。" : "这些文件正在发送中，请稍候。"));
       }
       case "export_session": {
         const session = this.db.getSession(sessionId);
         if (!session) return replace(claudeNoticeCard("无法导出", "没有找到这个会话。", "red"));
-        void this.exportSession(sessionId).catch((error) => this.fail("export_session", { sessionId }, error));
+        void this.exportOnce(sessionId).catch((error) => this.fail("export_session", { sessionId }, error));
         return replaceRoot(session);
       }
       case "refresh_session": {
