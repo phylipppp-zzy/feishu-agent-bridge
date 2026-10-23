@@ -9,7 +9,7 @@ Claude 桥接和 Codex 桥接互不影响：各用一个飞书应用、一个私
 - **一个会话一个话题。** 根卡片显示标题（`/rename` 起的名字优先，其次是 Claude 自动生成的标题）、项目目录、来源（VS Code、终端或飞书）、模型、最近的权限模式、当前状态和最后活动时间，并给出 `claude --resume <会话 ID>` 命令。根卡片上的按钮见“从飞书继续对话”一节。
 - **一轮对话一张卡片。** 先发一条提问（例如“VS Code：修复登录页的样式”），再发一张 Claude 卡片。卡片里是 Claude 的文字回复，工具调用折叠在“执行记录”里（例如 `✓ Bash · npm test`、`✗ Edit · src/a.ts`）。进行中的卡片会随日志更新，结束后标题显示“已完成 · 用时 …”。从飞书话题里发起的一轮，你发的那条消息就是提问，桥接不再另发提问行。Claude 工作期间收到的补充消息（无论在 VS Code、终端还是飞书中发送）会以“— 补充：… —”显示在当前这一轮的卡片里。
 - **不是你输入的轮次也会显示**，并注明来源：子 agent 回报、后台任务通知、斜杠命令（如 `/model`）。
-- **状态与提醒。** 根卡片上的状态来自 Claude Code 的 hooks：VS Code 或终端中“运行中”“等待你处理”“已打开（空闲）”“未在本机打开”。会话在本机等待你确认权限时，话题里会收到一条提醒，手机上会有推送。会话正在从飞书继续时，根卡片显示的是飞书中的状态，见“从飞书继续对话”一节。
+- **状态与提醒。** 根卡片上的状态来自 Claude Code 的 hooks：VS Code 或终端中“运行中”“等待你处理”“已打开（空闲）”“未在本机打开”。会话在本机等待你确认权限时，话题里会收到一条提醒，手机上会有推送。本机这一轮因 API 报错（例如额度用完，返回 429）停下时，话题里也会收到一条提醒，附上 Claude Code 显示的报错，其中通常有额度恢复时间；这种情况下会话不会自动继续，需要你发消息让它接着做。子 agent 自己遇到的报错不单独提醒，它会交给主会话处理。会话正在从飞书继续时，根卡片显示的是飞书中的状态，见“从飞书继续对话”一节。
 - **中途断掉的轮次**（会话被关掉、请求失败、没有完成记录）在本机不再运行、半小时没有新记录后显示为“未完成”。
 - **长回复**：卡片只保留最后约 18,000 字，完整内容会以 Markdown 附件发到话题里。
 
@@ -131,7 +131,7 @@ Claude 的执行记录照常通过会话日志同步到话题里，显示方式�
 
 ## 状态 hook 做了什么
 
-安装器在 `~/.claude/settings.json` 的 `SessionStart`、`UserPromptSubmit`、`Stop`、`StopFailure`、`Notification`、`SessionEnd` 事件上各加一条命令，调用 `scripts/claude-hook.mjs`。它只把会话的状态（运行中、等待、空闲、关闭）、等待原因和 Claude Code 进程号写到 `~/.local/state/feishu-claude-bridge/presence/<会话 ID>.json`，不联网、不输出任何内容、出错也不影响 Claude Code，每次耗时约 20 毫秒。VS Code 扩展里的会话同样会触发这些用户级 hook。
+安装器在 `~/.claude/settings.json` 的 `SessionStart`、`UserPromptSubmit`、`Stop`、`StopFailure`、`Notification`、`SessionEnd` 事件上各加一条命令，调用 `scripts/claude-hook.mjs`。它只把会话的状态（运行中、等待、空闲、关闭）、等待原因或报错和 Claude Code 进程号写到 `~/.local/state/feishu-claude-bridge/presence/<会话 ID>.json`，不联网、不输出任何内容、出错也不影响 Claude Code，每次耗时约 20 毫秒。VS Code 扩展里的会话同样会触发这些用户级 hook。
 
 桥接自己启动的 Claude Code 进程（从飞书继续、新建或分叉的会话）带有环境变量 `FEISHU_CLAUDE_BRIDGE=1`，hook 会跳过这些进程，所以这些会话不会被误判为“在本机打开”。
 

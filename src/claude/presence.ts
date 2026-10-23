@@ -6,7 +6,7 @@ import type { PresenceState } from "./db.js";
 
 /**
  * Live state of Claude Code sessions as reported by `scripts/claude-hook.mjs`, which
- * Claude Code runs on SessionStart, UserPromptSubmit, Stop, Notification and SessionEnd.
+ * Claude Code runs on SessionStart, UserPromptSubmit, Stop, StopFailure, Notification and SessionEnd.
  * VS Code sessions run the same user-level hooks as terminal sessions.
  */
 export interface PresenceRecord {
