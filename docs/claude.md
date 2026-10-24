@@ -215,6 +215,37 @@ journalctl --user -u feishu-claude-bridge.service --since today
 - WSL 需要保持运行；systemd 用户服务在没有登录会话时会停止，可以执行 `sudo loginctl enable-linger $USER` 让它常驻。
 - 会话日志格式属于 Claude Code 内部实现，会随版本变化。解析器对未知记录一律忽略；升级 Claude Code 后如发现显示异常，先运行测试，再检查 `src/claude/transcript.ts`。
 
+## 从命令行发送通知（如周报）
+
+本机的定时任务（例如每周日晚的科研进展周检）可以用命令行工具，把一份 Markdown 发到桥接已绑定的飞书群，作为一个新话题。
+
+```bash
+npm run build
+node dist/src/claude/notify.js --title "周报 2026-10-25" --markdown-file /path/to/weekly.md --attach /path/to/check.txt
+```
+
+完整用法：
+
+```
+node dist/src/claude/notify.js --title <标题> (--markdown-file <路径> | --text <正文>) [--attach <路径>]... [--env-file <路径>] [--dry-run]
+```
+
+- `--title`：卡片标题，必填。
+- `--markdown-file` 或 `--text`：正文，二选一，必填。
+- `--attach`：附件文件，可重复。每个附件会在这个话题里作为文件消息回复，顺序与参数一致。附件不存在时，工具在发送任何消息之前就报错退出。
+- `--env-file`：环境文件，默认 `~/.config/feishu-claude-bridge/env`。只补充当前环境里还没有的变量，不会覆盖已有的。需要 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`，状态目录按 `STATE_DIR`（默认 `~/.local/state/feishu-claude-bridge`）。不需要 `FEISHU_BIND_TOKEN`。
+- `--dry-run`：不读凭据、不联网、不读状态库，只打印将要发送的卡片 JSON 和附件列表。
+
+正文超过卡片的大小限制时会被截断，末尾加上“（正文过长，已截断，全文见附件）”，同时自动把 `--markdown-file` 指定的文件作为附件发出。
+
+成功时打印一行 `已发送：<话题根消息 ID>`，退出码 0；运行出错（例如桥接还没有绑定飞书群、飞书返回错误）退出码 1；参数错误退出码 2。
+
+说明：
+
+- 群 ID 从状态库 `bridge.sqlite` 的 `feishu.chat_id` 读取。工具只读打开这个数据库，不会写入，也不会建表或迁移，所以可以在服务运行时使用。它只调用飞书的 REST 接口，不建立长连接，也不需要重启服务。
+- 工具发出的消息不会记入桥接的状态库。桥接的“清理范围外话题”只会撤回它记录过的会话话题里的消息，所以不会碰到这些通知。
+- 如果根卡片发出后某个附件发送失败，话题已经存在，错误信息里会给出话题根消息 ID。
+
 ## 实现位置
 
 | 模块 | 作用 |
@@ -227,4 +258,5 @@ journalctl --user -u feishu-claude-bridge.service --since today
 | `src/claude/interactions.ts` | 等待你处理的权限确认、提问和计划请求 |
 | `src/claude/db.ts` | 会话索引、游标、已发送的卡片、飞书事件去重、飞书续聊的设置 |
 | `src/claude/cards.ts` | 根卡片、轮次卡片、权限确认/提问/计划卡片、新建会话卡片、控制台和导出的 Markdown |
+| `src/claude/notify.ts` | 命令行通知工具：把 Markdown 和附件作为新话题发到已绑定的飞书群 |
 | `src/claude/runtime.ts` | 串起导入、渲染、状态、飞书消息处理和从飞书运行的会话 |

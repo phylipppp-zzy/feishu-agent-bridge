@@ -18,6 +18,7 @@
     "doctor": "node scripts/doctor.mjs",
     "doctor:container": "node scripts/doctor.mjs --container",
     "doctor:claude": "node scripts/doctor-claude.mjs",
+    "notify:claude": "node dist/src/claude/notify.js",
     "check:cards": "node scripts/check-cards.mjs",
     "install:local": "node scripts/install.mjs",
     "install:claude": "node scripts/install-claude.mjs",
