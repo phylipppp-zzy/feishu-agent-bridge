@@ -182,6 +182,20 @@ test("hook states update the root card, notify once while waiting, and close ses
     assert.equal(env.db.getSession(RECENT)?.presenceState, "running");
     assert.match(JSON.stringify(env.feishu.updated.filter((update) => update.id === root).at(-1)?.card), /VS Code 中运行中/);
 
+    // A turn ended by an API error is announced once; a plain Stop is not.
+    const writeStop = (event: string, at: number, message: string | null) => writeFile(join(presenceDir, `${RECENT}.json`), JSON.stringify({
+      version: 1, sessionId: RECENT, event, state: "idle", notificationType: null, message, transcriptPath: env.path(RECENT), cwd: "/home/tester/project",
+      source: null, reason: null, pid: process.pid, pidStartTime: null, at }));
+    const failures = () => env.feishu.repliesTo(root).filter((item) => item.kind === "text" && item.text?.startsWith("⚠️")).map((item) => item.text);
+    await writeStop("Stop", Date.now() + 1_500, null);
+    await env.internals.presence.scan();
+    assert.deepEqual(failures(), []);
+    await writeStop("StopFailure", Date.now() + 1_600, "API Error: Request rejected (429) · resets 1:10pm");
+    await env.internals.presence.scan();
+    await env.internals.presence.scan();
+    assert.deepEqual(failures(), ["⚠️ 这个会话在VS Code中因 API 报错停下了：API Error: Request rejected (429) · resets 1:10pm\n不会自动继续，处理后发消息让它接着做。"]);
+    assert.equal(env.db.getSession(RECENT)?.presenceState, "idle");
+
     await writePresence("running", Date.now() + 2_000, 2_147_483_000);
     await env.internals.presence.scan();
     assert.equal(env.db.getSession(RECENT)?.presenceState, "running");

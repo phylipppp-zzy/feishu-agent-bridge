@@ -572,10 +572,18 @@ export class ClaudeRuntime {
       pid: record.pid, pidStart: record.pidStartTime, message: record.message });
     if (session && session.presenceAtMs === record.at) this.onLocalActivity(session, record);
     if (!session?.rootMessageId || !this.inScope(session.cwd)) return;
-    if (record.state === "waiting" && session.presenceAtMs === record.at && session.waitingNotifiedAtMs < record.at && record.at >= Date.now() - WAITING_NOTICE_MAX_AGE_MS) {
+    const fresh = session.presenceAtMs === record.at && session.waitingNotifiedAtMs < record.at && record.at >= Date.now() - WAITING_NOTICE_MAX_AGE_MS;
+    if (record.state === "waiting" && fresh) {
       this.db.setWaitingNotified(session.sessionId, record.at);
       await this.topicText(session.sessionId, session.rootMessageId, `⏳ 这个会话在${sourceLabel(session.entrypoint)}中等待你处理${record.message ? `：${record.message}` : "。"}`)
         .catch((error) => this.fail("waiting_notice", { sessionId: session.sessionId }, error));
+    }
+    // A turn ended by an API error (such as a usage limit) looks like a finished turn; nothing resumes it on its own.
+    if (record.event === "StopFailure" && fresh) {
+      this.db.setWaitingNotified(session.sessionId, record.at);
+      await this.topicText(session.sessionId, session.rootMessageId,
+        `⚠️ 这个会话在${sourceLabel(session.entrypoint)}中因 API 报错停下了${record.message ? `：${record.message}` : "。"}\n不会自动继续，处理后发消息让它接着做。`)
+        .catch((error) => this.fail("failure_notice", { sessionId: session.sessionId }, error));
     }
     await this.renderSession(session.sessionId);
   }

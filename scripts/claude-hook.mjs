@@ -55,8 +55,9 @@ function presenceState(input) {
     // Compaction also starts a session and can happen in the middle of a turn; keep the last state.
     case "SessionStart": return input.source === "compact" ? null : "idle";
     case "UserPromptSubmit": return "running";
-    case "Stop":
-    case "StopFailure": return "idle";
+    case "Stop": return "idle";
+    // A subagent's API error ends only that subagent; the main thread goes on and gets a notification.
+    case "StopFailure": return typeof input.agent_id === "string" ? null : "idle";
     case "SessionEnd": return "closed";
     case "Notification": {
       const type = input.notification_type;
@@ -215,13 +216,16 @@ async function main() {
     if (reason) { writeSync(1, JSON.stringify({ decision: "block", reason })); return; }
   }
   const notification = input.hook_event_name === "Notification";
+  // The last assistant message of a failed turn is the error Claude Code showed, such as "API Error: ... resets 1:10pm".
+  const failure = input.hook_event_name === "StopFailure"
+    ? text(input.last_assistant_message) ?? text(input.error_details) ?? text(input.error) : null;
   const record = {
     version: 1,
     sessionId,
     event: input.hook_event_name,
     state,
     notificationType: notification ? text(input.notification_type) : null,
-    message: notification ? truncate(text(input.message)) : null,
+    message: notification ? truncate(text(input.message)) : truncate(failure),
     transcriptPath: text(input.transcript_path),
     cwd: text(input.cwd),
     source: text(input.source),
