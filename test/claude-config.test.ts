@@ -16,7 +16,22 @@ test("SYNC_DIRS is optional, comma separated, expands ~ and resolves symlinks", 
     assert.throws(() => parseSyncDirs("relative/dir"), /absolute/);
     const config = loadClaudeConfig({ FEISHU_APP_ID: "a", FEISHU_APP_SECRET: "s", FEISHU_BIND_TOKEN: "t" });
     assert.deepEqual(config.syncDirs, []);
+    assert.equal(config.permissionHookEnabled, false);
+    assert.equal(config.reminderSubscriptionEnabled, false);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("permission hook and reminder subscription are explicit opt-in flags", () => {
+  const base = { FEISHU_APP_ID: "a", FEISHU_APP_SECRET: "s", FEISHU_BIND_TOKEN: "t" };
+  assert.deepEqual(
+    [
+      loadClaudeConfig({ ...base, PERMISSION_HOOK_ENABLED: "true", REMINDER_SUBSCRIPTION_ENABLED: "1" }).permissionHookEnabled,
+      loadClaudeConfig({ ...base, PERMISSION_HOOK_ENABLED: "true", REMINDER_SUBSCRIPTION_ENABLED: "1" }).reminderSubscriptionEnabled,
+    ],
+    [true, true],
+  );
+  assert.equal(loadClaudeConfig({ ...base, PERMISSION_HOOK_ENABLED: "off", REMINDER_SUBSCRIPTION_ENABLED: "no" }).permissionHookEnabled, false);
+  assert.throws(() => loadClaudeConfig({ ...base, PERMISSION_HOOK_ENABLED: "sometimes" }), /PERMISSION_HOOK_ENABLED/);
 });
 
 test("a session is in scope when its working directory is a sync directory or below it", () => {

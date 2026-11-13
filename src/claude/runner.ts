@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { query as sdkQuery, type CanUseTool, type ModelInfo, type Options, type PermissionMode, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { idleDelayFor, type BackgroundWorkState } from "./runner-idle-policy.js";
 
 /**
  * Runs Claude Code sessions for Feishu through the Agent SDK. The SDK starts the same `claude`
@@ -64,6 +65,8 @@ export interface RunnerHandlers {
   canUseTool: CanUseTool;
   /** The Claude Code process ended; `error` is set when it failed rather than finished. */
   onClosed(error: unknown): void;
+  /** Turn or background-task activity changed; runtime should re-evaluate its idle-close timer. */
+  onActivityChange?(): void;
 }
 
 export interface RunnerOptions {
@@ -77,6 +80,8 @@ export interface RunnerOptions {
   permissionMode: FeishuPermissionMode;
   model: string | null;
   effort: EffortLevel | null;
+  /** Legacy RUNNER_IDLE_MS override for a known-idle SDK snapshot; unknown state remains conservative. */
+  knownIdleDelayMs?: number;
 }
 
 export type QueryFactory = (params: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => Query;
@@ -89,12 +94,26 @@ export class SessionRunner {
   private livePrompt: string | null = null;
   /** Messages sent and not yet answered by a result; a turn is running while this is above zero. */
   private pending = 0;
+  private backgroundSnapshotSeen = false;
+  private readonly backgroundTaskIds = new Set<string>();
+  private readonly ambientTaskIds = new Set<string>();
   private closedPromise: Promise<void> | null = null;
 
   constructor(readonly options: RunnerOptions, private readonly handlers: RunnerHandlers, private readonly factory: QueryFactory = sdkQuery) {}
 
   get sessionId(): string { return this.options.sessionId; }
+  /** Main-thread queued/running turn state. Kept separate from background task activity. */
   get busy(): boolean { return this.pending > 0; }
+  /** Activity status derived from SDK background task events; unknown until a complete snapshot arrives. */
+  get backgroundWork(): BackgroundWorkState {
+    if (this.backgroundTaskIds.size > 0) return "busy";
+    return this.backgroundSnapshotSeen ? "idle" : "unknown";
+  }
+  /** Null means keep the runner alive; otherwise this is the grace period from the last idle transition. */
+  get idleDelayMs(): number | null {
+    const delay = idleDelayFor(this.backgroundWork, this.busy);
+    return delay !== null && this.backgroundWork === "idle" ? this.options.knownIdleDelayMs ?? delay : delay;
+  }
 
   start(): void {
     const { options } = this;
@@ -170,6 +189,45 @@ export class SessionRunner {
   }
 
   private handle(message: SDKMessage): void {
+    if (message.type === "system") {
+      if (message.subtype === "background_tasks_changed") {
+        this.backgroundSnapshotSeen = true;
+        this.backgroundTaskIds.clear();
+        this.ambientTaskIds.clear();
+        for (const task of message.tasks) {
+          if (task.ambient) this.ambientTaskIds.add(task.task_id);
+          else this.backgroundTaskIds.add(task.task_id);
+        }
+        this.handlers.onActivityChange?.();
+        return;
+      }
+      if (message.subtype === "task_started") {
+        if (message.ambient) {
+          this.ambientTaskIds.add(message.task_id);
+          this.backgroundTaskIds.delete(message.task_id);
+        } else if (message.is_backgrounded) this.backgroundTaskIds.add(message.task_id);
+        this.handlers.onActivityChange?.();
+        return;
+      }
+      if (message.subtype === "task_notification") {
+        this.backgroundTaskIds.delete(message.task_id);
+        this.ambientTaskIds.delete(message.task_id);
+        this.handlers.onActivityChange?.();
+        return;
+      }
+      if (message.subtype === "task_updated") {
+        if (["completed", "failed", "killed"].includes(message.patch.status ?? "")) {
+          this.backgroundTaskIds.delete(message.task_id);
+          this.ambientTaskIds.delete(message.task_id);
+        } else if (message.patch.is_backgrounded === false) {
+          this.backgroundTaskIds.delete(message.task_id);
+        } else if (message.patch.is_backgrounded === true && !this.ambientTaskIds.has(message.task_id)) {
+          this.backgroundTaskIds.add(message.task_id);
+        }
+        this.handlers.onActivityChange?.();
+        return;
+      }
+    }
     if (message.type === "user" && "isReplay" in message && message.isReplay && !message.parent_tool_use_id) {
       this.livePrompt = message.uuid;
       this.handlers.onPrompt(message.uuid);

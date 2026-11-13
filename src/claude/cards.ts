@@ -4,7 +4,7 @@ import { actionRow, button, card, codeBlock, inputForm, markdown, nextElementId,
 import type { CardDefinition } from "../types.js";
 import type { TurnBlock, TurnView } from "./conversation.js";
 import type { ClaudeSession } from "./db.js";
-import { formatBytes, type DeliverySelection, type DirectoryListing } from "./deliver.js";
+import { formatBytes, type DeliverySelection, type DirectoryListing, type LocalFileLink } from "./deliver.js";
 import type { Interaction } from "./interactions.js";
 
 /** Longest assistant text kept in a card; Feishu rejects card content above roughly 30 KB. */
@@ -117,7 +117,7 @@ function statusTitle(turn: TurnView, stale: boolean): { title: string; template:
  * terminal's transcript. `simpleTools` lists tools as plain text for clients without panels;
  * `stale` marks a turn that stopped without any completion record.
  */
-export function claudeTurnCard(turn: TurnView, options: { simpleTools?: boolean; stale?: boolean } = {}): CardDefinition {
+export function claudeTurnCard(turn: TurnView, options: { simpleTools?: boolean; stale?: boolean; sessionId?: string; turnId?: string; fileLinks?: readonly LocalFileLink[] } = {}): CardDefinition {
   const stale = Boolean(options.stale) && turn.status === "running";
   const { title, template } = statusTitle(turn, stale);
   let text = turnText(turn);
@@ -128,7 +128,20 @@ export function claudeTurnCard(turn: TurnView, options: { simpleTools?: boolean;
   const hidden = tools.length - lines.length + turn.omittedTools;
   if (hidden > 0) lines.unshift(`…另有 ${hidden} 项较早的操作`);
   const empty = stale ? "（这一轮没有完成记录，可能已被关闭或请求失败）" : turn.status === "running" ? "正在处理…" : "（没有文字回复）";
+  text = text.replace(/\[([^\]]+)\]\(([^\s)]+)(?:\s+"[^"]*")?\)/g, (whole, label: string, href: string) => {
+    if (/^[a-z][a-z\d+.-]*:/i.test(href) && !href.startsWith("file:") || href.startsWith("#")) return whole;
+    const match = options.fileLinks?.find((link) => link.references.some((reference) => reference.href === href));
+    const reference = match?.references.find((item) => item.href === href);
+    if (match?.sentAppLink) return `[${reference?.label ?? label}](${match.sentAppLink})`;
+    return match ? `${reference?.label ?? label}（请点卡片下方按钮）` : `${label}（本机文件链接不可在飞书打开）`;
+  });
   const elements: Record<string, unknown>[] = [markdown(text || empty)];
+  if (options.fileLinks?.length && options.sessionId) {
+    for (const link of options.fileLinks.filter((item) => !item.sentAppLink)) elements.push(actionRow([button(
+      `发送文件：${shorten(link.label, 24)}`, "deliver_link", "primary", { sessionId: options.sessionId, turnId: options.turnId ?? turn.turnId,
+        path: link.path, version: link.version, references: JSON.stringify(link.references) },
+    )]));
+  }
   const last = turn.blocks.at(-1);
   if (!stale && turn.status === "running" && last?.kind === "tool" && last.status === "running") elements.push(note(`正在执行：${safeMarkdown(toolLine(last).slice(2))}`));
   if (lines.length) {
@@ -472,6 +485,12 @@ export function claudeListCard(session: ClaudeSession, listing: DirectoryListing
 
 export function claudeNoticeCard(title: string, text: string, template = "grey"): CardDefinition {
   return card(title, template, [markdown(safeMarkdown(text))]);
+}
+
+export function claudeFileSentCard(label: string, link: string | null): CardDefinition {
+  return card("文件已发送", "green", [markdown(link
+    ? `已发送 **${safeMarkdown(label)}**。\n\n[跳到原文件消息](${link})`
+    : `已发送 **${safeMarkdown(label)}**，但暂时无法取得原消息链接。`)]);
 }
 
 /** A session was started from a card; links to its new topic. */

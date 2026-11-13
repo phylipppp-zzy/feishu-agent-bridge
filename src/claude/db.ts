@@ -144,7 +144,30 @@ export class ClaudeBridgeDatabase {
       CREATE TABLE IF NOT EXISTS sent_messages (
         message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS sent_messages_session ON sent_messages(session_id, created_at_ms);`);
+      CREATE INDEX IF NOT EXISTS sent_messages_session ON sent_messages(session_id, created_at_ms);
+      CREATE TABLE IF NOT EXISTS file_deliveries (
+        session_id TEXT NOT NULL, turn_id TEXT NOT NULL, path TEXT NOT NULL, version TEXT NOT NULL, source_refs_json TEXT NOT NULL,
+        content_hash TEXT, chat_id TEXT NOT NULL, root_message_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('sending','sent','failed')), file_message_id TEXT, request_uuid TEXT NOT NULL,
+        error TEXT, updated_at_ms INTEGER NOT NULL, PRIMARY KEY(session_id,turn_id,path,version,chat_id,root_message_id)
+      );
+      CREATE TABLE IF NOT EXISTS reminder_deliveries (
+        session_id TEXT NOT NULL, reminder_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('sending','sent','failed','permanent_failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0, message_id TEXT, destination TEXT, error TEXT, updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(session_id,reminder_id)
+      );
+      CREATE TABLE IF NOT EXISTS backlog_batches (
+        batch_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, root_message_id TEXT NOT NULL, entries_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL, card_message_id TEXT, markdown_message_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending','partial','sent')),
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS backlog_members (
+        session_id TEXT NOT NULL, turn_id TEXT NOT NULL, batch_id TEXT NOT NULL,
+        PRIMARY KEY(session_id,turn_id), FOREIGN KEY(batch_id) REFERENCES backlog_batches(batch_id)
+      );`);
+    // A process that died while sending must not permanently block a later user retry.
+    this.db.prepare("UPDATE file_deliveries SET status='failed',error=COALESCE(error,'bridge restarted during send'),updated_at_ms=? WHERE status='sending'").run(Date.now());
     this.ensureColumn("sessions", "root_out_of_scope", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("sessions", "pref_mode", "TEXT");
     this.ensureColumn("sessions", "pref_model", "TEXT");
@@ -274,6 +297,95 @@ export class ClaudeBridgeDatabase {
 
   recordSentMessage(sessionId: string, messageId: string): void {
     this.db.prepare("INSERT OR IGNORE INTO sent_messages(message_id,session_id,created_at_ms) VALUES(?,?,?)").run(messageId, sessionId, Date.now());
+  }
+  getFileDelivery(sessionId: string, turnId: string, path: string, version: string, chatId: string, rootMessageId: string): { status: "sending" | "sent" | "failed"; fileMessageId: string | null; requestUuid: string; contentHash: string | null; sourceRefs: Array<{ label: string; href: string }> } | null {
+    const row = this.db.prepare("SELECT status,file_message_id,request_uuid,content_hash,source_refs_json FROM file_deliveries WHERE session_id=? AND turn_id=? AND path=? AND version=? AND chat_id=? AND root_message_id=?")
+      .get(sessionId, turnId, path, version, chatId, rootMessageId) as Record<string, unknown> | undefined;
+    return row ? { status: String(row.status) as "sending" | "sent" | "failed", fileMessageId: row.file_message_id ? String(row.file_message_id) : null,
+      requestUuid: String(row.request_uuid), contentHash: row.content_hash ? String(row.content_hash) : null, sourceRefs: JSON.parse(String(row.source_refs_json)) as Array<{ label: string; href: string }> } : null;
+  }
+  fileDeliveriesForTurn(sessionId: string, turnId: string, chatId: string, rootMessageId: string): Array<{ path: string; version: string; fileMessageId: string; sourceRefs: Array<{ label: string; href: string }> }> {
+    return (this.db.prepare("SELECT path,version,file_message_id,source_refs_json FROM file_deliveries WHERE session_id=? AND turn_id=? AND chat_id=? AND root_message_id=? AND status='sent' ORDER BY updated_at_ms DESC")
+      .all(sessionId, turnId, chatId, rootMessageId) as Array<Record<string, unknown>>).map((row) => ({ path: String(row.path), version: String(row.version),
+        fileMessageId: String(row.file_message_id), sourceRefs: JSON.parse(String(row.source_refs_json)) as Array<{ label: string; href: string }> }));
+  }
+  claimFileDelivery(sessionId: string, turnId: string, path: string, version: string, sourceRefs: Array<{ label: string; href: string }>, chatId: string, rootMessageId: string, requestUuid: string): "claimed" | "sending" | "sent" {
+    const existing = this.getFileDelivery(sessionId, turnId, path, version, chatId, rootMessageId);
+    if (existing?.status === "sent" && existing.fileMessageId) return "sent";
+    if (existing?.status === "sending") return "sending";
+    this.db.prepare(`INSERT INTO file_deliveries(session_id,turn_id,path,version,source_refs_json,chat_id,root_message_id,status,request_uuid,updated_at_ms)
+      VALUES(?,?,?,?,?,?,?,'sending',?,?) ON CONFLICT(session_id,turn_id,path,version,chat_id,root_message_id) DO UPDATE SET
+      status='sending',source_refs_json=excluded.source_refs_json,request_uuid=excluded.request_uuid,error=NULL,file_message_id=NULL,updated_at_ms=excluded.updated_at_ms`)
+      .run(sessionId, turnId, path, version, JSON.stringify(sourceRefs), chatId, rootMessageId, requestUuid, Date.now());
+    return "claimed";
+  }
+  completeFileDelivery(sessionId: string, turnId: string, path: string, version: string, contentHash: string, chatId: string, rootMessageId: string, messageId: string): void {
+    this.db.prepare("UPDATE file_deliveries SET status='sent',file_message_id=?,content_hash=?,error=NULL,updated_at_ms=? WHERE session_id=? AND turn_id=? AND path=? AND version=? AND chat_id=? AND root_message_id=?")
+      .run(messageId, contentHash, Date.now(), sessionId, turnId, path, version, chatId, rootMessageId);
+    this.recordSentMessage(sessionId, messageId);
+  }
+  failFileDelivery(sessionId: string, turnId: string, path: string, version: string, chatId: string, rootMessageId: string, error: unknown): void {
+    const detail = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+    this.db.prepare("UPDATE file_deliveries SET status='failed',error=?,updated_at_ms=? WHERE session_id=? AND turn_id=? AND path=? AND version=? AND chat_id=? AND root_message_id=? AND status='sending'")
+      .run(detail, Date.now(), sessionId, turnId, path, version, chatId, rootMessageId);
+  }
+  getReminderDelivery(sessionId: string, reminderId: string): { status: "sending" | "sent" | "failed" | "permanent_failed"; attemptCount: number; messageId: string | null } | null {
+    const row = this.db.prepare("SELECT status,attempt_count,message_id FROM reminder_deliveries WHERE session_id=? AND reminder_id=?")
+      .get(sessionId, reminderId) as Record<string, unknown> | undefined;
+    return row ? { status: String(row.status) as "sending" | "sent" | "failed" | "permanent_failed", attemptCount: Number(row.attempt_count), messageId: row.message_id ? String(row.message_id) : null } : null;
+  }
+  claimReminderDelivery(sessionId: string, reminderId: string, maxAttempts = 2): "claimed" | "sending" | "sent" | "exhausted" {
+    const existing = this.getReminderDelivery(sessionId, reminderId);
+    if (existing?.status === "sent") return "sent";
+    if (existing?.status === "sending") return "sending";
+    if (existing?.status === "permanent_failed" || (existing?.attemptCount ?? 0) >= maxAttempts) return "exhausted";
+    this.db.prepare(`INSERT INTO reminder_deliveries(session_id,reminder_id,status,attempt_count,updated_at_ms) VALUES(?,?,'sending',1,?)
+      ON CONFLICT(session_id,reminder_id) DO UPDATE SET status='sending',attempt_count=reminder_deliveries.attempt_count+1,error=NULL,updated_at_ms=excluded.updated_at_ms`)
+      .run(sessionId, reminderId, Date.now());
+    return "claimed";
+  }
+  completeReminderDelivery(sessionId: string, reminderId: string, messageId: string, destination: "subscription" | "source_topic"): void {
+    this.db.prepare("UPDATE reminder_deliveries SET status='sent',message_id=?,destination=?,error=NULL,updated_at_ms=? WHERE session_id=? AND reminder_id=?")
+      .run(messageId, destination, Date.now(), sessionId, reminderId);
+  }
+  failReminderDelivery(sessionId: string, reminderId: string, error: unknown): void {
+    const detail = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+    this.db.prepare("UPDATE reminder_deliveries SET status='failed',error=?,updated_at_ms=? WHERE session_id=? AND reminder_id=? AND status='sending'")
+      .run(detail, Date.now(), sessionId, reminderId);
+  }
+  exhaustReminderDelivery(sessionId: string, reminderId: string, error: unknown): void {
+    const detail = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+    this.db.prepare("UPDATE reminder_deliveries SET status='permanent_failed',error=?,updated_at_ms=? WHERE session_id=? AND reminder_id=?")
+      .run(detail, Date.now(), sessionId, reminderId);
+  }
+  createBacklogBatch(batchId: string, sessionId: string, rootMessageId: string, turnIds: readonly string[], entries: unknown): void {
+    const now = Date.now();
+    this.transaction(() => {
+      this.db.prepare("INSERT OR IGNORE INTO backlog_batches(batch_id,session_id,root_message_id,entries_json,created_at_ms,status,updated_at_ms) VALUES(?,?,?,?,?,'pending',?)")
+        .run(batchId, sessionId, rootMessageId, JSON.stringify(entries), now, now);
+      const member = this.db.prepare("INSERT OR IGNORE INTO backlog_members(session_id,turn_id,batch_id) VALUES(?,?,?)");
+      for (const turnId of turnIds) member.run(sessionId, turnId, batchId);
+    });
+  }
+  backlogBatches(sessionId: string): Array<{ batchId: string; rootMessageId: string; entries: unknown; createdAtMs: number; cardMessageId: string | null; markdownMessageId: string | null; status: "pending" | "partial" | "sent"; turnIds: string[] }> {
+    const rows = this.db.prepare("SELECT * FROM backlog_batches WHERE session_id=? AND status!='sent' ORDER BY created_at_ms")
+      .all(sessionId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({ batchId: String(row.batch_id), rootMessageId: String(row.root_message_id), entries: JSON.parse(String(row.entries_json)) as unknown,
+      createdAtMs: Number(row.created_at_ms), cardMessageId: row.card_message_id ? String(row.card_message_id) : null,
+      markdownMessageId: row.markdown_message_id ? String(row.markdown_message_id) : null, status: String(row.status) as "pending" | "partial" | "sent",
+      turnIds: (this.db.prepare("SELECT turn_id FROM backlog_members WHERE session_id=? AND batch_id=? ORDER BY turn_id").all(String(row.session_id), String(row.batch_id)) as Array<{ turn_id: string }>).map((item) => String(item.turn_id)) }));
+  }
+  setBacklogCardMessage(batchId: string, messageId: string): void {
+    this.db.prepare("UPDATE backlog_batches SET card_message_id=?,status='partial',updated_at_ms=? WHERE batch_id=?").run(messageId, Date.now(), batchId);
+  }
+  setBacklogMarkdownMessage(batchId: string, messageId: string): void {
+    this.db.prepare("UPDATE backlog_batches SET markdown_message_id=?,status='sent',updated_at_ms=? WHERE batch_id=?").run(messageId, Date.now(), batchId);
+  }
+  backlogSessionsNeedingDelivery(): string[] {
+    return (this.db.prepare("SELECT DISTINCT session_id FROM backlog_batches WHERE status!='sent'").all() as Array<{ session_id: string }>).map((row) => String(row.session_id));
+  }
+  backlogMemberTurnIds(sessionId: string): string[] {
+    return (this.db.prepare("SELECT turn_id FROM backlog_members WHERE session_id=?").all(sessionId) as Array<{ turn_id: string }>).map((row) => String(row.turn_id));
   }
   /**
    * Every message the bridge posted in a session's topic, newest first and the root last, so
@@ -406,7 +518,8 @@ export class ClaudeBridgeDatabase {
    * enough to need a Markdown attachment that has not been sent. Oldest first.
    */
   turnsToRender(sessionId: string): StoredTurn[] {
-    return (this.db.prepare(`SELECT * FROM turns WHERE session_id=? AND render_state='pending'
+    return (this.db.prepare(`SELECT * FROM turns t WHERE session_id=? AND render_state='pending'
+      AND NOT EXISTS (SELECT 1 FROM backlog_members b WHERE b.session_id=t.session_id AND b.turn_id=t.turn_id)
       AND (card_message_id IS NULL OR updated_at_ms>=rendered_at_ms OR json_extract(view_json,'$.status')='running'
         OR (attachment_message_id IS NULL AND length(view_json)>?)) ORDER BY seq`)
       .all(sessionId, ATTACHMENT_HINT_CHARS) as Record<string, unknown>[]).map((row) => this.turnFromRow(row));
@@ -416,9 +529,12 @@ export class ClaudeBridgeDatabase {
    * sessions whose running turn has been quiet since `quietBeforeMs` and may now be unfinished.
    */
   sessionsNeedingRender(quietBeforeMs: number): string[] {
-    return (this.db.prepare(`SELECT DISTINCT session_id FROM turns WHERE render_state='pending' AND (card_message_id IS NULL OR updated_at_ms>rendered_at_ms
+    return (this.db.prepare(`SELECT DISTINCT session_id FROM turns t WHERE render_state='pending'
+      AND NOT EXISTS (SELECT 1 FROM backlog_members b WHERE b.session_id=t.session_id AND b.turn_id=t.turn_id)
+      AND (card_message_id IS NULL OR updated_at_ms>rendered_at_ms
         OR (json_extract(view_json,'$.status')='running' AND updated_at_ms<?))
-      UNION SELECT session_id FROM sessions WHERE root_dirty=1 AND root_message_id IS NOT NULL`).all(quietBeforeMs) as Array<{ session_id: string }>).map((row) => row.session_id);
+      UNION SELECT session_id FROM sessions WHERE root_dirty=1 AND root_message_id IS NOT NULL
+      UNION SELECT session_id FROM backlog_batches WHERE status!='sent'`).all(quietBeforeMs) as Array<{ session_id: string }>).map((row) => row.session_id);
   }
   setTurnPromptMessage(sessionId: string, turnId: string, messageId: string): void {
     this.db.prepare("UPDATE turns SET prompt_message_id=? WHERE session_id=? AND turn_id=?").run(messageId, sessionId, turnId);
