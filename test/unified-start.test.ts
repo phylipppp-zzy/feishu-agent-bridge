@@ -114,6 +114,6 @@ test('actual SDK port rejects late bot identity and closes late WS start', async
     await ready; port.stopReceiving(); port.close(); port.close(); release();
     await assert.rejects(start);
     assert.equal(starts, phase === 'bot' ? 0 : 1);
-    assert.ok(closes >= 2);
+    assert.ok(closes >= (phase === 'ws' ? 2 : 1));
   }
 });

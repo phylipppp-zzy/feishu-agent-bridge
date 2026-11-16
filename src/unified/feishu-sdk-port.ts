@@ -15,6 +15,9 @@ function rejectCode(code:unknown):void {if(typeof code==='number' && Number.isSa
 class UnknownTopic extends Error {}
 class UnknownCardRoute extends Error {}
 class ClosedTestRoute extends Error {}
+class UnknownTestRoute extends Error {}
+class ClosedKnownTestCreation extends Error { readonly deliveryKind='known_closed'; }
+class PendingKnownTestCreation extends Error { readonly deliveryKind='known_pending'; }
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
@@ -54,14 +57,19 @@ export async function handleSdkCardCallback(data:Lark.RawCardActionEvent, owner:
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:ChannelAction;
   try { action=parseFeishuAction(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
-  let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
+  let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownTestRoute ? {toast:{type:'info',content:'测试话题创建结果待核查，请联系管理员。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
   const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId}};
   try {await handle(envelope,action);} catch {return {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};} return undefined;
 }
+export type TestLaneToken={rootId:string;destination:string;appId:string;chatId:string;owner:string;laneId:string;namespace:string;generation:number;provider:'codex'|'claude'};
+type TestLaneHandler={handle:(e:TrustedEnvelope,a:ChannelAction,token:TestLaneToken)=>Promise<unknown>;capture:(e:TrustedEnvelope,token:TestLaneToken)=>Promise<string>};
 /** Only the SDK WS dispatcher invokes the inbound handler. Credentials are explicitly injected. */
 export class FeishuSdkPort implements FeishuPort {
   private readonly client: Lark.Client;
   private readonly appId:string;
+  private testHandler:TestLaneHandler|undefined;
+  private readonly testResourceFlights=new Map<string,Promise<void>>();
+  private readonly testCreates=new Set<Promise<TestLaneToken>>();private closeRequested=false;
   private readonly ws: Lark.WSClient;
   private readonly db: DatabaseSync;
   private migrationLocked=false;
@@ -76,8 +84,50 @@ export class FeishuSdkPort implements FeishuPort {
     this.appId=credentials.appId;
     const base = { appId: credentials.appId, appSecret: credentials.appSecret, appType:Lark.AppType.SelfBuild, domain:Lark.Domain.Feishu };
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
-    this.db = new DatabaseSync(dbPath); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_registry (root_id TEXT PRIMARY KEY, destination TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, owner TEXT NOT NULL, lane_id TEXT NOT NULL, namespace TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, operation_id TEXT NOT NULL, delivery_id TEXT NOT NULL, created_at INTEGER NOT NULL)'); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
+    this.db = new DatabaseSync(dbPath); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_creations (operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, provider TEXT NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, root_id TEXT, destination TEXT)'); this.db.exec("DROP INDEX IF EXISTS sdk_lane_creation_provider; CREATE UNIQUE INDEX IF NOT EXISTS sdk_lane_creation_reserved ON sdk_lane_creations(provider) WHERE state<>'rejected'; CREATE TABLE IF NOT EXISTS sdk_lane_resource_tokens (event_id TEXT PRIMARY KEY, token TEXT NOT NULL)"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_registry (root_id TEXT PRIMARY KEY, destination TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, owner TEXT NOT NULL, lane_id TEXT NOT NULL, namespace TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, operation_id TEXT NOT NULL, delivery_id TEXT NOT NULL, created_at INTEGER NOT NULL)'); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
   }
+  /** Only a local, constrained operator can create either mock provider root. */
+  createTestTopic(chatId:string,provider:'codex'|'claude',operationId:string,active:()=>boolean):Promise<TestLaneToken> {const flight=this.createTestTopicInner(chatId,provider,operationId,active);this.testCreates.add(flight);void flight.finally(()=>{this.testCreates.delete(flight);if(this.closeRequested && !this.testCreates.size && !this.dbClosed){this.dbClosed=true;this.db.close();}}).catch(()=>{});return flight;}
+  async drainTestCreates():Promise<void>{await Promise.allSettled([...this.testCreates]);}
+  private async createTestTopicInner(chatId:string,provider:'codex'|'claude',operationId:string,active:()=>boolean):Promise<TestLaneToken> {
+    if(this.closing || !active() || !this.destinations.has(chatId) || !['codex','claude'].includes(provider) || !/^[a-zA-Z0-9_-]{1,80}$/.test(operationId)) throw new Error('test creation unauthorized');
+    const deliveryId=`test-root:${operationId}`;const prior=this.db.prepare('SELECT state,root_id,destination FROM sdk_lane_creations WHERE operation_id=?').get(operationId) as {state:string;root_id:string|null;destination:string|null}|undefined;
+    if(prior){if(prior.state==='rejected')throw new Error('test creation rejected');if(prior.state==='known')throw new PendingKnownTestCreation('test root known; route recovery required');if(prior.state==='closed')throw new ClosedKnownTestCreation('test topic created and closed');if(prior.state==='active'&&prior.destination){const token=this.testToken(prior.destination);if(token&&token.chatId===chatId&&token.provider===provider)return token;}throw new Error('test creation outcome unknown');}
+    if(this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE provider=? AND state<>'rejected' LIMIT 1").get(provider)) throw new Error('test provider already reserved');const attempts=this.db.prepare('SELECT COUNT(*) AS n FROM sdk_lane_creations WHERE provider=?').get(provider) as {n:number};if(attempts.n>=3)throw new Error('test creation attempt limit reached');
+    this.db.prepare("INSERT INTO sdk_lane_creations VALUES (?,?,?,?,'unknown',NULL,NULL)").run(operationId,chatId,provider,deliveryId);
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'测试话题',text:`${provider} 模拟测试`,actions:[]}))}});
+    if(typeof response.code==='number' && Number.isSafeInteger(response.code) && response.code!==0){this.db.prepare("UPDATE sdk_lane_creations SET state='rejected' WHERE operation_id=? AND state='unknown'").run(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw new Error('test creation outcome unknown');
+    const root=response.data.message_id,destination=`topic:${randomUUID()}`,namespace=`mock-test:${provider}`,lane='mock-test';
+    this.db.prepare("UPDATE sdk_lane_creations SET state='known',root_id=?,destination=? WHERE operation_id=? AND state='unknown'").run(root,destination,operationId);
+    const closed=this.closing || !active(),state=closed?'closed':'active';
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,lane,namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.db.prepare("UPDATE sdk_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+    if(closed)throw new ClosedKnownTestCreation('test topic created and closed');const token=this.testToken(destination);if(!token)throw new Error('test creation outcome unknown');return token;
+  }
+  private testToken(destination:string):TestLaneToken|null {
+    const row=this.db.prepare('SELECT root_id,destination,app_id,chat_id,owner,lane_id,namespace,generation,state,version FROM sdk_lane_registry WHERE destination=?').get(destination) as {root_id:string;destination:string;app_id:string;chat_id:string;owner:string;lane_id:string;namespace:string;generation:number;state:string;version:number}|undefined;
+    if(!row || row.app_id!==this.appId || row.owner!==this.owner || !this.destinations.has(row.chat_id) || row.lane_id!=='mock-test' || row.state!=='active' || row.version!==1 || !Number.isSafeInteger(row.generation) || row.generation<1)return null;
+    const provider=row.namespace==='mock-test:codex'?'codex':row.namespace==='mock-test:claude'?'claude':null;if(!provider)return null;
+    const route=this.db.prepare('SELECT root_id,chat_id,session_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {root_id:string;chat_id:string;session_id:string}|undefined;if(!route||route.root_id!==row.root_id||route.chat_id!==row.chat_id||route.session_id!==row.namespace)return null;
+    return {rootId:row.root_id,destination:row.destination,appId:row.app_id,chatId:row.chat_id,owner:row.owner,laneId:row.lane_id,namespace:row.namespace,generation:row.generation,provider};
+  }
+  private validateTestToken(token:TestLaneToken):void {if(this.closing || JSON.stringify(this.testToken(token.destination))!==JSON.stringify(token))throw new Error('test lane unavailable');}
+  testLaneToken(destination:string):TestLaneToken|null{return this.testToken(destination);}
+  isTestClosed(token:TestLaneToken):boolean {const row=this.db.prepare("SELECT root_id,app_id,chat_id,owner,lane_id,namespace,generation,state FROM sdk_lane_registry WHERE destination=?").get(token.destination) as {root_id:string;app_id:string;chat_id:string;owner:string;lane_id:string;namespace:string;generation:number;state:string}|undefined;return !!row&&row.root_id===token.rootId&&row.app_id===token.appId&&row.chat_id===token.chatId&&row.owner===token.owner&&row.lane_id===token.laneId&&row.namespace===token.namespace&&row.state==='closed'&&row.generation>token.generation;}
+  listTestTokens():TestLaneToken[]{const rows=this.db.prepare("SELECT destination FROM sdk_lane_registry WHERE lane_id='mock-test' AND state='active'").all() as Array<{destination:string}>;return rows.map(r=>this.testToken(r.destination)).filter((t):t is TestLaneToken=>!!t);}
+  createTestPort(token:TestLaneToken):FeishuPort & {authorizedDestination:(destination:string)=>boolean} {
+    this.validateTestToken(token);const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');const validate=(destination:string)=>{if(destination!==token.destination)throw new Error('test destination mismatch');if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);};
+    return {
+      isTopicDestination:(destination)=>{try{validate(destination);return true;}catch{return false;}},
+      authorizedDestination:(destination)=>{try{validate(destination);return true;}catch{return false;}},
+      send:async(destination,card,deliveryId,guard)=>{await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(toFeishuCard(card)),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);return response.data.message_id;},
+      update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const response=await this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(toFeishuCard(card))}});rejectCode(response.code);this.remember(deliveryId,messageId,destination);},
+      sendFile:async(destination,name,content,deliveryId,guard)=>{if(content.length>1024*1024 || !/^[^/\\\x00-\x1f]{1,80}$/.test(name))throw new Error('test fixture rejected');await guard?.();validate(destination);const uploaded=await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});if(!uploaded?.file_key)throw new Error('test upload outcome unknown');await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'file',content:JSON.stringify({file_key:uploaded.file_key}),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);},
+      lookupDelivery:async(deliveryId)=>{validate(token.destination);const row=this.db.prepare('SELECT m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {destination:string}|undefined;return row?.destination===token.destination?'sent':'unknown';}
+    };
+  }
+  closeTestTopic(token:TestLaneToken):void {this.validateTestToken(token);this.db.prepare("UPDATE sdk_lane_registry SET state='closed',generation=generation+1 WHERE destination=? AND generation=? AND state='active'").run(token.destination,token.generation);this.routeGeneration++;}
+  installTestHandler(handler:TestLaneHandler):void {if(this.testHandler)throw new Error('test handler exists');this.testHandler=handler;}
+  removeTestHandler(handler:TestLaneHandler):void {if(this.testHandler===handler)this.testHandler=undefined;}
   beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
   endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
   inspectMigrationRoute(id:string,destination:string):'removable'|'retained'|'absent' { if(!this.migrationLocked) throw new Error('migration lock required'); this.db.exec('SAVEPOINT migration_inspect'); try {const result=this.rollbackMigrationRoute(id); if(result==='retained' && !this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE destination=?').get(destination)) throw new Error('migration route missing despite receipt; manual review'); this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); return result==='removed'?'removable':result==='absent' && this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE destination=?').get(destination)?'retained':result;} catch(e) {this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); throw e;} }
@@ -128,23 +178,27 @@ export class FeishuSdkPort implements FeishuPort {
     if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
     if (!rootId && !parentId && !threadId) return chatId;
     const candidates=[rootId,parentId,threadId].filter((v):v is string=>!!v);
-    for(const id of candidates) if(this.db.prepare('SELECT 1 FROM sdk_lane_registry WHERE root_id=?').get(id)) throw new UnknownTopic('test topic unavailable');
     const found=new Set<string>();
+    if(rootId && !this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE chat_id=? AND (root_id=? OR thread_id=?)').get(chatId,rootId,rootId)) throw new UnknownTopic('unknown topic');
+    if(!rootId && threadId && !this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE chat_id=? AND (root_id=? OR thread_id=?)').get(chatId,threadId,threadId)) throw new UnknownTopic('unknown topic');
     for (const id of candidates) {
+      const reserved=this.db.prepare('SELECT destination FROM sdk_lane_registry WHERE root_id=?').get(id) as {destination:string}|undefined;if(reserved) found.add(reserved.destination);
       const rows=this.db.prepare('SELECT destination FROM sdk_topic_routes WHERE chat_id=? AND (root_id=? OR thread_id=?) UNION SELECT r.destination FROM sdk_message_routes m JOIN sdk_topic_routes r ON r.destination=m.destination WHERE r.chat_id=? AND m.message_id=?').all(chatId,id,id,chatId,id) as Array<{destination:string}>;
       for (const row of rows) found.add(row.destination);
     }
     if (found.size===0) throw new UnknownTopic('unknown topic');
     if (found.size!==1) throw new Error('conflicting topic');
-    const destination=[...found][0]!;if(!this.authorizedDestination(destination)) throw new UnknownTopic('test topic unavailable');return destination;
+    const destination=[...found][0]!;if(!this.authorizedDestination(destination)){const token=this.testToken(destination);if(!this.testHandler || !token || token.chatId!==chatId)throw new UnknownTopic('test topic unavailable');}return destination;
   }
   public callbackDestination(chatId:string,messageId:string):string {
     if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
     const reservedRoot=this.db.prepare('SELECT state FROM sdk_lane_registry WHERE root_id=?').get(messageId) as {state:string}|undefined;
-    if(reservedRoot) {if(reservedRoot.state==='closed') throw new ClosedTestRoute('test topic closed');throw new UnknownCardRoute('test topic unavailable');}
+    if(reservedRoot?.state==='closed') throw new ClosedTestRoute('test topic closed');
     const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;
     if (row && this.db.prepare("SELECT 1 FROM sdk_lane_registry WHERE destination=? AND state='closed'").get(row.destination)) throw new ClosedTestRoute('test topic closed');
-    if (!row || !this.authorizedDestination(row.destination)) throw new UnknownCardRoute('unknown card message');
+    if (!row) {if(this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE chat_id=? AND state IN ('unknown','known')").get(chatId))throw new UnknownTestRoute('test creation unknown');throw new UnknownCardRoute('unknown card message');}
+    if(reservedRoot){const exact=this.testToken(row.destination);if(!exact || exact.rootId!==messageId || exact.chatId!==chatId || !this.testHandler)throw new UnknownCardRoute('test topic unavailable');}
+    if(!this.authorizedDestination(row.destination)){const token=this.testToken(row.destination);if(!this.testHandler || !token || token.chatId!==chatId || (reservedRoot && token.rootId!==messageId))throw new UnknownCardRoute('test topic unavailable');}
     const route=this.route(row.destination);
     if ((route?.chat_id ?? row.destination)!==chatId) throw new UnknownCardRoute('card chat mismatch');
     return row.destination;
@@ -202,6 +256,18 @@ export class FeishuSdkPort implements FeishuPort {
   async topicLinkForSession(destination:string,sessionId:string):Promise<string|null> {
     this.allowed(destination);const source=this.route(destination),chat=source?.chat_id ?? destination;const read=()=>this.db.prepare('SELECT destination,chat_id,root_id,session_id FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string;chat_id:string;root_id:string;session_id:string}|undefined;const row=read();if(!row)return null;this.allowed(row.destination);const scope=JSON.stringify([destination,sessionId,source ?? null,row]);return this.scopedMessageLink(chat,row.root_id,scope,()=>{const now=read();return JSON.stringify(now ?? null)===JSON.stringify(row) && JSON.stringify(this.route(destination) ?? null)===JSON.stringify(source ?? null) && this.authorizedDestination(row.destination);});
   }
+  private async dispatchLane(e:TrustedEnvelope,a:ChannelAction,production:(e:TrustedEnvelope,a:ChannelAction)=>Promise<unknown>):Promise<unknown>{const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);return handler.handle(e,a,token);}this.allowed(e.destination);return production(e,a);}
+  private queueTestResource(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',scope:string,token:TestLaneToken):void {
+    this.validateTestToken(token);if(e.destination!==token.destination || e.identity.source!=='feishu' || e.identity.subject!==token.owner)throw new Error('test resource unauthorized');
+    const old=this.db.prepare('SELECT envelope,message_id,resource_key,resource_type FROM sdk_inbound_resources WHERE event_id=?').get(e.eventId) as {envelope:string;message_id:string;resource_key:string;resource_type:string}|undefined;const serialized=JSON.stringify(e),encoded=JSON.stringify(token);
+    if(old){const prior=this.db.prepare('SELECT token FROM sdk_lane_resource_tokens WHERE event_id=?').get(e.eventId) as {token:string}|undefined;const priorScope=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(e.eventId) as {scope:string}|undefined;if(old.envelope!==serialized||old.message_id!==messageId||old.resource_key!==key||old.resource_type!==type||prior?.token!==encoded||priorScope?.scope!==scope)throw new Error('test resource conflict');return;}
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_inbound_resources VALUES (?,?,?,?,?)').run(e.eventId,serialized,messageId,key,type);this.db.prepare('INSERT INTO sdk_resource_scopes VALUES (?,?)').run(e.eventId,scope);this.db.prepare('INSERT INTO sdk_lane_resource_tokens VALUES (?,?)').run(e.eventId,encoded);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  async drainTestResources(handle:(e:TrustedEnvelope,a:ChannelAction,scope:string,token:TestLaneToken)=>Promise<unknown>):Promise<void> {
+    const rows=this.db.prepare("SELECT r.*,l.token,s.scope FROM sdk_inbound_resources r JOIN sdk_lane_resource_tokens l ON l.event_id=r.event_id JOIN sdk_resource_scopes s ON s.event_id=r.event_id LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE f.event_id IS NULL OR (f.state='retry' AND f.next_attempt<=?) ORDER BY r.rowid LIMIT 8").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file';token:string;scope:string}>;
+    for(const row of rows){if(this.testResourceFlights.has(row.event_id) || this.testResourceFlights.size>=8)continue;let active=true;let timer:ReturnType<typeof setTimeout>|undefined;try{const e=JSON.parse(row.envelope) as TrustedEnvelope,token=JSON.parse(row.token) as TestLaneToken;const check=()=>{if(!active)throw new ResourceRejected('test request expired');this.validateTestToken(token);};check();if(e.destination!==token.destination||e.identity.source!=='feishu'||e.identity.subject!==token.owner)throw new ResourceRejected('test scope changed');const flight=downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (id,key,type)=>{check();const response=await this.client.im.messageResource.get({params:{type},path:{message_id:id,file_key:key}});check();return response.getReadableStream();},async (env,action)=>{check();return handle(env,action,row.scope,token);},row.scope);this.testResourceFlights.set(row.event_id,flight);void flight.finally(()=>{if(this.testResourceFlights.get(row.event_id)===flight)this.testResourceFlights.delete(row.event_id);}).catch(()=>{});await Promise.race([flight,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('test resource timeout')),2000);})]);check();this.db.exec('BEGIN IMMEDIATE');try{for(const table of ['sdk_inbound_resources','sdk_resource_scopes','sdk_resource_failures','sdk_lane_resource_tokens'])this.db.prepare(`DELETE FROM ${table} WHERE event_id=?`).run(row.event_id);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}}catch{this.db.prepare("INSERT OR REPLACE INTO sdk_resource_failures VALUES (?, 'needs_review', 1, 'test resource unavailable or scope changed', 0)").run(row.event_id);}finally{active=false;if(timer)clearTimeout(timer);}}
+
+  }
   private queueResource(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',scope:string):void {
     this.allowed(e.destination); const serialized=JSON.stringify(e); const old=this.db.prepare('SELECT envelope,message_id,resource_key,resource_type FROM sdk_inbound_resources WHERE event_id=?').get(e.eventId) as {envelope:string;message_id:string;resource_key:string;resource_type:string}|undefined;
     if(old) { const oldScope=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(e.eventId) as {scope:string}|undefined; if(old.envelope!==serialized || old.message_id!==messageId || old.resource_key!==key || old.resource_type!==type || oldScope?.scope!==scope) throw new Error('resource event conflict'); return; }
@@ -214,7 +280,7 @@ export class FeishuSdkPort implements FeishuPort {
   onResourceHealth:(status:'healthy'|'degraded',reason:string|null)=>void=()=>{};
   /** GET may safely repeat; per-item failures are persisted and never block later work. */
   async drainInbound(handle:(envelope:TrustedEnvelope,action:ChannelAction,scope?:string)=>Promise<unknown>):Promise<void> {
-    const rows=this.db.prepare("SELECT r.* FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE f.event_id IS NULL OR (f.state='retry' AND f.next_attempt<=?) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file'}>;
+    const rows=this.db.prepare("SELECT r.* FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE NOT EXISTS (SELECT 1 FROM sdk_lane_resource_tokens l WHERE l.event_id=r.event_id) AND (f.event_id IS NULL OR (f.state='retry' AND f.next_attempt<=?)) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file'}>;
     for(const row of rows) {
       try {
         const e=JSON.parse(row.envelope) as TrustedEnvelope; this.allowed(e.destination); if(e.identity.source!=='feishu' || e.identity.subject!==this.owner) throw new ResourceRejected('authorization changed');
@@ -231,6 +297,11 @@ export class FeishuSdkPort implements FeishuPort {
       }
     }
   }
+  private async guideTestUnavailable(data:MessageEvent,botId:string):Promise<boolean>{
+    const m=parseIncoming(data,botId);if(!m||!m.mentionedBot||m.senderOpenId!==this.owner||!this.destinations.has(m.chatId))return false;const thread=(data.message as unknown as {thread_id?:string}).thread_id;const ids=[m.rootId,m.parentId,thread].filter((x):x is string=>!!x);if(!ids.length)return false;
+    const closed=ids.some(id=>!!this.db.prepare("SELECT 1 FROM sdk_lane_registry l JOIN sdk_topic_routes r ON r.destination=l.destination LEFT JOIN sdk_message_routes m ON m.destination=l.destination WHERE l.chat_id=? AND l.state='closed' AND (l.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1").get(m.chatId,id,id,id));const unknown=!!this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE chat_id=? AND state IN ('unknown','known')").get(m.chatId);if(!closed&&!unknown)return false;
+    const deliveryId=`test-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes)return true;if(this.closing)throw new Error('SDK port closing');const text=closed?'此测试话题已关闭。':'测试话题创建结果待核查，请联系管理员。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'测试提示',text,actions:[]}))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(deliveryId,response.data.message_id,m.chatId);return true;
+  }
   async start(handle:(envelope:TrustedEnvelope,action:ChannelAction)=>Promise<unknown>, captureScope:(e:TrustedEnvelope)=>Promise<string>):Promise<void> {
     if (this.started || this.closing) throw new Error('already started or closing'); this.started = true;
     try {
@@ -239,14 +310,14 @@ export class FeishuSdkPort implements FeishuPort {
     const botId = bot.bot?.open_id;
     if (!botId) throw new Error('bot identity unavailable');
     const handles: Partial<Lark.EventHandles> & {'card.action.trigger':(data:Lark.RawCardActionEvent)=>Promise<any>} = {
-      'im.message.receive_v1': async data => { await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),handle,async (e,id,key,type)=>this.queueResource(e,id,key,type,await captureScope(e)),(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread)); },
-      'card.action.trigger': async data => handleSdkCardCallback(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),handle),
+      'im.message.receive_v1': async data => { try {await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),(e,a)=>this.dispatchLane(e,a,handle),async (e,id,key,type)=>{const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);const scope=await handler.capture(e,token);if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);this.queueTestResource(e,id,key,type,scope,token);}else this.queueResource(e,id,key,type,await captureScope(e));},(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread));}catch(error){if(error instanceof UnknownTopic && await this.guideTestUnavailable(data,botId))return;throw error;} },
+      'card.action.trigger': async data => handleSdkCardCallback(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle)),
     };
     if (this.closing) throw new Error('SDK port closing');
     await this.ws.start({eventDispatcher:new Lark.EventDispatcher({}).register(handles)});
-    if (this.closing) throw new Error('SDK port closing');
-    } catch(error) { this.ws.close(); throw error; }
+    if (this.closing) {this.ws.close();throw new Error('SDK port closing');}
+    } catch(error) { this.stopReceiving(); throw error; }
   }
-  stopReceiving():void { this.closing=true; this.linkCache.clear(); this.ws.close(); }
-  close():void { this.stopReceiving(); if (!this.dbClosed) {this.dbClosed=true; this.db.close();} }
+  stopReceiving():void { if(this.closing)return;this.closing=true; this.linkCache.clear(); this.ws.close(); }
+  close():void { this.stopReceiving();this.closeRequested=true;if (!this.dbClosed && !this.testCreates.size) {this.dbClosed=true; this.db.close();} }
 }

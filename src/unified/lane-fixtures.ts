@@ -1,0 +1,72 @@
+import {DatabaseSync} from 'node:sqlite';
+import {randomUUID,createHash} from 'node:crypto';
+import {createMockAdapter} from './mock-adapter.js';
+import {contractError} from './errors.js';
+import {SCHEMA_VERSION,payloadDigest,type Event,type Interaction,type Message,type Provider,type ResolveInteraction,type Artifact,type SubmitInput,type Operation,type WriteContext} from './contracts.js';
+import type {UnifiedService,WriteRequest} from './adapter.js';
+export type LaneScenario='question-single'|'question-multiple'|'question-free'|'approval'|'final'|'long-final'|'failure'|'unknown'|'file'|'image';
+const png=Uint8Array.from(Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63606060f80f00010401005fe5c34b0000000049454e44ae426082','hex'));
+const text=new TextEncoder().encode('TEST fixture\n');
+/** Synthetic fixtures only; no native provider, shell, caller-supplied file path or model. */
+export class LaneFixtureService {
+  readonly service:UnifiedService; private readonly db:DatabaseSync;
+  constructor(readonly provider:Provider,path:string){
+    this.db=new DatabaseSync(path);this.db.exec('CREATE TABLE IF NOT EXISTS fixture_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, object_id TEXT NOT NULL, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS fixture_interactions (id TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS fixture_messages (id TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS fixture_operations (idempotency_key TEXT PRIMARY KEY,operation_id TEXT NOT NULL UNIQUE,action TEXT NOT NULL,digest TEXT NOT NULL,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS fixture_files (id TEXT PRIMARY KEY,name TEXT NOT NULL,media_type TEXT NOT NULL,version TEXT NOT NULL,content BLOB NOT NULL); CREATE TABLE IF NOT EXISTS fixture_triggers (operation_id TEXT PRIMARY KEY,scenario TEXT NOT NULL)');
+    const base=createMockAdapter(provider),self=this;
+    this.service=new Proxy(base,{get(target,key,receiver){
+      if(['attachSession','createSession','requestControl','releaseControl','interruptTurn','cancelQueuedInput'].includes(String(key)))return async()=>{throw contractError('unsupported','mock fixture does not implement this operation')};
+      if(key==='getConfirmedSettings')return async()=>null;
+      if(key==='getSnapshot')return async()=>{const snapshot=await base.getSnapshot('s');return {...snapshot,cursor:String(self.last()),value:{...snapshot.value,session:self.session(snapshot.value.session),messages:self.messages(),interactions:self.interactions()}}};
+      if(key==='getSession')return async(id:string)=>self.session(await base.getSession(id));
+      if(key==='listSessions')return async()=>({items:[self.session(await base.getSession('s'))],nextCursor:null});
+      if(key==='getWorkState')return async()=>({runningTurns:[],queuedInputs:[],canArchive:false});
+      if(key==='readHistory')return async()=>({items:self.messages(),nextCursor:null});
+      if(key==='capabilities')return async()=>self.session(await base.getSession('s')).capabilities;
+      if(key==='getInteraction')return async(id:string)=>self.interaction(id);
+      if(key==='listInteractions')return async()=>({items:self.interactions(),nextCursor:null});
+      if(key==='subscribeEvents')return async(_id:string,cursor:string,limit:number)=>self.events(cursor,limit);
+      if(key==='resolveInteraction')return async(request:ResolveInteraction)=>self.resolve(request);
+      if(key==='submitInput')return async(request:SubmitInput)=>self.input(request);
+      if(key==='stageInputArtifact')return async(request:WriteRequest<{name:string;mediaType:string;size:number;contentDigest:string;content:Uint8Array}>)=>self.stage(request);
+      if(key==='getOperation')return async(id:string)=>self.operationById(id);
+      if(key==='listArtifacts')return async()=>({items:self.artifacts(),nextCursor:null});
+      if(key==='readArtifact')return async(_s:string,id:string,version:string)=>self.readArtifact(id,version);
+      return Reflect.get(target,key,receiver);
+    }});
+  }
+  private session(session:Awaited<ReturnType<UnifiedService['getSession']>>){return {...session,title:`模拟测试 · ${this.provider}`,project:'模拟数据',capabilities:{...session.capabilities,answer:{status:'available' as const},approve:{status:'available' as const},files:{status:'available' as const}}};}
+  private last():number{return Number((this.db.prepare('SELECT COALESCE(MAX(sequence),0) AS n FROM fixture_events').get() as {n:number}).n)}
+  private append(kind:string,id:string,body:unknown):void{this.db.prepare('INSERT INTO fixture_events(kind,object_id,body) VALUES (?,?,?)').run(kind,id,JSON.stringify(body))}
+  private interactions():Interaction[]{return (this.db.prepare('SELECT body FROM fixture_interactions ORDER BY rowid').all() as Array<{body:string}>).map(x=>JSON.parse(x.body) as Interaction)}
+  private messages():Message[]{return (this.db.prepare('SELECT body FROM fixture_messages ORDER BY rowid').all() as Array<{body:string}>).map(x=>JSON.parse(x.body) as Message)}
+  private interaction(id:string):Interaction{const row=this.db.prepare('SELECT body FROM fixture_interactions WHERE id=?').get(id) as {body:string}|undefined;if(!row)throw new Error('fixture interaction unavailable');return JSON.parse(row.body) as Interaction}
+  private existing(context:WriteContext,action:string,digest:string):Operation|null{const row=this.db.prepare('SELECT action,digest,body FROM fixture_operations WHERE idempotency_key=?').get(context.idempotencyKey) as {action:string;digest:string;body:string}|undefined;if(!row)return null;if(row.action!==action||row.digest!==digest)throw new Error('fixture idempotency conflict');return JSON.parse(row.body) as Operation}
+  private operation(context:WriteContext,action:string,digest:string,result?:Operation['result']):Operation{return {operationId:context.operationId,idempotencyKey:context.idempotencyKey,targetId:context.targetId,action,payloadDigest:digest,status:'completed',revision:1,error:null,...(result?{result}:{})}}
+  private save(op:Operation):void{this.db.prepare('INSERT INTO fixture_operations VALUES (?,?,?,?,?)').run(op.idempotencyKey,op.operationId,op.action,op.payloadDigest,JSON.stringify(op))}
+  private operationById(id:string):Operation{const row=this.db.prepare('SELECT body FROM fixture_operations WHERE operation_id=?').get(id) as {body:string}|undefined;if(!row)throw new Error('fixture operation unavailable');return JSON.parse(row.body) as Operation}
+  private resolve(request:ResolveInteraction):Operation{
+    const digest=payloadDigest({interactionId:request.interactionId,answer:request.answer}),old=this.existing(request.context,'resolveInteraction',digest);if(old)return old;const current=this.interaction(request.interactionId);
+    if(current.status!=='awaiting_answer'||current.connectionGeneration!==request.expectedConnectionGeneration||current.toolInputDigest!==request.toolInputDigest||current.kind!==request.answer.kind)throw new Error('fixture answer mismatch');
+    const next={...current,status:'resolved',revision:current.revision+1,nativeResult:{status:'accepted',source:'mock',answer:request.answer}} as Interaction,op=this.operation(request.context,'resolveInteraction',digest);
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('UPDATE fixture_interactions SET body=? WHERE id=?').run(JSON.stringify(next),next.interactionId);this.append('interaction.updated',next.interactionId,{status:'resolved'});this.save(op);this.db.exec('COMMIT');return op;}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  private input(request:SubmitInput):Operation{
+    const digest=payloadDigest({mode:request.mode,blocks:request.blocks}),old=this.existing(request.context,'submitInput',digest);if(old)return old;if(request.mode!=='new'||request.blocks.length<1)throw new Error('fixture input mode unsupported');
+    const content=request.blocks.map(block=>{if(block.type==='text')return block.text;if(block.type==='artifact'){this.readArtifact(block.artifactId,block.contentVersion);return '[测试附件]';}throw new Error('invalid fixture input')}).join('\n');if(content.length>4000)throw new Error('fixture input too long');
+    const id=`echo-${request.context.operationId}`,op=this.operation(request.context,'submitInput',digest),message:Message={messageId:id,sessionId:'s',turnId:id,role:'assistant',blocks:[{type:'text',text:`测试回显：${content}`}],sequence:this.last()+1,revision:1,final:true,source:'mock'};
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO fixture_messages VALUES (?,?)').run(id,JSON.stringify(message));this.append('message.updated',id,{});this.save(op);this.db.exec('COMMIT');return op;}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  private stage(request:WriteRequest<{name:string;mediaType:string;size:number;contentDigest:string;content:Uint8Array}>):Operation{
+    const p=request.payload;if(!(p.content instanceof Uint8Array)||p.size!==p.content.length||p.size>1024*1024||createHash('sha256').update(p.content).digest('hex')!==p.contentDigest||!p.name||!p.mediaType)throw new Error('invalid fixture attachment');
+    const digest=payloadDigest({name:p.name,mediaType:p.mediaType,size:p.size,contentDigest:p.contentDigest}),old=this.existing(request.context,'stageInputArtifact',digest);if(old)return old;const id=`fixture-upload-${request.context.operationId}`,op=this.operation(request.context,'stageInputArtifact',digest,{kind:'artifact',artifactId:id,contentVersion:p.contentDigest});
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO fixture_files VALUES (?,?,?,?,?)').run(id,p.name,p.mediaType,p.contentDigest,Buffer.from(p.content));this.save(op);this.db.exec('COMMIT');return op;}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  private artifacts():Artifact[]{const fixed=(['file','image'] as const).map(kind=>{const bytes=kind==='image'?png:text;return {artifactId:`fixture-${kind}`,sessionId:'s',contentVersion:createHash('sha256').update(bytes).digest('hex'),name:kind==='image'?'fixture.png':'fixture.txt',mediaType:kind==='image'?'image/png':'text/plain',size:bytes.length} as Artifact});const uploaded=(this.db.prepare('SELECT id,name,media_type,version,length(content) AS size FROM fixture_files ORDER BY rowid').all() as Array<{id:string;name:string;media_type:string;version:string;size:number}>).map(x=>({artifactId:x.id,sessionId:'s',contentVersion:x.version,name:x.name,mediaType:x.media_type,size:x.size}));return [...fixed,...uploaded]}
+  private readArtifact(id:string,version:string):Uint8Array{const a=this.artifacts().find(x=>x.artifactId===id&&x.contentVersion===version);if(!a)throw new Error('fixture artifact unavailable');if(id==='fixture-image')return Uint8Array.from(png);if(id==='fixture-file')return Uint8Array.from(text);const row=this.db.prepare('SELECT content FROM fixture_files WHERE id=? AND version=?').get(id,version) as {content:Uint8Array}|undefined;if(!row)throw new Error('fixture artifact unavailable');return Uint8Array.from(row.content)}
+  private async events(cursor:string,limit:number){const offset=Number(cursor);if(!Number.isSafeInteger(offset)||offset<0)throw new Error('invalid fixture cursor');const rows=this.db.prepare('SELECT sequence,kind,object_id,body FROM fixture_events WHERE sequence>? ORDER BY sequence LIMIT ?').all(offset,limit) as Array<{sequence:number;kind:string;object_id:string;body:string}>;const now=new Date().toISOString();const events:Event[]=rows.map(r=>({schemaVersion:SCHEMA_VERSION,eventId:`fixture-${r.sequence}`,sessionId:'s',objectId:r.object_id,objectRevision:1,sequence:r.sequence,type:r.kind,occurredAt:now,receivedAt:now,operationId:null,cursor:String(r.sequence),data:JSON.parse(r.body)}));return {status:'events' as const,events,cursor:String(rows.at(-1)?.sequence??offset)}}
+  trigger(scenario:LaneScenario,operationId:string=randomUUID()):void{
+    if(!/^[a-zA-Z0-9_-]{1,80}$/.test(operationId))throw new Error('invalid fixture operation');const prior=this.db.prepare('SELECT scenario FROM fixture_triggers WHERE operation_id=?').get(operationId) as {scenario:string}|undefined;if(prior){if(prior.scenario!==scenario)throw new Error('fixture operation conflict');return;}
+    if(!['question-single','question-multiple','question-free','approval','final','long-final','failure','unknown','file','image'].includes(scenario))throw new Error('unknown fixture');const id=randomUUID();this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO fixture_triggers VALUES (?,?)').run(operationId,scenario);if(scenario.startsWith('question')||scenario==='approval'){const base={interactionId:id,sessionId:'s',turnId:'fixture-turn',nativeRequestId:id,connectionGeneration:1,revision:1,status:'awaiting_answer' as const,expiresAt:null,nativeResult:null};const interaction:Interaction=scenario==='approval'?{...base,kind:'approval',tool:'fixture',action:'模拟操作',scope:'test',toolInputDigest:'fixture-digest'}:{...base,kind:'question',toolInputDigest:null,prompt:'模拟问题',choices:['选项一','选项二'],multiple:scenario==='question-multiple',allowFreeText:scenario==='question-free'};this.db.prepare('INSERT INTO fixture_interactions VALUES (?,?)').run(id,JSON.stringify(interaction));this.append('interaction.created',id,{status:'awaiting_answer'});}else if(scenario==='final'||scenario==='long-final'){const message:Message={messageId:id,sessionId:'s',turnId:id,role:'assistant',blocks:[{type:'text',text:scenario==='long-final'?'测试长内容。'.repeat(2000):'这是测试回复。'}],sequence:this.last()+1,revision:1,final:true,source:'mock'};this.db.prepare('INSERT INTO fixture_messages VALUES (?,?)').run(id,JSON.stringify(message));this.append('message.updated',id,{});}else if(scenario==='file'||scenario==='image'){const a=this.artifacts().find(x=>x.artifactId===`fixture-${scenario}`)!;const message:Message={messageId:id,sessionId:'s',turnId:id,role:'assistant',blocks:[{type:'text',text:`测试文件 ${a.name} 已准备，请打开会话控制中的文件列表。`}],sequence:this.last()+1,revision:1,final:true,source:'mock'};this.db.prepare('INSERT INTO fixture_messages VALUES (?,?)').run(id,JSON.stringify(message));this.append('message.updated',id,{});}else this.append(scenario==='failure'?'operation.failed':'operation.unknown',id,{operationId:id,action:'fixture',status:scenario==='failure'?'failed':'unknown'});this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  close():void{this.db.close()}
+}
