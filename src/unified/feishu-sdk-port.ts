@@ -125,6 +125,11 @@ export class FeishuSdkPort implements FeishuPort {
       lookupDelivery:async(deliveryId)=>{validate(token.destination);const row=this.db.prepare('SELECT m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {destination:string}|undefined;return row?.destination===token.destination?'sent':'unknown';}
     };
   }
+  /** Proof for one fixed fixture delivery; a NULL receipt is an attempt, never absence. */
+  testDeliveryEvidence(token:TestLaneToken,deliveryIds:string[]):{unattempted:boolean;knownIds:number} {
+    this.validateTestToken(token);if(deliveryIds.length!==2||deliveryIds.some(id=>!id))throw new Error('invalid test repair proof');const attempted=deliveryIds.some(id=>!!this.db.prepare('SELECT 1 FROM sdk_deliveries WHERE id=?').get(id));const row=this.db.prepare('SELECT COUNT(*) AS n FROM sdk_message_routes WHERE destination=? AND message_id<>?').get(token.destination,token.rootId) as {n:number};return {unattempted:!attempted&&row.n===0,knownIds:Number(row.n)};
+  }
+  testDeliveryKnown(token:TestLaneToken,deliveryId:string):boolean {this.validateTestToken(token);const row=this.db.prepare('SELECT m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {destination:string}|undefined;return row?.destination===token.destination;}
   closeTestTopic(token:TestLaneToken):void {this.validateTestToken(token);this.db.prepare("UPDATE sdk_lane_registry SET state='closed',generation=generation+1 WHERE destination=? AND generation=? AND state='active'").run(token.destination,token.generation);this.routeGeneration++;}
   installTestHandler(handler:TestLaneHandler):void {if(this.testHandler)throw new Error('test handler exists');this.testHandler=handler;}
   removeTestHandler(handler:TestLaneHandler):void {if(this.testHandler===handler)this.testHandler=undefined;}

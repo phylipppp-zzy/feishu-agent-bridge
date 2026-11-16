@@ -575,7 +575,7 @@ export class FeishuChannel {
     const rows = this.db.prepare('SELECT interaction_id FROM channel_interaction_cards WHERE destination=? AND session_id=?').all(destination,sessionId) as Array<{interaction_id:string}>;
     for (const row of rows) { await this.checkBinding(destination,sessionId,scope); const interaction = await this.service.getInteraction(row.interaction_id); await this.checkBinding(destination,sessionId,scope); if (interaction.sessionId !== sessionId) throw new Error('interaction target mismatch'); await this.renderInteraction(destination,sessionId,interaction,scope); }
   }
-  private async renderStreamMessage(destination:string, sessionId:string, scope:string, message:import('./contracts.js').Message):Promise<void> {
+  protected async renderStreamMessage(destination:string, sessionId:string, scope:string, message:import('./contracts.js').Message):Promise<void> {
     const sequence=Number.isSafeInteger(message.sequence) ? message.sequence : 0; const guard=()=>this.checkBinding(destination,sessionId,scope); await guard();
     const row=this.db.prepare('SELECT card_id,revision,updated_at,final,current_message,latest_sequence FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,message.turnId || message.messageId) as {card_id:string|null;revision:number;updated_at:number;final:number;current_message:string;latest_sequence:number}|undefined;
     if(row && (sequence<row.latest_sequence || (row.current_message!==message.messageId && sequence===row.latest_sequence))) return;
