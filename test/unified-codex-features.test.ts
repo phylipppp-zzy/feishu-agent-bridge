@@ -35,3 +35,11 @@ test('owned control changes track subscription, unknown sessions cannot be acqui
  const n=calls.length; await assert.rejects(adapter.input(ref,'new',[{type:'text',text:'blocked'}],guard),code('control_conflict')); assert.equal(calls.length,n);
  await adapter.control(ref,'acquire',guard); assert.equal(calls.at(-1)!.method,'thread/resume');
 });
+
+test('catalog reasoning effort is validated and reaches only later new turns',async()=>{
+ const {adapter,calls}=setup(); await adapter.create('/tmp',null); const transport=adapter.transport as any; const request=transport.request.bind(transport); transport.request=async(method:string,params:any)=> method==='model/list' ? (params.cursor ? {data:[{model:'m2',displayName:'M2',supportedReasoningEfforts:[{reasoningEffort:'high',description:''}]}],nextCursor:null} : {data:[{model:'m1',displayName:'M1',supportedReasoningEfforts:[{reasoningEffort:'low',description:''}]}],nextCursor:'p2'}) : request(method,params);
+ assert.deepEqual((await adapter.listModels(ref)).map(x=>x.reasoningEfforts),[['low'],['high']]);
+ await assert.rejects(adapter.updateSettings(ref,{model:'m2',preferences:{reasoningEffort:'low'}},guard),code('invalid_request'));
+ await assert.rejects(adapter.updateSettings(ref,{model:'m2',preferences:{reasoningEffort:'high',other:'x'}},guard),code('unsupported'));
+ await adapter.updateSettings(ref,{model:'m2',preferences:{reasoningEffort:'high'}},guard); await adapter.input(ref,'new',[{type:'text',text:'next'}],guard); assert.equal(calls.at(-1)!.params.effort,'high');
+});

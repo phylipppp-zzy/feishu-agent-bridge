@@ -98,7 +98,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   const sourceAllowed=(s:Session)=>s.native.hostId===config.hostId && s.native.serviceId===(s.native.provider==='claude'?config.claudeServiceId:config.codexServiceId) && sources.some(x=>x.provider===s.native.provider && x.hostId===s.native.hostId && x.serviceId===s.native.serviceId);
   const trusted=(s:Session):boolean=>{try {return sourceAllowed(s) && isAbsolute(s.project) && projects.some(root=>inside(realpathSync(s.project),root));}catch{return false;}};
   const registry=new ArtifactRegistry({},20*1024*1024,config.artifactStatePath); const catalog=new LocalCatalog(sources); const discovered=new Set<string>(); let enrichmentError=false;
-  const configure=(s:Session)=>{if(!trusted(s)) throw new Error('session outside trusted configuration'); const project=realpathSync(s.project); registry.setRoots(s.native,outputs.filter(root=>inside(root,project)));};
+  const configure=(s:Session)=>{if(!trusted(s)) throw new Error('session outside trusted configuration'); const project=realpathSync(s.project); registry.setRoots(s.native,outputs.filter(root=>inside(root,project))); registry.setProjectRoot(s.native,project);};
   // Pin each verified native ref to its canonical project; provider events alone cannot establish authority.
   const pinned=new Map<string,Session>();
   const buffered:Array<{observation:PlatformObservation; listener:(o:PlatformObservation)=>void; bytes:number; expires:number}> = [];

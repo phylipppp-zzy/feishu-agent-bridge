@@ -135,7 +135,7 @@ export class UnifiedStore {
   hasInteractiveIntent(id:string):boolean { return !!this.row('SELECT session_id FROM interactive_intent WHERE session_id=?',id); }
   maxConnectionGeneration(): number { const row=this.row('SELECT MAX(connection_generation) AS value FROM sessions'); return Number(row?.value ?? 0); }
   /** Attach a native mapping and an idempotent bootstrap receipt in one transaction. */
-  attachSession(context: WriteContext, session: Session, payload: unknown, connectionGeneration: number | null = null, observed?: {messages:Message[];interactions:Interaction[]}): Operation { return this.transaction(() => {
+  attachSession(context: WriteContext, session: Session, payload: unknown, connectionGeneration: number | null = null, observed?: {messages:Message[];interactions:Interaction[];turns?:Turn[]}): Operation { return this.transaction(() => {
     const old = this.existing(context, 'attachSession', payload); if (old.operation) return old.operation;
     if (connectionGeneration !== null && (!Number.isSafeInteger(connectionGeneration) || connectionGeneration < 0)) return fail('invalid_request','invalid connection generation');
     const existing = this.findSession(session.native); const mapped = existing ?? session;
@@ -150,6 +150,7 @@ export class UnifiedStore {
       this.eventFor(existing.sessionId,existing.sessionId,updated.revision,'session.updated',null,updated);
     }
     if (observed) {
+      for (const native of observed.turns ?? []) this.putTurnInTransaction({...native,sessionId:mapped.sessionId});
       for (const native of observed.messages) { const value={...native,sessionId:mapped.sessionId}; const prior=this.row('SELECT session_id FROM messages WHERE id=?',value.messageId); if(prior && prior.session_id !== mapped.sessionId) return fail('idempotency_conflict','message id belongs to another session'); if(!prior) { this.run('INSERT INTO messages(id,session_id,value) VALUES(?,?,?)',value.messageId,mapped.sessionId,JSON.stringify(value)); this.eventFor(mapped.sessionId,value.messageId,value.revision,'message.updated',null,value); } }
       for (const native of observed.interactions) { const value={...native,sessionId:mapped.sessionId}; const prior=this.row('SELECT session_id FROM interactions WHERE id=?',value.interactionId); if(prior && prior.session_id !== mapped.sessionId) return fail('idempotency_conflict','interaction id belongs to another session'); if(!prior) { if(value.connectionGeneration !== this.connectionGeneration(mapped.sessionId)) return fail('interaction_expired'); this.run('INSERT INTO interactions(id,session_id,value) VALUES(?,?,?)',value.interactionId,mapped.sessionId,JSON.stringify(value)); if(native.status === 'awaiting_answer') this.run('INSERT INTO native_interactions(id,value) VALUES(?,?)',value.interactionId,JSON.stringify(native)); this.eventFor(mapped.sessionId,value.interactionId,value.revision,'interaction.created',null,value); } }
     }
@@ -172,7 +173,7 @@ export class UnifiedStore {
   private settleTurn(turn: Turn): void {
     if (!['completed','failed','interrupted'].includes(turn.status)) return;
     const row = this.row('SELECT operation_id FROM operation_turns WHERE session_id=? AND turn_id=?',turn.sessionId,turn.turnId); if (!row) return;
-    const id=String(row.operation_id), op=this.getOperation(id); if (op.status !== 'accepted') return;
+    const id=String(row.operation_id), op=this.getOperation(id); if (op.status !== 'accepted' && op.status !== 'unknown') return;
     const status = turn.status === 'completed' ? 'completed' : 'failed'; const next: Operation = {...op,status,revision:op.revision+1,error:null,result:{kind:'turn',turnId:turn.turnId,status:turn.status as 'completed'|'failed'|'interrupted'}};
     this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id); this.run("UPDATE outbox SET state='done' WHERE operation_id=?",id); this.eventFor(turn.sessionId,id,next.revision,`operation.${status}`,id,next);
   }
@@ -192,7 +193,30 @@ export class UnifiedStore {
     if (op.action === 'submitInput' && nativeReference) {const row=this.row('SELECT value FROM turns WHERE id=? AND session_id=?',nativeReference,op.targetId); if(row) this.settleTurn(parse<Turn>(row.value));}
     return this.getOperation(id);
   }); }
-  putTurn(turn: Turn): void { this.transaction(() => { this.session(turn.sessionId); const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId); if (old) {const prior=parse<Turn>(old.value); if(prior.sessionId !== turn.sessionId) return fail('invalid_request'); if(JSON.stringify(prior) === JSON.stringify(turn)) return; if (['completed','failed','interrupted'].includes(prior.status)) return fail('stale_revision','terminal turn cannot be overwritten'); } this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',turn.turnId,turn.sessionId,JSON.stringify(turn)); this.eventFor(turn.sessionId,turn.turnId,0,'turn.updated',null,turn); this.settleTurn(turn); }); }
+  private putTurnInTransaction(turn: Turn): void { this.session(turn.sessionId); const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId); if (old) {const prior=parse<Turn>(old.value); if(prior.sessionId !== turn.sessionId) return fail('invalid_request'); if(JSON.stringify(prior) === JSON.stringify(turn)) { this.settleTurn(prior); return; } if (['completed','failed','interrupted'].includes(prior.status)) { this.settleTurn(prior); return; } } this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',turn.turnId,turn.sessionId,JSON.stringify(turn)); this.eventFor(turn.sessionId,turn.turnId,0,'turn.updated',null,turn); this.settleTurn(turn); }
+  putTurn(turn: Turn): void { this.transaction(() => this.putTurnInTransaction(turn)); }
+  operationTurn(id:string): {sessionId:string;turnId:string} | null { const row=this.row('SELECT session_id,turn_id FROM operation_turns WHERE operation_id=?',id); return row ? {sessionId:String(row.session_id),turnId:String(row.turn_id)} : null; }
+  /** Apply live turn evidence and its session status atomically; stale terminals never clear newer work. */
+  observeTurn(turn: Turn): void { this.transaction(() => {
+    const current=this.session(turn.sessionId), previous=this.listTurns(turn.sessionId).find(t=>t.turnId===turn.turnId);
+    this.putTurnInTransaction(turn);
+    if (this.isDetached(turn.sessionId) || this.recoveryQuarantined(turn.sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return;
+    const interactions=this.snapshotInteractions(turn.sessionId).filter(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery');
+    const active=this.listTurns(turn.sessionId).some(t=>t.status==='running'||t.status==='queued');
+    let status=current.status;
+    if (interactions.length) status=interactions.some(i=>i.kind==='approval') ? 'waiting_approval' : 'waiting_question';
+    else if (turn.status==='running' && (!previous || previous.status==='queued' || previous.status==='running')) status='running';
+    else if (previous?.status==='running' && ['completed','failed','interrupted'].includes(turn.status) && !active) status=turn.status==='completed' ? 'idle' : turn.status as 'failed'|'interrupted';
+    if(status!==current.status) { const next={...current,status,revision:current.revision+1}; this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,turn.sessionId); this.eventFor(turn.sessionId,turn.sessionId,next.revision,'session.updated',null,next); }
+  }); }
+  observeInteractionStatus(sessionId:string, turnId:string): void { this.transaction(() => {
+    const current=this.session(sessionId); if(this.isDetached(sessionId) || this.recoveryQuarantined(sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return;
+    const interactions=this.snapshotInteractions(sessionId).filter(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery'); const turns=this.listTurns(sessionId), turn=turns.find(t=>t.turnId===turnId); let status=current.status;
+    if(interactions.length) status=interactions.some(i=>i.kind==='approval') ? 'waiting_approval' : 'waiting_question';
+    else if(turn?.status==='running') status='running';
+    else if(turn && ['completed','failed','interrupted'].includes(turn.status) && !turns.some(t=>t.status==='running'||t.status==='queued')) status=turn.status==='completed' ? 'idle' : turn.status as 'failed'|'interrupted';
+    if(status!==current.status) {const next={...current,status,revision:current.revision+1};this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,sessionId);this.eventFor(sessionId,sessionId,next.revision,'session.updated',null,next);}
+  }); }
   listTurns(sessionId: string): Turn[] { this.session(sessionId); return (this.db.prepare('SELECT value FROM turns WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string,unknown>[]).map(r => parse<Turn>(r.value)); }
   queuedInputs(sessionId:string): Array<{inputId:string}> { this.session(sessionId); return this.pendingOutbox().filter(id=>{const o=this.getOutbox(id);return o.context.targetId===sessionId && o.kind==='submitInput' && (o.payload as {mode?:string}).mode==='queue';}).map(inputId=>({inputId})); }
   cancelQueuedInput(context: WriteContext, inputId: string): Operation { return this.transaction(() => {
@@ -348,7 +372,7 @@ export class UnifiedStore {
   private cancelPending(id: string): void {
     this.run("UPDATE outbox SET state='cancelled' WHERE operation_id=? AND state='pending'", id);
     const op = this.getOperation(id);
-    if (canTransitionOperation(op.status, 'failed')) { const next: Operation = { ...op, status: 'failed', revision: op.revision + 1, error: contractError('interaction_expired', 'delivery context no longer valid') }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id); this.eventFor(op.targetId, id, next.revision, 'operation.failed', id, next); }
+    if (canTransitionOperation(op.status, 'failed')) { const next: Operation = { ...op, status: 'failed', revision: op.revision + 1, error: op.action === 'resolveInteraction' ? contractError('interaction_expired', 'delivery context no longer valid') : contractError('control_conflict', 'request was not executed; submit again after control is restored') }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id); this.eventFor(op.targetId, id, next.revision, 'operation.failed', id, next); }
   }
   private invalidateDeliveries(sessionId: string, expireInteractions: boolean): void {
     const rows = this.db.prepare("SELECT operation_id,state,context FROM outbox WHERE state IN ('pending','in_flight')").all() as Record<string, unknown>[];

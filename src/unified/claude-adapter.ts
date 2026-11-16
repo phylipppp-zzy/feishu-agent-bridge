@@ -8,7 +8,7 @@ import { ClaudeState } from './claude-state.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
 type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
-type Live = { completion?: Promise<void>; id: string; cwd: string; model: string | null; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending> };
+type Live = { completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending> };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
 const safeNumber = (n: unknown): number | null => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
@@ -77,7 +77,7 @@ export class ClaudeAdapter implements PlatformPort {
       this.emit({ type: 'interaction', ref: this.ref(id), interaction });
     });
     const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', ...(model ? { model } : {}), canUseTool };
-    const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map() }; this.lives.set(id, live); live.completion = this.consume(live);
+    const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map() }; this.lives.set(id, live); live.completion = this.consume(live);
   }
   private async consume(live: Live): Promise<void> {
     const ref = this.ref(live.id);
@@ -97,8 +97,8 @@ export class ClaudeAdapter implements PlatformPort {
       if (providerEvent) { const now = new Date().toISOString(), sequence = ++this.sequence; this.emit({ type: 'event', ref, event: { schemaVersion: 1, eventId: randomUUID(), sessionId: live.id, objectId: live.turn ?? live.id, objectRevision: 0, sequence, type: providerEvent.type, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: providerEvent.data } }); }
       if (m.type === 'assistant' && !m.parent_tool_use_id) { const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence); if (normalized) { normalized.turnId = live.turn ?? normalized.turnId; live.messages.push(normalized); this.emit({ type: 'message', ref, message: normalized }); } }
       if (m.type === 'user' && Array.isArray(m.message?.content)) for (const b of m.message.content) if (b.type === 'tool_result') for (const p of live.pending.values()) if (p.toolId === b.tool_use_id && p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'resolved', revision: p.interaction.revision + 1, nativeResult: { status: 'unknown', source: b.is_error ? 'claude_tool_result_error' : 'claude_tool_result' } }; this.emit({ type: 'interaction', ref, interaction: p.interaction }); }
-      if (m.type === 'result' && live.turn) { const turn: Turn = { turnId: live.turn, sessionId: live.id, status: live.interrupted ? 'interrupted' : m.subtype === 'success' && !m.is_error ? 'completed' : 'failed', inputId: null, startedAt: null, endedAt: new Date().toISOString(), model: live.model, outputIds: [] }; live.turn = null; live.interrupted = false; this.emit({ type: 'turn', ref, turn }); }
-    } } catch (error) { const exitCode = error && typeof error === 'object' && 'exitCode' in error && Number.isSafeInteger((error as {exitCode:unknown}).exitCode) ? (error as {exitCode:number}).exitCode : null; streamFailure = {kind:'sdk_stream_error',exitCode}; } finally { if (this.lives.get(live.id) === live) this.lives.delete(live.id); if (live.turn) { const failure = streamFailure ?? {kind:'sdk_stream_closed_without_result',exitCode:null}; const now = new Date().toISOString(); this.emit({type:'event',ref,event:{schemaVersion:1,eventId:randomUUID(),sessionId:live.id,objectId:live.turn,objectRevision:0,sequence:++this.sequence,type:'adapter.stream_failed',occurredAt:now,receivedAt:now,operationId:null,cursor:String(this.sequence),data:failure}}); this.emit({type:'turn',ref,turn:{turnId:live.turn,sessionId:live.id,status:'failed',inputId:null,startedAt:null,endedAt:now,model:live.model,outputIds:[]}}); live.turn=null; }  for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'expired', revision: p.interaction.revision + 1, nativeResult: p.interaction.status === 'answer_pending_delivery' ? { status: 'unknown', source: 'connection_closed' } : null }; p.settle({ behavior: 'deny', message: 'connection closed' }); this.emit({ type: 'interaction', ref, interaction: p.interaction }); } }
+      if (m.type === 'result' && live.turn) { const turn: Turn = { turnId: live.turn, sessionId: live.id, status: live.interrupted ? 'interrupted' : m.subtype === 'success' && !m.is_error ? 'completed' : 'failed', inputId: null, startedAt: null, endedAt: new Date().toISOString(), model: live.turnModel, outputIds: [] }; live.turn = null; live.interrupted = false; this.emit({ type: 'turn', ref, turn }); }
+    } } catch (error) { const exitCode = error && typeof error === 'object' && 'exitCode' in error && Number.isSafeInteger((error as {exitCode:unknown}).exitCode) ? (error as {exitCode:number}).exitCode : null; streamFailure = {kind:'sdk_stream_error',exitCode}; } finally { if (this.lives.get(live.id) === live) this.lives.delete(live.id); if (live.turn) { const failure = streamFailure ?? {kind:'sdk_stream_closed_without_result',exitCode:null}; const now = new Date().toISOString(); this.emit({type:'event',ref,event:{schemaVersion:1,eventId:randomUUID(),sessionId:live.id,objectId:live.turn,objectRevision:0,sequence:++this.sequence,type:'adapter.stream_failed',occurredAt:now,receivedAt:now,operationId:null,cursor:String(this.sequence),data:failure}}); this.emit({type:'turn',ref,turn:{turnId:live.turn,sessionId:live.id,status:'failed',inputId:null,startedAt:null,endedAt:now,model:live.turnModel,outputIds:[]}}); live.turn=null; }  for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'expired', revision: p.interaction.revision + 1, nativeResult: p.interaction.status === 'answer_pending_delivery' ? { status: 'unknown', source: 'connection_closed' } : null }; p.settle({ behavior: 'deny', message: 'connection closed' }); this.emit({ type: 'interaction', ref, interaction: p.interaction }); } }
   }
   /** Stop owned SDK queries and settle outstanding requests before detaching observers. */
   async close(): Promise<void> {
@@ -118,7 +118,7 @@ export class ClaudeAdapter implements PlatformPort {
     const live = this.active(ref, guard); if (mode !== 'new' || !blocks.length) throw contractError('unsupported'); if (live.turn) throw contractError('busy');
     const content: Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string } }> = [];
     for (const block of blocks) { if (block.type === 'text') content.push({ type: 'text', text: block.text }); else { const data = Buffer.from(block.content); const media = imageMediaType(data); if (!media || media !== block.mediaType) throw contractError('unsupported', 'only verified PNG, JPEG, GIF and WebP images are supported'); content.push({ type: 'image', source: { type: 'base64', media_type: media, data: data.toString('base64') } }); } }
-    const id = randomUUID(); guard.assertCurrent(); live.turn = id; live.queue.push({ type: 'user', uuid: id, parent_tool_use_id: null, message: { role: 'user', content: content.length === 1 && content[0]!.type === 'text' ? content[0]!.text : content } });
+    const id = randomUUID(); guard.assertCurrent(); live.turn = id; live.turnModel = live.model; live.queue.push({ type: 'user', uuid: id, parent_tool_use_id: null, message: { role: 'user', content: content.length === 1 && content[0]!.type === 'text' ? content[0]!.text : content } });
     const message: Message = { messageId: id, sessionId: live.id, turnId: id, role: 'user', blocks: blocks.map(b => b.type === 'text' ? b : { type: 'artifact', artifactId: b.artifactId, contentVersion: b.contentVersion }), sequence: ++this.sequence, revision: 1, final: true, source: 'claude' }; live.messages.push(message); this.emit({ type: 'message', ref, message }); this.emit({ type: 'turn', ref, turn: { turnId: id, sessionId: live.id, status: 'running', inputId: id, startedAt: new Date().toISOString(), endedAt: null, model: live.model, outputIds: [] } }); return ack(id);
   }
   async interrupt(ref: NativeSessionRef, turnId: string, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard); if (live.turn !== turnId) throw contractError('stale_revision'); guard.assertCurrent(); live.interrupted = true; await live.query.interrupt(); return ack(turnId); }
@@ -128,7 +128,36 @@ export class ClaudeAdapter implements PlatformPort {
     guard.assertCurrent(); p.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 }; p.settle(result); this.emit({ type: 'interaction', ref, interaction: p.interaction }); return ack(); }
   async listArtifacts(ref: NativeSessionRef): Promise<Artifact[]> { this.check(ref); throw contractError('unsupported'); }
   async readArtifact(ref: NativeSessionRef, _id: string, _version: string): Promise<Uint8Array> { this.check(ref); throw contractError('unsupported'); }
-  async listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string }>> { const live = this.lives.get(this.check(ref)); if (!live) throw contractError('unsupported'); return (await live.query.supportedModels()).map(m => ({ id: m.value, label: m.displayName })); }
-  async updateSettings(ref: NativeSessionRef, settings: { model: string | null; preferences: Record<string, string> }, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard); if (Object.keys(settings.preferences).length) throw contractError('unsupported'); if (settings.model !== null && !(await live.query.supportedModels()).some(m => m.value === settings.model)) throw contractError('invalid_request','unknown model'); guard.assertCurrent(); await live.query.setModel(settings.model ?? undefined); live.model = settings.model; return {...ack(),settingsApplied:true}; }
+  async listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string; reasoningEfforts?: string[] }>> {
+    const live = this.lives.get(this.check(ref)); if (!live) throw contractError('unsupported');
+    return (await live.query.supportedModels()).map(m => ({ id: m.value, label: m.displayName, ...(m.supportsEffort && m.supportedEffortLevels?.length ? { reasoningEfforts: [...m.supportedEffortLevels] } : {}) }));
+  }
+  async updateSettings(ref: NativeSessionRef, settings: { model: string | null; preferences: Record<string, string> }, guard: DispatchGuard): Promise<PlatformAcknowledgement> {
+    const live = this.active(ref, guard);
+    if (Object.keys(settings.preferences).some(k => k !== 'reasoningEffort')) throw contractError('unsupported');
+    const effort = settings.preferences.reasoningEffort;
+    const models = settings.model !== null ? await live.query.supportedModels() : [];
+    const model = models.find(m => m.value === settings.model);
+    if (settings.model !== null && !model) throw contractError('invalid_request', 'unknown model');
+    if (effort !== undefined && (!model?.supportsEffort || !model.supportedEffortLevels?.includes(effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max'))) throw contractError('invalid_request', 'reasoning effort not in selected model catalog');
+    // Empty preferences clear an existing session effort override to the model default.
+    // A null model selects the SDK default and cannot validate an explicit effort.
+    guard.assertCurrent();
+    try {
+      await live.query.setModel(settings.model ?? undefined);
+      // Do not issue a second native write after control or connection has changed.
+      this.active(ref, guard); guard.assertCurrent();
+      if (effort !== undefined || live.effortOverride) {
+        await live.query.applyFlagSettings({ effortLevel: (effort ?? null) as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null });
+        this.active(ref, guard); guard.assertCurrent();
+      }
+      live.model = settings.model; live.effortOverride = effort !== undefined;
+      // The SDK accepts the requested flag; managed policy may limit actual effort.
+      return {...ack(), settingsApplied:true};
+    } catch {
+      // Either native call may have applied before its receipt was lost. Do not confirm.
+      throw contractError('outcome_unknown', 'Claude session settings may have partially changed');
+    }
+  }
   async control(ref: NativeSessionRef, _action: 'acquire' | 'release', _guard: DispatchGuard): Promise<PlatformAcknowledgement> { this.check(ref); throw contractError('unsupported', 'Claude SDK does not provide observable native control handoff'); }
 }

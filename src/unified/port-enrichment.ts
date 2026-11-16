@@ -1,5 +1,8 @@
+import { listSafeProjectDirectory } from './project-files.js';
+import { realpath } from 'node:fs/promises';
+import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { createHash } from 'node:crypto';
-import { localFileLinks } from '../claude/deliver.js';
+import { localFileLinks, selectDeliverables, deliverArguments } from '../claude/deliver.js';
 import type { PlatformObservation, PlatformPort } from './adapter.js';
 import type { Artifact, NativeSessionRef, Session } from './contracts.js';
 import { contractError } from './errors.js';
@@ -74,6 +77,8 @@ export class EnrichedPort implements PlatformPort {
   }
   private async isExternal(ref:NativeSessionRef):Promise<boolean> { const base=await this.allBase(); if (base.some(s=>nativeRefKey(s.native)===nativeRefKey(ref))) return false; await this.catalog.refresh(); try { this.catalog.read(ref); return true; } catch { throw contractError('invalid_request','session not found'); } }
   private async writable(ref:NativeSessionRef):Promise<void> { if (await this.isExternal(ref)) throw contractError('unsupported','external session is read-only'); }
+  async listProjectFiles(ref:NativeSessionRef,directory:string,showHidden:boolean) { await this.read(ref); const root=this.registry.getProjectRoot(ref); if(!root) throw contractError('unsupported'); return listSafeProjectDirectory(directory,root,showHidden); }
+  async selectProjectFiles(ref:NativeSessionRef,args:string):Promise<Artifact[]> { await this.read(ref); const root=this.registry.getProjectRoot(ref); if(!root) throw contractError('unsupported'); const parts=deliverArguments(args); if(!parts.length || parts.length>20 || parts.some(p=>/[?*\[\]{}]/.test(p))) throw contractError('invalid_request','explicit file or directory paths only; patterns are unsupported'); for(const part of parts) { const path=await realpath(resolve(root,part)).catch(()=>null); if(!path) throw contractError('invalid_request','path unavailable'); const rel=relative(root,path); if(rel==='..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw contractError('invalid_request','path outside project'); } const selection=await selectDeliverables(parts,root,root); if(selection.skipped.length || !selection.files.length) throw contractError('invalid_request','selection incomplete or unsafe'); const result:Artifact[]=[]; for(const file of selection.files) result.push(await this.registry.register(nativeRefKey(ref),file.path,'application/octet-stream',true)); return result; }
   async listArtifacts(ref:NativeSessionRef):Promise<Artifact[]> {
     const local = this.registry.list(nativeRefKey(ref),1000); let cursor=local.nextCursor; const result=[...local.items]; while(cursor) { const p=this.registry.list(nativeRefKey(ref),1000,cursor); result.push(...p.items); cursor=p.nextCursor; }
     if (await this.isExternal(ref)) return result;

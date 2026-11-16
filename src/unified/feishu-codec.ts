@@ -26,6 +26,7 @@ function parseAction(value: unknown): ChannelAction {
     case 'stop': if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration)) return {action:'stop',turnId:value.turnId,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'cancel': if (str(value.inputId) && counter(value.revision) && counter(value.controlGeneration)) return {action:'cancel',inputId:value.inputId,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'control': if (str(value.owner) && (value.strategy === 'wait' || value.strategy === 'interrupt') && counter(value.revision) && counter(value.controlGeneration) && (value.release === undefined || typeof value.release === 'boolean')) return {action:'control',owner:value.owner,strategy:value.strategy,revision:value.revision,controlGeneration:value.controlGeneration,...(typeof value.release === 'boolean' ? {release:value.release}:{})}; break;
+    case 'models': if (value.cursor === undefined || str(value.cursor)) return {action:'models',...(str(value.cursor) ? {cursor:value.cursor}:{})}; break;
     case 'settings': if ((value.model === null || str(value.model)) && object(value.preferences) && Object.values(value.preferences).every(v => typeof v === 'string') && counter(value.revision) && counter(value.controlGeneration)) return {action:'settings',model:value.model,preferences:value.preferences as Record<string,string>,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'notifications': if (typeof value.enabled === 'boolean' && Array.isArray(value.eventTypes) && value.eventTypes.every(str) && counter(value.revision) && counter(value.controlGeneration)) return {action:'notifications',enabled:value.enabled,eventTypes:value.eventTypes,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'archive': if (typeof value.archived === 'boolean' && counter(value.revision) && counter(value.controlGeneration)) return {action:'archive',archived:value.archived,revision:value.revision,controlGeneration:value.controlGeneration}; break;
@@ -58,10 +59,14 @@ export function parseFeishuText(text: string): ChannelAction {
   if (!input.startsWith('/')) return {action:'input',text:input,mode:'new'};
   const [command, ...parts] = input.split(/\s+/); const rest = parts.join(' ');
   switch (command) {
+    case '/help': return {action:'help'};
+    case '/new': return {action:'new_help'};
+    case '/sessions': return {action:'list'};
+    case '/model': return parts.length === 0 ? {action:'legacy_model'} : parts.length === 2 ? {action:'legacy_model',model:parts[0]!,effort:parts[1]!} : {action:'legacy_model',invalid:true};
     case '/list': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/bind': if (parts[0] && (!parts[1] || parts[1] === 'read_only' || parts[1] === 'interactive')) return {action:'bind',sessionId:parts[0],...(parts[1] ? {mode:parts[1] as 'read_only'|'interactive'} : {})}; break;
     case '/attach': { const [provider,hostId,serviceId,nativeSessionId,mode] = parts; return parseAction({action:'attach',provider,hostId,serviceId,nativeSessionId,mode}); }
-    case '/stop': { const [turnId,r,g]=parts; return parseAction({action:'stop',turnId,revision:Number(r),controlGeneration:Number(g)}); }
+    case '/stop': { if(!parts.length) return {action:'legacy_stop'}; const [turnId,r,g]=parts; return parseAction({action:'stop',turnId,revision:Number(r),controlGeneration:Number(g)}); }
     case '/cancel': { const [inputId,r,g]=parts; return parseAction({action:'cancel',inputId,revision:Number(r),controlGeneration:Number(g)}); }
     case '/control': { const [owner,strategy,r,g,release]=parts; return parseAction({action:'control',owner,strategy,revision:Number(r),controlGeneration:Number(g),release:release === 'release'}); }
     case '/settings': { const [model,r,g]=parts; return parseAction({action:'settings',model:model === '-' ? null : model,preferences:{},revision:Number(r),controlGeneration:Number(g)}); }
@@ -76,7 +81,11 @@ export function parseFeishuText(text: string): ChannelAction {
     }
     case '/queue': if (rest) return {action:'input',text:rest,mode:'queue'}; break;
     case '/steer': if (rest) return {action:'input',text:rest,mode:'steer'}; break;
+    case '/': case '/status': case '/menu': return {action:'panel'};
     case '/panel': return {action:'panel',...(parts[0] && parts[0] !== '-' ? {turnId:parts[0]} : {}),...(parts[1] && parts[1] !== '-' ? {inputId:parts[1]} : {})};
+    case '/ls': { const args=parts.filter(x=>x!=='-a'); if(args.length>1) break; return {action:'project_files',directory:args[0] ?? '.',showHidden:parts.includes('-a')}; }
+    case '/deliver': if (rest) return {action:'deliver_files',args:input.slice(command!.length).trim()}; break;
+    case '/export': if (!rest) return {action:'export'}; break;
     case '/history': return {action:'history',...(rest ? {cursor:rest}:{})};
     case '/files': return {action:'artifacts'};
     case '/models': return {action:'models'};

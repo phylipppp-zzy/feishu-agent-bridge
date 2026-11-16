@@ -44,7 +44,7 @@ test('normalized message and turn observations include native reference', async 
 test('unsupported file and control operations return standard error', async () => { const { adapter } = setup(); await assert.rejects(adapter.listArtifacts(ref), errorCode('unsupported')); await assert.rejects(adapter.control(ref, 'acquire', guard), errorCode('unsupported')); });
 test('list and read normalize provider data and preserve host/service reference', async () => {
   const { sockets, transport, adapter } = setup(); await transport.connect();
-  const thread = { id: 't', cwd: '/work', name: 'title', status: { type: 'idle' }, turns: [{ id: 'turn', items: [{ id: 'item', type: 'agentMessage', text: 'ok' }] }] };
+  const thread = { id: 't', cwd: '/work', name: 'title', status: { type: 'idle' }, turns: [{ id: 'turn', status: 'completed', items: [{ id: 'item', type: 'agentMessage', text: 'ok' }] }] };
   const pendingList = adapter.list(null, 10); const listId = sockets[0]!.sent.at(-1).id; sockets[0]!.message({ id: listId, result: { data: [thread], nextCursor: null } }); const list = await pendingList; assert.deepEqual(list.items[0]!.native, ref);
   const pendingRead = adapter.read(ref); const readId = sockets[0]!.sent.at(-1).id; sockets[0]!.message({ id: readId, result: { thread } }); const snapshot = await pendingRead; assert.equal(snapshot.session.title, 'title'); assert.equal(snapshot.messages[0]!.messageId, 'item'); assert.deepEqual(snapshot.messages[0]!.blocks, [{ type: 'text', text: 'ok' }]); transport.close();
 });

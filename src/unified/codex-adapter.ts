@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
-import { payloadDigest, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
+import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
 import { contractError } from './errors.js';
 import { CodexTransport } from './codex-transport.js';
 
@@ -58,6 +58,10 @@ export class CodexAdapter implements PlatformPort {
     const key = `${thread}\0${item.id}`, old = this.messages.get(key);
     const value: Message = { messageId: item.id, sessionId: thread, turnId: turn, role, blocks: [{ type: 'text', text }], sequence: ++this.sequence, revision: (old?.revision ?? 0) + 1, final, source: 'codex' }; this.messages.set(key, value); return value;
   }
+  private turn(thread: string, native: Obj): Turn {
+    if (!native || !isString(native.id) || !['inProgress','completed','failed','interrupted'].includes(native.status)) return invalidNative();
+    return {turnId:native.id,sessionId:thread,status:native.status === 'inProgress' ? 'running' : native.status,inputId:null,startedAt:null,endedAt:null,model:null,outputIds:[]};
+  }
   private receive(m: Obj, generation: number): void {
     const p = m.params as Obj | undefined; if (!p || typeof p !== 'object') return;
     const thread = typeof p.threadId === 'string' ? p.threadId : undefined;
@@ -84,7 +88,7 @@ export class CodexAdapter implements PlatformPort {
     }
     if (!thread) return;
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
-      const turn: Turn = { turnId: p.turn.id, sessionId: thread, status: p.turn.status === 'completed' ? 'completed' : p.turn.status === 'interrupted' ? 'interrupted' : p.turn.status === 'failed' ? 'failed' : 'running', inputId: null, startedAt: typeof p.turn.startedAt === 'number' ? new Date(p.turn.startedAt * 1000).toISOString() : null, endedAt: typeof p.turn.completedAt === 'number' ? new Date(p.turn.completedAt * 1000).toISOString() : null, model: null, outputIds: [] };
+      const turn = this.turn(thread,p.turn);
       this.emit({ type: 'turn', turn, ref: this.ref(thread) } as PlatformObservation); return;
     }
     if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread) } as PlatformObservation); }
@@ -97,7 +101,8 @@ export class CodexAdapter implements PlatformPort {
     const id = this.check(ref), r = await this.transport.request('thread/read', { threadId: id, includeTurns: true }) as Obj; const session = this.session(r?.thread);
     if (session.native.nativeSessionId !== id || !Array.isArray(r.thread.turns)) return invalidNative();
     const messages: Message[] = []; for (const turn of r.thread.turns) if (isString(turn.id) && Array.isArray(turn.items)) for (const item of turn.items) { const message = this.message(id, turn.id, item, true); if (message) messages.push(message); }
-    return { session, messages, interactions: [...this.requests.values()].map(x => x.interaction).filter(x => x.sessionId === id), connectionGeneration: this.transport.generation };
+    const turns = r.thread.turns.map((turn: Obj) => this.turn(id,turn));
+    return { session, messages, turns, interactions: [...this.requests.values()].map(x => x.interaction).filter(x => x.sessionId === id), connectionGeneration: this.transport.generation };
   }
   async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> {
     const id = this.check(ref);
@@ -143,20 +148,23 @@ export class CodexAdapter implements PlatformPort {
   }
   async listArtifacts(_ref: NativeSessionRef): Promise<Artifact[]> { throw contractError('unsupported'); }
   async readArtifact(_ref: NativeSessionRef, _id: string, _version: string): Promise<Uint8Array> { throw contractError('unsupported'); }
-  async listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string }>> {
-    this.check(ref); const result: Array<{id:string;label:string}> = []; let cursor: string | null = null; const seen = new Set<string>();
+  async listModels(ref: NativeSessionRef): Promise<ModelOption[]> {
+    this.check(ref); const result: ModelOption[] = []; let cursor: string | null = null; const seen = new Set<string>();
     do { const r = await this.transport.request('model/list', { cursor, limit: 100 }) as Obj;
-      if (!Array.isArray(r?.data) || !(r.nextCursor == null || typeof r.nextCursor === 'string') || !r.data.every((m:Obj) => isString(m.model) && typeof m.displayName === 'string')) return invalidNative();
-      result.push(...r.data.map((m:Obj) => ({id:m.model,label:m.displayName}))); cursor = r.nextCursor ?? null;
+      if (!Array.isArray(r?.data) || !(r.nextCursor == null || typeof r.nextCursor === 'string') || !r.data.every((m:Obj) => isString(m.model) && typeof m.displayName === 'string' && (m.supportedReasoningEfforts === undefined || (Array.isArray(m.supportedReasoningEfforts) && m.supportedReasoningEfforts.every((e:Obj) => isString(e?.reasoningEffort)))))) return invalidNative();
+      result.push(...r.data.map((m:Obj) => ({id:m.model,label:m.displayName,...(m.supportedReasoningEfforts === undefined ? {} : {reasoningEfforts:m.supportedReasoningEfforts.map((e:Obj) => e.reasoningEffort)})}))); cursor = r.nextCursor ?? null;
       if (cursor !== null && (seen.has(cursor) || seen.size >= 100)) return invalidNative(); if (cursor !== null) seen.add(cursor);
     } while (cursor !== null); return result;
   }
   async updateSettings(ref: NativeSessionRef, settings: { model: string | null; preferences: Record<string, string> }, guard: DispatchGuard): Promise<PlatformAcknowledgement> {
     const id = this.check(ref); if (!this.active.has(id) || !this.transport.connected) throw contractError('control_conflict');
-    if (Object.keys(settings.preferences).length || settings.model === null) throw contractError('unsupported', 'only an explicit catalog model is supported');
-    if (settings.model !== null && !(await this.listModels(ref)).some(m => m.id === settings.model)) throw contractError('invalid_request', 'model not in catalog');
+    if (Object.keys(settings.preferences).some(k => k !== 'reasoningEffort') || settings.model === null) throw contractError('unsupported', 'unsupported preference or missing model');
+    const model = (await this.listModels(ref)).find(m => m.id === settings.model);
+    if (!model) throw contractError('invalid_request', 'model not in catalog');
+    const effort = settings.preferences.reasoningEffort;
+    if (effort !== undefined && !model.reasoningEfforts?.includes(effort)) throw contractError('invalid_request', 'reasoning effort not in catalog');
     if (guard.expectedConnectionGeneration !== null && guard.expectedConnectionGeneration !== this.transport.generation) throw contractError('control_conflict'); guard.assertCurrent();
-    this.settings.set(id, { model: settings.model }); return {...ack(id), settingsApplied: true};
+    this.settings.set(id, { model: settings.model, ...(effort === undefined ? {} : {effort}) }); return {...ack(id), settingsApplied: true};
   }
   async control(ref: NativeSessionRef, action: 'acquire' | 'release', guard: DispatchGuard): Promise<PlatformAcknowledgement> {
     const id = this.check(ref); if (!this.owned.has(id)) throw contractError('unsupported', 'external ownership not verified');

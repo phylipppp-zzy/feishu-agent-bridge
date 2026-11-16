@@ -31,7 +31,7 @@ export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 's
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
 export interface Page<T> { items: T[]; nextCursor: string | null }
 /** All collections and the cursor are read at one consistent event watermark. Interaction status includes delivery state. */
-export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; connectionGeneration?: number }
+export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; connectionGeneration?: number }
 export interface Snapshot<T> { value: T; cursor: string }
 export type EventSubscription = { status: 'events'; events: Event[]; cursor: string } | { status: 'snapshot_required'; error: ContractError };
 
@@ -89,3 +89,7 @@ export function validateEvent(event: Event): Validation<Event> {
   if (!event || !Object.prototype.hasOwnProperty.call(event, 'data') || event.data === undefined || event.schemaVersion !== SCHEMA_VERSION || !nonempty(event.eventId) || !nonempty(event.sessionId) || !nonempty(event.objectId) || !nonempty(event.type) || !nonempty(event.cursor) || !counter(event.objectRevision) || !counter(event.sequence) || !Number.isFinite(Date.parse(event.occurredAt)) || !Number.isFinite(Date.parse(event.receivedAt)) || (event.operationId !== null && !nonempty(event.operationId))) return fail('invalid event envelope');
   return { ok: true, value: event };
 }
+
+/** Provider-neutral model options; absent preferences mean no selectable values advertised. */
+export interface ModelOption { id: string; label: string; reasoningEfforts?: string[] }
+export interface ConfirmedSettings { model: string | null; preferences: Record<string,string>; revision: number }

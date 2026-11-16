@@ -12,6 +12,7 @@ export class ArtifactRegistry {
   private readonly entries = new Map<string, Entry>();
   private tail: Promise<void> = Promise.resolve();
   private readonly roots: Record<string, readonly string[]>;
+  private readonly projectRoots: Record<string, string> = {};
   private readonly eventTimes = new Map<string,string>();
   constructor(roots: Readonly<Record<string, readonly string[]>>, private readonly maxBytes = 20 * 1024 * 1024, private readonly statePath?: string) { this.roots = {...roots}; }
   /** Trusted process configuration only; never pass roots supplied by messages or channel requests. */
@@ -20,7 +21,9 @@ export class ArtifactRegistry {
     this.roots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])] = roots.map(r=>resolve(r));
   }
   getRoots(ref: NativeSessionRef): readonly string[] { return [...(this.roots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])] ?? [])]; }
-  private authorized(e: Entry): boolean { return (this.roots[e.artifact.sessionId] ?? []).some(r=>resolve(r)===e.root); }
+  setProjectRoot(ref:NativeSessionRef, root:string):void { if(!isAbsolute(root)) throw new Error('absolute project root required'); this.projectRoots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])]=resolve(root); }
+  getProjectRoot(ref:NativeSessionRef):string | undefined { return this.projectRoots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])]; }
+  private authorized(e: Entry): boolean { return [...(this.roots[e.artifact.sessionId] ?? []),...(this.projectRoots[e.artifact.sessionId] ? [this.projectRoots[e.artifact.sessionId]!] : [])].some(r=>resolve(r)===e.root); }
   async eventTime(eventId: string, observedAt: string): Promise<string> {
     const task = this.tail.catch(()=>undefined).then(async () => {
       const old = this.eventTimes.get(eventId); if (old) return old;
@@ -63,9 +66,9 @@ export class ArtifactRegistry {
     } finally { await handle.close(); }
   }
   /** Called only for a path observed as an output or an explicitly trusted safe file reference. */
-  async register(sessionId: string, observedPath: string, mediaType = 'application/octet-stream'): Promise<Artifact> {
+  async register(sessionId: string, observedPath: string, mediaType = 'application/octet-stream', explicit = false): Promise<Artifact> {
     if (!isAbsolute(observedPath)) throw new Error('absolute observed path required');
-    const roots = this.roots[sessionId] ?? []; let data: Uint8Array | undefined; let root = '';
+    const roots = explicit && this.projectRoots[sessionId] ? [...(this.roots[sessionId] ?? []),this.projectRoots[sessionId]!] : (this.roots[sessionId] ?? []); let data: Uint8Array | undefined; let root = '';
     for (const candidate of roots) { try { data = await this.readSafe(observedPath,candidate); root = resolve(candidate); break; } catch { /* try another authorized root */ } }
     if (!data) throw new Error('artifact unavailable or outside allowed roots');
     const path = resolve(observedPath), artifactId = digest(JSON.stringify([sessionId,path]));

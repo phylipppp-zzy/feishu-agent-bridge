@@ -10,7 +10,7 @@ import { CodexAdapter } from '../src/unified/codex-adapter.js';
 class FakeTransport {
   generation=1; connected=true; calls:string[]=[]; project='/work';
   seedGeneration(n:number){this.generation=Math.max(this.generation,n)+1;}
-  async request(method:string):Promise<any>{this.calls.push(method); const thread={id:'t',cwd:this.project,status:{type:'idle'},turns:[{id:'turn',items:[{id:'answer',type:'agentMessage',text:'finished'}]}]}; if(['thread/start','thread/read','thread/resume'].includes(method)) return {thread}; throw Error(method);}
+  async request(method:string):Promise<any>{this.calls.push(method); const thread={id:'t',cwd:this.project,status:{type:'idle'},turns:[{id:'turn',status:'completed',items:[{id:'answer',type:'agentMessage',text:'finished'}]}]}; if(['thread/start','thread/read','thread/resume'].includes(method)) return {thread}; throw Error(method);}
 }
 const port={async send(){return 'm'},async update(){},async sendFile(){}};
 const identity={source:'feishu',subject:'owner'};

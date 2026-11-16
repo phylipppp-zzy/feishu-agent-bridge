@@ -1,6 +1,8 @@
+import type { DirectoryListing } from '../claude/deliver.js';
+import type { ModelOption, ConfirmedSettings } from './contracts.js';
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event } from './contracts.js';
 
-export interface ListQuery { cursor?: string; limit: number; search?: string }
+export interface ListQuery { cursor?: string; limit: number; search?: string; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
@@ -11,6 +13,8 @@ export interface UnifiedService {
   detachSession(request: WriteRequest<Record<string, never>>): Promise<Operation>;
   createSession(request: WriteRequest<{ provider: Provider; project: string; model: string | null }>): Promise<Operation>;
   readHistory(sessionId: string, query: ListQuery): Promise<Page<Message>>;
+  listProjectFiles?(sessionId:string, directory:string, showHidden:boolean):Promise<DirectoryListing>;
+  selectProjectFiles?(sessionId:string, args:string):Promise<Artifact[]>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
   getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
@@ -26,7 +30,8 @@ export interface UnifiedService {
   listArtifacts(sessionId: string, query: ListQuery): Promise<Page<Artifact>>;
   readArtifact(sessionId: string, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   stageInputArtifact(request: WriteRequest<{ name: string; mediaType: string; size: number; contentDigest: string; content: Uint8Array }>): Promise<Operation>;
-  listModels(sessionId: string, query: ListQuery): Promise<Page<{ id: string; label: string }>>;
+  getConfirmedSettings?(sessionId: string): Promise<ConfirmedSettings | null>;
+  listModels(sessionId: string, query: ListQuery): Promise<Page<ModelOption>>;
   updateSessionSettings(request: WriteRequest<{ model: string | null; preferences: Record<string, string> }>): Promise<Operation>;
   getOperation(operationId: string): Promise<Operation>;
   reconcile(operationId: string): Promise<Operation>;
@@ -40,7 +45,7 @@ export interface UnifiedService {
  * Unsupported provider capabilities must reject with the stable unsupported error. */
 export type PlatformAcknowledgement = { status: 'submitted'; nativeReference: string | null; createdSession?: Session; connectionGeneration?: number; settingsApplied?: true }; 
 /** Each observation carries its native ref for core's durable ID mapping.
- * Object sessionId may be a temporary native identifier; core replaces it using ref.
+ * Object sessionId must be the ref nativeSessionId or the corresponding unified sessionId; core validates it before mapping.
  * Provider message revision may use a stable native item ID and native event sequence;
  * after reconnect core reconciles snapshot revisions and assigns durable cursors. */
 export type PlatformObservation =
@@ -69,9 +74,11 @@ export interface PlatformPort {
   interrupt(ref: NativeSessionRef, turnId: string, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   onObservation(listener: (observation: PlatformObservation) => void): () => void;
+  listProjectFiles?(ref:NativeSessionRef, directory:string, showHidden:boolean):Promise<DirectoryListing>;
+  selectProjectFiles?(ref:NativeSessionRef, args:string):Promise<Artifact[]>;
   listArtifacts(ref: NativeSessionRef): Promise<Artifact[]>;
   readArtifact(ref: NativeSessionRef, artifactId: string, contentVersion: string): Promise<Uint8Array>;
-  listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string }>>;
+  listModels(ref: NativeSessionRef): Promise<ModelOption[]>;
   updateSettings(ref: NativeSessionRef, settings: { model: string | null; preferences: Record<string, string> }, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   control(ref: NativeSessionRef, action: 'acquire' | 'release', guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   archive?(ref: NativeSessionRef, archived: boolean, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
