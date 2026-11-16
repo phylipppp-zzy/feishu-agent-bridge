@@ -15,6 +15,7 @@ const invalidNative = (): never => { throw contractError('temporarily_unavailabl
 /** Native identifiers in normalized objects are provider-local; core maps and persists them. */
 export class CodexAdapter implements PlatformPort {
   readonly provider = 'codex' as const;
+  private discovery = new Map<string,{generation:number; loaded:Set<string>; phase:'loaded'|'list'; cursor:string|null; seen:Set<string>; buffer:Session[]; done:boolean; expires:number}>();
   private readonly owned = new Set<string>();
   private readonly active = new Set<string>();
   private readonly controlEpoch = new Map<string, number>();
@@ -98,6 +99,34 @@ export class CodexAdapter implements PlatformPort {
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request'); const r = await this.transport.request('thread/list', { cursor, limit }) as Obj;
     if (!Array.isArray(r?.data) || !(r.nextCursor == null || typeof r.nextCursor === 'string')) return invalidNative(); return { items: r.data.map((t: Obj) => this.session(t)), nextCursor: r.nextCursor ?? null };
+  }
+  /** Incremental bounded scan: loaded IDs are intersected with raw active list entries. */
+  async discoverRunning(cursor:string|null, limit:number):Promise<{items:Session[];nextCursor:string|null}> {
+    if (!Number.isSafeInteger(limit) || limit<1 || limit>100) throw contractError('invalid_request');
+    for (const [key,value] of this.discovery) if(value.expires<Date.now()) this.discovery.delete(key);
+    let key=cursor, state=key ? this.discovery.get(key) : undefined;
+    if (!key) { key=randomUUID(); state={generation:this.transport.generation,loaded:new Set(),phase:'loaded',cursor:null,seen:new Set(),buffer:[],done:false,expires:Date.now()+600000}; if(this.discovery.size>=4) this.discovery.delete(this.discovery.keys().next().value!); this.discovery.set(key,state); }
+    if (!state || !this.transport.connected || state.generation!==this.transport.generation) { if(key) this.discovery.delete(key); throw contractError('snapshot_required'); }
+    try {
+      if (!state.buffer.length && !state.done) {
+        const method=state.phase==='loaded' ? 'thread/loaded/list' : 'thread/list';
+        const r=await this.transport.request(method,{cursor:state.cursor,limit:100}) as Obj;
+        if (!this.transport.connected || state.generation!==this.transport.generation || !Array.isArray(r?.data) || !(r.nextCursor==null || (typeof r.nextCursor==='string' && r.nextCursor.length>0))) return invalidNative();
+        if (state.phase==='loaded') {
+          for(const id of r.data) { if(!isString(id)) return invalidNative(); state.loaded.add(id); }
+          if(state.loaded.size>10000) throw contractError('snapshot_required');
+        } else {
+          for(const t of r.data) if(t?.status?.type==='active' && isString(t.id) && state.loaded.has(t.id)) state.buffer.push(this.session(t));
+        }
+        const next=r.nextCursor ?? null;
+        if(next!==null) {if(state.seen.has(next) || state.seen.size>=1000) throw contractError('snapshot_required'); state.seen.add(next); state.cursor=next;}
+        else if(state.phase==='loaded') {state.phase='list';state.cursor=null;state.seen.clear();}
+        else state.done=true;
+      }
+      const items=state.buffer.splice(0,limit), nextCursor=state.done && !state.buffer.length ? null : key;
+      if(nextCursor===null) this.discovery.delete(key);
+      return {items,nextCursor};
+    } catch(e) { this.discovery.delete(key); throw e; }
   }
   async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
     const id = this.check(ref), r = await this.transport.request('thread/read', { threadId: id, includeTurns: true }) as Obj; const session = this.session(r?.thread);

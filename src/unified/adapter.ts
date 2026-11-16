@@ -66,6 +66,7 @@ export interface PlatformPort {
   seedConnectionGeneration?(minimum: number): void;
   seedControlGeneration?(ref: NativeSessionRef, minimum: number): void;
   list(cursor: string | null, limit: number): Promise<Page<Session>>;
+  discoverRunning?(cursor: string | null, limit: number): Promise<Page<Session>>;
   read(ref: NativeSessionRef): Promise<SessionSnapshot>;
   resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement>;
   create(cwd: string, model: string | null): Promise<PlatformAcknowledgement>;

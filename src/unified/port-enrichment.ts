@@ -86,6 +86,10 @@ export class EnrichedPort implements PlatformPort {
     if(items.length>limit) { this.pruneListSnapshots(Date.now()); while(this.listSnapshots.size>=LIST_MAX_SNAPSHOTS) this.dropListSnapshot(this.listSnapshots.values().next().value!); this.listSnapshots.add(snapshot); }
     return this.listPage(snapshot,0);
   }
+  async discoverRunning(cursor:string|null, limit:number) {
+    if (!this.base.discoverRunning) throw contractError('unsupported');
+    return this.base.discoverRunning(cursor,limit);
+  }
   async read(ref:NativeSessionRef) {
     if (ref.provider !== this.provider) throw contractError('invalid_request');
     const base = await this.allBase(); if (base.some(s=>nativeRefKey(s.native)===nativeRefKey(ref))) return this.base.read(ref);

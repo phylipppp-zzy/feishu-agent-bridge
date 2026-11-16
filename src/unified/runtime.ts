@@ -19,7 +19,7 @@ import { EnrichedPort, nativeRefKey } from './port-enrichment.js';
 import { localFileLinks } from '../claude/deliver.js';
 import { payloadDigest, type Session } from './contracts.js';
 
-export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string} }
+export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string} }
 /** Pure validation: never reads environment, opens a database, connects or sends. */
 export function validateRuntimeConfig(c:RuntimeConfig):void {
   if (!c || ![c.coreDb,c.channelDb,c.ownerOpenId,c.hostId,c.claudeServiceId,c.codexServiceId,c.claudeStateDir,c.codexEndpoint].every(x=>typeof x==='string' && !!x.trim()) || !Array.isArray(c.allowedDestinations) || !c.allowedDestinations.length || !c.allowedDestinations.every(x=>typeof x==='string' && !!x.trim()) || c.coreDb===c.channelDb || c.channelDb===':memory:' || !Number.isSafeInteger(c.intervalMs) || c.intervalMs<100) throw new Error('invalid runtime configuration');
@@ -28,6 +28,7 @@ export function validateRuntimeConfig(c:RuntimeConfig):void {
   if (c.catalogSources?.some(x=>x.hostId!==c.hostId || x.serviceId!==(x.provider==='claude' ? c.claudeServiceId : c.codexServiceId))) throw new Error('catalog source namespace does not match runtime configuration');
   if (c.artifactStatePath !== undefined && !isAbsolute(c.artifactStatePath)) throw new Error('invalid artifact state path');
   if(c.historyArchive && (!isAbsolute(c.historyArchive.root) || !isAbsolute(c.historyArchive.manifestPath) || !/^[0-9a-f]{64}$/.test(c.historyArchive.manifestSha256))) throw new Error('invalid archive configuration');
+  if (c.autoMirror && (typeof c.autoMirror.enabled!=='boolean' || (c.autoMirror.enabled && (!c.autoMirror.destination || !c.allowedDestinations.includes(c.autoMirror.destination))))) throw new Error('invalid auto mirror configuration');
   const url = new URL(c.codexEndpoint); if ((!['ws:','wss:'].includes(url.protocol) && c.codexEndpoint !== 'codex-proxy://default') || url.username || url.password) throw new Error('invalid Codex endpoint');
 }
 /** The caller must ensure inbound envelopes originate from authenticated transport. */
@@ -65,7 +66,7 @@ export class UnifiedRuntime {
   async handleTrusted(envelope:TrustedEnvelope,action:ChannelAction):Promise<unknown> { if(this.closed || this.closing) throw new Error('closed'); const intake=this.channel.intake(envelope,action); this.intakes.add(intake); try { return await intake; } finally { this.intakes.delete(intake); } }
   async tick():Promise<void> {
     if (this.closed || this.closing || this.baselinePreparing) throw new Error('closed or baseline preparation active'); if (this.running) return this.running;
-    this.running = (async()=>{ let failed=false; try { await this.port.drainInbound?.((e,a,scope)=>this.channel.intake(e,a,scope)); for (const id of this.channel.pendingInbox()) { try { await this.channel.drain(id); } catch { failed=true; } } await this.core.dispatchPending(); await this.channel.advanceCompleted(); await this.options.refresh?.(this); for(const destination of this.channel.boundDestinations()) { try { const binding=this.channel.bindingsForRestore().find(b=>b.destination===destination); if(this.options.requireReadonlyHydration && binding?.accessMode==='read_only' && !this.channel.readonlyHydrated(destination,binding.sessionId)) continue; await this.channel.sync(destination); } catch(e) { if (!(e instanceof Error && e.message==='destination is not bound')) failed=true; } } if (failed) throw new Error('isolated work failed'); this.lastError=null; } catch { this.lastError='dispatch or synchronization failed; inspect persisted state before retry'; throw new Error(this.lastError); } })();
+    this.running = (async()=>{ let failed=false; try { await this.port.drainInbound?.((e,a,scope)=>this.channel.intake(e,a,scope)); for (const id of this.channel.pendingInbox()) { try { await this.channel.drain(id); } catch { failed=true; } } await this.core.dispatchPending(); await this.channel.advanceCompleted(); try {await this.options.refresh?.(this);} catch {failed=true;} for(const destination of this.channel.boundDestinations()) { try { const binding=this.channel.bindingsForRestore().find(b=>b.destination===destination); if(this.options.requireReadonlyHydration && binding?.accessMode==='read_only' && !this.channel.readonlyHydrated(destination,binding.sessionId)) continue; await this.channel.sync(destination); } catch(e) { if (!(e instanceof Error && e.message==='destination is not bound')) failed=true; } } if (failed) throw new Error('isolated work failed'); this.lastError=null; } catch { this.lastError='dispatch or synchronization failed; inspect persisted state before retry'; throw new Error(this.lastError); } })();
     try { await this.running; } finally { this.running=undefined; }
   }
   /** Explicit startup only; no input or new model turn is started by restoration. */
@@ -141,6 +142,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     override seedConnectionGeneration(minimum:number):void { super.seedConnectionGeneration(minimum); }
     override seedControlGeneration(ref:Session['native'],minimum:number):void { if(!namespace(ref,this.provider)) throw contractError('invalid_request','provider namespace mismatch'); super.seedControlGeneration(ref,minimum); }
     override async list(cursor:string|null,limit:number) { const page=await super.list(cursor,limit); const items=page.items.filter(s=>{if(!namespace(s.native,this.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; if(!pin(s)) {enrichmentError=true;return false;} configure(s); discovered.add(`session_${payloadDigest(s.native)}`); return true;}); return {...page,items}; }
+    override async discoverRunning(cursor:string|null,limit:number) { const page=await super.discoverRunning(cursor,limit); const items=page.items.filter(s=>{if(!namespace(s.native,this.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; if(!pin(s)) {enrichmentError=true;return false;} configure(s); discovered.add(`session_${payloadDigest(s.native)}`); return true;}); return {...page,items}; }
     override async read(ref:Session['native']) { const result=await super.read(ref); if(payloadDigest(result.session.native)!==payloadDigest(ref) || !pin(result.session)) throw contractError('invalid_request','provider session metadata mismatch'); configure(result.session); return result; }
     override async create(cwd:string,model:string|null) {
       let project:string; try { project=realpathSync(cwd); } catch {throw contractError('invalid_request','untrusted project');}
@@ -160,8 +162,35 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   }
   const ports=bases.map(base=>new ScopedPort(secured(base),catalog,registry,()=>{enrichmentError=true;}));
   const stateLock=new DatabaseSync(`${canonicalPath(config.artifactStatePath)}.runtime-lock`); try {stateLock.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE');} catch {stateLock.close(); await Promise.all(ports.map(p=>p.close())); throw new Error('artifact state already active');}
-  let runtime:UnifiedRuntime; let refreshOffset=0;
+  let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null;
   try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
+      let autoFailed=false;
+      try {await r.channel.applyPendingAutoBaselines();} catch {autoFailed=true;}
+      if(config.autoMirror?.enabled) {
+        try {
+        const target=config.autoMirror.destination!, source=ports.find(p=>p.provider==='codex'), authorized=(port as FeishuPort & {authorizedDestination?:(destination:string)=>boolean}).authorizedDestination?.bind(port);
+        if (!source || !(authorized?.(target) ?? config.allowedDestinations.includes(target))) throw new Error('auto mirror destination unavailable');
+        let page; try {page=await source.discoverRunning(autoCursor,2);autoCursor=page.nextCursor;} catch(error) {autoCursor=null;throw error;}
+        for(const item of page.items) {
+          try {
+          if (!(authorized?.(target) ?? config.allowedDestinations.includes(target)) || !trusted(item)) continue;
+          let session=r.store.findSession(item.native);
+          if(!session) {
+            const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view'?value:{status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];
+            const candidate:Session={...item,sessionId:`session_${payloadDigest(item.native)}`,status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}};
+            try {r.store.insertSession(candidate);session=candidate;} catch(error) {session=r.store.findSession(item.native);if(!session)throw error;}
+          }
+          if(r.store.isDetached(session.sessionId) || !trusted(session)) continue;
+          const eventId=`auto-mirror:${payloadDigest([target,item.native])}`;
+          await r.channel.applyAutoBaseline(eventId);
+          if(r.channel.bindingsForRestore().some(b=>b.sessionId===session!.sessionId)) continue;
+          await r.core.refreshReadOnlySession(session.sessionId);
+          await r.channel.prepareAutoBaseline(eventId,session.sessionId);
+          await r.channel.handle({eventId,destination:target,identity:{source:'feishu',subject:config.ownerOpenId}},{action:'bind',sessionId:session.sessionId,mode:'read_only'});await r.channel.applyAutoBaseline(eventId);
+          } catch {autoFailed=true;}
+        }
+        } catch {autoFailed=true;}
+      }
       for(let i=0;i<buffered.length;) {const entry=buffered[i]!,o=entry.observation,existing=pinned.get(nativeRefKey(o.ref)); if(entry.expires<=Date.now()) {discard(i);enrichmentError=true;continue;} if(!existing || !r.store.findSession(o.ref)) {i++;continue;} discard(i); if(!trusted(existing) || (o.type==='session' && (payloadDigest(o.session.native)!==payloadDigest(o.ref) || !pin(o.session)))) {enrichmentError=true;continue;} entry.listener(o);}
       // Native history reads may be expensive. Keep each polling cycle bounded so
       // an imported backlog cannot postpone new inbox work until all sessions refresh.
@@ -176,13 +205,13 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
         const baselines=r.channel.bindingsForRestore().filter(binding=>binding.sessionId===session.sessionId && binding.accessMode==='read_only' && !r.channel.readonlyHydrated(binding.destination,session.sessionId));
         if(session.status==='read_only' && session.control.input!=='available') await r.core.refreshReadOnlySession(session.sessionId);
         else if(baselines.length) await r.core.hydrateSessionHistory(session.sessionId);
-        for(const binding of baselines) await r.channel.baselineReadonlyHistory(binding.destination,session.sessionId);
+        for(const binding of baselines) if(!r.channel.hasPendingAutoBaseline(binding.destination,session.sessionId)) await r.channel.baselineReadonlyHistory(binding.destination,session.sessionId);
         { const snapshot=await r.core.getSnapshot(session.sessionId);
           for(const m of snapshot.value.messages) if(m.role==='assistant') for(const block of m.blocks) if(block.type==='text') for(const root of registry.getRoots(session.native)) for(const link of await localFileLinks(block.text.replace(/\]\(localfile:\/\/\//g,'](file:///'),session.project,root)) await registry.register(nativeRefKey(session.native),link.path);
         }
         } catch {refreshFailed=true;}
       }
-      if(enrichmentError || refreshFailed) throw new Error('session refresh or artifact observation failed');
+      if(enrichmentError || refreshFailed || autoFailed) throw new Error('session refresh or artifact observation failed');
     }});
   } catch(error) {stateLock.exec('ROLLBACK');stateLock.close();await Promise.all(ports.map(p=>p.close()));throw error;}
   activeRuntime=runtime;
