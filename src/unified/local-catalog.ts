@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readdir, readFile, lstat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { readdir, readFile, lstat, open, realpath } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { parseJsonlChunk } from '../session-parser.js';
 import { parseTranscriptChunk } from '../claude/transcript.js';
@@ -16,6 +17,14 @@ interface Entry { ref: NativeSessionRef; path: string; snapshot: SessionSnapshot
 export class LocalCatalog {
   private entries = new Map<string, Entry>();
   constructor(private readonly roots: readonly CatalogRoot[], private readonly maxLogBytes = 32 * 1024 * 1024) {}
+  /** Bounded source proof: no transcript content leaves this method. */
+  async isClaudeCliMain(ref:NativeSessionRef,project:string):Promise<boolean> {
+    if(ref.provider!=='claude' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref.nativeSessionId)) return false;
+    let count=0,valid=false,entries=0;const wanted=await realpath(project);
+    const walk=async(dir:string,depth=0):Promise<void>=>{if(depth>32)throw new Error('source proof directory depth exceeded');for(const ent of await readdir(dir,{withFileTypes:true})) {if(++entries>100000)throw new Error('source proof scan budget exceeded');const path=join(dir,ent.name);if(ent.isDirectory()){if(ent.name!=='subagents')await walk(path,depth+1);continue;}if(!ent.isFile() || ent.name!==`${ref.nativeSessionId}.jsonl`)continue;count++;if(count>1)continue;const f=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);try{const buf=Buffer.alloc(65536),r=await f.read(buf,0,buf.length,0);const lines=buf.subarray(0,r.bytesRead).toString('utf8').split('\n');for(const line of lines.slice(0,-1)){let x:any;try{x=JSON.parse(line);}catch{continue;}if(x?.type!=='user'&&x?.type!=='assistant')continue;valid=x.sessionId===ref.nativeSessionId&&['cli','claude-vscode','sdk-cli'].includes(x.entrypoint)&&x.isSidechain===false&&!x.agentId&&x.sessionKind!=='daemon'&&x.sessionKind!=='daemon-worker'&&typeof x.cwd==='string'&&await realpath(x.cwd)===wanted;break;}}finally{await f.close();}}};
+    for(const root of this.roots) if(root.provider==='claude'&&root.hostId===ref.hostId&&root.serviceId===ref.serviceId) await walk(root.directory);
+    return count===1&&valid;
+  }
   async refresh(): Promise<void> {
     const next = new Map<string, Entry>();
     const walk = async (root: CatalogRoot, dir: string): Promise<void> => {

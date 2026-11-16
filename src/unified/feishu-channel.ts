@@ -88,6 +88,7 @@ export class FeishuChannel {
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_uncertain (destination TEXT NOT NULL, native_key TEXT NOT NULL, PRIMARY KEY(destination,native_key))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_watermarks (destination TEXT PRIMARY KEY, enabled INTEGER NOT NULL, watermark INTEGER NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_scope_watermarks (destination TEXT NOT NULL, source TEXT NOT NULL, root TEXT NOT NULL, watermark INTEGER NOT NULL, PRIMARY KEY(destination,source,root))');
+    this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_claude_scope_watermarks (destination TEXT NOT NULL, source TEXT NOT NULL, root TEXT NOT NULL, watermark INTEGER NOT NULL, PRIMARY KEY(destination,source,root))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_baselines (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, snapshot TEXT NOT NULL, destination TEXT, binding_scope TEXT)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_history_baselines (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope))');
     const columns = this.db.prepare('PRAGMA table_info(channel_bindings)').all() as Array<{name:string}>;
@@ -197,18 +198,19 @@ export class FeishuChannel {
   readonlyHydrated(destination:string, sessionId:string):boolean { const scope=this.bindingScope(destination);return !!this.db.prepare('SELECT 1 FROM channel_history_baselines WHERE destination=? AND session_id=? AND binding_scope=?').get(destination,sessionId,scope); }
   markAutoUncertain(destination:string,native:Session['native']):void {this.db.prepare('INSERT OR IGNORE INTO channel_auto_uncertain VALUES (?,?)').run(destination,payloadDigest(native));}
   isAutoUncertain(destination:string,native:Session['native']):boolean {return !!this.db.prepare('SELECT 1 FROM channel_auto_uncertain WHERE destination=? AND native_key=?').get(destination,payloadDigest(native));}
-  configureAutoScopeWatermarks(destination:string|null,source:string,roots:string[],nowSeconds:number):Array<{root:string;watermark:number}> {
+  configureAutoScopeWatermarks(destination:string|null,source:string,roots:string[],nowSeconds:number,provider:'codex'|'claude'='codex'):Array<{root:string;watermark:number}> {
     if(!Number.isSafeInteger(nowSeconds) || nowSeconds<0 || !source || roots.some(root=>!isAbsolute(root))) throw new Error('invalid auto scope');
     const inside=(child:string,root:string)=>{const rel=relative(root,child);return rel==='' || (!isAbsolute(rel) && rel!=='..' && !rel.startsWith(`..${sep}`));};
+    const table=provider==='codex'?'channel_auto_scope_watermarks':'channel_auto_claude_scope_watermarks';
     this.db.exec('BEGIN IMMEDIATE');try {
-      if(!destination){this.db.prepare('DELETE FROM channel_auto_scope_watermarks').run();this.db.exec('COMMIT');return [];}
-      const previous=this.db.prepare('SELECT root,watermark FROM channel_auto_scope_watermarks WHERE destination=? AND source=?').all(destination,source) as Array<{root:string;watermark:number}>;
+      if(!destination){this.db.prepare(`DELETE FROM ${table}`).run();this.db.exec('COMMIT');return [];}
+      const previous=this.db.prepare(`SELECT root,watermark FROM ${table} WHERE destination=? AND source=?`).all(destination,source) as Array<{root:string;watermark:number}>;
       const retained=new Map<string,number>();
       const put=(root:string,watermark:number)=>retained.set(root,Math.min(retained.get(root) ?? watermark,watermark));
       for(const old of previous) for(const root of roots) {if(inside(old.root,root)) put(old.root,old.watermark);else if(inside(root,old.root)) put(root,old.watermark);}
       for(const root of roots) put(root,nowSeconds);
-      this.db.prepare('DELETE FROM channel_auto_scope_watermarks').run();
-      const insert=this.db.prepare('INSERT INTO channel_auto_scope_watermarks VALUES (?,?,?,?)');
+      this.db.prepare(`DELETE FROM ${table}`).run();
+      const insert=this.db.prepare(`INSERT INTO ${table} VALUES (?,?,?,?)`);
       for(const [root,watermark] of retained) insert.run(destination,source,root,watermark);
       this.db.exec('COMMIT');return [...retained].map(([root,watermark])=>({root,watermark}));
     }catch(error){this.db.exec('ROLLBACK');throw error;}

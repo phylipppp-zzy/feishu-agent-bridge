@@ -66,6 +66,7 @@ export class UnifiedRuntime {
     for(const [id,bindings] of [...groups].slice(0,limit)) {attempted++;try {const session=this.store.getSession(id);if(this.store.isDetached(id) || session.status!=='read_only' || session.control.input==='available' || (this.options.canDiscover && !this.options.canDiscover(session))) throw new Error('session unavailable');for(const binding of bindings) if(!await this.channel.isReadonlyBaselineAuthorized(binding.destination,id)) throw new Error('binding unauthorized');await this.core.refreshReadOnlySession(id);for(const binding of bindings) await this.channel.baselineReadonlyHistory(binding.destination,id);completed++;}catch{failed++;}}
     return {attempted,completed,failed,remaining:new Set(pending().map(b=>b.sessionId)).size};} finally {this.baselinePreparing=false;}
   }
+  acceptsBackgroundWork():boolean { return !this.closed && !this.closing; }
   async captureResourceScope(envelope:TrustedEnvelope):Promise<string> { if(this.closed || this.closing) throw new Error('closed'); const capture=this.channel.captureBindingScope(envelope); this.intakes.add(capture); try { return await capture; } finally { this.intakes.delete(capture); } }
   async handleTrusted(envelope:TrustedEnvelope,action:ChannelAction):Promise<unknown> { if(this.closed || this.closing) throw new Error('closed'); const intake=this.channel.intake(envelope,action); this.intakes.add(intake); try { return await intake; } finally { this.intakes.delete(intake); } }
   async tick():Promise<void> {
@@ -174,20 +175,28 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   }
   const ports=bases.map(base=>new ScopedPort(secured(base),catalog,registry,()=>{enrichmentError=true;}));
   const stateLock=new DatabaseSync(`${canonicalPath(config.artifactStatePath)}.runtime-lock`); try {stateLock.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE');} catch {stateLock.close(); await Promise.all(ports.map(p=>p.close())); throw new Error('artifact state already active');}
-  let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null; let recentCursor:string|null=null; let autoWatermark:number|null=null; let autoScopes:Array<{root:string;watermark:number}>=[]; const localCodexClock=config.codexEndpoint==='codex-proxy://default' || ['localhost','127.0.0.1','[::1]','::1'].includes(new URL(config.codexEndpoint).hostname);
+  let proofPending:Promise<boolean>|undefined;
+  const proofClaude=async(item:Session):Promise<boolean>=>{if(proofPending) throw new Error('source proof pending');const p=catalog.isClaudeCliMain(item.native,item.project);proofPending=p;void p.finally(()=>{if(proofPending===p)proofPending=undefined;}).catch(()=>{});let timer:ReturnType<typeof setTimeout>|undefined;try{return await Promise.race([p,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('source proof timed out')),2000);})]);}finally{if(timer)clearTimeout(timer);}};
+  let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null; const recentCursors:Record<'codex'|'claude',string|null>={codex:null,claude:null}; const scopeByProvider:Record<'codex'|'claude',Array<{root:string;watermark:number}>>={codex:[],claude:[]}; const localCodexClock=config.codexEndpoint==='codex-proxy://default' || ['localhost','127.0.0.1','[::1]','::1'].includes(new URL(config.codexEndpoint).hostname);
   try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
       let autoFailed=false;
       try {await r.channel.applyPendingAutoBaselines();} catch {autoFailed=true;}
       if(config.autoMirror?.enabled) {
         try {
-        const target=config.autoMirror.destination!, source=ports.find(p=>p.provider==='codex'), authorized=(port as FeishuPort & {authorizedDestination?:(destination:string)=>boolean}).authorizedDestination?.bind(port);
-        if (!source || !(authorized?.(target) ?? config.allowedDestinations.includes(target))) throw new Error('auto mirror destination unavailable');
-        const watermarkFor=(item:Session):number|null=>{try {const project=realpathSync(item.project);const matching=autoScopes.filter(x=>inside(project,x.root)).map(x=>x.watermark);return matching.length ? Math.min(...matching) : null;}catch{return null;}};
-        const candidates:Session[]=[]; if(localCodexClock && autoWatermark!==null && bases.find(p=>p.provider==='codex')?.discoverNewer) {try {const recent=await source.discoverNewer(autoWatermark,recentCursor,1);recentCursor=recent.nextCursor;if(recent.partialFailure)autoFailed=true;for(const item of recent.items) {const created=item.createdAt ? Date.parse(item.createdAt)/1000 : NaN;const observed=item.discoveryObservedAt ? Date.parse(item.discoveryObservedAt)/1000 : Math.floor(Date.now()/1000);if(Number.isSafeInteger(created) && Number.isSafeInteger(observed) && created>observed) r.channel.markAutoUncertain(target,item.native);else if(Number.isSafeInteger(created) && (watermarkFor(item)!==null && created>watermarkFor(item)!) && created<=observed && !r.channel.isAutoUncertain(target,item.native)) candidates.push(item);}} catch {recentCursor=null;autoFailed=true;}} try {const active=await source.discoverRunning(autoCursor,1);autoCursor=active.nextCursor;if(active.partialFailure)autoFailed=true;for(const item of active.items) if(!candidates.some(x=>payloadDigest(x.native)===payloadDigest(item.native))) candidates.push(item);} catch {autoCursor=null;autoFailed=true;}
+        const target=config.autoMirror.destination!, authorized=(port as FeishuPort & {authorizedDestination?:(destination:string)=>boolean}).authorizedDestination?.bind(port);
+        if (!(authorized?.(target) ?? config.allowedDestinations.includes(target))) throw new Error('auto mirror destination unavailable');
+        for(const provider of ['codex','claude'] as const) {try {
+        const source=ports.find(p=>p.provider===provider);if(!source)continue;const scopes=scopeByProvider[provider];const autoWatermark=scopes.length ? Math.min(...scopes.map(x=>x.watermark)) : null;
+        const time=(iso:string|undefined):number=>iso ? (provider==='codex'?Date.parse(iso)/1000:Date.parse(iso)) : NaN;
+        const clock=()=>provider==='codex'?Math.floor(Date.now()/1000):Date.now();
+        const watermarkFor=(item:Session):number|null=>{try {const project=realpathSync(item.project);const matching=scopes.filter(x=>inside(project,x.root)).map(x=>x.watermark);return matching.length ? Math.min(...matching) : null;}catch{return null;}};
+        const candidates:Session[]=[]; if((provider==='claude'||localCodexClock) && autoWatermark!==null && bases.find(p=>p.provider===provider)?.discoverNewer) {try {const recent=await source.discoverNewer(autoWatermark,recentCursors[provider],1);recentCursors[provider]=recent.nextCursor;if(recent.partialFailure)autoFailed=true;for(const item of recent.items) {const created=time(item.createdAt),observed=item.discoveryObservedAt ? time(item.discoveryObservedAt) : clock();if(Number.isSafeInteger(created) && Number.isSafeInteger(observed) && created>observed) r.channel.markAutoUncertain(target,item.native);else if(Number.isSafeInteger(created) && watermarkFor(item)!==null && created>watermarkFor(item)! && created<=observed && !r.channel.isAutoUncertain(target,item.native)) candidates.push(item);}} catch {recentCursors[provider]=null;autoFailed=true;}} if(provider==='codex') try {const active=await source.discoverRunning(autoCursor,1);autoCursor=active.nextCursor;if(active.partialFailure)autoFailed=true;for(const item of active.items) if(!candidates.some(x=>payloadDigest(x.native)===payloadDigest(item.native))) candidates.push(item);} catch {autoCursor=null;autoFailed=true;}
         for(const item of candidates) {
           try {
           if (!(authorized?.(target) ?? config.allowedDestinations.includes(target)) || !trusted(item)) continue;
-          const created=item.createdAt ? Date.parse(item.createdAt)/1000 : NaN;const observed=item.discoveryObservedAt ? Date.parse(item.discoveryObservedAt)/1000 : Math.floor(Date.now()/1000);if(Number.isSafeInteger(created) && Number.isSafeInteger(observed) && created>observed) r.channel.markAutoUncertain(target,item.native);
+          if(provider==='claude' && !await proofClaude(item)) continue;
+          if(!r.acceptsBackgroundWork()) continue;
+          const created=time(item.createdAt);const observed=item.discoveryObservedAt ? time(item.discoveryObservedAt) : clock();if(Number.isSafeInteger(created) && Number.isSafeInteger(observed) && created>observed) r.channel.markAutoUncertain(target,item.native);
           let session=r.store.findSession(item.native);
           if(!session) {
             const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view'?value:{status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];
@@ -199,10 +208,13 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
           await r.channel.applyAutoBaseline(eventId);
           if(r.channel.bindingsForRestore().some(b=>b.sessionId===session!.sessionId)) continue;
           await r.core.refreshReadOnlySession(session.sessionId);
-          const now=Math.floor(Date.now()/1000);const provenNew=localCodexClock && autoWatermark!==null && Number.isSafeInteger(created) && (watermarkFor(item)!==null && created>watermarkFor(item)!) && created<=now && !r.channel.isAutoUncertain(target,item.native); await r.channel.prepareAutoBaseline(eventId,session.sessionId,provenNew);
+          if(!r.acceptsBackgroundWork()) continue;
+          const now=clock();const provenNew=(provider==='claude'||localCodexClock) && autoWatermark!==null && Number.isSafeInteger(created) && (watermarkFor(item)!==null && created>watermarkFor(item)!) && created<=now && !r.channel.isAutoUncertain(target,item.native); await r.channel.prepareAutoBaseline(eventId,session.sessionId,provenNew);
+          if(!r.acceptsBackgroundWork()) continue;
           await r.channel.handle({eventId,destination:target,identity:{source:'feishu',subject:config.ownerOpenId}},{action:'bind',sessionId:session.sessionId,mode:'read_only'});await r.channel.applyAutoBaseline(eventId);
           } catch {autoFailed=true;}
         }
+        } catch {autoFailed=true;}}
         } catch {autoFailed=true;}
       }
       for(let i=0;i<buffered.length;) {const entry=buffered[i]!,o=entry.observation,existing=pinned.get(nativeRefKey(o.ref)); if(entry.expires<=Date.now()) {discard(i);enrichmentError=true;continue;} if(!existing || !r.store.findSession(o.ref)) {i++;continue;} discard(i); if(!trusted(existing) || (o.type==='session' && (payloadDigest(o.session.native)!==payloadDigest(o.ref) || !pin(o.session)))) {enrichmentError=true;continue;} entry.listener(o);}
@@ -229,7 +241,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     }});
   } catch(error) {stateLock.exec('ROLLBACK');stateLock.close();await Promise.all(ports.map(p=>p.close()));throw error;}
   activeRuntime=runtime;
-  try {const sourceKey=payloadDigest([config.hostId,config.codexServiceId,config.codexEndpoint,sources.filter(s=>s.provider==='codex').map(s=>s.directory).sort()]);autoScopes=runtime.channel.configureAutoScopeWatermarks(config.autoMirror?.enabled ? config.autoMirror.destination! : null,sourceKey,[...new Set(projects)].sort(),Math.floor(Date.now()/1000));autoWatermark=autoScopes.length ? Math.min(...autoScopes.map(s=>s.watermark)) : null; await registry.load(); for(const s of runtime.store.listSessions()) if(pin(s)) configure(s); return runtime; } catch(error) {await runtime.close();throw error;}
+  try {for(const provider of ['codex','claude'] as const){const sourceKey=provider==='codex' ? payloadDigest([config.hostId,config.codexServiceId,config.codexEndpoint,sources.filter(s=>s.provider==='codex').map(s=>s.directory).sort()]) : payloadDigest([config.hostId,config.claudeServiceId,sources.filter(s=>s.provider==='claude').map(s=>s.directory).sort()]);scopeByProvider[provider]=runtime.channel.configureAutoScopeWatermarks(config.autoMirror?.enabled ? config.autoMirror.destination! : null,sourceKey,[...new Set(projects)].sort(),provider==='codex'?Math.floor(Date.now()/1000):Date.now(),provider);} await registry.load(); for(const s of runtime.store.listSessions()) if(pin(s)) configure(s); return runtime; } catch(error) {await runtime.close();throw error;}
 }
 /** Explicit opt-in factory. Construction opens isolated local state, never connects. */
 export async function createLiveRuntime(config:RuntimeConfig, credentials:{appId:string;appSecret:string}, sdkDb:string) {
