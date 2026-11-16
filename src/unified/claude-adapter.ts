@@ -6,10 +6,11 @@ import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, Platf
 import { payloadDigest, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
 import { contractError } from './errors.js';
 import { ClaudeState } from './claude-state.js';
+import { ClaudeResidualObservation } from './claude-residual.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
 type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
-type Live = { completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null };
+type Live = { completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
 const safeNumber = (n: unknown): number | null => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
@@ -95,13 +96,14 @@ export class ClaudeAdapter implements PlatformPort {
       this.emit({ type: 'interaction', ref: this.ref(id), interaction });
     });
     const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool };
-    const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream:null }; this.lives.set(id, live); live.completion = this.consume(live);
+    const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream:null, residual:new ClaudeResidualObservation(id) }; this.lives.set(id, live); live.completion = this.consume(live);
   }
   private async consume(live: Live): Promise<void> {
     const ref = this.ref(live.id);
     let streamFailure: {kind:string; exitCode:number|null} | null = null;
     try { for await (const raw of live.query) {
       const m = raw as any;
+      if(!this.closed && this.lives.get(live.id)===live)live.residual.observe(m);
       let providerEvent: { type: string; data: Record<string, unknown> } | null = null;
       if (m.type === 'system' && m.subtype === 'api_retry') {
         const status = safeNumber(m.error_status);
@@ -137,9 +139,10 @@ export class ClaudeAdapter implements PlatformPort {
     const live = this.active(ref, guard); if (mode !== 'new' || !blocks.length) throw contractError('unsupported'); if (live.turn) throw contractError('busy');
     const content: Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string } }> = [];
     for (const block of blocks) { if (block.type === 'text') content.push({ type: 'text', text: block.text }); else { const data = Buffer.from(block.content); const media = imageMediaType(data); if (!media || media !== block.mediaType) throw contractError('unsupported', 'only verified PNG, JPEG, GIF and WebP images are supported'); content.push({ type: 'image', source: { type: 'base64', media_type: media, data: data.toString('base64') } }); } }
-    const id = randomUUID(); guard.assertCurrent(); live.turn = id; live.turnModel = live.model; live.queue.push({ type: 'user', uuid: id, parent_tool_use_id: null, message: { role: 'user', content: content.length === 1 && content[0]!.type === 'text' ? content[0]!.text : content } });
+    const id = randomUUID(); guard.assertCurrent(); live.residual.beginTurn(id);live.turn = id; live.turnModel = live.model; live.queue.push({ type: 'user', uuid: id, parent_tool_use_id: null, message: { role: 'user', content: content.length === 1 && content[0]!.type === 'text' ? content[0]!.text : content } });
     const message: Message = { messageId: id, sessionId: live.id, turnId: id, role: 'user', blocks: blocks.map(b => b.type === 'text' ? b : { type: 'artifact', artifactId: b.artifactId, contentVersion: b.contentVersion }), sequence: ++this.sequence, revision: 1, final: true, source: 'claude' }; live.messages.push(message); this.emit({ type: 'message', ref, message,connectionGeneration:live.generation }); this.emit({ type: 'turn', ref, connectionGeneration:live.generation, turn: { turnId: id, sessionId: live.id, status: 'running', inputId: id, startedAt: new Date().toISOString(), endedAt: null, model: live.model, outputIds: [] } }); return ack(id);
   }
+  async inspectTurnResidual(ref:NativeSessionRef,turnId:string) {const id=this.check(ref);const live=this.lives.get(id);if(this.closed||!live||!this.owned.get(id))return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'外部或已断开会话没有当前可信任务观察'};return live.residual.inspect(turnId);}
   async interrupt(ref: NativeSessionRef, turnId: string, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard); if (live.turn !== turnId) throw contractError('stale_revision'); guard.assertCurrent(); live.interrupted = true; await live.query.interrupt(); return ack(turnId); }
   async respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard), p = live.pending.get(interaction.interactionId), i = p?.interaction; if (!p || !i || i.status !== 'awaiting_answer' || i.connectionGeneration !== interaction.connectionGeneration || i.connectionGeneration !== guard.expectedConnectionGeneration) throw contractError('interaction_expired'); if (i.revision !== interaction.revision || i.toolInputDigest !== interaction.toolInputDigest || i.nativeRequestId !== interaction.nativeRequestId) throw contractError('stale_revision'); let result: Awaited<ReturnType<CanUseTool>>;
     if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope) result = answer.decision === 'allow' ? { behavior: 'allow', updatedInput: p.input } : { behavior: 'deny', message: 'Denied by user' };
