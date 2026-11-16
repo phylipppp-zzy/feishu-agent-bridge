@@ -118,7 +118,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   };
   const namespace=(ref:Session['native'],provider:PlatformPort['provider']):boolean=>ref.provider===provider && ref.hostId===config.hostId && ref.serviceId===(provider==='claude'?config.claudeServiceId:config.codexServiceId) && !!ref.nativeSessionId;
   const secured=(base:PlatformPort):PlatformPort=>new Proxy(base, {get(target,key) {
-    if(key==='list') return async (cursor:string|null,limit:number)=>{ const page=await target.list(cursor,limit); return {...page,items:page.items.filter(s=>{const ok=namespace(s.native,target.provider) && pin(s); if(!ok) enrichmentError=true; return ok;})}; };
+    if(key==='list') return async (cursor:string|null,limit:number)=>{ const page=await target.list(cursor,limit); return {...page,items:page.items.filter(s=>{if(!namespace(s.native,target.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; const ok=pin(s); if(!ok) enrichmentError=true; return ok;})}; };
     if(key==='read') return async (ref:Session['native'])=>{ if(!namespace(ref,target.provider)) throw contractError('invalid_request','provider namespace mismatch'); const snapshot=await target.read(ref); if(payloadDigest(snapshot.session.native)!==payloadDigest(ref) || !pin(snapshot.session)) throw contractError('invalid_request','provider session metadata mismatch'); return snapshot; };
     if(key==='onObservation') return (listener:(o:PlatformObservation)=>void)=>target.onObservation(o=>{
       if(!namespace(o.ref,target.provider)) {enrichmentError=true;return;}
@@ -132,7 +132,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   class ScopedPort extends EnrichedPort {
     override seedConnectionGeneration(minimum:number):void { super.seedConnectionGeneration(minimum); }
     override seedControlGeneration(ref:Session['native'],minimum:number):void { if(!namespace(ref,this.provider)) throw contractError('invalid_request','provider namespace mismatch'); super.seedControlGeneration(ref,minimum); }
-    override async list(cursor:string|null,limit:number) { const page=await super.list(cursor,limit); const items=page.items.filter(s=>{if(!pin(s)) {enrichmentError=true;return false;} configure(s); discovered.add(`session_${payloadDigest(s.native)}`); return true;}); return {...page,items}; }
+    override async list(cursor:string|null,limit:number) { const page=await super.list(cursor,limit); const items=page.items.filter(s=>{if(!namespace(s.native,this.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; if(!pin(s)) {enrichmentError=true;return false;} configure(s); discovered.add(`session_${payloadDigest(s.native)}`); return true;}); return {...page,items}; }
     override async read(ref:Session['native']) { const result=await super.read(ref); if(payloadDigest(result.session.native)!==payloadDigest(ref) || !pin(result.session)) throw contractError('invalid_request','provider session metadata mismatch'); configure(result.session); return result; }
     override async create(cwd:string,model:string|null) {
       let project:string; try { project=realpathSync(cwd); } catch {throw contractError('invalid_request','untrusted project');}
@@ -152,18 +152,25 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   }
   const ports=bases.map(base=>new ScopedPort(secured(base),catalog,registry,()=>{enrichmentError=true;}));
   const stateLock=new DatabaseSync(`${canonicalPath(config.artifactStatePath)}.runtime-lock`); try {stateLock.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE');} catch {stateLock.close(); await Promise.all(ports.map(p=>p.close())); throw new Error('artifact state already active');}
-  let runtime:UnifiedRuntime;
+  let runtime:UnifiedRuntime; let refreshOffset=0;
   try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,allowDiscovered:id=>discovered.has(id),cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
       for(let i=0;i<buffered.length;) {const entry=buffered[i]!,o=entry.observation,existing=pinned.get(nativeRefKey(o.ref)); if(entry.expires<=Date.now()) {discard(i);enrichmentError=true;continue;} if(!existing || !r.store.findSession(o.ref)) {i++;continue;} discard(i); if(!trusted(existing) || (o.type==='session' && (payloadDigest(o.session.native)!==payloadDigest(o.ref) || !pin(o.session)))) {enrichmentError=true;continue;} entry.listener(o);}
-      for(const session of r.store.listSessions()) {
-        if(r.store.isDetached(session.sessionId) || !trusted(session)) continue;
+      // Native history reads may be expensive. Keep each polling cycle bounded so
+      // an imported backlog cannot postpone new inbox work until all sessions refresh.
+      const candidates=r.store.listSessions().filter(s=>!r.store.isDetached(s.sessionId) && trusted(s));
+      const count=Math.min(2,candidates.length), start=candidates.length ? refreshOffset%candidates.length : 0; let refreshFailed=false;
+      refreshOffset=candidates.length ? (start+count)%candidates.length : 0;
+      for(let index=0;index<count;index++) {
+        const session=candidates[(start+index)%candidates.length]!;
+        try {
         configure(session);
         if(session.status==='read_only' && session.control.input!=='available') await r.core.refreshReadOnlySession(session.sessionId);
         { const snapshot=await r.core.getSnapshot(session.sessionId);
           for(const m of snapshot.value.messages) if(m.role==='assistant') for(const block of m.blocks) if(block.type==='text') for(const root of registry.getRoots(session.native)) for(const link of await localFileLinks(block.text.replace(/\]\(localfile:\/\/\//g,'](file:///'),session.project,root)) await registry.register(nativeRefKey(session.native),link.path);
         }
+        } catch {refreshFailed=true;}
       }
-      if(enrichmentError) throw new Error('artifact observation failed');
+      if(enrichmentError || refreshFailed) throw new Error('session refresh or artifact observation failed');
     }});
   } catch(error) {stateLock.exec('ROLLBACK');stateLock.close();await Promise.all(ports.map(p=>p.close()));throw error;}
   activeRuntime=runtime;

@@ -26,7 +26,7 @@ test('binding modes isolate writes, persist and require successful attach to upg
   await handle('history','ro',{action:'history'}); await handle('notifications','ro',{action:'notifications',enabled:false,eventTypes:[],revision:1,controlGeneration:1}); assert.equal(reads,1);
   channel.close(); channel=new FeishuChannel(service,port,async()=>true,path);
   assert.deepEqual(await handle('ro-restart','ro',{action:'input',text:'x',mode:'new'}),{status:'rejected',reason:'read_only_binding'}); await handle('rw-restart','rw',{action:'input',text:'x',mode:'new'}); assert.equal(writes,2);
-  await assert.rejects(handle('forged-bind','ro',{action:'bind',sessionId:'s',mode:'interactive'}),/use upgrade/);
+  const requested:any=await handle('forged-bind','ro',{action:'bind',sessionId:'s',mode:'interactive'});assert.equal(requested.status,'completed');await assert.rejects(channel.captureBindingScope(env('pending-bind')),/read-only/);
   await handle('panel','ro',{action:'panel'}); const old=cards.at(-1).actions.find((x:any)=>x.value.action==='upgrade').value;
   fail=true; await assert.rejects(handle('upgrade-fail','ro',{action:'upgrade'}),/resume failed/); assert.deepEqual(await handle('still-ro','ro',{action:'input',text:'x',mode:'new'}),{status:'rejected',reason:'read_only_binding'});
   fail=false; const upgrade:any=await handle('upgrade','ro',parseFeishuAction(old)); await handle('finish-upgrade','ro',{action:'finish',operationId:upgrade.operationId});

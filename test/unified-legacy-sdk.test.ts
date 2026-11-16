@@ -13,7 +13,7 @@ test('old and unknown SDK cards show owner-only toast without trusting old field
   await assert.rejects(handleSdkCardCallback(card(value,'owner','outside'),'owner',new Set(['chat']),resolve,handle),/unauthorized/);
  }
  await handleSdkCardCallback(card({action:'list'}),'owner',new Set(['chat']),resolve,handle); assert.equal(calls,1);assert.equal(resolutions,1);
- await assert.rejects(handleSdkCardCallback(card({action:'list'}),'owner',new Set(['chat']),()=>{throw Error('route unavailable');},handle),/route unavailable/);
+ const unavailable=await handleSdkCardCallback(card({action:'list'}),'owner',new Set(['chat']),()=>{throw Error('private database detail');},handle);assert.match(unavailable!.toast.content,/暂时无法处理/);assert.doesNotMatch(unavailable!.toast.content,/private/);
 });
 test('unknown and malformed slash use static help after owner and chat checks',async()=>{
  const actions:any[]=[];const download=async()=>Readable.from([]);const handle=async(_e:unknown,a:unknown)=>{actions.push(a);};

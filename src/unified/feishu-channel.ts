@@ -210,6 +210,7 @@ export class FeishuChannel {
     if (expectedScope !== undefined && (a.action !== 'attachment' || capturedScope !== expectedScope)) throw new Error('binding changed');
     if (a.bindingId) { const row = this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(e.destination) as {binding_id:string} | undefined; if (!row || row.binding_id !== a.bindingId) throw new Error('binding changed'); }
     const bound = this.binding(e.destination);
+    if (e.eventId.startsWith('card:') && a.action === 'bind' && bound && !a.bindingId) throw new Error('binding changed');
     const target = a.action === 'bind' ? a.sessionId : bound;
     if (!await this.authorize(e.identity,e.destination,target)) throw new Error('unauthorized');
     await this.checkManager(e,a);
@@ -290,11 +291,19 @@ export class FeishuChannel {
     const reply = async (card: ChannelCard, suffix = 'reply') => { await guard(); effects.started=true; return this.deliver(e.destination, card, `${e.eventId}:${suffix}`,guard); };
     if (a.action === 'help' || a.action === 'new_help') { const text = a.action === 'help' ? '会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；中断当前回复：/stop；后台任务是否终止尚未确认。' : '请先选择 provider 和可信项目目录，再发送 /create <codex|claude> <项目目录>。创建完成后在新话题发送任务；目录须符合服务端允许范围。'; await reply({title:a.action === 'help' ? '帮助' : '新建会话',text,actions:[]}); return {status:'guidance'}; }
     if (a.action === 'pending') { const pending = this.pendingOperations(e.destination); await reply({title:'待完成操作',text:pending.length ? '查询完成结果后继续' : '没有待完成操作',actions:pending.map(p=>({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}}))}); return pending; }
-    if (a.action === 'list') { const page = await this.service.listSessions({ limit: 20, ...(a.search === undefined ? {} : { search: a.search }), ...(a.cursor === undefined ? {} : { cursor: a.cursor }) }); for (const s of page.items) if (await this.authorize(e.identity, e.destination, s.sessionId)) await reply(sessionCard(s), s.sessionId); if (page.nextCursor) await reply({title:'会话列表',text:'还有更多会话',actions:[{label:'下一页',value:{action:'list',cursor:page.nextCursor,...(a.search ? {search:a.search}:{})}}]},'next'); return { nextCursor: page.nextCursor }; }
+    if (a.action === 'list') {
+      const page=await this.service.listSessions({limit:5,...(a.search === undefined ? {} : {search:a.search}),...(a.cursor === undefined ? {} : {cursor:a.cursor})});
+      const sessions=[]; for(const s of page.items) if(await this.authorize(e.identity,e.destination,s.sessionId)) sessions.push(s);
+      const actions:ChannelCard['actions']=sessions.flatMap((s,index)=>[{label:`${index+1} 查看`,value:{action:'bind',sessionId:s.sessionId,mode:'read_only'}},{label:`${index+1} 接入`,value:{action:'bind',sessionId:s.sessionId,mode:'interactive'}}]);
+      if(page.nextCursor) actions.push({label:'下一页',value:{action:'list',cursor:page.nextCursor,...(a.search ? {search:a.search}:{})}});
+      const text=sessions.length ? sessions.map((s,index)=>`${index+1}. ${s.native.provider} · ${s.title.slice(0,100)} · ${s.project.slice(0,200)}`).join('\n') : '此页没有可查看的会话。';
+      await reply({title:'会话列表',text,actions});return {nextCursor:page.nextCursor};
+    }
     if (a.action === 'health') { const health = await this.service.health(); await reply({ title: '健康状态', text: JSON.stringify(health), actions: [] }); return health; }
     if (a.action === 'bind' && a.mode === 'interactive') {
-      if (bound && this.accessMode(e.destination) === 'read_only') throw new Error('use upgrade for a read-only binding');
-      const session=await this.service.getSession(a.sessionId); const n=session.native;
+      if (bound && bound !== a.sessionId) {await reply({title:'无法接入',text:'此话题已绑定其他会话，请先在目标话题操作。',actions:[]});return {status:'rejected',reason:'session_mismatch'};}
+      if (bound && this.accessMode(e.destination) === 'interactive') {await reply({title:'已接入',text:'此话题已绑定为可交互，可查看会话控制确认当前状态。',actions:[]});return {status:'completed',sessionId:bound,accessMode:'interactive'};}
+      const session=await this.service.getSession(a.sessionId); await guard(); if(!await this.authorize(e.identity,e.destination,a.sessionId)) throw new Error('unauthorized'); await guard(); const n=session.native;
       if (bound && bound !== session.sessionId) throw new Error('unbind before interactive attach');
       const ctx=this.context(e,`new:${e.destination}`,0,0);
       this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session','interactive','pending')").run(ctx.operationId,e.destination);
@@ -319,15 +328,15 @@ export class FeishuChannel {
       if (pending.state === 'completed') return {status:'completed'};
       const pendingScope = this.db.prepare('SELECT scope FROM channel_pending_scope WHERE operation_id=?').get(a.operationId) as {scope:string} | undefined;
       if (!pendingScope || pendingScope.scope !== this.bindingScope(e.destination)) return {status:'expired',reason:'binding_changed'};
-      const op = await this.service.getOperation(a.operationId);
+      const op = await this.service.getOperation(a.operationId); await guard();
       if (op.status !== 'completed' || !op.result) return op;
       if (pending.kind === 'session' && op.result.kind === 'session') {
         if (!await this.authorize(e.identity,e.destination,op.result.sessionId)) throw new Error('unauthorized');
-        const session = await this.service.getSession(op.result.sessionId);
+        const session = await this.service.getSession(op.result.sessionId); await guard();
         if (pending.mode === 'interactive' && bound && op.result.sessionId !== bound) throw new Error('upgrade session mismatch');
         const destination = this.port.createTopic && !this.port.isTopicDestination?.(e.destination) ? await this.port.createTopic(e.destination,session.sessionId,{title:session.title,text:`${session.native.provider} · ${session.project} · ${session.status}`,actions:[]},`${a.operationId}:topic`) : e.destination;
-        if (!await this.authorize(e.identity,destination,session.sessionId)) throw new Error('unauthorized');
-        const existing=this.db.prepare('SELECT session_id,owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;owner_source:string;owner_subject:string}|undefined; if(existing && (existing.owner_source!==e.identity.source || existing.owner_subject!==e.identity.subject) && !await this.authorizeBindingAdmin?.(e.identity,destination,existing.session_id)) throw new Error('binding management unauthorized');
+        if (!await this.authorize(e.identity,destination,session.sessionId)) throw new Error('unauthorized'); await guard();
+        const existing=this.db.prepare('SELECT session_id,owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;owner_source:string;owner_subject:string}|undefined; if(existing && (existing.owner_source!==e.identity.source || existing.owner_subject!==e.identity.subject) && !await this.authorizeBindingAdmin?.(e.identity,destination,existing.session_id)) throw new Error('binding management unauthorized'); await guard();
         if (existing?.session_id === session.sessionId && destination !== e.destination && pending.mode === 'interactive' && this.accessMode(destination) === 'read_only') {
           this.db.prepare("UPDATE channel_pending SET state='completed' WHERE operation_id=?").run(a.operationId);
           await this.deliver(destination,{title:'只读话题已存在',text:'此话题仍为只读。请在本话题打开会话控制，选择转为可交互。',actions:[{label:'会话控制',value:{action:'panel',sessionId:session.sessionId}}]},`${a.operationId}:existing-readonly`);

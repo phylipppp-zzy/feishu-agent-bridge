@@ -11,6 +11,7 @@ import type { Readable } from 'node:stream';
 
 class ResourceRejected extends Error {}
 class UnknownTopic extends Error {}
+class UnknownCardRoute extends Error {}
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
@@ -52,8 +53,9 @@ export async function handleSdkCardCallback(data:Lark.RawCardActionEvent, owner:
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:ChannelAction;
   try { action=parseFeishuAction(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
-  const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId}};
-  await handle(envelope,action); return undefined;
+  let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
+  const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId}};
+  try {await handle(envelope,action);} catch {return {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};} return undefined;
 }
 /** Only the SDK WS dispatcher invokes the inbound handler. Credentials are explicitly injected. */
 export class FeishuSdkPort implements FeishuPort {
@@ -130,9 +132,9 @@ export class FeishuSdkPort implements FeishuPort {
   public callbackDestination(chatId:string,messageId:string):string {
     if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
     const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;
-    if (!row || !this.authorizedDestination(row.destination)) throw new Error('unknown card message');
+    if (!row || !this.authorizedDestination(row.destination)) throw new UnknownCardRoute('unknown card message');
     const route=this.route(row.destination);
-    if ((route?.chat_id ?? row.destination)!==chatId) throw new Error('card chat mismatch');
+    if ((route?.chat_id ?? row.destination)!==chatId) throw new UnknownCardRoute('card chat mismatch');
     return row.destination;
   }
   private remember(id:string, messageId:string|null,destination:string):void {
