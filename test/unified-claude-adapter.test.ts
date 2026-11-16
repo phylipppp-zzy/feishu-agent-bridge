@@ -84,3 +84,20 @@ test('native tool error does not assert that the approval was rejected', async (
   f.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'err', is_error: true }] } }); await tick();
   assert.deepEqual(f.events.at(-1).interaction.nativeResult, { status: 'unknown', source: 'claude_tool_result_error' }); f.end();
 });
+
+test('partial text blocks converge on one message and omit tool and thinking', async()=>{
+  const f=fixture(); await f.adapter.create('/tmp',null); assert.equal(f.options.includePartialMessages,true);
+  const push=(event:any)=>f.push({type:'stream_event',parent_tool_use_id:null,event});
+  push({type:'message_start',message:{id:'inner'}});
+  push({type:'content_block_start',index:0,content_block:{type:'text',text:''}});
+  for(const text of ['a','b','c']) push({type:'content_block_delta',index:0,delta:{type:'text_delta',text}});
+  f.push({type:'assistant',uuid:'outer-one',parent_tool_use_id:null,message:{id:'inner',content:[{type:'text',text:'abc'}]}});
+  push({type:'content_block_start',index:1,content_block:{type:'tool_use'}});
+  push({type:'content_block_delta',index:1,delta:{type:'input_json_delta',partial_json:'secret'}});
+  push({type:'content_block_start',index:2,content_block:{type:'text',text:''}});
+  push({type:'content_block_delta',index:2,delta:{type:'text_delta',text:'xyz'}});
+  push({type:'message_stop'});
+  f.push({type:'assistant',uuid:'outer-two',parent_tool_use_id:null,message:{id:'inner',content:[{type:'text',text:'xyz'}]}});
+  push({type:'content_block_delta',index:2,delta:{type:'text_delta',text:'late'}});
+  await tick(); const messages=f.events.filter(x=>x.type==='message').map(x=>x.message); assert.ok(messages.filter(x=>!x.final).length>=3); assert.ok(messages.every(x=>x.messageId==='inner')); assert.deepEqual(messages.at(-1).blocks,[{type:'text',text:'abc\nxyz'}]); assert.equal(messages.at(-1).final,true); f.end();
+});

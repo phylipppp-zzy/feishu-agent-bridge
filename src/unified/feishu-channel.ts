@@ -72,6 +72,7 @@ export class FeishuChannel {
     this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL);`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_interaction_view (destination TEXT NOT NULL,session_id TEXT NOT NULL,interaction_id TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(destination,session_id,interaction_id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_pending_actors (operation_id TEXT PRIMARY KEY, envelope TEXT NOT NULL)');
+    this.db.exec('CREATE TABLE IF NOT EXISTS channel_stream_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, message_id TEXT NOT NULL, card_id TEXT, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, final INTEGER NOT NULL, current_message TEXT NOT NULL, latest_sequence INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,message_id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_baselines (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, snapshot TEXT NOT NULL, destination TEXT, binding_scope TEXT)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_history_baselines (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope))');
     const columns = this.db.prepare('PRAGMA table_info(channel_bindings)').all() as Array<{name:string}>;
@@ -520,6 +521,22 @@ export class FeishuChannel {
     const rows = this.db.prepare('SELECT interaction_id FROM channel_interaction_cards WHERE destination=? AND session_id=?').all(destination,sessionId) as Array<{interaction_id:string}>;
     for (const row of rows) { await this.checkBinding(destination,sessionId,scope); const interaction = await this.service.getInteraction(row.interaction_id); await this.checkBinding(destination,sessionId,scope); if (interaction.sessionId !== sessionId) throw new Error('interaction target mismatch'); await this.renderInteraction(destination,sessionId,interaction,scope); }
   }
+  private async renderStreamMessage(destination:string, sessionId:string, scope:string, message:import('./contracts.js').Message):Promise<void> {
+    const sequence=Number.isSafeInteger(message.sequence) ? message.sequence : 0; const guard=()=>this.checkBinding(destination,sessionId,scope); await guard();
+    const row=this.db.prepare('SELECT card_id,revision,updated_at,final,current_message,latest_sequence FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,message.turnId || message.messageId) as {card_id:string|null;revision:number;updated_at:number;final:number;current_message:string;latest_sequence:number}|undefined;
+    if(row && (sequence<row.latest_sequence || (row.current_message!==message.messageId && sequence===row.latest_sequence))) return;
+    if(row && ((row.current_message===message.messageId && ((row.final && !message.final) || row.revision>=message.revision)))) return;
+    if(row && !message.final && Date.now()-row.updated_at<1000) {if(row.current_message!==message.messageId) this.db.prepare('UPDATE channel_stream_cards SET current_message=?,latest_sequence=?,revision=0,final=0 WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId); return;}
+    const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${b.artifactId}]`).join('\n');
+    const card=message.final ? await this.longTextCard(destination,sessionId,'回复',text,[],guard) : {title:'回复中',text:[...text].slice(0,1000).join(''),actions:[]};
+    await guard();
+    if(!row) { const id=`stream:${payloadDigest([scope,destination,sessionId,message.turnId || message.messageId])}`; this.db.prepare('INSERT INTO channel_stream_cards VALUES (?,?,?,?,NULL,0,0,0,?,?)').run(destination,sessionId,scope,message.turnId || message.messageId,message.messageId,sequence); const cardId=await this.deliver(destination,card,id,guard); await guard(); if(cardId) this.db.prepare('UPDATE channel_stream_cards SET card_id=?,revision=?,updated_at=?,final=?,current_message=?,latest_sequence=? WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(cardId,message.revision,Date.now(),Number(message.final),message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId); return; }
+    if(!row.card_id) return;
+    const id=`stream-update:${payloadDigest([scope,destination,sessionId,message.messageId,message.revision])}`;
+    if(!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) return;
+    await guard(); await this.port.update(destination,row.card_id,this.stampCard(destination,card),id,guard); await guard();
+    this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('UPDATE channel_stream_cards SET revision=?,updated_at=?,final=?,current_message=?,latest_sequence=? WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(message.revision,Date.now(),Number(message.final),message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId);
+  }
   /** Poll using the bound owner's current authorization, never callback-provided identity. */
   async sync(destination: string): Promise<void> {
     const row=this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string}|undefined; if(!row) throw new Error('destination is not bound'); const sessionId=row.session_id, scope=JSON.stringify(row);
@@ -537,6 +554,7 @@ export class FeishuChannel {
       if (events.status === 'events') {
         const snapshot=await this.service.getSnapshot(sessionId); await syncGuard();
         for (const i of snapshot.value.interactions) await this.renderInteraction(destination,sessionId,i,scope);
+        const pending=this.db.prepare('SELECT current_message AS message_id FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND final=0').all(destination,sessionId,scope) as Array<{message_id:string}>; for(const p of pending) { const m=snapshot.value.messages.find(x=>x.messageId===p.message_id && x.role==='assistant'); if(m) await this.renderStreamMessage(destination,sessionId,scope,m); }
         let retryCount=0; let firstRetry='';
         const visible=events.events.filter(event=>!eventTypes.length || eventTypes.includes(event.type));
         const failedTurnIds=new Set(visible.filter(event=>event.type==='operation.failed' && event.data && typeof event.data==='object').map(event=>(event.data as {result?:{kind?:string;turnId?:string}}).result).filter((result):result is {kind:string;turnId:string}=>result?.kind==='turn' && typeof result.turnId==='string').map(result=>result.turnId));
@@ -544,12 +562,12 @@ export class FeishuChannel {
         for (const event of events.events) {
           await syncGuard();
           if (eventTypes.length && !eventTypes.includes(event.type)) continue;
-          const message=snapshot.value.messages.find(m=>m.messageId===event.objectId && m.final && m.role==='assistant');
+          const message=event.type==='message.updated' ? snapshot.value.messages.find(m=>m.messageId===event.objectId && m.role==='assistant') : undefined;
           if (message) {
             const known=this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?').get(destination,sessionId,message.messageId) as {revision:number}|undefined;
             if(known && known.revision>=message.revision) continue;
-            await sendSync(destination,await this.longTextCard(destination,sessionId,'回复',message.blocks.map(b=>b.type==='text' ? b.text : `[文件 ${b.artifactId}]`).join('\n'),[],syncGuard),`message:${destination}:${sessionId}:${message.messageId}:${message.revision}`);
-            this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)').run(destination,sessionId,message.messageId,message.revision); continue;
+            await this.renderStreamMessage(destination,sessionId,scope,message);
+            if(message.final) this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)').run(destination,sessionId,message.messageId,message.revision); continue;
           }
           const data=event.data && typeof event.data==='object' ? event.data as Record<string,unknown> : {};
           if (event.type === 'provider.api_retry') { retryCount++; firstRetry ||= event.eventId; continue; }
@@ -566,7 +584,7 @@ export class FeishuChannel {
           if (waitingSession && (snapshot.value.session.status!==status || snapshot.value.interactions.some(i=>['awaiting_answer','answer_pending_delivery'].includes(i.status) && (status==='waiting_approval' ? i.kind==='approval' : i.kind!=='approval')))) continue;
           const critical=event.type==='operation.failed' || event.type==='operation.unknown' || event.type==='operation.completed' || (event.type==='turn.updated' && ['failed','completed','interrupted'].includes(status)) || (event.type==='session.updated' && ['failed','waiting_question','waiting_approval'].includes(status));
           if (critical) {
-            const statusText:Record<string,string>={failed:'运行失败',completed:'运行已完成',interrupted:'本轮回复已中断；后台任务是否终止尚未确认',waiting_question:'等待回答',waiting_approval:'等待审批'};
+            const statusText:Record<string,string>={failed:'运行失败，未形成完整回复',completed:'运行已完成',interrupted:'本轮回复已中断，未形成完整回复；后台任务是否终止尚未确认',waiting_question:'等待回答',waiting_approval:'等待审批'};
             const waitingHint=this.accessMode(destination)==='read_only' && snapshot.value.session.native.provider==='claude' && ['waiting_question','waiting_approval'].includes(status) ? '；外部终端会话若仅同步等待状态，请回原终端处理。' : '';
             const card=event.type.startsWith('operation.') && typeof data.action==='string' && typeof data.status==='string' ? operationCard(data as unknown as import('./contracts.js').Operation) : {title:'会话更新',text:(statusText[status] ?? '会话状态已更新')+waitingHint,actions:[]};
             await sendSync(destination,card,`event:${destination}:${sessionId}:${event.eventId}`);
@@ -582,11 +600,10 @@ export class FeishuChannel {
       // cursor compares a consistent snapshot with that baseline and emits unseen finals.
       for (const m of snapshot.value.messages) {
         const known = this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?').get(destination,sessionId,m.messageId) as {revision:number} | undefined;
-        if (expired && m.role === 'assistant' && m.final && (!known || known.revision < m.revision)) {
-          await syncGuard();
-          await sendSync(destination,await this.longTextCard(destination,sessionId,'回复',m.blocks.map(b=>b.type === 'text' ? b.text : `[文件 ${b.artifactId}]`).join('\n'),[],syncGuard),`message:${destination}:${sessionId}:${m.messageId}:${m.revision}`);
+        if (expired && m.role === 'assistant' && (!known || known.revision < m.revision)) {
+          await syncGuard(); await this.renderStreamMessage(destination,sessionId,scope,m);
         }
-        this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)').run(destination,sessionId,m.messageId,m.revision);
+        if(!expired || m.final) this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)').run(destination,sessionId,m.messageId,m.revision);
       }
       for (const i of snapshot.value.interactions) await this.renderInteraction(destination,sessionId,i,scope);
       cursor = snapshot.cursor;

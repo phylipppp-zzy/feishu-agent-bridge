@@ -49,3 +49,11 @@ test('list and read normalize provider data and preserve host/service reference'
   const pendingRead = adapter.read(ref); const readId = sockets[0]!.sent.at(-1).id; sockets[0]!.message({ id: readId, result: { thread } }); const snapshot = await pendingRead; assert.equal(snapshot.session.title, 'title'); assert.equal(snapshot.messages[0]!.messageId, 'item'); assert.deepEqual(snapshot.messages[0]!.blocks, [{ type: 'text', text: 'ok' }]); transport.close();
 });
 test('secret question is explicitly unsupported without responding', async () => { const { sockets, transport, events } = setup(); await transport.connect(); const count = sockets[0]!.sent.length; sockets[0]!.message({ id: 9, method: 'item/tool/requestUserInput', params: { threadId: 't', turnId: 'x', questions: [{ id: 'a', question: 'Secret', isSecret: true }] } }); assert.equal(events.at(-1)?.type, 'event'); if (events.at(-1)?.type === 'event') assert.equal((events.at(-1) as Extract<PlatformObservation, { type: 'event' }>).event.type, 'interaction.unsupported'); assert.equal(sockets[0]!.sent.length, count); transport.close(); });
+
+test('agent delta uses one native item and completed is authoritative, late delta ignored',async()=>{
+ const {sockets,transport,adapter,events}=setup();await transport.connect();await adapter.resume(ref);
+ for(const delta of ['a','b','c']) sockets[0]!.message({method:'item/agentMessage/delta',params:{threadId:'t',turnId:'turn',itemId:'i',delta}});
+ sockets[0]!.message({method:'item/completed',params:{threadId:'t',turnId:'turn',item:{type:'agentMessage',id:'i',text:'authoritative'}}});
+ sockets[0]!.message({method:'item/agentMessage/delta',params:{threadId:'t',turnId:'turn',itemId:'i',delta:'late'}});
+ const ms=events.filter((e):e is Extract<PlatformObservation,{type:'message'}>=>e.type==='message');assert.equal(ms.length,4);assert.deepEqual(ms.map(x=>x.message.final),[false,false,false,true]);assert.deepEqual(ms.at(-1)!.message.blocks,[{type:'text',text:'authoritative'}]);assert.ok(ms.every(x=>x.connectionGeneration===1));transport.close();
+});

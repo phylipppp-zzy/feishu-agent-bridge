@@ -19,6 +19,7 @@ export class UnifiedCore implements UnifiedService {
   private readonly quarantinedHere = new Set<string>();
   private readonly providers = new Map<Provider, PlatformPort>();
   private readonly tails = new Map<string, Promise<unknown>>();
+  private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
   private readonly unsubscribe: Array<() => void> = [];
   constructor(readonly store: UnifiedStore, providers: PlatformPort[], private readonly authorize: Authorize, private readonly authorizeBootstrap: (identity: WriteContext['identity'], provider: Provider) => boolean = () => false, private readonly mayDetach: (session: Session) => boolean = () => false, private readonly canDiscover?: (session: Session) => boolean, private readonly historyReader?: HistoryReader) {
@@ -79,7 +80,7 @@ export class UnifiedCore implements UnifiedService {
       const latest=this.store.getSession(id); if(latest.status==='read_only' && latest.control.input!=='available' && payloadDigest(latest.native)===payloadDigest(current.native) && latest.project===current.project) {const title=observed.session.title?.trim() || latest.title; const candidateTime=observed.session.updatedAt; const updatedAt=candidateTime && Number.isFinite(Date.parse(candidateTime)) && (!latest.updatedAt || !Number.isFinite(Date.parse(latest.updatedAt)) || Date.parse(candidateTime)>Date.parse(latest.updatedAt)) ? candidateTime : latest.updatedAt; if(title!==latest.title || updatedAt!==latest.updatedAt) {try {this.store.updateSession({...latest,title,...(updatedAt ? {updatedAt}:{}),revision:latest.revision+1},latest.revision,latest.control.generation);} catch(error) {const code=error instanceof StoreError ? error.detail.code : undefined;if(code!=='stale_revision' && code!=='control_conflict')throw error;}}}
 
       for (const native of observed.turns ?? []) this.store.putTurn({...native,sessionId:id});
-      for (const native of observed.messages) { const snapshot=this.store.snapshot(id); const old=snapshot.value.messages.find(m=>m.messageId===native.messageId); const value={...native,sessionId:id,revision:old?.revision ?? native.revision}; if(old && payloadDigest(value)===payloadDigest(old)) continue; if(old?.final && !value.final) continue; this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null); }
+      for (const native of observed.messages) { const snapshot=this.store.snapshot(id); const old=snapshot.value.messages.find(m=>m.messageId===native.messageId); const value={...native,sessionId:id,sequence:old?.sequence ?? Math.max(0,...snapshot.value.messages.map(m=>m.sequence))+1,revision:old?.revision ?? native.revision}; if(old && payloadDigest(value)===payloadDigest(old)) continue; if(old?.final && !value.final) continue; this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null); }
     } catch (error) { this.observationFailure='read-only refresh failed'; throw error; }
   }
   async getSnapshot(id: string) { const snapshot=this.store.snapshot(id); return {...snapshot,value:{...snapshot.value,session:this.present(snapshot.value.session)}}; }
@@ -148,8 +149,8 @@ export class UnifiedCore implements UnifiedService {
       if ((snapshot.turns ?? []).some(t=>t.sessionId!==restored.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
       for (const native of snapshot.turns ?? []) this.store.putTurn({...native,sessionId:id});
       for (const native of snapshot.messages) {
-        const old=this.store.snapshot(id).value.messages.find(m=>m.messageId===native.messageId);
-        const value={...native,sessionId:id,revision:old?.revision ?? native.revision};
+        const messages=this.store.snapshot(id).value.messages; const old=messages.find(m=>m.messageId===native.messageId);
+        const value={...native,sessionId:id,sequence:old?.sequence ?? Math.max(0,...messages.map(m=>m.sequence))+1,revision:old?.revision ?? native.revision};
         if (old && (payloadDigest(value)===payloadDigest(old) || (old.final && !value.final))) continue;
         this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null);
       }
@@ -298,9 +299,9 @@ export class UnifiedCore implements UnifiedService {
     }
     if (observation.type === 'connection') { const previous = this.store.connectionGeneration(mapped.sessionId); if (!Number.isSafeInteger(observation.connectionGeneration) || observation.connectionGeneration < previous) return fail('control_conflict'); if (observation.connectionGeneration > previous) this.store.setConnectionGeneration(mapped.sessionId,previous,observation.connectionGeneration); return; }
     if (observation.type === 'message') {
-      const m: Message = {...observation.message, sessionId:mapped.sessionId}; const snapshot = this.store.snapshot(m.sessionId); const prior = snapshot.value.messages.find(x => x.messageId === m.messageId);
-      if (prior && JSON.stringify(prior) === JSON.stringify(m)) return;
-      this.store.putMessage(m, prior?.revision ?? null); return;
+      const m: Message = {...observation.message, sessionId:mapped.sessionId}; const generation=observation.connectionGeneration; if(generation!==undefined && generation!==this.store.connectionGeneration(mapped.sessionId)) return; const snapshot = this.store.snapshot(m.sessionId); const prior = snapshot.value.messages.find(x => x.messageId === m.messageId);
+      const key=JSON.stringify([mapped.sessionId,generation,m.messageId]); const seen=this.messageObservations.get(key); if((seen!==undefined && m.revision<=seen) || (generation===undefined && prior && m.revision<=prior.revision) || (prior?.final && !m.final)) return; this.messageObservations.set(key,m.revision); if(prior && payloadDigest({...m,sequence:prior.sequence,revision:prior.revision})===payloadDigest(prior)) return;
+      this.store.putMessage(prior ? {...m,sequence:prior.sequence,revision:prior.revision+1} : {...m,sequence:Math.max(0,...snapshot.value.messages.map(x=>x.sequence))+1}, prior?.revision ?? null); return;
     }
     if (observation.type === 'interaction') {
       {

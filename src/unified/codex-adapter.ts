@@ -89,12 +89,13 @@ export class CodexAdapter implements PlatformPort {
       }
       const req: NativeRequest = { id: m.id, generation, interaction }; this.requests.set(id, req); this.nativeIndex.set(this.key(generation, m.id), id); this.emitInteraction(interaction); return;
     }
-    if (!thread) return;
+    if (!thread || generation!==this.transport.generation) return;
+    if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
       const turn = this.turn(thread,p.turn);
       this.emit({ type: 'turn', turn, ref: this.ref(thread) } as PlatformObservation); return;
     }
-    if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread) } as PlatformObservation); }
+    if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread), connectionGeneration:generation } as PlatformObservation); }
   }
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request'); const r = await this.transport.request('thread/list', { cursor, limit }) as Obj;
@@ -131,7 +132,7 @@ export class CodexAdapter implements PlatformPort {
   async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
     const id = this.check(ref), r = await this.transport.request('thread/read', { threadId: id, includeTurns: true }) as Obj; const session = this.session(r?.thread);
     if (session.native.nativeSessionId !== id || !Array.isArray(r.thread.turns)) return invalidNative();
-    const messages: Message[] = []; for (const turn of r.thread.turns) if (isString(turn.id) && Array.isArray(turn.items)) for (const item of turn.items) { const message = this.message(id, turn.id, item, true); if (message) messages.push(message); }
+    const messages: Message[] = []; for (const turn of r.thread.turns) if (isString(turn.id) && Array.isArray(turn.items)) for (const item of turn.items) { const prior=this.messages.get(`${id}\0${item.id}`); const final=item.type!=='agentMessage' || turn.status!=='inProgress' || !!prior?.final; const message = this.message(id, turn.id, item, final); if (message) messages.push(message); }
     const turns = r.thread.turns.map((turn: Obj) => this.turn(id,turn));
     return { session, messages, turns, interactions: [...this.requests.values()].map(x => x.interaction).filter(x => x.sessionId === id), connectionGeneration: this.transport.generation };
   }

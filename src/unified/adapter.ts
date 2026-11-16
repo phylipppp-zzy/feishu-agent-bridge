@@ -52,7 +52,7 @@ export type PlatformObservation =
   | { type: 'connection'; ref: NativeSessionRef; connectionGeneration: number }
   | { type: 'session'; ref: NativeSessionRef; session: Session }
   | { type: 'turn'; ref: NativeSessionRef; turn: Turn }
-  | { type: 'message'; ref: NativeSessionRef; message: Message }
+  | { type: 'message'; ref: NativeSessionRef; message: Message; connectionGeneration?: number }
   | { type: 'interaction'; ref: NativeSessionRef; interaction: Interaction }
   | { type: 'event'; ref: NativeSessionRef; event: Event };
 /** Core holds the session dispatch lock through provider submission. Provider calls
