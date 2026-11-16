@@ -55,10 +55,10 @@ export type PlatformAcknowledgement = { status: 'submitted'; nativeReference: st
 export type PlatformObservation =
   | { type: 'connection'; ref: NativeSessionRef; connectionGeneration: number }
   | { type: 'session'; ref: NativeSessionRef; session: Session }
-  | { type: 'turn'; ref: NativeSessionRef; turn: Turn }
+  | { type: 'turn'; ref: NativeSessionRef; turn: Turn; connectionGeneration?:number }
   | { type: 'message'; ref: NativeSessionRef; message: Message; connectionGeneration?: number }
   | { type: 'interaction'; ref: NativeSessionRef; interaction: Interaction }
-  | { type: 'event'; ref: NativeSessionRef; event: Event };
+  | { type: 'event'; ref: NativeSessionRef; event: Event; connectionGeneration?:number };
 /** Core holds the session dispatch lock through provider submission. Provider calls
  * assertCurrent immediately before the SDK/socket write; throw aborts submission.
  * External native clients are outside this lock and still require native arbitration. */

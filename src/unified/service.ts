@@ -25,6 +25,7 @@ export class UnifiedCore implements UnifiedService {
   private readonly tails = new Map<string, Promise<unknown>>();
   private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
+  private closed=false;
   onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
   constructor(readonly store: UnifiedStore, providers: PlatformPort[], private readonly authorize: Authorize, private readonly authorizeBootstrap: (identity: WriteContext['identity'], provider: Provider) => boolean = () => false, private readonly mayDetach: (session: Session) => boolean = () => false, private readonly canDiscover?: (session: Session) => boolean, private readonly historyReader?: HistoryReader) {
@@ -42,7 +43,7 @@ export class UnifiedCore implements UnifiedService {
     }
     store.recoverAbandonedInFlight();
   }
-  close(): void { for (const off of this.unsubscribe) off(); }
+  close(): void { this.closed=true;for (const off of this.unsubscribe) off(); }
   private port(session: Session): PlatformPort { return this.providers.get(session.native.provider) ?? fail('temporarily_unavailable', 'provider unavailable'); }
   private check(context: WriteContext, action: string): Session {
     const session = this.store.getSession(context.targetId);
@@ -303,6 +304,7 @@ export class UnifiedCore implements UnifiedService {
   }
   /** Apply only normalized observations. Existing native/session mappings must already be established. */
   async observe(observation: PlatformObservation): Promise<void> {
+    if(this.closed)return;
     const mapped = this.store.findSession(observation.ref); if (!mapped || this.store.isDetached(mapped.sessionId)) return fail('invalid_request', 'observation native session is not attached');
     if(this.store.recoveryQuarantined(mapped.sessionId)) return;
     if (observation.type !== 'connection') {
@@ -327,12 +329,13 @@ export class UnifiedCore implements UnifiedService {
       } return;
     }
     if (observation.type === 'event') {
+      if(observation.connectionGeneration!==undefined && observation.connectionGeneration!==this.store.connectionGeneration(mapped.sessionId))return;
       const { schemaVersion: _v, sequence: _s, cursor: _c, ...event } = observation.event; const data = event.type === 'artifact.available' && event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? {...event.data,sessionId:mapped.sessionId} : event.data; const before=this.store.snapshot(mapped.sessionId).cursor; this.store.appendEvent({...event,sessionId:mapped.sessionId,data}); if(this.store.snapshot(mapped.sessionId).cursor!==before) this.onAcceptedObservation?.(observation); return;
     }
     if (observation.type === 'session') {
       const next = {...observation.session, sessionId:mapped.sessionId, native:mapped.native};
       await this.serial(next.sessionId, async () => { const owner = randomUUID(); const generation = this.store.acquireDispatchLease(next.sessionId,owner,Date.now(),30000); if (generation === null) return fail('busy','control observation needs replay'); try { if(this.store.recoveryQuarantined(next.sessionId)) return; const current = this.store.getSession(next.sessionId); if (next.control.generation < current.control.generation) return fail('control_conflict'); const normalized = {...next, revision:current.revision}; if (JSON.stringify(normalized) !== JSON.stringify(current)) this.store.updateSession({...normalized,revision:current.revision+1},current.revision,current.control.generation); } finally { this.store.releaseDispatchLease(next.sessionId,owner,generation); } });
     }
-    if (observation.type === 'turn') await this.serial(mapped.sessionId,async () => { if (this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId)) return; const before=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); this.store.observeTurn({...observation.turn,sessionId:mapped.sessionId}); const persisted=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); if(persisted?.status===observation.turn.status && (!before || payloadDigest(before)!==payloadDigest(persisted))) this.onAcceptedObservation?.(observation); });
+    if (observation.type === 'turn') await this.serial(mapped.sessionId,async () => { if (this.closed || this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId) || (observation.connectionGeneration!==undefined && observation.connectionGeneration!==this.store.connectionGeneration(mapped.sessionId))) return; const before=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); this.store.observeTurn({...observation.turn,sessionId:mapped.sessionId}); const persisted=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); if(persisted?.status===observation.turn.status && (!before || payloadDigest(before)!==payloadDigest(persisted))) this.onAcceptedObservation?.(observation); });
   }
 }
