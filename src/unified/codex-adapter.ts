@@ -57,7 +57,8 @@ export class CodexAdapter implements PlatformPort {
     else if (item.type === 'userMessage' && Array.isArray(item.content) && item.content.every((c: Obj) => c?.type === 'text' && typeof c.text === 'string')) { role = 'user'; text = item.content.map((c: Obj) => c.text).join(''); }
     else return;
     const key = `${thread}\0${item.id}`, old = this.messages.get(key);
-    const value: Message = { messageId: item.id, sessionId: thread, turnId: turn, role, blocks: [{ type: 'text', text }], sequence: ++this.sequence, revision: (old?.revision ?? 0) + 1, final, source: 'codex' }; this.messages.set(key, value); return value;
+    if (old && old.turnId === turn && old.role === role && old.final === final && old.blocks.length === 1 && old.blocks[0]?.type === 'text' && old.blocks[0].text === text) return old;
+    const value: Message = { messageId: item.id, sessionId: thread, turnId: turn, role, blocks: [{ type: 'text', text }], sequence: old?.sequence ?? ++this.sequence, revision: (old?.revision ?? 0) + 1, final, source: 'codex' }; this.messages.set(key, value); return value;
   }
   private turn(thread: string, native: Obj): Turn {
     if (!native || !isString(native.id) || !['inProgress','completed','failed','interrupted'].includes(native.status)) return invalidNative();

@@ -19,7 +19,7 @@ export function sessionListCard(items: readonly Session[], options: {topicUrls?:
     lines.push(`${index + 1}. ${title}\n${session.native.provider} · ${project}${time}${available ? '' : ' · 暂不可查看'}`);
     if (available) {
       const url=options.topicUrls?.get(session.sessionId);
-      const label=`打开 ${compact(session.title,18) || `未命名会话${index + 1}`}`;
+      const label=String(index+1);
       actions.push(url ? {label,value:{},url} : {label,value:{action:'bind',sessionId:session.sessionId,mode:'read_only'}});
     }
   });

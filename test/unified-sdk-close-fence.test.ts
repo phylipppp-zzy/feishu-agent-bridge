@@ -18,7 +18,7 @@ test('shutdown prevents new sends and posting a file whose upload finishes after
 
 test('session topic links use only the allowed chat and exact registered session',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'sdk-topic-link-'));const port=new FeishuSdkPort({appId:'test',appSecret:'test'},join(dir,'sdk'),new Set(['chat']),'owner');
- (port as any).client.im.message.create=async()=>({code:0,data:{message_id:'root',thread_id:'thread'}});
+ (port as any).client.im.message.create=async()=>({code:0,data:{message_id:'root',thread_id:'thread'}});(port as any).client.im.message.get=async({path}:any)=>({code:0,data:{items:[{message_id:path.message_id,chat_id:'chat',thread_id:'thread',thread_message_position:'-1',sender:{id:'test',id_type:'app_id',sender_type:'app'}}]}});
  try {
   const topic=await port.createTopic('chat','s',{title:'x',text:'x',actions:[]},'topic');
   const a=await port.topicLinkForSession('chat','s');assert.ok(a);assert.equal(await port.topicLinkForSession(topic,'s'),a);

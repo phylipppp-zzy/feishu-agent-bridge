@@ -1,4 +1,4 @@
-import { messageAppLink } from '../feishu.js';
+import { verifiedMessageAppLink } from './feishu-message-link.js';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -66,6 +66,9 @@ export class FeishuSdkPort implements FeishuPort {
   private migrationLocked=false;
   private started = false;
   private closing = false;
+  private routeGeneration=0;
+  private readonly linkCache=new Map<string,{url:string;expires:number}>();
+  private readonly linkFlights=new Map<string,Promise<string|null>>();
   private dbClosed = false;
   constructor(credentials: {appId:string; appSecret:string}, dbPath:string, private readonly destinations: ReadonlySet<string>, private readonly owner:string) {
     if (!credentials.appId || !credentials.appSecret || !destinations.size || !owner) throw new Error('missing SDK configuration');
@@ -82,6 +85,7 @@ export class FeishuSdkPort implements FeishuPort {
   private migrationAbort():void {this.db.exec(this.migrationLocked?'ROLLBACK TO migration_op; RELEASE migration_op':'ROLLBACK');}
   /** Only reviewed snapshot routes in an allowed chat may be installed. */
   public importMigrationRoute(id:string, record:{destination:string;chatId:string;rootId:string;threadId?:string;sessionId:string;owner:string;appId:string}):'inserted'|'already-imported' {
+    this.routeGeneration++;
     if (![id,record.destination,record.chatId,record.rootId,record.sessionId,record.owner,record.appId].every(x=>typeof x==='string' && x.trim()) || record.owner!==this.owner || record.appId!==this.appId || !this.destinations.has(record.chatId)) throw new Error('migration route unauthorized');
     const digest=JSON.stringify(record); this.migrationBegin();
     try {
@@ -96,6 +100,7 @@ export class FeishuSdkPort implements FeishuPort {
     } catch(e) { this.migrationAbort(); throw e; }
   }
   public rollbackMigrationRoute(id:string):'removed'|'retained'|'absent' {
+    this.routeGeneration++;
     this.migrationBegin(); try {
       this.db.exec('CREATE TABLE IF NOT EXISTS sdk_migration_receipts (id TEXT PRIMARY KEY,digest TEXT NOT NULL,destination TEXT NOT NULL)');
       const receipt=this.db.prepare('SELECT digest,destination FROM sdk_migration_receipts WHERE id=?').get(id) as {digest:string;destination:string}|undefined;
@@ -108,7 +113,7 @@ export class FeishuSdkPort implements FeishuPort {
     } catch(e) {this.migrationAbort();throw e;}
   }
   public isTopicDestination(destination:string):boolean { return !!this.route(destination); }
-  public reassignTopic(destination:string,sessionId:string):void { this.allowed(destination); if (!this.route(destination)) throw new Error('topic required'); this.db.prepare('UPDATE sdk_topic_routes SET session_id=? WHERE destination=?').run(sessionId,destination); }
+  public reassignTopic(destination:string,sessionId:string):void { this.allowed(destination); this.routeGeneration++; if (!this.route(destination)) throw new Error('topic required'); this.db.prepare('UPDATE sdk_topic_routes SET session_id=? WHERE destination=?').run(sessionId,destination); }
   public authorizedDestination(destination:string):boolean {
     if (this.destinations.has(destination)) return true;
     const route=this.db.prepare('SELECT chat_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string}|undefined;
@@ -138,6 +143,7 @@ export class FeishuSdkPort implements FeishuPort {
     return row.destination;
   }
   private remember(id:string, messageId:string|null,destination:string):void {
+    const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined; if(prior && prior.destination!==destination) this.routeGeneration++;
     this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT OR REPLACE INTO sdk_deliveries VALUES (?,?)').run(id,messageId); if(messageId) this.db.prepare('INSERT OR REPLACE INTO sdk_message_routes VALUES (?,?)').run(messageId,destination); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
   }
   async createTopic(destination:string,sessionId:string,card:ChannelCard,deliveryId:string):Promise<string> {
@@ -149,7 +155,7 @@ export class FeishuSdkPort implements FeishuPort {
     const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content:JSON.stringify(toFeishuCard(card))}});
     if(response.code || !response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
     const root=response.data.message_id; const key=`topic:${randomUUID()}`;
-    this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId); this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key); this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+    this.routeGeneration++; this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId); this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key); this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
     return key;
   }
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
@@ -171,22 +177,22 @@ export class FeishuSdkPort implements FeishuPort {
     if (sent.code || !sent.data?.message_id) throw new Error('Feishu file send failed or outcome unknown'); this.remember(deliveryId,sent.data.message_id,destination);
   }
   async lookupDelivery(id:string):Promise<'sent'|'unknown'> { return this.db.prepare('SELECT id FROM sdk_deliveries WHERE id=? AND message_id IS NOT NULL').get(id) ? 'sent' : 'unknown'; }
+  private dataVersion():number { const row=this.db.prepare('PRAGMA data_version').get() as {data_version:number};return row.data_version; }
+  /** GET is scoped to an already-registered route and revalidated after every await. */
+  private async scopedMessageLink(chat:string,messageId:string,scope:string,stillCurrent:()=>boolean):Promise<string|null> {
+    const generation=this.routeGeneration, version=this.dataVersion();const valid=()=>!this.closing && generation===this.routeGeneration && version===this.dataVersion() && this.destinations.has(chat) && stillCurrent();
+    if(!valid())return null;const key=JSON.stringify([chat,messageId,scope,generation,version]);const cached=this.linkCache.get(key);if(cached && cached.expires>Date.now())return valid()?cached.url:null;if(cached)this.linkCache.delete(key);
+    let task=this.linkFlights.get(key);if(!task) {if(this.linkFlights.size>=16)return null;task=(async()=>{let timeout:ReturnType<typeof setTimeout>|undefined;try {const response=await Promise.race([this.client.im.message.get({path:{message_id:messageId},params:{user_id_type:'open_id'}}),new Promise<never>((_,reject)=>{timeout=setTimeout(()=>reject(new Error('link lookup timeout')),5000);})]);if(!valid() || response.code!==0 || !Array.isArray(response.data?.items))return null;const matches=response.data.items.filter(m=>m.message_id===messageId);if(matches.length!==1)return null;const m=matches[0]!;if(m.chat_id!==chat || m.sender?.id_type!=='app_id' || !['app','bot'].includes(m.sender.sender_type) || m.sender.id!==this.appId)return null;const url=verifiedMessageAppLink(m);if(!url || !valid())return null;while(this.linkCache.size>=128)this.linkCache.delete(this.linkCache.keys().next().value!);this.linkCache.set(key,{url,expires:Date.now()+30000});return url;}catch{return null;}finally{if(timeout)clearTimeout(timeout);}})();this.linkFlights.set(key,task);}
+    try {const value=await task;return !this.closing && valid()?value:null;}catch{return null;}finally{if(this.linkFlights.get(key)===task)this.linkFlights.delete(key);}
+  }
   async fileMessageLink(destination:string,sessionId:string,deliveryId:string):Promise<string|null> {
-    this.allowed(destination);
-    const delivery=this.db.prepare('SELECT d.message_id,m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {message_id:string;destination:string}|undefined;
-    if (!delivery || delivery.destination !== destination) return null;
-    const route=this.db.prepare('SELECT chat_id,session_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string;session_id:string}|undefined;
-    if (route && route.session_id !== sessionId) return null;
-    const chat=route?.chat_id ?? destination;
-    if (!this.destinations.has(chat)) return null;
-    return messageAppLink(chat,delivery.message_id);
+    this.allowed(destination);const read=()=>this.db.prepare('SELECT d.message_id,m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {message_id:string;destination:string}|undefined;
+    const delivery=read();if(!delivery || delivery.destination!==destination)return null;const route=this.db.prepare('SELECT chat_id,root_id,session_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string;root_id:string;session_id:string}|undefined;if(route && route.session_id!==sessionId)return null;const chat=route?.chat_id ?? destination;if(!this.destinations.has(chat))return null;
+    const scope=JSON.stringify([destination,sessionId,deliveryId,route ?? null]);return this.scopedMessageLink(chat,delivery.message_id,scope,()=>{const now=read(),r=this.db.prepare('SELECT chat_id,root_id,session_id FROM sdk_topic_routes WHERE destination=?').get(destination) as typeof route;return !!now && now.message_id===delivery.message_id && now.destination===destination && JSON.stringify(r ?? null)===JSON.stringify(route ?? null);});
   }
   async lookupMessageId(id:string):Promise<string|null> { return (this.db.prepare('SELECT message_id FROM sdk_deliveries WHERE id=?').get(id) as {message_id:string|null}|undefined)?.message_id ?? null; }
   async topicLinkForSession(destination:string,sessionId:string):Promise<string|null> {
-    this.allowed(destination); const chat=this.route(destination)?.chat_id ?? destination;
-    const row=this.db.prepare('SELECT destination,chat_id,root_id FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string;chat_id:string;root_id:string}|undefined;
-    if(!row) return null; this.allowed(row.destination);
-    return messageAppLink(row.chat_id,row.root_id);
+    this.allowed(destination);const source=this.route(destination),chat=source?.chat_id ?? destination;const read=()=>this.db.prepare('SELECT destination,chat_id,root_id,session_id FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string;chat_id:string;root_id:string;session_id:string}|undefined;const row=read();if(!row)return null;this.allowed(row.destination);const scope=JSON.stringify([destination,sessionId,source ?? null,row]);return this.scopedMessageLink(chat,row.root_id,scope,()=>{const now=read();return JSON.stringify(now ?? null)===JSON.stringify(row) && JSON.stringify(this.route(destination) ?? null)===JSON.stringify(source ?? null) && this.authorizedDestination(row.destination);});
   }
   private queueResource(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',scope:string):void {
     const serialized=JSON.stringify(e); const old=this.db.prepare('SELECT envelope,message_id,resource_key,resource_type FROM sdk_inbound_resources WHERE event_id=?').get(e.eventId) as {envelope:string;message_id:string;resource_key:string;resource_type:string}|undefined;
@@ -231,6 +237,6 @@ export class FeishuSdkPort implements FeishuPort {
     if (this.closing) throw new Error('SDK port closing');
     } catch(error) { this.ws.close(); throw error; }
   }
-  stopReceiving():void { this.closing=true; this.ws.close(); }
+  stopReceiving():void { this.closing=true; this.linkCache.clear(); this.ws.close(); }
   close():void { this.stopReceiving(); if (!this.dbClosed) {this.dbClosed=true; this.db.close();} }
 }
