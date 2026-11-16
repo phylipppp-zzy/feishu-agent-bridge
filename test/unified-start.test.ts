@@ -95,7 +95,7 @@ test('real lifecycle with entry closes during either pending startup phase', asy
       const live = liveRuntimeLifecycle(runtime as never, transport as never, port as never);
       const result = main(['--run', '--config', path], { signals, env: { FEISHU_APP_ID: 'id', FEISHU_APP_SECRET: 'secret' }, log() {}, fail() {}, loadRuntime: async () => ({ validateRuntimeConfig() {}, createLiveRuntime: async () => live }) });
       await ready; signals.emit('SIGTERM'); assert.equal(await result, 0); release(); await new Promise(resolve => setImmediate(resolve));
-      assert.equal(runtimeCloses, 1); assert.equal(polling, 0); assert.equal(portStarts, phase === 'connect' ? 0 : 1);
+      assert.equal(runtimeCloses, 1); assert.equal(polling, phase === 'connect' ? 1 : 0); assert.equal(portStarts, 1);
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

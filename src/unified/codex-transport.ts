@@ -88,7 +88,7 @@ export class CodexTransport {
   close(): void { const s = this.socket; if (s) { this.closed(s, this.generation); s.close(); } }
   request(method: string, params: unknown): Promise<unknown> {
     const socket = this.socket;
-    if (!socket || socket.readyState !== 1) return Promise.reject(contractError('temporarily_unavailable', 'not connected'));
+    if ((method!=='initialize' && !this.verified) || !socket || socket.readyState !== 1) return Promise.reject(contractError('temporarily_unavailable', 'not connected'));
     const id = ++this.serial;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); this.fault('response timed out'); reject(contractError('outcome_unknown', 'response timed out')); }, this.timeoutMs);

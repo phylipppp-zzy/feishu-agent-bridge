@@ -14,9 +14,13 @@ function page<T>(items: T[], q: ListQuery) {
   if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(q.limit) || q.limit < 1 || q.limit > 1000) return fail('invalid_request');
   return { items: items.slice(start, start + q.limit), nextCursor: start + q.limit < items.length ? String(start + q.limit) : null };
 }
+const pendingProviderLists=new WeakMap<PlatformPort,{cursor:string|null;work:ReturnType<PlatformPort['list']>}>();
+async function boundedProviderList(port:PlatformPort,cursor:string|null):ReturnType<PlatformPort['list']> {const prior=pendingProviderLists.get(port);if(prior && prior.cursor!==cursor) throw contractError('temporarily_unavailable','provider list already pending'); let timer:ReturnType<typeof setTimeout>|undefined;const work=prior?.work ?? Promise.resolve().then(()=>port.list(cursor,100));if(!prior){pendingProviderLists.set(port,{cursor,work});void work.finally(()=>{if(pendingProviderLists.get(port)?.work===work)pendingProviderLists.delete(port);}).catch(()=>{});}try {return await Promise.race([work,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(contractError('temporarily_unavailable','provider list timed out')),2000);})]);} finally {if(timer)clearTimeout(timer);}}
 /** Normalized core. Native transports and credentials are injected through PlatformPort. */
 export class UnifiedCore implements UnifiedService {
   private readonly quarantinedHere = new Set<string>();
+  private readonly unavailableProviders=new Set<Provider>();
+  setProviderAvailable(provider:Provider,available:boolean):void {if(available){if(this.unavailableProviders.has(provider)){const port=this.providers.get(provider);if(port)pendingProviderLists.delete(port);}this.unavailableProviders.delete(provider);}else this.unavailableProviders.add(provider);}
   private readonly providers = new Map<Provider, PlatformPort>();
   private readonly tails = new Map<string, Promise<unknown>>();
   private readonly messageObservations=new Map<string,number>();
@@ -43,6 +47,7 @@ export class UnifiedCore implements UnifiedService {
   private check(context: WriteContext, action: string): Session {
     const session = this.store.getSession(context.targetId);
     if (!this.authorize(context.identity, session, action)) return fail('unauthorized');
+    if(this.unavailableProviders.has(session.native.provider) && ['attachSession','submitInput','resolveInteraction','interruptTurn','requestControl','releaseControl','updateSessionSettings','archiveSession'].includes(action)) return fail('temporarily_unavailable','provider unavailable');
     if (this.store.recoveryQuarantined(session.sessionId)) return fail('control_conflict','reconnect and explicitly attach to reconcile recovery quarantine');
     return session;
   }
@@ -52,14 +57,14 @@ export class UnifiedCore implements UnifiedService {
     this.tails.set(id, next); void next.finally(() => { if (this.tails.get(id) === next) this.tails.delete(id); }).catch(() => undefined);
     return next;
   }
-  private present(session: Session): Session { const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
+  private present(session: Session): Session { if(this.unavailableProviders.has(session.native.provider)) {const capabilities=Object.fromEntries(Object.entries(session.capabilities).map(([key,value])=>[key,key==='view'?value:{status:'temporarily_unavailable',reason:'provider unavailable'}])) as Session['capabilities'];return {...session,status:'unreachable',capabilities,control:{...session.control,input:'unavailable',reason:'provider unavailable'}};} const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
   async listSessions(q: ListQuery) {
     const stored=this.store.listSessions(); const known=new Set(stored.map(s=>payloadDigest(s.native)));
     const all=stored.filter(s=>!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))).map(s=>this.present(s));
-    if(this.canDiscover) for(const port of this.providers.values()) {let cursor:string|null=null;const seen=new Set<string>();do {const found=await port.list(cursor,100);for(const item of found.items) {if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');const key=payloadDigest(item.native);if(known.has(key)||!this.canDiscover(item))continue;known.add(key);const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});}cursor=found.nextCursor;if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}}while(cursor!==null);}
+    const unavailableProviders:Provider[]=[]; if(this.canDiscover) for(const port of this.providers.values()) {try {let cursor:string|null=null;const seen=new Set<string>();do {const found=await boundedProviderList(port,cursor);for(const item of found.items) {if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');const key=payloadDigest(item.native);if(known.has(key)||!this.canDiscover(item))continue;known.add(key);const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});}cursor=found.nextCursor;if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}}while(cursor!==null);this.setProviderAvailable(port.provider,true);} catch {unavailableProviders.push(port.provider);this.setProviderAvailable(port.provider,false);}}
     all.sort((a,b)=>payloadDigest(a.native).localeCompare(payloadDigest(b.native)));const search=q.search?.toLowerCase();const selected=page(all.filter(s=>!search||`${s.native.provider} ${s.title} ${s.project}`.toLowerCase().includes(search)),q);const items:Session[]=[];
     for(const candidate of selected.items) {let current=this.store.findSession(candidate.native);if(!current) {try {this.store.insertSession(candidate);current=candidate;} catch(error) {current=this.store.findSession(candidate.native);if(!current)throw error;}} if(this.store.isDetached(current.sessionId) || (this.canDiscover && !this.canDiscover(current))) continue;items.push(this.present(current));}
-    return {items,nextCursor:selected.nextCursor};
+    return {items,nextCursor:selected.nextCursor,...(unavailableProviders.length?{unavailableProviders}:{})};
   }
   async getSession(id: string) { return this.present(this.store.getSession(id)); }
   async getWorkState(id:string) { const session=this.store.getSession(id); return {runningTurns:this.store.listTurns(id).filter(t=>t.status==='running'),queuedInputs:this.store.queuedInputs(id),canArchive:typeof this.port(session).archive === 'function'}; }
@@ -92,10 +97,13 @@ export class UnifiedCore implements UnifiedService {
   async createSession(request: {context:WriteContext; payload:{provider:Provider; project:string; model:string|null}}): Promise<Operation> {
     // A channel must explicitly authorize this operation through the dedicated bootstrap hook.
     if (!this.authorizeBootstrap(request.context.identity, request.payload.provider)) return fail('unauthorized');
+    const existing=this.store.findIdempotent(request.context,'createSession',request.payload); if(existing) return existing;
+    if(this.unavailableProviders.has(request.payload.provider)) return fail('temporarily_unavailable','provider unavailable');
     return this.store.registerCreate(request.context,request.payload);
   }
   async attachSession(request: { context: WriteContext; payload: { provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' } }): Promise<Operation> {
     const {provider,hostId,serviceId,nativeSessionId}=request.payload;
+    if(this.unavailableProviders.has(provider)) return fail('temporarily_unavailable','provider unavailable');
     return this.serial(sessionIdFor({provider,hostId,serviceId,nativeSessionId}), async () => {
     const prior=this.store.findIdempotent(request.context,'attachSession',request.payload); if (prior) { if(prior.result?.kind !== 'session') return fail('outcome_unknown'); this.check({...request.context,targetId:prior.result.sessionId},'attachSession'); return prior; }
     const ref = {provider,hostId,serviceId,nativeSessionId};
@@ -207,8 +215,8 @@ export class UnifiedCore implements UnifiedService {
       const owner = randomUUID(); const generation = this.store.acquireDispatchLease(pending.context.targetId, owner, Date.now(), 30000); if (generation === null) return fail('busy', 'another dispatcher owns this session');
       try {
       if (pending.kind === 'createSession') {
+        const data = pending.payload as {provider: Provider; project: string; model: string | null}; if(this.unavailableProviders.has(data.provider)) return fail('temporarily_unavailable','provider unavailable');
         if (!this.store.claimCreate(id)) return this.store.getOperation(id);
-        const data = pending.payload as {provider: Provider; project: string; model: string | null};
         try {
           const port = this.providers.get(data.provider); if (!port) throw contractError('temporarily_unavailable');
           const ack = await port.create(data.project,data.model);
@@ -271,7 +279,7 @@ export class UnifiedCore implements UnifiedService {
       } finally { this.store.releaseDispatchLease(pending.context.targetId,owner,generation); }
     });
   }
-  async dispatchPending(): Promise<void> { for (const id of this.store.pendingOutbox()) await this.dispatch(id); }
+  async dispatchPending(): Promise<void> { for (const id of this.store.pendingOutbox()) try {await this.dispatch(id);} catch(error) {if(error instanceof StoreError && error.detail.code==='temporarily_unavailable') {this.store.failUnreboundPending([id]);continue;}throw error;} }
   /** Native acknowledgement alone does not establish completion; callers must supply observed evidence. */
   reconcileObserved(id: string, status: 'accepted' | 'completed' | 'failed', error: ReturnType<typeof contractError> | null = null): Operation { return this.store.reconcileOperation(id, status, error); }
   async reconcile(id: string): Promise<Operation> {
