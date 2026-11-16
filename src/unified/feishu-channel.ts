@@ -424,7 +424,9 @@ export class FeishuChannel {
       case 'cancel': op = await this.service.cancelQueuedInput({context:ctx,payload:{inputId:a.inputId}}); break;
       case 'archive': op = await this.service.archiveSession({context:ctx,payload:{archived:a.archived}}); break;
     } }
-    const card = operationCard(op); if (a.action === 'attachment') card.actions.push({label:'查看处理进度',value:{action:'finish',operationId:op.operationId}});
+    if ((a.action === 'answer' || a.action === 'answer_form') && op.status !== 'failed' && op.status !== 'unknown') { await guard(); const interaction=await this.service.getInteraction(a.interactionId); await guard(); if(interaction.sessionId!==bound) throw new Error('interaction target mismatch'); await this.renderInteraction(e.destination,bound,interaction,executionScope); return op; }
+    if (a.action === 'input' && a.mode !== 'queue' && op.status !== 'queued' && op.status !== 'failed' && op.status !== 'unknown') return op;
+    const card = operationCard(op); if (a.action === 'input' && (a.mode === 'queue' || op.status === 'queued')) card.actions.push({label:'查看排队',value:{action:'panel'}}); if (a.action === 'attachment') card.actions.push({label:'查看处理进度',value:{action:'finish',operationId:op.operationId}});
     await reply(card); return op;
   }
   private async longTextCard(destination:string, sessionId:string, title:string, text:string, actions:ChannelCard['actions'] = [], initialGuard?:()=>Promise<void>, onSend?:()=>void): Promise<ChannelCard> {
@@ -490,7 +492,10 @@ export class FeishuChannel {
       if (events.status === 'events') {
         const snapshot=await this.service.getSnapshot(sessionId); await syncGuard();
         for (const i of snapshot.value.interactions) await this.renderInteraction(destination,sessionId,i,scope);
-        let ordinary=0; let firstOrdinary=''; let retryCount=0; let firstRetry='';
+        let retryCount=0; let firstRetry='';
+        const visible=events.events.filter(event=>!eventTypes.length || eventTypes.includes(event.type));
+        const failedTurnIds=new Set(visible.filter(event=>event.type==='operation.failed' && event.data && typeof event.data==='object').map(event=>(event.data as {result?:{kind?:string;turnId?:string}}).result).filter((result):result is {kind:string;turnId:string}=>result?.kind==='turn' && typeof result.turnId==='string').map(result=>result.turnId));
+        const hasTurnFailure=visible.some(event=>event.type==='turn.updated' && (event.data as {status?:string}|null)?.status==='failed');
         for (const event of events.events) {
           await syncGuard();
           if (eventTypes.length && !eventTypes.includes(event.type)) continue;
@@ -504,17 +509,23 @@ export class FeishuChannel {
           if (event.type === 'provider.usage_limit' && (data.status === 'rejected' || data.status === 'allowed_warning')) { await sendSync(destination,{title:'额度提示',text:data.status === 'rejected' ? '模型服务报告额度不足或受到限额，请稍后恢复后再使用。' : '模型服务提示额度接近限制，当前仍可继续。',actions:[]},`event:${destination}:${sessionId}:${event.eventId}`); continue; }
           if (event.type === 'provider.usage_available' && data.status === 'allowed') { await sendSync(destination,{title:'额度提示',text:'模型服务报告本次额度检查结果：可用。',actions:[]},`event:${destination}:${sessionId}:${event.eventId}`); continue; }
           const status=typeof data.status==='string' ? data.status : '';
-          const waitingInteraction=event.type==='interaction.created' && status==='awaiting_answer';
-          const critical=waitingInteraction || event.type==='operation.failed' || event.type==='operation.completed' || event.type==='operation.unknown' || (event.type==='turn.updated' && ['failed','completed','interrupted'].includes(status)) || (event.type==='session.updated' && ['failed','waiting_question','waiting_approval'].includes(status));
+          // Pending interaction cards above already present the question or approval.
+          if (event.type==='interaction.created') continue;
+          if (event.type==='operation.completed' && (data.action==='submitInput' || data.action==='resolveInteraction')) continue;
+          if (event.type==='turn.updated' && status==='completed') { const turnId=typeof data.turnId==='string' ? data.turnId : event.objectId; if(snapshot.value.messages.some(m=>m.turnId===turnId && m.role==='assistant' && m.final)) continue; }
+          if (event.type==='turn.updated' && status==='failed' && failedTurnIds.has(typeof data.turnId==='string' ? data.turnId : event.objectId)) continue;
+          if (event.type==='session.updated' && status==='failed' && (hasTurnFailure || failedTurnIds.size>0)) continue;
+          const waitingSession=event.type==='session.updated' && ['waiting_question','waiting_approval'].includes(status);
+          if (waitingSession && (snapshot.value.session.status!==status || snapshot.value.interactions.some(i=>['awaiting_answer','answer_pending_delivery'].includes(i.status) && (status==='waiting_approval' ? i.kind==='approval' : i.kind!=='approval')))) continue;
+          const critical=event.type==='operation.failed' || event.type==='operation.unknown' || event.type==='operation.completed' || (event.type==='turn.updated' && ['failed','completed','interrupted'].includes(status)) || (event.type==='session.updated' && ['failed','waiting_question','waiting_approval'].includes(status));
           if (critical) {
             const statusText:Record<string,string>={failed:'运行失败',completed:'运行已完成',interrupted:'本轮回复已中断；后台任务是否终止尚未确认',waiting_question:'等待回答',waiting_approval:'等待审批'};
-            const waitingHint=this.accessMode(destination)==='read_only' && snapshot.value.session.native.provider==='claude' && (waitingInteraction || ['waiting_question','waiting_approval'].includes(status)) ? '；外部终端会话若仅同步等待状态，请回原终端处理。' : '';
-            const card=event.type.startsWith('operation.') && typeof data.action==='string' && typeof data.status==='string' ? operationCard(data as unknown as import('./contracts.js').Operation) : {title:'会话更新',text:(waitingInteraction ? (data.kind==='approval' ? '等待审批' : '等待回答') : statusText[status] ?? '会话状态已更新')+waitingHint,actions:[]};
+            const waitingHint=this.accessMode(destination)==='read_only' && snapshot.value.session.native.provider==='claude' && ['waiting_question','waiting_approval'].includes(status) ? '；外部终端会话若仅同步等待状态，请回原终端处理。' : '';
+            const card=event.type.startsWith('operation.') && typeof data.action==='string' && typeof data.status==='string' ? operationCard(data as unknown as import('./contracts.js').Operation) : {title:'会话更新',text:(statusText[status] ?? '会话状态已更新')+waitingHint,actions:[]};
             await sendSync(destination,card,`event:${destination}:${sessionId}:${event.eventId}`);
-          } else { ordinary++; firstOrdinary ||= event.eventId; }
+          }
         }
         if (retryCount) { await syncGuard(); await sendSync(destination,{title:'连接重试',text:`模型服务正在重试（本次收到 ${retryCount} 次重试通知）。`,actions:[]},`retry:${destination}:${sessionId}:${firstRetry}:${events.cursor}`); }
-        if (ordinary) { await syncGuard(); await sendSync(destination,{title:'会话进展',text:'会话有新的进展。',actions:[]},`progress:${destination}:${sessionId}:${firstOrdinary}:${events.cursor}`); }
         cursor = events.cursor;
       } else { cursor = undefined; expired = true; }
     }
