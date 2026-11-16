@@ -17,6 +17,7 @@ function readCursor(value: string, sessionId: string): number {
 /** Isolated store; callers authenticate identities and mediate all native effects. */
 export class UnifiedStore {
   private db: DatabaseSync;
+  private migrationLocked=false;
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     // Per-connection timeout permits concurrent open without changing database contents.
@@ -49,7 +50,11 @@ export class UnifiedStore {
       PRAGMA application_id=1431193926; PRAGMA user_version=2; COMMIT;`);
   }
   close(): void { this.db.close(); }
-  private transaction<T>(f: () => T): T { this.db.exec('BEGIN IMMEDIATE'); try { const v = f(); this.db.exec('COMMIT'); return v; } catch (e) { this.db.exec('ROLLBACK'); throw e; } }
+  private transaction<T>(f: () => T): T { const nested=this.migrationLocked; this.db.exec(nested?'SAVEPOINT migration_op':'BEGIN IMMEDIATE'); try { const v=f(); this.db.exec(nested?'RELEASE migration_op':'COMMIT'); return v; } catch(e) { this.db.exec(nested?'ROLLBACK TO migration_op; RELEASE migration_op':'ROLLBACK'); throw e; } }
+  beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
+  endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
+  inspectMigrationSession(id:string,sessionId:string):'removable'|'retained'|'absent' { if(!this.migrationLocked) throw new Error('migration lock required'); this.db.exec('SAVEPOINT migration_inspect'); try {const result=this.rollbackMigrationSession(id); if(result==='retained' && !this.row('SELECT 1 AS present FROM sessions WHERE id=?',sessionId)) throw new Error('migration session missing despite receipt; manual review'); this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); return result==='removed'?'removable':result==='absent' && this.row('SELECT 1 AS present FROM sessions WHERE id=?',sessionId)?'retained':result;} catch(e) {this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect');throw e;} }
+
   private row(sql: string, ...args: (string | number)[]): Record<string, unknown> | undefined { return this.db.prepare(sql).get(...args) as Record<string, unknown> | undefined; }
   private run(sql: string, ...args: (string | number)[]): void { this.db.prepare(sql).run(...args); }
   private session(id: string): Session { const r = this.row('SELECT value FROM sessions WHERE id=?', id); if (!r) return fail('invalid_request', 'unknown session'); return parse<Session>(r.value); }
@@ -189,6 +194,7 @@ export class UnifiedStore {
   }); }
   putTurn(turn: Turn): void { this.transaction(() => { this.session(turn.sessionId); const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId); if (old) {const prior=parse<Turn>(old.value); if(prior.sessionId !== turn.sessionId) return fail('invalid_request'); if(JSON.stringify(prior) === JSON.stringify(turn)) return; if (['completed','failed','interrupted'].includes(prior.status)) return fail('stale_revision','terminal turn cannot be overwritten'); } this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',turn.turnId,turn.sessionId,JSON.stringify(turn)); this.eventFor(turn.sessionId,turn.turnId,0,'turn.updated',null,turn); this.settleTurn(turn); }); }
   listTurns(sessionId: string): Turn[] { this.session(sessionId); return (this.db.prepare('SELECT value FROM turns WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string,unknown>[]).map(r => parse<Turn>(r.value)); }
+  queuedInputs(sessionId:string): Array<{inputId:string}> { this.session(sessionId); return this.pendingOutbox().filter(id=>{const o=this.getOutbox(id);return o.context.targetId===sessionId && o.kind==='submitInput' && (o.payload as {mode?:string}).mode==='queue';}).map(inputId=>({inputId})); }
   cancelQueuedInput(context: WriteContext, inputId: string): Operation { return this.transaction(() => {
     const payload = {inputId}; const existing = this.existing(context,'cancelQueuedInput',payload); if (existing.operation) return existing.operation;
     const session = this.session(context.targetId); if (session.revision !== context.expectedRevision) return fail('stale_revision'); if (session.control.generation !== context.controlGeneration) return fail('control_conflict');
@@ -275,6 +281,7 @@ export class UnifiedStore {
     const session = this.session(context.targetId);
     if (session.revision !== context.expectedRevision) return fail('stale_revision');
     if (session.control.generation !== context.controlGeneration) return fail('control_conflict');
+    if (action === 'interruptTurn' && !this.listTurns(context.targetId).some(t=>t.turnId === (payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
     return this.receipt(context, action, existing.digest, payload);
   }); }
   /** The bridge CAS registers an intent, not a claim that the native request accepted it. */

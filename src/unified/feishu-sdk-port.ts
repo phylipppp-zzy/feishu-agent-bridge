@@ -34,12 +34,19 @@ async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:s
   await handle(envelope,{action:'attachment',name:`image.${ext}`,mediaType,content,mode:'new'},scope);
 }
 
+/** Extract callback only from a verified SDK WS event; form values are persisted as input, never identity. */
+export function parseSdkCardCallback(data:Lark.RawCardActionEvent, owner:string, resolve:(chatId:string,messageId:string)=>string): {envelope:TrustedEnvelope;action:ChannelAction} | null {
+  const a=parseCardAction(data); if (!a || !a.eventId) return null;
+  if (a.openId !== owner) throw new Error('unauthorized');
+  return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId}},action:parseFeishuAction(a.value,a.formValues)};
+}
 /** Only the SDK WS dispatcher invokes the inbound handler. Credentials are explicitly injected. */
 export class FeishuSdkPort implements FeishuPort {
   private readonly client: Lark.Client;
   private readonly appId:string;
   private readonly ws: Lark.WSClient;
   private readonly db: DatabaseSync;
+  private migrationLocked=false;
   private started = false;
   private closing = false;
   private dbClosed = false;
@@ -50,32 +57,38 @@ export class FeishuSdkPort implements FeishuPort {
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
     this.db = new DatabaseSync(dbPath); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
   }
+  beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
+  endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
+  inspectMigrationRoute(id:string,destination:string):'removable'|'retained'|'absent' { if(!this.migrationLocked) throw new Error('migration lock required'); this.db.exec('SAVEPOINT migration_inspect'); try {const result=this.rollbackMigrationRoute(id); if(result==='retained' && !this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE destination=?').get(destination)) throw new Error('migration route missing despite receipt; manual review'); this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); return result==='removed'?'removable':result==='absent' && this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE destination=?').get(destination)?'retained':result;} catch(e) {this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); throw e;} }
+  private migrationBegin():void {this.db.exec(this.migrationLocked?'SAVEPOINT migration_op':'BEGIN IMMEDIATE');}
+  private migrationCommit():void {this.db.exec(this.migrationLocked?'RELEASE migration_op':'COMMIT');}
+  private migrationAbort():void {this.db.exec(this.migrationLocked?'ROLLBACK TO migration_op; RELEASE migration_op':'ROLLBACK');}
   /** Only reviewed snapshot routes in an allowed chat may be installed. */
   public importMigrationRoute(id:string, record:{destination:string;chatId:string;rootId:string;threadId?:string;sessionId:string;owner:string;appId:string}):'inserted'|'already-imported' {
     if (![id,record.destination,record.chatId,record.rootId,record.sessionId,record.owner,record.appId].every(x=>typeof x==='string' && x.trim()) || record.owner!==this.owner || record.appId!==this.appId || !this.destinations.has(record.chatId)) throw new Error('migration route unauthorized');
-    const digest=JSON.stringify(record); this.db.exec('BEGIN IMMEDIATE');
+    const digest=JSON.stringify(record); this.migrationBegin();
     try {
       this.db.exec('CREATE TABLE IF NOT EXISTS sdk_migration_receipts (id TEXT PRIMARY KEY,digest TEXT NOT NULL,destination TEXT NOT NULL)');
       const old=this.db.prepare('SELECT digest FROM sdk_migration_receipts WHERE id=?').get(id) as {digest:string}|undefined;
       const route=this.db.prepare('SELECT chat_id,root_id,thread_id,session_id FROM sdk_topic_routes WHERE destination=?').get(record.destination) as {chat_id:string;root_id:string;thread_id:string|null;session_id:string}|undefined;
-      if(old) { if(old.digest!==digest || !route || route.chat_id!==record.chatId || route.root_id!==record.rootId || route.thread_id!==(record.threadId ?? null) || route.session_id!==record.sessionId) throw new Error('migration route changed'); this.db.exec('COMMIT'); return 'already-imported'; }
+      if(old) { if(old.digest!==digest || !route || route.chat_id!==record.chatId || route.root_id!==record.rootId || route.thread_id!==(record.threadId ?? null) || route.session_id!==record.sessionId) throw new Error('migration route changed'); this.migrationCommit(); return 'already-imported'; }
       if(route || this.db.prepare('SELECT 1 FROM sdk_topic_routes WHERE root_id=? OR (chat_id=? AND session_id=?)').get(record.rootId,record.chatId,record.sessionId) || this.db.prepare('SELECT 1 FROM sdk_message_routes WHERE message_id=?').get(record.rootId)) throw new Error('migration route conflict');
       this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(record.destination,record.chatId,record.rootId,record.threadId ?? null,record.sessionId);
       this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(record.rootId,record.destination);
-      this.db.prepare('INSERT INTO sdk_migration_receipts VALUES (?,?,?)').run(id,digest,record.destination); this.db.exec('COMMIT'); return 'inserted';
-    } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+      this.db.prepare('INSERT INTO sdk_migration_receipts VALUES (?,?,?)').run(id,digest,record.destination); this.migrationCommit(); return 'inserted';
+    } catch(e) { this.migrationAbort(); throw e; }
   }
   public rollbackMigrationRoute(id:string):'removed'|'retained'|'absent' {
-    this.db.exec('BEGIN IMMEDIATE'); try {
+    this.migrationBegin(); try {
       this.db.exec('CREATE TABLE IF NOT EXISTS sdk_migration_receipts (id TEXT PRIMARY KEY,digest TEXT NOT NULL,destination TEXT NOT NULL)');
       const receipt=this.db.prepare('SELECT digest,destination FROM sdk_migration_receipts WHERE id=?').get(id) as {digest:string;destination:string}|undefined;
-      if(!receipt) {this.db.exec('COMMIT'); return 'absent';}
+      if(!receipt) {this.migrationCommit(); return 'absent';}
       const r=JSON.parse(receipt.digest) as {chatId:string;rootId:string;threadId?:string;sessionId:string};
       const route=this.db.prepare('SELECT chat_id,root_id,thread_id,session_id FROM sdk_topic_routes WHERE destination=?').get(receipt.destination) as {chat_id:string;root_id:string;thread_id:string|null;session_id:string}|undefined;
       const activity=this.db.prepare('SELECT 1 FROM sdk_message_routes WHERE destination=? AND message_id<>? LIMIT 1').get(receipt.destination,r.rootId) || this.db.prepare('SELECT 1 FROM sdk_inbound_resources WHERE envelope LIKE ? LIMIT 1').get(`%${receipt.destination}%`);
-      if(!route || route.chat_id!==r.chatId || route.root_id!==r.rootId || route.thread_id!==(r.threadId ?? null) || route.session_id!==r.sessionId || activity) {this.db.exec('COMMIT');return 'retained';}
-      this.db.prepare('DELETE FROM sdk_message_routes WHERE destination=? AND message_id=?').run(receipt.destination,r.rootId); this.db.prepare('DELETE FROM sdk_topic_routes WHERE destination=?').run(receipt.destination); this.db.prepare('DELETE FROM sdk_migration_receipts WHERE id=?').run(id); this.db.exec('COMMIT'); return 'removed';
-    } catch(e) {this.db.exec('ROLLBACK');throw e;}
+      if(!route || route.chat_id!==r.chatId || route.root_id!==r.rootId || route.thread_id!==(r.threadId ?? null) || route.session_id!==r.sessionId || activity) {this.migrationCommit();return 'retained';}
+      this.db.prepare('DELETE FROM sdk_message_routes WHERE destination=? AND message_id=?').run(receipt.destination,r.rootId); this.db.prepare('DELETE FROM sdk_topic_routes WHERE destination=?').run(receipt.destination); this.db.prepare('DELETE FROM sdk_migration_receipts WHERE id=?').run(id); this.migrationCommit(); return 'removed';
+    } catch(e) {this.migrationAbort();throw e;}
   }
   public isTopicDestination(destination:string):boolean { return !!this.route(destination); }
   public reassignTopic(destination:string,sessionId:string):void { this.allowed(destination); if (!this.route(destination)) throw new Error('topic required'); this.db.prepare('UPDATE sdk_topic_routes SET session_id=? WHERE destination=?').run(sessionId,destination); }
@@ -132,10 +145,10 @@ export class FeishuSdkPort implements FeishuPort {
     const response = await this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(toFeishuCard(card))}});
     if (response.code) throw new Error('Feishu update failed or outcome unknown'); this.remember(deliveryId,messageId,destination);
   }
-  async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string):Promise<void> {
-    this.allowed(destination); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
+  async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
+    this.allowed(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
     if (!uploaded?.file_key) throw new Error('Feishu upload failed or outcome unknown');
-    const route=this.route(destination); const body=JSON.stringify({file_key:uploaded.file_key});
+    await guard?.(); this.allowed(destination); const route=this.route(destination); const body=JSON.stringify({file_key:uploaded.file_key});
     const sent=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'file',content:body,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'file',content:body}});
     if (sent.code || !sent.data?.message_id) throw new Error('Feishu file send failed or outcome unknown'); this.remember(deliveryId,sent.data.message_id,destination);
   }
@@ -187,7 +200,7 @@ export class FeishuSdkPort implements FeishuPort {
     if (!botId) throw new Error('bot identity unavailable');
     const handles: Partial<Lark.EventHandles> & {'card.action.trigger':(data:Lark.RawCardActionEvent)=>Promise<undefined>} = {
       'im.message.receive_v1': async data => { await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),handle,async (e,id,key,type)=>this.queueResource(e,id,key,type,await captureScope(e)),(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread)); },
-      'card.action.trigger': async data => { const a = parseCardAction(data); if (!a || !a.eventId) return undefined; const destination=this.callbackDestination(a.chatId,a.openMessageId); if (a.openId !== this.owner) throw new Error('unauthorized'); await handle({eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId}},parseFeishuAction(a.value)); return undefined; },
+      'card.action.trigger': async data => { const parsed=parseSdkCardCallback(data,this.owner,(chat,message)=>this.callbackDestination(chat,message)); if (parsed) await handle(parsed.envelope,parsed.action); return undefined; },
     };
     if (this.closing) throw new Error('SDK port closing');
     await this.ws.start({eventDispatcher:new Lark.EventDispatcher({}).register(handles)});

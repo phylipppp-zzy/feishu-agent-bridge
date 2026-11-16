@@ -9,8 +9,7 @@ import type { Capabilities, Interaction, Session } from '../src/unified/contract
 
 async function bindInteractive(runtime:UnifiedRuntime, envelope:{eventId:string;destination:string;identity:{source:string;subject:string}}, sessionId:string) {
  await runtime.handleTrusted(envelope,{action:'bind',sessionId,mode:'interactive'}); await runtime.tick();
- const pending=runtime.channel.pendingOperations(envelope.destination); assert.equal(pending.length,1);
- await runtime.handleTrusted({...envelope,eventId:`${envelope.eventId}:finish`},{action:'finish',operationId:pending[0]!.operationId}); await runtime.tick();
+ assert.equal(runtime.channel.pendingOperations(envelope.destination).length,0);
 }
 
 const caps=Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config'].map(k=>[k,{status:'available'}])) as Capabilities;
@@ -52,8 +51,7 @@ test('SDK image event downloads bounded verified bytes and stages them through c
   const png=Buffer.from([137,80,78,71,13,10,26,10,1,2]); let downloads=0;const download=async(id:string,key:string,type:string)=>{assert.equal(id,'image-id');assert.equal(key,'img-key');assert.equal(type,'image');downloads++;return Readable.from([png]);};
   try {r.store.insertSession(s);await bindInteractive(r,envelope,'s');
     await assert.rejects(receiveSdkMessage({...data,sender:{sender_type:'user',sender_id:{open_id:'other'}}},'bot','owner',new Set(['chat']),download,(e,a)=>r.handleTrusted(e,a)));assert.equal(downloads,0);
-    await receiveSdkMessage(data,'bot','owner',new Set(['chat']),download,(e,a)=>r.handleTrusted(e,a));await r.tick();const pending=r.channel.pendingOperations('chat');assert.equal(pending.length,1);
-    await r.handleTrusted({eventId:'finish',destination:'chat',identity:{source:'feishu',subject:'owner'}},{action:'finish',operationId:pending[0]!.operationId});await r.tick();assert.equal(input[0].mediaType,'image/png');assert.deepEqual(Buffer.from(input[0].content),png);
+    await receiveSdkMessage(data,'bot','owner',new Set(['chat']),download,(e,a)=>r.handleTrusted(e,a));await r.tick();assert.equal(r.channel.pendingOperations('chat').length,0);await r.tick();assert.equal(input[0].mediaType,'image/png');assert.deepEqual(Buffer.from(input[0].content),png);
     await assert.rejects(receiveSdkMessage(data,'bot','owner',new Set(['chat']),async()=>Readable.from([Buffer.alloc(MAX_INBOUND_BYTES+1)]),async()=>{}),/exceeds limit/);
     await assert.rejects(receiveSdkMessage(data,'bot','owner',new Set(['chat']),async()=>Readable.from([Buffer.from('not image')]),async()=>{}),/unsupported resource/);
   } finally {await r.close();rmSync(dir,{recursive:true,force:true});}
@@ -130,7 +128,7 @@ test('integrated SDK channel discovers both providers, attaches history and send
   const message=async(chat:string,id:string,text:string)=>{const data:any={sender:{sender_type:'user',sender_id:{open_id:'owner'}},message:{message_id:id,chat_id:chat,chat_type:'p2p',message_type:'text',content:JSON.stringify({text})}};await receiveSdkMessage(data,'bot','owner',new Set(config.allowedDestinations),async()=>{throw Error('unexpected download');},(e,a)=>runtime.handleTrusted(e,a));await runtime.tick();};
   try {await message('chat-c','list','/list');const found=await runtime.core.listSessions({limit:10});assert.equal(found.items.length,2);assert.ok(found.items.every(s=>s.status==='read_only'));
     for(const [chat,provider,service,native] of [['chat-c','claude','c','cl-native'],['chat-x','codex','x','cx-native']] as const){
-      await message(chat,`attach-${provider}`,`/attach ${provider} h ${service} ${native} read_only`);const pending=runtime.channel.pendingOperations(chat);assert.equal(pending.length,1);await message(chat,`finish-${provider}`,`/finish ${pending[0]!.operationId}`);await message(chat,`history-${provider}`,'/history');assert.ok(cards.some(x=>x.receive_id===chat && x.content.includes('result')));
+      await message(chat,`attach-${provider}`,`/attach ${provider} h ${service} ${native} read_only`);assert.equal(runtime.channel.pendingOperations(chat).length,0);await message(chat,`history-${provider}`,'/history');assert.ok(cards.some(x=>x.receive_id===chat && x.content.includes('result')));
       await message(chat,`files-${provider}`,'/files');const latest=[...cards].reverse().find(x=>x.receive_id===chat && x.content.includes('result.txt'));assert.ok(latest);const card=JSON.parse(latest.content);const value=card.elements.flatMap((x:any)=>x.actions??[]).map((x:any)=>x.value).find((x:any)=>x.action==='file');assert.ok(value);await runtime.handleTrusted({eventId:`download-${provider}`,destination:chat,identity:{source:'feishu',subject:'owner'}},parseFeishuAction(value));await runtime.tick();
     }assert.equal(files.length,2);assert.ok(files.every(f=>f.toString()==='fixture output'));assert.equal((await runtime.core.listSessions({limit:10})).items.length,2);
   }finally{await runtime.close();port.close();rmSync(dir,{recursive:true,force:true});}

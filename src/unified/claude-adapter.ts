@@ -9,6 +9,9 @@ import { ClaudeState } from './claude-state.js';
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
 type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
 type Live = { completion?: Promise<void>; id: string; cwd: string; model: string | null; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending> };
+const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
+const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
+const safeNumber = (n: unknown): number | null => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
 const ack = (nativeReference: string | null = null): PlatformAcknowledgement => ({ status: 'submitted', nativeReference });
 const available = { status: 'available' as const };
 const unsupported = { status: 'unsupported' as const, reason: 'Claude SDK port does not support this capability' };
@@ -81,6 +84,17 @@ export class ClaudeAdapter implements PlatformPort {
     let streamFailure: {kind:string; exitCode:number|null} | null = null;
     try { for await (const raw of live.query) {
       const m = raw as any;
+      let providerEvent: { type: string; data: Record<string, unknown> } | null = null;
+      if (m.type === 'system' && m.subtype === 'api_retry') {
+        const status = safeNumber(m.error_status);
+        providerEvent = { type: 'provider.api_retry', data: { attempt: safeNumber(m.attempt), maxRetries: safeNumber(m.max_retries), retryDelayMs: safeNumber(m.retry_delay_ms), httpStatus: status !== null && Number.isInteger(status) && status >= 100 && status <= 599 ? status : null, errorType: retryErrors.has(m.error) ? m.error : 'unknown' } };
+      } else if (m.type === 'rate_limit_event' && m.rate_limit_info && typeof m.rate_limit_info === 'object') {
+        const info = m.rate_limit_info;
+        if (info.status === 'rejected' || info.status === 'allowed_warning' || info.status === 'allowed') {
+          providerEvent = { type: info.status === 'allowed' ? 'provider.usage_available' : 'provider.usage_limit', data: { status: info.status, resetsAt: safeNumber(info.resetsAt), rateLimitType: limitTypes.has(info.rateLimitType) ? info.rateLimitType : null, errorCode: info.errorCode === 'credits_required' ? 'credits_required' : null } };
+        }
+      }
+      if (providerEvent) { const now = new Date().toISOString(), sequence = ++this.sequence; this.emit({ type: 'event', ref, event: { schemaVersion: 1, eventId: randomUUID(), sessionId: live.id, objectId: live.turn ?? live.id, objectRevision: 0, sequence, type: providerEvent.type, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: providerEvent.data } }); }
       if (m.type === 'assistant' && !m.parent_tool_use_id) { const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence); if (normalized) { normalized.turnId = live.turn ?? normalized.turnId; live.messages.push(normalized); this.emit({ type: 'message', ref, message: normalized }); } }
       if (m.type === 'user' && Array.isArray(m.message?.content)) for (const b of m.message.content) if (b.type === 'tool_result') for (const p of live.pending.values()) if (p.toolId === b.tool_use_id && p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'resolved', revision: p.interaction.revision + 1, nativeResult: { status: 'unknown', source: b.is_error ? 'claude_tool_result_error' : 'claude_tool_result' } }; this.emit({ type: 'interaction', ref, interaction: p.interaction }); }
       if (m.type === 'result' && live.turn) { const turn: Turn = { turnId: live.turn, sessionId: live.id, status: live.interrupted ? 'interrupted' : m.subtype === 'success' && !m.is_error ? 'completed' : 'failed', inputId: null, startedAt: null, endedAt: new Date().toISOString(), model: live.model, outputIds: [] }; live.turn = null; live.interrupted = false; this.emit({ type: 'turn', ref, turn }); }

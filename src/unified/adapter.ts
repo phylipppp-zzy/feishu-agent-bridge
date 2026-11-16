@@ -13,6 +13,7 @@ export interface UnifiedService {
   readHistory(sessionId: string, query: ListQuery): Promise<Page<Message>>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
+  getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
   submitInput(request: SubmitInput): Promise<Operation>;
   listInteractions(sessionId: string, query: ListQuery): Promise<Page<Interaction>>;
   getInteraction(interactionId: string): Promise<Interaction>;

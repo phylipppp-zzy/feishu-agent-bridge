@@ -55,3 +55,19 @@ test('base sessions take precedence and merged pages reject stale cursor',async(
     try {const p=await port.list(null,1);assert.ok(p.nextCursor);const q=await port.list(p.nextCursor,1);assert.equal(p.items.length+q.items.length,2); assert.equal((await port.read(live.native)).session.title,'live');assert.equal((await port.listArtifacts(live.native))[0]?.artifactId,'native');assert.deepEqual(await port.readArtifact(live.native,'native','v'),new Uint8Array([1]));await writeFile(join(dir,'c.jsonl'),lines('c'));await assert.rejects(port.list(p.nextCursor,1),e=>(e as any).code==='snapshot_required');}finally{await port.close();}
   } finally {await rm(dir,{recursive:true,force:true});}
 });
+
+for (const hasArchive of [false,true]) test(`archive capability matches base and inherited wrapper (${hasArchive ? 'available' : 'unsupported'})`,async()=>{
+ const {FeishuChannel}=await import('../src/unified/feishu-channel.js');const dir=await mkdtemp(join(tmpdir(),'enriched-archive-'));const logs=join(dir,'logs');await mkdir(logs);
+ const rows=[{type:'user',uuid:'m',cwd:dir,message:{content:'hello'}}];await writeFile(join(logs,'external.jsonl'),rows.map(x=>JSON.stringify(x)).join('\n')+'\n');
+ const ref={provider:'claude' as const,hostId:'h',serviceId:'s',nativeSessionId:'live'};const caps=Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config'].map(k=>[k,{status:'available'}]));
+ const live={sessionId:'s',native:ref,title:'live',project:dir,status:'idle',revision:0,capabilities:caps,control:{serviceId:'s',owner:'owner',input:'available',generation:1,operationId:null,reason:null}} as Session;
+ let calls=0,seenGuard:unknown;const base:any={provider:'claude',marker:'base',onObservation:()=>()=>{},list:async()=>({items:[live],nextCursor:null})};
+ if(hasArchive) base.archive=async function(this:any,r:any,archived:boolean,guard:any){assert.equal(this.marker,'base');assert.deepEqual(r,ref);assert.equal(archived,true);seenGuard=guard;guard.assertCurrent();calls++;return {status:'submitted',nativeReference:null};};
+ class ScopedPort extends EnrichedPort {} const cat=new LocalCatalog([{provider:'claude',directory:logs,hostId:'h',serviceId:'s'}]);const port=new ScopedPort(base,cat,new ArtifactRegistry({}),()=>{});const store=new UnifiedStore(join(dir,'db'));store.insertSession(live);const core=new UnifiedCore(store,[port],()=>true);const cards:any[]=[];const channel=new FeishuChannel(core,{send:async(_d,c)=>{cards.push(c);return 'm';},update:async()=>{},sendFile:async()=>{}},async()=>true,join(dir,'channel'));const env=(eventId:string)=>({eventId,destination:'chat',identity:{source:'feishu',subject:'owner'}});
+ try {
+  assert.equal(typeof port.archive,hasArchive ? 'function' : 'undefined');assert.equal((await core.getWorkState('s')).canArchive,hasArchive);
+  const op:any=await channel.handle(env('bind'),{action:'bind',sessionId:'s',mode:'interactive'});await channel.handle(env('finish'),{action:'finish',operationId:op.operationId});await channel.handle(env('panel'),{action:'panel'});
+  const button=cards.at(-1).actions.find((a:any)=>a.label==='归档');assert.equal(!!button,hasArchive);
+  if(hasArchive){const receipt:any=await channel.handle(env('archive'),button.value);await core.dispatch(receipt.operationId);assert.equal(calls,1);assert.ok(seenGuard);const external={...ref,nativeSessionId:'external'};await assert.rejects(port.archive!(external,true,{expectedControlGeneration:0,expectedConnectionGeneration:null,assertCurrent(){throw Error('guard must not be called');}}),(e:any)=>e.code==='unsupported');assert.equal(calls,1);}
+ }finally{channel.close();core.close();store.close();await port.close();await rm(dir,{recursive:true,force:true});}
+});

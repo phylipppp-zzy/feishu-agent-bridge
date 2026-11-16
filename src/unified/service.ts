@@ -57,6 +57,7 @@ export class UnifiedCore implements UnifiedService {
     const search=q.search?.toLowerCase();return page(all.filter(s=>!search||`${s.title} ${s.project}`.toLowerCase().includes(search)),q);
   }
   async getSession(id: string) { return this.present(this.store.getSession(id)); }
+  async getWorkState(id:string) { const session=this.store.getSession(id); return {runningTurns:this.store.listTurns(id).filter(t=>t.status==='running'),queuedInputs:this.store.queuedInputs(id),canArchive:typeof this.port(session).archive === 'function'}; }
   async capabilities(id: string) { return this.present(this.store.getSession(id)).capabilities; }
   async readHistory(id: string, q: ListQuery) { const snapshot=this.store.snapshot(id).value; const archived=await this.historyReader?.read(snapshot.session) ?? []; const current=snapshot.messages; const ids=new Set(current.map(m=>m.messageId)); return page([...archived.filter(m=>!ids.has(m.messageId)),...current],q); }
   async listInteractions(id: string, q: ListQuery) { return page(this.store.snapshot(id).value.interactions, q); }
@@ -207,6 +208,7 @@ export class UnifiedCore implements UnifiedService {
       if (earlier !== id) return fail('busy', 'earlier input awaits dispatch');
       if (out.kind === 'submitInput') { const barrier=this.store.settingsBarrier(session.sessionId); if(barrier) return fail(barrier === 'unknown' ? 'outcome_unknown' : 'busy','settings must be reconciled before input'); }
       if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (session.status !== 'idle' || this.store.hasUnsettledInput(session.sessionId,id))) return this.store.getOperation(id);
+      if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return this.store.reconcileOperation(id,'failed',contractError('busy','turn is no longer running'));
       if (!this.store.claimOutbox(id)) return this.store.getOperation(id);
       const originalInteraction = out.kind === 'resolveInteraction' ? this.store.getInteraction((out.payload as ResolveInteraction).interactionId) : null;
       let guarded = false;
@@ -218,6 +220,7 @@ export class UnifiedCore implements UnifiedService {
           const current = this.store.getSession(session.sessionId);
           if (current.control.generation !== out.context.controlGeneration || (out.kind !== 'requestControl' && current.control.input !== 'available')) return fail('control_conflict');
           if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration) return fail('interaction_expired');
+          if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
           if (originalInteraction) {
             const now = this.store.getInteraction(originalInteraction.interactionId);
             if (now.revision !== originalInteraction.revision || now.status !== 'answer_pending_delivery' || now.nativeRequestId !== originalInteraction.nativeRequestId || now.nativeResult !== null || (now.expiresAt !== null && Date.parse(now.expiresAt) <= Date.now())) return fail('interaction_expired');

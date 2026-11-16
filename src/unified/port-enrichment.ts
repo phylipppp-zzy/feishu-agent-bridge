@@ -12,11 +12,18 @@ const unsupported = (e: unknown) => !!e && typeof e === 'object' && (e as {code?
 /** Wrap one provider. Caller configures registry roots by nativeRefKey and calls registry.load() before use. */
 export class EnrichedPort implements PlatformPort {
   readonly provider: PlatformPort['provider'];
+  readonly archive?: NonNullable<PlatformPort['archive']>;
   private readonly listeners = new Set<(o:PlatformObservation)=>void>();
   private readonly unsubscribe: () => void;
   private work: Promise<void> = Promise.resolve();
   constructor(private readonly base: PlatformPort, private readonly catalog: LocalCatalog, private readonly registry: ArtifactRegistry, private readonly onError: (error:unknown)=>void) {
     this.provider = base.provider;
+    if (typeof base.archive === 'function') this.archive = async (...args) => {
+      await this.writable(args[0]);
+      const archive=this.base.archive;
+      if (typeof archive !== 'function') throw contractError('unsupported');
+      return archive.apply(this.base,args);
+    };
     this.unsubscribe = base.onObservation(o => {
       for (const f of this.listeners) f(o);
       if (o.type === 'message' && o.message.role === 'assistant') {
@@ -88,5 +95,5 @@ export class EnrichedPort implements PlatformPort {
   async control(...args:Parameters<PlatformPort['control']>) { await this.writable(args[0]); return this.base.control(...args); }
   async updateSettings(...args:Parameters<PlatformPort['updateSettings']>) { await this.writable(args[0]); return this.base.updateSettings(...args); }
   async listModels(ref:NativeSessionRef) { if (await this.isExternal(ref)) throw contractError('unsupported'); return this.base.listModels(ref); }
-  async archive(...args:Parameters<NonNullable<PlatformPort['archive']>>) { await this.writable(args[0]); if (!this.base.archive) throw contractError('unsupported'); return this.base.archive(...args); }
+
 }

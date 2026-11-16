@@ -1,9 +1,11 @@
+import { renderQuestionForm } from './feishu-question-forms.js';
 import type { ChannelAction } from './feishu-channel.js';
 import type { ChannelCard } from './feishu-cards.js';
 
 /** Converts a presentation card into the Lark interactive card content object.
  * Pass JSON.stringify(result) as the SDK message content with msg_type=interactive. */
 export function toFeishuCard(card: ChannelCard): object {
+  if (card.form) return renderQuestionForm(card.form);
   return { config: { wide_screen_mode: true }, header: { title: { tag:'plain_text', content:card.title } }, elements: [
     { tag:'div', text:{ tag:'plain_text', content:card.text } },
     ...(card.actions.length ? [{tag:'action',actions:card.actions.map(a => ({tag:'button',text:{tag:'plain_text',content:a.label},type:'default',...(a.url ? {url:a.url} : {value:a.value})}))}] : []),
@@ -43,7 +45,8 @@ function parseAction(value: unknown): ChannelAction {
   throw new Error('invalid or unsupported card action');
 }
 /** Callback buttons must carry the binding epoch stamped by the channel. */
-export function parseFeishuAction(value: unknown): ChannelAction {
+export function parseFeishuAction(value: unknown, formValues?: unknown): ChannelAction {
+  if (object(value) && value.action === 'answer_form') { if (!str(value.bindingId) || !str(value.interactionId) || !counter(value.revision) || !counter(value.connectionGeneration) || !object(formValues) || JSON.stringify(formValues).length > 100_000) throw new Error('invalid question form callback'); return {action:'answer_form',bindingId:value.bindingId,interactionId:value.interactionId,revision:value.revision,connectionGeneration:value.connectionGeneration,fields:formValues}; }
   const action = parseAction(value);
   if (!object(value)) throw new Error('invalid card action');
   if (!['bind','list','finish'].includes(action.action) && !str(value.bindingId)) throw new Error('missing binding identity');

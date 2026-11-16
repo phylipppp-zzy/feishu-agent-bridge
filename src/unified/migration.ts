@@ -149,15 +149,20 @@ export function applyManifest(manifest: MigrationManifest, ledgerPath: string, a
 }
 
 
-export interface MigrationCoreSink {
+interface RollbackLock { beginMigrationRollback():void; endMigrationRollback(commit:boolean):void }
+type Inspection='removable'|'retained'|'absent';
+export interface MigrationCoreSink extends RollbackLock {
+  inspectMigrationSession(id:string,sessionId:string):Inspection;
   importMigrationSession(id: string, session: Session): 'inserted'|'already-imported';
   rollbackMigrationSession(id: string): 'removed'|'retained'|'absent';
 }
-export interface MigrationRouteSink {
+export interface MigrationRouteSink extends RollbackLock {
+  inspectMigrationRoute(id:string,destination:string):Inspection;
   importMigrationRoute(id:string, record:{destination:string;chatId:string;rootId:string;threadId?:string;sessionId:string;owner:string;appId:string}):'inserted'|'already-imported';
   rollbackMigrationRoute(id:string):'removed'|'retained'|'absent';
 }
-export interface MigrationChannelSink {
+export interface MigrationChannelSink extends RollbackLock {
+  inspectMigrationBinding(id:string,destination:string):Inspection;
   importMigrationBinding(id: string, record: {destination:string;sessionId:string;bindingId:string;owner:Identity}): 'inserted'|'already-imported';
   rollbackMigrationBinding(id: string): 'removed'|'retained'|'absent';
 }
@@ -167,10 +172,11 @@ function normalizedSession(s: ImportSession): Session {
   return {...s,status:'read_only',revision:0,capabilities,control:{serviceId:s.native.serviceId,owner:null,input:'unavailable',generation:0,operationId:null,reason:'migration requires native verification'}};
 }
 /** Resumable per-sink saga. The sink receipt, not the advisory ledger, is authoritative. */
-export function applyToSinks(manifest: MigrationManifest, ledgerPath: string, core: MigrationCoreSink, channel: MigrationChannelSink, route?: MigrationRouteSink): void {
+export function applyToSinks(manifest: MigrationManifest, ledgerPath: string, core: Pick<MigrationCoreSink,'importMigrationSession'>, channel: Pick<MigrationChannelSink,'importMigrationBinding'>, route?: Pick<MigrationRouteSink,'importMigrationRoute'>): void {
   for (const snap of manifest.snapshots) { if(existsSync(`${snap.path}-wal`) || existsSync(`${snap.path}-journal`) || snapshotDigest(snap.path)!==snap.sha256) throw new Error('snapshot changed since planning'); const source=new DatabaseSync(snap.path,{readOnly:true}); try {if(schemaDigest(source)!==snap.schemaSha256) throw new Error('snapshot schema changed');} finally {source.close();} }
   const {digest} = applyManifest(manifest,ledgerPath,true); const db = new DatabaseSync(ledgerPath);
   try {
+    const phase=db.prepare("SELECT state FROM migration_steps WHERE id='rollback:phase'").get() as {state:string}|undefined; if(phase && phase.state!=='complete') throw new Error('rollback incomplete; reconcile before apply');
     const mark = (id:string) => db.prepare("INSERT INTO migration_steps VALUES(?,'applied') ON CONFLICT(id) DO UPDATE SET state='applied'").run(id);
     for (const s of manifest.sessions) { const id = `core:${digest}:${s.sessionId}`; core.importMigrationSession(id,normalizedSession(s)); mark(id); }
     for (const b of manifest.bindings) {
@@ -181,17 +187,34 @@ export function applyToSinks(manifest: MigrationManifest, ledgerPath: string, co
     for (const b of manifest.bindings) {
       const id = `channel:${digest}:${hash(b)}`; channel.importMigrationBinding(id,{destination:b.destination,sessionId:b.sessionId,owner:b.owner,bindingId:`migration:${hash([digest,b])}`}); mark(id);
     }
+    db.prepare("DELETE FROM migration_steps WHERE id LIKE 'rollback:%'").run();
   } finally { db.close(); }
 }
 /** Roll back only records whose own sink proves removal safe; preserve all other data. */
-export function rollbackFromSinks(manifest: MigrationManifest, ledgerPath: string, core: MigrationCoreSink, channel: MigrationChannelSink, route?: MigrationRouteSink): {retained: string[]} {
-  const {digest} = applyManifest(manifest,ledgerPath,true); const db = new DatabaseSync(ledgerPath); const retained:string[]=[];
+export function rollbackFromSinks(manifest: MigrationManifest, ledgerPath: string, core: MigrationCoreSink, channel: MigrationChannelSink, route?: MigrationRouteSink): {retained:string[]} {
+  if(manifest.bindings.length && !route) throw new Error('migration route sink required');
+  const {digest}=applyManifest(manifest,ledgerPath,true); const db=new DatabaseSync(ledgerPath);
+  const locks:RollbackLock[]=[core,...(route?[route]:[]),channel], held:RollbackLock[]=[];
+  type Entry={id:string; inspect:()=>Inspection; remove:()=>string; restore:()=>unknown};
+  const entries:Entry[]=[...manifest.sessions.map(s=>({id:`core:${digest}:${s.sessionId}`,inspect:()=>core.inspectMigrationSession(`core:${digest}:${s.sessionId}`,s.sessionId),remove:()=>core.rollbackMigrationSession(`core:${digest}:${s.sessionId}`),restore:()=>core.importMigrationSession(`core:${digest}:${s.sessionId}`,normalizedSession(s))})), ...manifest.bindings.map(b=>({id:`route:${digest}:${hash(b)}`,inspect:()=>route!.inspectMigrationRoute(`route:${digest}:${hash(b)}`,b.destination),remove:()=>route!.rollbackMigrationRoute(`route:${digest}:${hash(b)}`),restore:()=>route!.importMigrationRoute(`route:${digest}:${hash(b)}`,{destination:b.destination,chatId:b.chatId,rootId:b.rootId,...(b.threadId?{threadId:b.threadId}:{}),sessionId:b.sessionId,owner:b.owner.subject,appId:b.appId})})), ...manifest.bindings.map(b=>({id:`channel:${digest}:${hash(b)}`,inspect:()=>channel.inspectMigrationBinding(`channel:${digest}:${hash(b)}`,b.destination),remove:()=>channel.rollbackMigrationBinding(`channel:${digest}:${hash(b)}`),restore:()=>channel.importMigrationBinding(`channel:${digest}:${hash(b)}`,{destination:b.destination,sessionId:b.sessionId,owner:b.owner,bindingId:`migration:${hash([digest,b])}`})}))];
+  const put=(id:string,state:string)=>db.prepare('INSERT INTO migration_steps VALUES(?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state').run(id,state);
   try {
-    const mark=(id:string,state:string)=>db.prepare('INSERT INTO migration_steps VALUES(?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state').run(id,state);
-    for (const b of [...manifest.bindings].reverse()) { const id=`channel:${digest}:${hash(b)}`; const state=channel.rollbackMigrationBinding(id); mark(id,state); if(state==='retained') retained.push(id); }
-    for (const b of [...manifest.bindings].reverse()) { const id=`route:${digest}:${hash(b)}`; if(!route) throw new Error('migration route sink required'); const state=retained.length ? 'retained' : route.rollbackMigrationRoute(id); mark(id,state); if(state==='retained') retained.push(id); }
-    // A retained binding may reference any imported session; retain all core records conservatively.
-    for (const s of [...manifest.sessions].reverse()) { const id=`core:${digest}:${s.sessionId}`; const state=retained.length ? 'retained' : core.rollbackMigrationSession(id); mark(id,state); if(state==='retained') retained.push(id); }
-    return {retained};
-  } finally { db.close(); }
+    for(const lock of locks) {lock.beginMigrationRollback();held.push(lock);}
+    const current=entries.map(e=>e.inspect());
+    const phase=db.prepare("SELECT state FROM migration_steps WHERE id='rollback:phase'").get() as {state:string}|undefined;
+    if(!phase || phase.state==='complete') {
+      db.exec('BEGIN IMMEDIATE'); try {db.prepare("DELETE FROM migration_steps WHERE id LIKE 'rollback:%'").run();entries.forEach((e,i)=>put(`rollback:plan:${e.id}`,current[i]!));put('rollback:phase','planned');db.exec('COMMIT');} catch(e) {db.exec('ROLLBACK');throw e;}
+    }
+    const retained=entries.filter((_,i)=>current[i]==='retained').map(e=>e.id);
+    if(retained.length) {
+      for(let i=0;i<entries.length;i++) {const e=entries[i]!; if(current[i]==='absent') e.restore();}
+      // Commit restorations in dependency order. A partial commit is retried from the durable plan.
+      for(const lock of locks) {held.shift();lock.endMigrationRollback(true);}
+      put('rollback:phase','retained'); return {retained};
+    }
+    for(const e of entries) {const state=e.remove(); if(state==='retained') throw new Error('rollback state changed under lock');}
+    for(const lock of locks) {held.shift();lock.endMigrationRollback(true);}
+    db.exec('BEGIN IMMEDIATE'); try {for(const e of entries) put(e.id,'removed');put('rollback:phase','complete');db.exec('COMMIT');} catch(e) {db.exec('ROLLBACK');throw e;}
+    return {retained:[]};
+  } finally { for(const lock of held.reverse()) lock.endMigrationRollback(false); db.close(); }
 }
