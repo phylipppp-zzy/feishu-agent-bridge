@@ -16,6 +16,7 @@ const invalidNative = (): never => { throw contractError('temporarily_unavailabl
 export class CodexAdapter implements PlatformPort {
   readonly provider = 'codex' as const;
   private discovery = new Map<string,{generation:number; loaded:Set<string>; phase:'loaded'|'list'; cursor:string|null; seen:Set<string>; buffer:Session[]; done:boolean; expires:number}>();
+  private readonly recentDiscovery=new Map<string,{generation:number;watermark:number;cursor:string|null;seenCursors:Set<string>;seenIds:Set<string>;buffer:Session[];done:boolean;expires:number}>();
   private readonly owned = new Set<string>();
   private readonly active = new Set<string>();
   private readonly controlEpoch = new Map<string, number>();
@@ -50,8 +51,8 @@ export class CodexAdapter implements PlatformPort {
     if (!t || typeof t !== 'object' || !isString(t.id) || typeof t.cwd !== 'string' || !t.status || typeof t.status.type !== 'string') return invalidNative();
     const status = t.status.type === 'idle' ? 'idle' : t.status.type === 'active' ? 'running' : t.status.type === 'systemError' ? 'failed' : 'unreachable';
     const active = this.active.has(t.id) && this.transport.connected; const available = {status:'available' as const}; const liveCaps: Capabilities = {...caps,send:available,queue:available,answer:available,approve:available,interrupt:available,handoff:available,config:available};
-    const timestamp = t.updatedAt; const updatedAt = typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8.64e12 ? new Date(timestamp * 1000).toISOString() : undefined;
-    return { ...(updatedAt ? {updatedAt} : {}), sessionId: t.id, native: this.ref(t.id), project: t.cwd, title: typeof t.name === 'string' && t.name ? t.name : typeof t.preview === 'string' ? t.preview : '', status: active ? status : 'read_only', revision: 0, capabilities: active ? liveCaps : this.owned.has(t.id) && this.transport.connected ? {...caps,handoff:available} : caps, control: { serviceId: this.serviceId, owner: active ? this.serviceId : null, input: active ? 'available' : 'unavailable', generation: this.controlEpoch.get(t.id) ?? 0, operationId: null, reason: active ? null : 'session not held by this adapter connection' } };
+    const timestamp = t.updatedAt; const updatedAt = typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8.64e12 ? new Date(timestamp * 1000).toISOString() : undefined; const ct=t.createdAt; const createdAt=Number.isSafeInteger(ct) && ct>0 && ct<=8.64e12 && ['cli','vscode','appServer'].includes(t.source) && t.parentThreadId==null ? new Date(ct*1000).toISOString() : undefined;
+    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: t.id, native: this.ref(t.id), project: t.cwd, title: typeof t.name === 'string' && t.name ? t.name : typeof t.preview === 'string' ? t.preview : '', status: active ? status : 'read_only', revision: 0, capabilities: active ? liveCaps : this.owned.has(t.id) && this.transport.connected ? {...caps,handoff:available} : caps, control: { serviceId: this.serviceId, owner: active ? this.serviceId : null, input: active ? 'available' : 'unavailable', generation: this.controlEpoch.get(t.id) ?? 0, operationId: null, reason: active ? null : 'session not held by this adapter connection' } };
   }
   private message(thread: string, turn: string, item: Obj, final: boolean): Message | undefined {
     if (!item || typeof item !== 'object' || !isString(item.id)) return;
@@ -106,13 +107,13 @@ export class CodexAdapter implements PlatformPort {
     if (!Array.isArray(r?.data) || !(r.nextCursor == null || typeof r.nextCursor === 'string')) return invalidNative(); return { items: r.data.map((t: Obj) => this.session(t)), nextCursor: r.nextCursor ?? null };
   }
   /** Incremental bounded scan: loaded IDs are intersected with raw active list entries. */
-  async discoverRunning(cursor:string|null, limit:number):Promise<{items:Session[];nextCursor:string|null}> {
+  async discoverRunning(cursor:string|null, limit:number):Promise<{items:Session[];nextCursor:string|null;partialFailure?:boolean}> {
     if (!Number.isSafeInteger(limit) || limit<1 || limit>100) throw contractError('invalid_request');
     for (const [key,value] of this.discovery) if(value.expires<Date.now()) this.discovery.delete(key);
     let key=cursor, state=key ? this.discovery.get(key) : undefined;
     if (!key) { key=randomUUID(); state={generation:this.transport.generation,loaded:new Set(),phase:'loaded',cursor:null,seen:new Set(),buffer:[],done:false,expires:Date.now()+600000}; if(this.discovery.size>=4) this.discovery.delete(this.discovery.keys().next().value!); this.discovery.set(key,state); }
     if (!state || !this.transport.connected || state.generation!==this.transport.generation) { if(key) this.discovery.delete(key); throw contractError('snapshot_required'); }
-    try {
+    let partialFailure=false; try {state.expires=Date.now()+600000;
       if (!state.buffer.length && !state.done) {
         const method=state.phase==='loaded' ? 'thread/loaded/list' : 'thread/list';
         const r=await this.transport.request(method,{cursor:state.cursor,limit:100}) as Obj;
@@ -121,7 +122,7 @@ export class CodexAdapter implements PlatformPort {
           for(const id of r.data) { if(!isString(id)) return invalidNative(); state.loaded.add(id); }
           if(state.loaded.size>10000) throw contractError('snapshot_required');
         } else {
-          for(const t of r.data) if(t?.status?.type==='active' && isString(t.id) && state.loaded.has(t.id)) state.buffer.push(this.session(t));
+          for(const t of r.data) if(t?.status?.type==='active') {if(!isString(t.id)){partialFailure=true;continue;}if(state.loaded.has(t.id)) try {state.buffer.push(this.session(t));} catch {partialFailure=true;}}
         }
         const next=r.nextCursor ?? null;
         if(next!==null) {if(state.seen.has(next) || state.seen.size>=1000) throw contractError('snapshot_required'); state.seen.add(next); state.cursor=next;}
@@ -130,9 +131,11 @@ export class CodexAdapter implements PlatformPort {
       }
       const items=state.buffer.splice(0,limit), nextCursor=state.done && !state.buffer.length ? null : key;
       if(nextCursor===null) this.discovery.delete(key);
-      return {items,nextCursor};
+      return {items,nextCursor,...(partialFailure?{partialFailure:true}:{})};
     } catch(e) { this.discovery.delete(key); throw e; }
   }
+  /** Scan default interactive sources by native created_at; second-precision boundary is excluded. */
+  async discoverNewer(watermark:number,cursor:string|null,limit:number):Promise<{items:Session[];nextCursor:string|null;partialFailure?:boolean}> {if(!Number.isSafeInteger(watermark) || watermark<0 || !Number.isSafeInteger(limit) || limit<1 || limit>100) throw contractError('invalid_request'); for(const [key,value] of this.recentDiscovery) if(value.expires<Date.now()) this.recentDiscovery.delete(key); let key=cursor,state=key?this.recentDiscovery.get(key):undefined;if(!key){key=randomUUID();state={generation:this.transport.generation,watermark,cursor:null,seenCursors:new Set(),seenIds:new Set(),buffer:[],done:false,expires:Date.now()+600000};if(this.recentDiscovery.size>=4)this.recentDiscovery.delete(this.recentDiscovery.keys().next().value!);this.recentDiscovery.set(key,state);}if(!state || state.watermark!==watermark || !this.transport.connected || state.generation!==this.transport.generation){if(key)this.recentDiscovery.delete(key);throw contractError('snapshot_required');}let partialFailure=false;try {state.expires=Date.now()+600000;if(!state.buffer.length && !state.done){const r=await this.transport.request('thread/list',{cursor:state.cursor,limit:100,sortKey:'created_at',sortDirection:'desc'}) as Obj;if(!this.transport.connected || state.generation!==this.transport.generation || !Array.isArray(r?.data) || !(r.nextCursor==null || isString(r.nextCursor))) return invalidNative();const now=Math.floor(Date.now()/1000);for(const t of r.data){if(!isString(t?.id) || !Number.isSafeInteger(t?.createdAt)){partialFailure=true;continue;}if(state.seenIds.has(t.id))continue;if(state.seenIds.size>=1024)state.seenIds.delete(state.seenIds.values().next().value!);state.seenIds.add(t.id);if(Number.isSafeInteger(t.createdAt) && t.createdAt>watermark && ['cli','vscode','appServer'].includes(t.source) && t.parentThreadId==null) try {state.buffer.push({...this.session(t),discoveryObservedAt:new Date(now*1000).toISOString()});} catch {partialFailure=true;}}const orderedOld=r.data.length>0 && r.data.every((t:Obj,i:number)=>Number.isSafeInteger(t?.createdAt) && t.createdAt<=watermark && (i===0 || r.data[i-1].createdAt>=t.createdAt));const next=orderedOld?null:r.nextCursor??null;if(next!==null){if(state.seenCursors.has(next))throw contractError('snapshot_required');if(state.seenCursors.size>=10000)state.seenCursors.delete(state.seenCursors.values().next().value!);state.seenCursors.add(next);state.cursor=next;}else state.done=true;}const items=state.buffer.splice(0,limit),nextCursor=state.done && !state.buffer.length?null:key;if(nextCursor===null)this.recentDiscovery.delete(key);return {items,nextCursor,...(partialFailure?{partialFailure:true}:{})};}catch(e){this.recentDiscovery.delete(key);throw e;}}
   async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
     const id = this.check(ref), r = await this.transport.request('thread/read', { threadId: id, includeTurns: true }) as Obj; const session = this.session(r?.thread);
     if (session.native.nativeSessionId !== id || !Array.isArray(r.thread.turns)) return invalidNative();

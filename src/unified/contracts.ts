@@ -13,7 +13,7 @@ export interface WriteContext { operationId: string; idempotencyKey: string; tar
 export interface NativeSessionRef { provider: Provider; hostId: string; serviceId: string; nativeSessionId: string }
 export type RunStatus = 'idle' | 'running' | 'waiting_question' | 'waiting_approval' | 'interrupted' | 'failed' | 'unreachable' | 'read_only';
 export interface ControlState { serviceId: string; owner: string | null; input: 'available' | 'unavailable' | 'unknown'; generation: number; operationId: string | null; reason: string | null }
-export interface Session { updatedAt?: string; sessionId: string; native: NativeSessionRef; project: string; title: string; status: RunStatus; revision: Revision; capabilities: Capabilities; control: ControlState }
+export interface Session { createdAt?: string; discoveryObservedAt?:string; updatedAt?: string; sessionId: string; native: NativeSessionRef; project: string; title: string; status: RunStatus; revision: Revision; capabilities: Capabilities; control: ControlState }
 export interface Turn { turnId: string; sessionId: string; status: 'queued' | 'running' | 'completed' | 'interrupted' | 'failed'; inputId: string | null; startedAt: string | null; endedAt: string | null; model: string | null; outputIds: string[] }
 export type ContentBlock = { type: 'text'; text: string } | { type: 'artifact'; artifactId: string; contentVersion: string };
 export interface Message { messageId: string; sessionId: string; turnId: string; role: 'user' | 'assistant' | 'tool'; blocks: ContentBlock[]; sequence: number; revision: Revision; final: boolean; source: string }
@@ -30,7 +30,7 @@ export interface ResolveInteraction { context: WriteContext; interactionId: stri
 export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[] }
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
 export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
-export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[] }
+export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[]; partialFailure?:boolean }
 /** All collections and the cursor are read at one consistent event watermark. Interaction status includes delivery state. */
 export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; connectionGeneration?: number }
 export interface Snapshot<T> { value: T; cursor: string }

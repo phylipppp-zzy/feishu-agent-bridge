@@ -152,6 +152,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     override seedConnectionGeneration(minimum:number):void { super.seedConnectionGeneration(minimum); }
     override seedControlGeneration(ref:Session['native'],minimum:number):void { if(!namespace(ref,this.provider)) throw contractError('invalid_request','provider namespace mismatch'); super.seedControlGeneration(ref,minimum); }
     override async list(cursor:string|null,limit:number) { const page=await super.list(cursor,limit); const items=page.items.filter(s=>{if(!namespace(s.native,this.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; if(!pin(s)) {enrichmentError=true;return false;} configure(s); discovered.add(`session_${payloadDigest(s.native)}`); return true;}); return {...page,items}; }
+    override async discoverNewer(watermark:number,cursor:string|null,limit:number) {const page=await super.discoverNewer(watermark,cursor,limit);const items=page.items.filter(s=>{if(!namespace(s.native,this.provider)) {enrichmentError=true;return false;}if(!trusted(s))return false;if(!pin(s)){enrichmentError=true;return false;}configure(s);discovered.add(`session_${payloadDigest(s.native)}`);return true;});return {...page,items};}
     override async discoverRunning(cursor:string|null,limit:number) { const page=await super.discoverRunning(cursor,limit); const items=page.items.filter(s=>{if(!namespace(s.native,this.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; if(!pin(s)) {enrichmentError=true;return false;} configure(s); discovered.add(`session_${payloadDigest(s.native)}`); return true;}); return {...page,items}; }
     override async read(ref:Session['native']) { const result=await super.read(ref); if(payloadDigest(result.session.native)!==payloadDigest(ref) || !pin(result.session)) throw contractError('invalid_request','provider session metadata mismatch'); configure(result.session); return result; }
     override async inspectTurnResidual(ref:Session['native'],turnId:string) {const pinnedSession=pinned.get(nativeRefKey(ref));if(!namespace(ref,this.provider) || !pinnedSession || !trusted(pinnedSession)) throw contractError('unauthorized','provider session scope unavailable');return super.inspectTurnResidual(ref,turnId);}
@@ -173,7 +174,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   }
   const ports=bases.map(base=>new ScopedPort(secured(base),catalog,registry,()=>{enrichmentError=true;}));
   const stateLock=new DatabaseSync(`${canonicalPath(config.artifactStatePath)}.runtime-lock`); try {stateLock.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE');} catch {stateLock.close(); await Promise.all(ports.map(p=>p.close())); throw new Error('artifact state already active');}
-  let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null;
+  let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null; let recentCursor:string|null=null; let autoWatermark:number|null=null; let autoScopes:Array<{root:string;watermark:number}>=[]; const localCodexClock=config.codexEndpoint==='codex-proxy://default' || ['localhost','127.0.0.1','[::1]','::1'].includes(new URL(config.codexEndpoint).hostname);
   try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
       let autoFailed=false;
       try {await r.channel.applyPendingAutoBaselines();} catch {autoFailed=true;}
@@ -181,10 +182,12 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
         try {
         const target=config.autoMirror.destination!, source=ports.find(p=>p.provider==='codex'), authorized=(port as FeishuPort & {authorizedDestination?:(destination:string)=>boolean}).authorizedDestination?.bind(port);
         if (!source || !(authorized?.(target) ?? config.allowedDestinations.includes(target))) throw new Error('auto mirror destination unavailable');
-        let page; try {page=await source.discoverRunning(autoCursor,2);autoCursor=page.nextCursor;} catch(error) {autoCursor=null;throw error;}
-        for(const item of page.items) {
+        const watermarkFor=(item:Session):number|null=>{try {const project=realpathSync(item.project);const matching=autoScopes.filter(x=>inside(project,x.root)).map(x=>x.watermark);return matching.length ? Math.min(...matching) : null;}catch{return null;}};
+        const candidates:Session[]=[]; if(localCodexClock && autoWatermark!==null && bases.find(p=>p.provider==='codex')?.discoverNewer) {try {const recent=await source.discoverNewer(autoWatermark,recentCursor,1);recentCursor=recent.nextCursor;if(recent.partialFailure)autoFailed=true;for(const item of recent.items) {const created=item.createdAt ? Date.parse(item.createdAt)/1000 : NaN;const observed=item.discoveryObservedAt ? Date.parse(item.discoveryObservedAt)/1000 : Math.floor(Date.now()/1000);if(Number.isSafeInteger(created) && Number.isSafeInteger(observed) && created>observed) r.channel.markAutoUncertain(target,item.native);else if(Number.isSafeInteger(created) && (watermarkFor(item)!==null && created>watermarkFor(item)!) && created<=observed && !r.channel.isAutoUncertain(target,item.native)) candidates.push(item);}} catch {recentCursor=null;autoFailed=true;}} try {const active=await source.discoverRunning(autoCursor,1);autoCursor=active.nextCursor;if(active.partialFailure)autoFailed=true;for(const item of active.items) if(!candidates.some(x=>payloadDigest(x.native)===payloadDigest(item.native))) candidates.push(item);} catch {autoCursor=null;autoFailed=true;}
+        for(const item of candidates) {
           try {
           if (!(authorized?.(target) ?? config.allowedDestinations.includes(target)) || !trusted(item)) continue;
+          const created=item.createdAt ? Date.parse(item.createdAt)/1000 : NaN;const observed=item.discoveryObservedAt ? Date.parse(item.discoveryObservedAt)/1000 : Math.floor(Date.now()/1000);if(Number.isSafeInteger(created) && Number.isSafeInteger(observed) && created>observed) r.channel.markAutoUncertain(target,item.native);
           let session=r.store.findSession(item.native);
           if(!session) {
             const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view'?value:{status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];
@@ -196,7 +199,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
           await r.channel.applyAutoBaseline(eventId);
           if(r.channel.bindingsForRestore().some(b=>b.sessionId===session!.sessionId)) continue;
           await r.core.refreshReadOnlySession(session.sessionId);
-          await r.channel.prepareAutoBaseline(eventId,session.sessionId);
+          const now=Math.floor(Date.now()/1000);const provenNew=localCodexClock && autoWatermark!==null && Number.isSafeInteger(created) && (watermarkFor(item)!==null && created>watermarkFor(item)!) && created<=now && !r.channel.isAutoUncertain(target,item.native); await r.channel.prepareAutoBaseline(eventId,session.sessionId,provenNew);
           await r.channel.handle({eventId,destination:target,identity:{source:'feishu',subject:config.ownerOpenId}},{action:'bind',sessionId:session.sessionId,mode:'read_only'});await r.channel.applyAutoBaseline(eventId);
           } catch {autoFailed=true;}
         }
@@ -226,7 +229,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     }});
   } catch(error) {stateLock.exec('ROLLBACK');stateLock.close();await Promise.all(ports.map(p=>p.close()));throw error;}
   activeRuntime=runtime;
-  try { await registry.load(); for(const s of runtime.store.listSessions()) if(pin(s)) configure(s); return runtime; } catch(error) {await runtime.close();throw error;}
+  try {const sourceKey=payloadDigest([config.hostId,config.codexServiceId,config.codexEndpoint,sources.filter(s=>s.provider==='codex').map(s=>s.directory).sort()]);autoScopes=runtime.channel.configureAutoScopeWatermarks(config.autoMirror?.enabled ? config.autoMirror.destination! : null,sourceKey,[...new Set(projects)].sort(),Math.floor(Date.now()/1000));autoWatermark=autoScopes.length ? Math.min(...autoScopes.map(s=>s.watermark)) : null; await registry.load(); for(const s of runtime.store.listSessions()) if(pin(s)) configure(s); return runtime; } catch(error) {await runtime.close();throw error;}
 }
 /** Explicit opt-in factory. Construction opens isolated local state, never connects. */
 export async function createLiveRuntime(config:RuntimeConfig, credentials:{appId:string;appSecret:string}, sdkDb:string) {

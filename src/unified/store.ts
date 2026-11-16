@@ -425,6 +425,7 @@ export class UnifiedStore {
     this.run('INSERT INTO event_keys(event_id,value) VALUES(?,?)', input.eventId, JSON.stringify(event));
     this.run('INSERT INTO events(event_id,session_id,seq,value) VALUES(?,?,?,?)', input.eventId, input.sessionId, sequence, JSON.stringify(event)); this.run('UPDATE sessions SET event_seq=? WHERE id=?', sequence, input.sessionId); return event;
   }
+  initialCursor(sessionId:string):string {this.session(sessionId);return cursor(sessionId,0);}
   snapshot(sessionId: string): Snapshot<{ session: Session; messages: Message[]; interactions: Interaction[] }> { return this.transaction(() => {
     const session = this.session(sessionId);
     const messages = (this.db.prepare('SELECT value FROM messages WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string, unknown>[]).map(r => parse<Message>(r.value));

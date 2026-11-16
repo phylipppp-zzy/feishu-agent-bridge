@@ -86,6 +86,7 @@ export class EnrichedPort implements PlatformPort {
     if(items.length>limit) { this.pruneListSnapshots(Date.now()); while(this.listSnapshots.size>=LIST_MAX_SNAPSHOTS) this.dropListSnapshot(this.listSnapshots.values().next().value!); this.listSnapshots.add(snapshot); }
     return this.listPage(snapshot,0);
   }
+  async discoverNewer(watermark:number,cursor:string|null,limit:number) {if(!this.base.discoverNewer) throw contractError('unsupported');return this.base.discoverNewer(watermark,cursor,limit);}
   async discoverRunning(cursor:string|null, limit:number) {
     if (!this.base.discoverRunning) throw contractError('unsupported');
     return this.base.discoverRunning(cursor,limit);

@@ -91,6 +91,7 @@ export class UnifiedCore implements UnifiedService {
       for (const native of observed.messages) { const snapshot=this.store.snapshot(id); const old=snapshot.value.messages.find(m=>m.messageId===native.messageId); const value={...native,sessionId:id,sequence:old?.sequence ?? Math.max(0,...snapshot.value.messages.map(m=>m.sequence))+1,revision:old?.revision ?? native.revision}; if(old && payloadDigest(value)===payloadDigest(old)) continue; if(old?.final && !value.final) continue; this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null); }
     } catch (error) { this.observationFailure='read-only refresh failed'; throw error; }
   }
+  async initialCursor(id:string) {return this.store.initialCursor(id);}
   async getSnapshot(id: string) { const snapshot=this.store.snapshot(id); return {...snapshot,value:{...snapshot.value,session:this.present(snapshot.value.session)}}; }
   async subscribeEvents(id: string, cursor: string, limit: number) { return this.store.subscribeEvents(id, cursor, limit); }
   async getControlState(id: string) { return this.store.getSession(id).control; }

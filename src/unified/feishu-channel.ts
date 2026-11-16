@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
+import { relative, isAbsolute, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
 import type { Answer, Identity, Provider, WriteContext, Session } from './contracts.js';
 import { payloadDigest } from './contracts.js';
@@ -84,6 +85,9 @@ export class FeishuChannel {
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_markers (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, category TEXT NOT NULL, object_key TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,category,object_key))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_settings (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, paused INTEGER NOT NULL, completed INTEGER NOT NULL, waiting INTEGER NOT NULL, failed INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_stream_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, message_id TEXT NOT NULL, card_id TEXT, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, final INTEGER NOT NULL, current_message TEXT NOT NULL, latest_sequence INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,message_id))');
+    this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_uncertain (destination TEXT NOT NULL, native_key TEXT NOT NULL, PRIMARY KEY(destination,native_key))');
+    this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_watermarks (destination TEXT PRIMARY KEY, enabled INTEGER NOT NULL, watermark INTEGER NOT NULL)');
+    this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_scope_watermarks (destination TEXT NOT NULL, source TEXT NOT NULL, root TEXT NOT NULL, watermark INTEGER NOT NULL, PRIMARY KEY(destination,source,root))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_baselines (event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, snapshot TEXT NOT NULL, destination TEXT, binding_scope TEXT)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_history_baselines (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope))');
     const columns = this.db.prepare('PRAGMA table_info(channel_bindings)').all() as Array<{name:string}>;
@@ -191,10 +195,29 @@ export class FeishuChannel {
   /** A successful initial history read is baselined once per binding epoch. */
   async isReadonlyBaselineAuthorized(destination:string,sessionId:string):Promise<boolean> {const scope=this.bindingScope(destination);try {await this.checkBinding(destination,sessionId,scope);return this.accessMode(destination)==='read_only' && scope===this.bindingScope(destination);} catch {return false;}}
   readonlyHydrated(destination:string, sessionId:string):boolean { const scope=this.bindingScope(destination);return !!this.db.prepare('SELECT 1 FROM channel_history_baselines WHERE destination=? AND session_id=? AND binding_scope=?').get(destination,sessionId,scope); }
-  async prepareAutoBaseline(eventId:string,sessionId:string):Promise<void> {
+  markAutoUncertain(destination:string,native:Session['native']):void {this.db.prepare('INSERT OR IGNORE INTO channel_auto_uncertain VALUES (?,?)').run(destination,payloadDigest(native));}
+  isAutoUncertain(destination:string,native:Session['native']):boolean {return !!this.db.prepare('SELECT 1 FROM channel_auto_uncertain WHERE destination=? AND native_key=?').get(destination,payloadDigest(native));}
+  configureAutoScopeWatermarks(destination:string|null,source:string,roots:string[],nowSeconds:number):Array<{root:string;watermark:number}> {
+    if(!Number.isSafeInteger(nowSeconds) || nowSeconds<0 || !source || roots.some(root=>!isAbsolute(root))) throw new Error('invalid auto scope');
+    const inside=(child:string,root:string)=>{const rel=relative(root,child);return rel==='' || (!isAbsolute(rel) && rel!=='..' && !rel.startsWith(`..${sep}`));};
+    this.db.exec('BEGIN IMMEDIATE');try {
+      if(!destination){this.db.prepare('DELETE FROM channel_auto_scope_watermarks').run();this.db.exec('COMMIT');return [];}
+      const previous=this.db.prepare('SELECT root,watermark FROM channel_auto_scope_watermarks WHERE destination=? AND source=?').all(destination,source) as Array<{root:string;watermark:number}>;
+      const retained=new Map<string,number>();
+      const put=(root:string,watermark:number)=>retained.set(root,Math.min(retained.get(root) ?? watermark,watermark));
+      for(const old of previous) for(const root of roots) {if(inside(old.root,root)) put(old.root,old.watermark);else if(inside(root,old.root)) put(root,old.watermark);}
+      for(const root of roots) put(root,nowSeconds);
+      this.db.prepare('DELETE FROM channel_auto_scope_watermarks').run();
+      const insert=this.db.prepare('INSERT INTO channel_auto_scope_watermarks VALUES (?,?,?,?)');
+      for(const [root,watermark] of retained) insert.run(destination,source,root,watermark);
+      this.db.exec('COMMIT');return [...retained].map(([root,watermark])=>({root,watermark}));
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
+  }
+  configureAutoWatermark(destination:string|null,nowSeconds:number):number|null {if(!Number.isSafeInteger(nowSeconds) || nowSeconds<0) throw new Error('invalid watermark');this.db.exec('BEGIN IMMEDIATE');try {if(!destination){this.db.prepare('UPDATE channel_auto_watermarks SET enabled=0').run();this.db.exec('COMMIT');return null;}this.db.prepare('UPDATE channel_auto_watermarks SET enabled=0 WHERE destination<>?').run(destination);const row=this.db.prepare('SELECT enabled,watermark FROM channel_auto_watermarks WHERE destination=?').get(destination) as {enabled:number;watermark:number}|undefined;const watermark=row?.enabled ? row.watermark : nowSeconds;this.db.prepare('INSERT INTO channel_auto_watermarks VALUES (?,1,?) ON CONFLICT(destination) DO UPDATE SET enabled=1,watermark=excluded.watermark').run(destination,watermark);this.db.exec('COMMIT');return watermark;}catch(error){this.db.exec('ROLLBACK');throw error;}}
+  async prepareAutoBaseline(eventId:string,sessionId:string,provenNew=false):Promise<void> {
     if(this.db.prepare('SELECT 1 FROM channel_auto_baselines WHERE event_id=?').get(eventId)) return;
     const snapshot=await this.service.getSnapshot(sessionId);
-    const baseline={cursor:snapshot.cursor,messages:snapshot.value.messages.map(m=>({messageId:m.messageId,revision:m.revision}))};
+    const initial=provenNew ? await this.service.initialCursor?.(sessionId) : undefined; if(provenNew && !initial) throw new Error('initial cursor unavailable'); const baseline=provenNew ? {cursor:initial!,messages:[]} : {cursor:snapshot.cursor,messages:snapshot.value.messages.map(m=>({messageId:m.messageId,revision:m.revision}))};
     this.db.prepare('INSERT OR IGNORE INTO channel_auto_baselines(event_id,session_id,snapshot) VALUES (?,?,?)').run(eventId,sessionId,JSON.stringify(baseline));
   }
   private autoBaselineOffset=0;

@@ -16,6 +16,7 @@ export interface UnifiedService {
   listProjectFiles?(sessionId:string, directory:string, showHidden:boolean):Promise<DirectoryListing>;
   selectProjectFiles?(sessionId:string, args:string):Promise<Artifact[]>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
+  initialCursor?(sessionId:string):Promise<string>;
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
   getTurn?(sessionId:string,turnId:string):Promise<Turn|null>;
   hasStopRequest?(sessionId:string,turnId:string):Promise<boolean>;
@@ -70,6 +71,7 @@ export interface PlatformPort {
   seedControlGeneration?(ref: NativeSessionRef, minimum: number): void;
   list(cursor: string | null, limit: number): Promise<Page<Session>>;
   discoverRunning?(cursor: string | null, limit: number): Promise<Page<Session>>;
+  discoverNewer?(watermark:number,cursor:string|null,limit:number):Promise<Page<Session>>;
   read(ref: NativeSessionRef): Promise<SessionSnapshot>;
   resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement>;
   create(cwd: string, model: string | null): Promise<PlatformAcknowledgement>;
