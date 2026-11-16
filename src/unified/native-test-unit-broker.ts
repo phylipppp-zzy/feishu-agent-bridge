@@ -1,0 +1,29 @@
+import {spawn,execFile} from 'node:child_process';
+import {readFileSync} from 'node:fs';
+import {randomUUID} from 'node:crypto';
+import {promisify} from 'node:util';
+import type {ChildProcessByStdio} from 'node:child_process';
+import type {Readable,Writable} from 'node:stream';
+const exec=promisify(execFile);
+const parents=['feishu-unified-production.service','feishu-native-broker-probe.service'] as const;
+export type BrokerParent=typeof parents[number];
+export function brokerParent(cgroup:string):BrokerParent {const hits=parents.filter(p=>cgroup.split(/[\/\n]/).includes(p));if(hits.length!==1)throw Error('native test parent unit unavailable');return hits[0]!;}
+export interface BrokerUnitStatus {unit:string;state:string;substate:string;group:string;populated:boolean|null}
+export class NativeTestExitUnconfirmed extends Error {constructor(readonly retry:()=>Promise<void>){super('native test helper exit unconfirmed');}}
+export interface BrokerManager {start(unit:string,parent:BrokerParent,args:string[],ttlSeconds:number):ChildProcessByStdio<Writable,Readable,null>;inspect(unit:string):Promise<BrokerUnitStatus>;signal(unit:string,force?:boolean):Promise<void>;stop(unit:string):Promise<void>}
+function unitName(unit:string):void{if(!/^feishu-native-test-[0-9a-f]{32}\.service$/.test(unit))throw Error('invalid native test helper unit');}
+export function brokerArguments(unit:string,parent:BrokerParent,args:string[],ttlSeconds:number):string[]{unitName(unit);if(!parents.includes(parent)||!Number.isSafeInteger(ttlSeconds)||ttlSeconds<300||ttlSeconds>7200)throw Error('invalid native helper');return ['--user','--quiet','--pipe','--wait','--remain-after-exit',`--unit=${unit}`,'--service-type=exec',`--property=BindsTo=${parent}`,`--property=PartOf=${parent}`,`--property=After=${parent}`,'--property=KillMode=control-group','--property=NoNewPrivileges=yes','--property=RestrictSUIDSGID=yes','--property=UMask=0077','--property=TimeoutStopSec=5s',`--property=RuntimeMaxSec=${ttlSeconds}s`,'/usr/bin/env','-i','PATH=/usr/bin:/bin','/usr/bin/bwrap',...args];}
+export class SystemdBrokerManager implements BrokerManager {
+  start(unit:string,parent:BrokerParent,args:string[],ttlSeconds:number):ChildProcessByStdio<Writable,Readable,null>{return spawn('/usr/bin/systemd-run',brokerArguments(unit,parent,args,ttlSeconds),{stdio:['pipe','pipe','ignore'],env:{PATH:'/usr/bin:/bin',XDG_RUNTIME_DIR:`/run/user/${process.getuid?.()}`}});}
+  async inspect(unit:string):Promise<BrokerUnitStatus>{unitName(unit);const {stdout}=await exec('/usr/bin/systemctl',['--user','show',unit,'--property=Id','--property=LoadState','--property=ActiveState','--property=SubState','--property=ControlGroup'],{timeout:3000,env:{PATH:'/usr/bin:/bin',XDG_RUNTIME_DIR:`/run/user/${process.getuid?.()}`},maxBuffer:16384});const fields=Object.fromEntries(stdout.trim().split('\n').map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)];}));if(fields.Id!==unit||fields.LoadState!=='loaded'||!fields.ActiveState||!fields.SubState)throw Error('native helper state unavailable');let populated:boolean|null=null;const group=fields.ControlGroup??'';if(!group){if(fields.ActiveState==='active'&&fields.SubState==='exited')populated=false;}else {if(!group.startsWith('/')||group.split('/').includes('..'))throw Error('invalid helper cgroup');const events=readFileSync(`/sys/fs/cgroup${group}/cgroup.events`,'utf8');const m=/^populated ([01])$/m.exec(events);if(m)populated=m[1]==='1';}return {unit,state:fields.ActiveState,substate:fields.SubState,group,populated};}
+  async signal(unit:string,force?:boolean):Promise<void>{unitName(unit);await exec('/usr/bin/systemctl',['--user','kill','--kill-whom=all',`--signal=${force?'KILL':'TERM'}`,unit],{timeout:3000,env:{PATH:'/usr/bin:/bin',XDG_RUNTIME_DIR:`/run/user/${process.getuid?.()}`}});}
+  async stop(unit:string):Promise<void>{unitName(unit);await exec('/usr/bin/systemctl',['--user','stop',unit],{timeout:8000,env:{PATH:'/usr/bin:/bin',XDG_RUNTIME_DIR:`/run/user/${process.getuid?.()}`}});}
+}
+/** Only this unit is signalled. The client exit is not proof the unit/cgroup exited. */
+export class NativeTestUnitBroker {
+  readonly unit=`feishu-native-test-${randomUUID().replaceAll('-','')}.service`;readonly child:ChildProcessByStdio<Writable,Readable,null>;private closing:Promise<void>|undefined;
+  constructor(private readonly manager:BrokerManager,parent:BrokerParent,args:string[],ttlSeconds:number,private readonly timeoutMs=8000){this.child=manager.start(this.unit,parent,args,ttlSeconds);}
+  watch(onExit:()=>void):()=>void {let active=true,busy=false;const timer=setInterval(()=>{if(!active||busy||this.closing)return;busy=true;void this.manager.inspect(this.unit).then(s=>{if(active&&!this.closing&&s.unit===this.unit&&(s.state==='failed'||s.state==='inactive'||(s.state==='active'&&s.substate==='exited'))){active=false;clearInterval(timer);onExit();}}).catch(()=>{}).finally(()=>{busy=false;});},1000);timer.unref();return ()=>{active=false;clearInterval(timer);};}
+  close():Promise<void>{if(this.closing)return this.closing;const work=(async()=>{try{await this.manager.signal(this.unit);}catch{}const deadline=Date.now()+this.timeoutMs;let killed=false;for(;;){try{const state=await this.manager.inspect(this.unit);if(state.unit===this.unit&&state.populated===false&&((state.state==='active'&&state.substate==='exited')||state.state==='inactive'||state.state==='failed')){await this.manager.stop(this.unit);return;}}catch{}if(Date.now()>=deadline)throw new NativeTestExitUnconfirmed(()=>this.close());if(!killed&&Date.now()>=deadline-this.timeoutMs/2){killed=true;try{await this.manager.signal(this.unit,true);}catch{}}await new Promise(r=>setTimeout(r,100));}})();this.closing=work;void work.catch(()=>{if(this.closing===work)this.closing=undefined;});return work;}
+}
+export function currentBrokerParent():BrokerParent{return brokerParent(readFileSync('/proc/self/cgroup','utf8'));}
