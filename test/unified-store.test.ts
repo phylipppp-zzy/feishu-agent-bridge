@@ -1,0 +1,92 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
+import { UnifiedStore, StoreError } from '../src/unified/store.js';
+import type { Capabilities, Interaction, ResolveInteraction, Session } from '../src/unified/contracts.js';
+
+const caps = Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config'].map(k => [k, {status:'available'}])) as Capabilities;
+const session: Session = { sessionId:'s', native:{provider:'codex',hostId:'h',serviceId:'svc',nativeSessionId:'native'}, project:'p', title:'t', status:'idle', revision:0, capabilities:caps, control:{serviceId:'svc',owner:'x',input:'available',generation:1,operationId:null,reason:null} };
+const interaction: Interaction = { interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'42',connectionGeneration:1,revision:0,status:'awaiting_answer',expiresAt:null,toolInputDigest:null,nativeResult:null,kind:'question',prompt:'?',choices:['a','b'],multiple:false,allowFreeText:false };
+function request(id: string, value = 'a'): ResolveInteraction { return {context:{operationId:id,idempotencyKey:id,targetId:'s',expectedRevision:0,controlGeneration:1,identity:{subject:'u',source:'test'}},interactionId:'i',expectedConnectionGeneration:1,answer:{kind:'question',values:[value]},toolInputDigest:null}; }
+function code(fn: () => unknown, expected: string): void { assert.throws(fn, (e: unknown) => e instanceof StoreError && e.detail.code === expected); }
+function setup(): {dir:string; path:string; store:UnifiedStore} { const dir = mkdtempSync(join(tmpdir(),'unified-store-')); const path = join(dir,'new.sqlite'); const store = new UnifiedStore(path); store.insertSession(session); store.setConnectionGeneration('s',0,1); store.insertInteraction(interaction); return {dir,path,store}; }
+function child(path: string, id: string, mode = 'answer'): Promise<string> { return new Promise((resolve,reject) => { const p = spawn(process.execPath,['--import','tsx',import.meta.filename],{env:{...process.env, STORE_WORKER:'1', STORE_PATH:path, STORE_ID:id, STORE_MODE:mode},stdio:['ignore','pipe','pipe']}); let out=''; let err=''; p.stdout.on('data', x => out+=x); p.stderr.on('data', x => err+=x); p.on('error',reject); p.on('close', c => c === 0 ? resolve(out.trim()) : reject(new Error(err))); }); }
+if (process.env.STORE_WORKER === '1') {
+  const store = new UnifiedStore(process.env.STORE_PATH!); try { if (process.env.STORE_MODE === 'claim') console.log(store.claimOutbox('a') ? 'claimed' : 'blocked'); else if (process.env.STORE_MODE === 'switch') { store.setConnectionGeneration('s',1,2); console.log('switched'); } else { store.resolveInteraction(request(process.env.STORE_ID!)); console.log('won'); } } catch (e) { console.log(e instanceof StoreError ? e.detail.code : 'unexpected'); } finally { store.close(); }
+} else {
+  test('cross-process answer CAS; native terminal result is authoritative and survives reopen', async () => {
+    const {dir,path,store} = setup(); store.close();
+    try { const results = await Promise.all([child(path,'one'),child(path,'two')]); assert.equal(results.filter(x => x === 'won').length,1); assert.equal(results.filter(x => x === 'stale_revision').length,1);
+      let db = new UnifiedStore(path); const winner = results[0] === 'won' ? 'one' : 'two'; assert.equal(db.getInteraction('i').status,'answer_pending_delivery');
+      db.recordNativeResult('i',1,'42',{status:'accepted',source:'terminal',answer:null}); assert.equal(db.getOutbox(winner).state,'cancelled'); db.close();
+      db = new UnifiedStore(path); assert.deepEqual(db.getInteraction('i').nativeResult,{status:'accepted',source:'terminal',answer:null}); assert.equal(db.getInteraction('i').status,'resolved'); code(() => db.resolveInteraction(request('third')),'stale_revision'); db.close();
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('duplicate key, control and connection generations, unknown recovery', () => {
+    const {dir,path,store} = setup(); try {
+      const a = request('a'); assert.equal(store.resolveInteraction(a).status,'received'); assert.deepEqual(store.resolveInteraction(a),store.getOperation('a')); code(() => store.resolveInteraction(request('a','b')),'idempotency_conflict');
+      assert.equal(store.claimOutbox('a'),true); assert.equal(store.claimOutbox('a'),false); store.close();
+      const reopened = new UnifiedStore(path); assert.equal(reopened.recoverInFlight()[0]?.status,'unknown'); assert.equal(reopened.getOperation('a').status,'unknown'); assert.equal(reopened.claimOutbox('a'),false); reopened.reconcileOperation('a','completed'); assert.equal(reopened.getOutbox('a').state,'done');
+      reopened.setConnectionGeneration('s',1,2); code(() => reopened.recordNativeResult('i',1,'42',{status:'accepted',source:'old',answer:null}),'interaction_expired');
+      const next = {...session,revision:1,control:{...session.control,generation:2}}; reopened.updateSession(next,0,1); code(() => reopened.registerOperation({ ...request('x').context, expectedRevision:1 },'send',{}),'control_conflict'); reopened.close();
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('native terminal acceptance while delivery is in flight requires reconciliation', () => {
+    const {dir,store} = setup(); try { store.resolveInteraction(request('a')); store.claimOutbox('a');
+      store.recordNativeResult('i',1,'42',{status:'accepted',source:'terminal',answer:null});
+      assert.equal(store.getOutbox('a').state,'unknown'); assert.equal(store.getOperation('a').status,'unknown'); assert.equal(store.claimOutbox('a'),false);
+    } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('two connections fence old pending delivery and retain its context', () => {
+    const {dir,path,store: a} = setup(); const b = new UnifiedStore(path);
+    try { const req = request('a'); a.resolveInteraction(req);
+      assert.deepEqual(a.getOutbox('a').context,req.context); assert.equal(a.getOutbox('a').connectionGeneration,1);
+      b.setConnectionGeneration('s',1,2); b.updateSession({...session,revision:1,control:{...session.control,generation:2}},0,1);
+      assert.equal(a.claimOutbox('a'),false); assert.equal(a.getOutbox('a').state,'cancelled'); assert.equal(a.getOperation('a').status,'failed');
+      assert.equal(a.getInteraction('i').status,'expired'); assert.deepEqual(a.resolveInteraction(req),a.getOperation('a'));
+    } finally { b.close(); a.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('control change fences pending and a claimed delivery becomes unknown on generation change', () => {
+    for (const claimed of [false,true]) { const {dir,path,store: a} = setup(); const b = new UnifiedStore(path);
+      try { a.resolveInteraction(request('a')); if (claimed) assert.equal(a.claimOutbox('a'),true);
+        b.updateSession({...session,revision:1,control:{...session.control,generation:2}},0,1);
+        assert.equal(a.claimOutbox('a'),false); assert.equal(a.getOutbox('a').state,claimed ? 'unknown' : 'cancelled');
+        assert.equal(a.getOperation('a').status,claimed ? 'unknown' : 'failed');
+        assert.equal(a.getInteraction('i').nativeResult,null);
+      } finally { b.close(); a.close(); rmSync(dir,{recursive:true,force:true}); }
+    }
+  });
+  test('concurrent claim and generation switch serialize across SQLite connections', async () => {
+    const {dir,path,store} = setup(); store.resolveInteraction(request('a')); store.close();
+    try { const results = await Promise.all([child(path,'x','claim'),child(path,'y','switch')]);
+      assert.equal(results[1],'switched'); assert.ok(['claimed','blocked'].includes(results[0]!));
+      const reopened = new UnifiedStore(path); try {
+        assert.equal(reopened.getOutbox('a').state,results[0] === 'claimed' ? 'unknown' : 'cancelled');
+        assert.equal(reopened.getOperation('a').status,results[0] === 'claimed' ? 'unknown' : 'failed');
+        assert.equal(reopened.claimOutbox('a'),false); assert.equal(reopened.getInteraction('i').status,'expired');
+      } finally { reopened.close(); }
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('expired interaction cannot be claimed', () => {
+    const {dir,store} = setup(); try { store.resolveInteraction(request('a')); assert.equal(store.claimOutbox('a',NaN),false); assert.equal(store.getOutbox('a').state,'cancelled'); } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('refuses a database belonging to another application', () => {
+    const dir = mkdtempSync(join(tmpdir(),'unified-store-')); const path = join(dir,'other.sqlite');
+    try { const db = new DatabaseSync(path); db.exec("CREATE TABLE original(value TEXT); INSERT INTO original VALUES ('keep')"); db.close();
+      assert.throws(() => new UnifiedStore(path), /refusing/); const verify = new DatabaseSync(path); assert.equal(verify.prepare('SELECT value FROM original').get()?.value,'keep'); verify.close();
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('snapshot and event watermark, deduplication, compaction and replay', () => {
+    const {dir,store} = setup(); try {
+      const snap = store.snapshot('s'); assert.equal(snap.value.interactions.length,1); assert.deepEqual(snap.value.messages,[]);
+      const input = {eventId:'e',sessionId:'s',objectId:'s',objectRevision:0,type:'example',occurredAt:'2026-01-01T00:00:00Z',receivedAt:'2026-01-01T00:00:00Z',operationId:null,data:{x:1}};
+      const event = store.appendEvent(input); assert.deepEqual(store.appendEvent(input),event); code(() => store.appendEvent({...input,data:{x:2}}),'idempotency_conflict');
+      const page = store.subscribeEvents('s',snap.cursor,10); assert.equal(page.status,'events'); if (page.status === 'events') assert.deepEqual(page.events,[event]);
+      store.compactEvents('s',event.cursor); assert.deepEqual(store.appendEvent(input),event); assert.equal(store.subscribeEvents('s',snap.cursor,10).status,'snapshot_required'); assert.equal(store.subscribeEvents('s',store.snapshot('s').cursor,10).status,'events');
+    } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+}
