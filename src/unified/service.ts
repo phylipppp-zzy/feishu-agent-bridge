@@ -1,7 +1,7 @@
 import type { HistoryReader } from './history-port.js';
 import { randomUUID } from 'node:crypto';
 import type { PlatformInputBlock, UnifiedService, DispatchGuard, ListQuery, PlatformObservation, PlatformPort } from './adapter.js';
-import { payloadDigest, validateSubmitInput, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SubmitInput, type WriteContext } from './contracts.js';
+import { payloadDigest, validateSubmitInput, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SessionSnapshot, type SubmitInput, type WriteContext } from './contracts.js';
 import { contractError } from './errors.js';
 import { StoreError, UnifiedStore } from './store.js';
 
@@ -58,7 +58,8 @@ export class UnifiedCore implements UnifiedService {
     this.tails.set(id, next); void next.finally(() => { if (this.tails.get(id) === next) this.tails.delete(id); }).catch(() => undefined);
     return next;
   }
-  private present(session: Session): Session { if(this.unavailableProviders.has(session.native.provider)) {const capabilities=Object.fromEntries(Object.entries(session.capabilities).map(([key,value])=>[key,key==='view'?value:{status:'temporarily_unavailable',reason:'provider unavailable'}])) as Session['capabilities'];return {...session,status:'unreachable',capabilities,control:{...session.control,input:'unavailable',reason:'provider unavailable'}};} const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
+  presentSession:(session:Session)=>Session=session=>session;
+  private present(session: Session): Session { session=this.presentSession(session); if(this.unavailableProviders.has(session.native.provider)) {const capabilities=Object.fromEntries(Object.entries(session.capabilities).map(([key,value])=>[key,key==='view'?value:{status:'temporarily_unavailable',reason:'provider unavailable'}])) as Session['capabilities'];return {...session,status:'unreachable',capabilities,control:{...session.control,input:'unavailable',reason:'provider unavailable'}};} const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
   async listSessions(q: ListQuery) {
     const stored=this.store.listSessions(); const known=new Set(stored.map(s=>payloadDigest(s.native)));
     const all=stored.filter(s=>!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))).map(s=>this.present(s));
@@ -76,13 +77,13 @@ export class UnifiedCore implements UnifiedService {
   async listInteractions(id: string, q: ListQuery) { return page(this.store.snapshot(id).value.interactions, q); }
   async getInteraction(id: string) { return this.store.getInteraction(id); }
   /** Trusted runtime polling for a read-only attachment; never resumes or acquires control. */
-  async refreshReadOnlySession(id: string): Promise<void> { return this.refreshHistory(id,false); }
+  async refreshReadOnlySession(id: string, observed?:SessionSnapshot): Promise<void> { return this.refreshHistory(id,false,observed); }
   /** Initial history baseline is read-only even when another binding has interactive control. */
   async hydrateSessionHistory(id:string):Promise<void> { return this.refreshHistory(id,true); }
-  private async refreshHistory(id:string, allowInteractive:boolean):Promise<void> {
+  private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot):Promise<void> {
     try {
       const current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
-      const observed=await this.port(current).read(current.native); if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project) return fail('invalid_request','provider returned wrong native session or project');
+      const observed=supplied ?? await this.port(current).read(current.native); if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project) return fail('invalid_request','provider returned wrong native session or project');
       if (observed.connectionGeneration !== undefined && observed.connectionGeneration < this.store.connectionGeneration(id)) return fail('control_conflict','stale connection generation');
       if ((observed.turns ?? []).some(t=>t.sessionId!==current.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
       // Only refresh presentation metadata on the still-readonly, same native session.

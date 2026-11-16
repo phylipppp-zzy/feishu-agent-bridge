@@ -70,6 +70,7 @@ export interface PlatformPort {
   seedConnectionGeneration?(minimum: number): void;
   seedControlGeneration?(ref: NativeSessionRef, minimum: number): void;
   list(cursor: string | null, limit: number): Promise<Page<Session>>;
+  discoverExisting?(cursor:string|null,limit:number):Promise<Page<Session>>;
   discoverRunning?(cursor: string | null, limit: number): Promise<Page<Session>>;
   discoverNewer?(watermark:number,cursor:string|null,limit:number):Promise<Page<Session>>;
   read(ref: NativeSessionRef): Promise<SessionSnapshot>;

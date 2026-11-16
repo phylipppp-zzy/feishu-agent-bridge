@@ -25,6 +25,19 @@ export class LocalCatalog {
     for(const root of this.roots) if(root.provider==='claude'&&root.hostId===ref.hostId&&root.serviceId===ref.serviceId) await walk(root.directory);
     return count===1&&valid;
   }
+  /** Returns a uniquely joined first post-watermark SDK user message, or unknown. */
+  async claudeActivityBoundary(ref:NativeSessionRef,project:string,messages:Message[],watermark:number,observed:number):Promise<string|null|'uncertain'> {
+    if(ref.provider!=='claude' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref.nativeSessionId) || !Number.isSafeInteger(watermark) || !Number.isSafeInteger(observed) || watermark>=observed || messages.length>50000) return null;
+    const wanted=await realpath(project);let entries=0;const files:string[]=[];
+    const walk=async(dir:string,depth=0):Promise<void>=>{if(depth>32)throw new Error('source proof depth exceeded');for(const ent of await readdir(dir,{withFileTypes:true})){if(++entries>100000)throw new Error('source proof budget exceeded');const path=join(dir,ent.name);if(ent.isDirectory()){if(ent.name!=='subagents')await walk(path,depth+1);}else if(ent.isFile()&&ent.name===`${ref.nativeSessionId}.jsonl`)files.push(path);}};
+    for(const root of this.roots) if(root.provider==='claude'&&root.hostId===ref.hostId&&root.serviceId===ref.serviceId)await walk(root.directory);
+    if(files.length!==1)return null;const f=await open(files[0]!,constants.O_RDONLY|constants.O_NOFOLLOW);let text:string;try{const stat=await f.stat();if(!stat.isFile()||stat.size>this.maxLogBytes)return null;text=await f.readFile('utf8');}finally{await f.close();}if(!text.endsWith('\n'))return null;
+    const records=new Map<string,any[]>();let main=false;
+    for(const line of text.split('\n')){if(!line)continue;let row:any;try{row=JSON.parse(line);}catch{return null;}if((row?.type==='user'||row?.type==='assistant')&&!main){if(row.sessionId!==ref.nativeSessionId || !['cli','claude-vscode','sdk-cli'].includes(row.entrypoint) || row.isSidechain!==false || row.agentId || row.sessionKind==='daemon' || row.sessionKind==='daemon-worker' || typeof row.cwd!=='string' || await realpath(row.cwd)!==wanted)return null;main=true;}if(row?.type==='user' && row.sessionId===ref.nativeSessionId && row.isSidechain===false && !row.agentId && typeof row.timestamp==='string' && Date.parse(row.timestamp)>observed)return 'uncertain';if(row?.type==='user' && typeof row.uuid==='string'){const list=records.get(row.uuid)??[];list.push(row);records.set(row.uuid,list);}}
+    if(!main)return null;let first:string|null=null;let seenNew=false;const ids=new Set<string>();
+    for(const m of messages){if(ids.has(m.messageId))return null;ids.add(m.messageId);if(m.role!=='user')continue;const rows=records.get(m.messageId);if(!rows || rows.length!==1)return null;const row=rows[0],at=typeof row.timestamp==='string'?Date.parse(row.timestamp):NaN;if(row.sessionId!==ref.nativeSessionId || row.isSidechain!==false || row.agentId || typeof row.cwd!=='string' || await realpath(row.cwd)!==wanted || !Number.isSafeInteger(at) || at===watermark)return null;if(at>observed)return 'uncertain';if(at>watermark){if(!['cli','claude-vscode','sdk-cli'].includes(row.entrypoint) || row.sessionKind==='daemon' || row.sessionKind==='daemon-worker')return null;first??=m.messageId;seenNew=true;}else if(seenNew)return null;}
+    return first;
+  }
   async refresh(): Promise<void> {
     const next = new Map<string, Entry>();
     const walk = async (root: CatalogRoot, dir: string): Promise<void> => {
