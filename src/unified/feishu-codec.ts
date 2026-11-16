@@ -6,7 +6,7 @@ import type { ChannelCard } from './feishu-cards.js';
  * Pass JSON.stringify(result) as the SDK message content with msg_type=interactive. */
 export function toFeishuCard(card: ChannelCard): object {
   if (card.form) return renderQuestionForm(card.form);
-  return { config: { wide_screen_mode: true }, header: { title: { tag:'plain_text', content:card.title } }, elements: [
+  return { config: { wide_screen_mode: true }, header: { title: { tag:'plain_text', content:card.title.trim() || '未命名会话' } }, elements: [
     { tag:'div', text:{ tag:'plain_text', content:card.text } },
     ...(card.actions.length ? [{tag:'action',actions:card.actions.map(a => ({tag:'button',text:{tag:'plain_text',content:a.label},type:'default',...(a.url ? {url:a.url} : {value:a.value})}))}] : []),
   ] };
