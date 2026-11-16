@@ -14,6 +14,7 @@ class FeishuApiRejected extends Error { readonly deliveryKind='api_rejected'; co
 function rejectCode(code:unknown):void {if(typeof code==='number' && Number.isSafeInteger(code) && code!==0) throw new FeishuApiRejected(code);}
 class UnknownTopic extends Error {}
 class UnknownCardRoute extends Error {}
+class ClosedTestRoute extends Error {}
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
@@ -22,9 +23,7 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
   if (m.senderOpenId !== owner || !destinations.has(m.chatId)) throw new Error('unauthorized');
   let textAction:ChannelAction | undefined;
   if (data.message.message_type === 'text' && m.text) { try { textAction=parseFeishuText(m.text); } catch (error) { if (!m.text.startsWith('/')) throw error; textAction={action:'help'}; } }
-  let destination:string;
-  try { destination=resolveDestination ? resolveDestination(m.chatId,m.rootId,m.parentId,(data.message as unknown as {thread_id?:string}).thread_id) : m.chatId; }
-  catch (error) { if (!(error instanceof UnknownTopic) || textAction?.action !== 'help') throw error; destination=m.chatId; }
+  const destination=resolveDestination ? resolveDestination(m.chatId,m.rootId,m.parentId,(data.message as unknown as {thread_id?:string}).thread_id) : m.chatId;
   const envelope={eventId:`message:${m.messageId}`,destination,identity:{source:'feishu',subject:m.senderOpenId}};
   if (textAction) { await handle(envelope,textAction); return; }
   if (data.message.message_type !== 'image' && data.message.message_type !== 'file') throw new Error('unsupported inbound message type');
@@ -55,7 +54,7 @@ export async function handleSdkCardCallback(data:Lark.RawCardActionEvent, owner:
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:ChannelAction;
   try { action=parseFeishuAction(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
-  let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
+  let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
   const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId}};
   try {await handle(envelope,action);} catch {return {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};} return undefined;
 }
@@ -77,7 +76,7 @@ export class FeishuSdkPort implements FeishuPort {
     this.appId=credentials.appId;
     const base = { appId: credentials.appId, appSecret: credentials.appSecret, appType:Lark.AppType.SelfBuild, domain:Lark.Domain.Feishu };
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
-    this.db = new DatabaseSync(dbPath); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
+    this.db = new DatabaseSync(dbPath); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_registry (root_id TEXT PRIMARY KEY, destination TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, owner TEXT NOT NULL, lane_id TEXT NOT NULL, namespace TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, operation_id TEXT NOT NULL, delivery_id TEXT NOT NULL, created_at INTEGER NOT NULL)'); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
   }
   beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
   endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
@@ -116,7 +115,9 @@ export class FeishuSdkPort implements FeishuPort {
   }
   public isTopicDestination(destination:string):boolean { return !!this.route(destination); }
   public reassignTopic(destination:string,sessionId:string):void { this.allowed(destination); this.routeGeneration++; if (!this.route(destination)) throw new Error('topic required'); this.db.prepare('UPDATE sdk_topic_routes SET session_id=? WHERE destination=?').run(sessionId,destination); }
+  private laneReserved(destination:string):boolean { return !!this.db.prepare('SELECT 1 FROM sdk_lane_registry WHERE destination=?').get(destination); }
   public authorizedDestination(destination:string):boolean {
+    if (this.laneReserved(destination)) return false;
     if (this.destinations.has(destination)) return true;
     const route=this.db.prepare('SELECT chat_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string}|undefined;
     return !!route && this.destinations.has(route.chat_id);
@@ -127,6 +128,7 @@ export class FeishuSdkPort implements FeishuPort {
     if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
     if (!rootId && !parentId && !threadId) return chatId;
     const candidates=[rootId,parentId,threadId].filter((v):v is string=>!!v);
+    for(const id of candidates) if(this.db.prepare('SELECT 1 FROM sdk_lane_registry WHERE root_id=?').get(id)) throw new UnknownTopic('test topic unavailable');
     const found=new Set<string>();
     for (const id of candidates) {
       const rows=this.db.prepare('SELECT destination FROM sdk_topic_routes WHERE chat_id=? AND (root_id=? OR thread_id=?) UNION SELECT r.destination FROM sdk_message_routes m JOIN sdk_topic_routes r ON r.destination=m.destination WHERE r.chat_id=? AND m.message_id=?').all(chatId,id,id,chatId,id) as Array<{destination:string}>;
@@ -134,11 +136,14 @@ export class FeishuSdkPort implements FeishuPort {
     }
     if (found.size===0) throw new UnknownTopic('unknown topic');
     if (found.size!==1) throw new Error('conflicting topic');
-    return [...found][0]!;
+    const destination=[...found][0]!;if(!this.authorizedDestination(destination)) throw new UnknownTopic('test topic unavailable');return destination;
   }
   public callbackDestination(chatId:string,messageId:string):string {
     if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
+    const reservedRoot=this.db.prepare('SELECT state FROM sdk_lane_registry WHERE root_id=?').get(messageId) as {state:string}|undefined;
+    if(reservedRoot) {if(reservedRoot.state==='closed') throw new ClosedTestRoute('test topic closed');throw new UnknownCardRoute('test topic unavailable');}
     const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;
+    if (row && this.db.prepare("SELECT 1 FROM sdk_lane_registry WHERE destination=? AND state='closed'").get(row.destination)) throw new ClosedTestRoute('test topic closed');
     if (!row || !this.authorizedDestination(row.destination)) throw new UnknownCardRoute('unknown card message');
     const route=this.route(row.destination);
     if ((route?.chat_id ?? row.destination)!==chatId) throw new UnknownCardRoute('card chat mismatch');
@@ -198,7 +203,7 @@ export class FeishuSdkPort implements FeishuPort {
     this.allowed(destination);const source=this.route(destination),chat=source?.chat_id ?? destination;const read=()=>this.db.prepare('SELECT destination,chat_id,root_id,session_id FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string;chat_id:string;root_id:string;session_id:string}|undefined;const row=read();if(!row)return null;this.allowed(row.destination);const scope=JSON.stringify([destination,sessionId,source ?? null,row]);return this.scopedMessageLink(chat,row.root_id,scope,()=>{const now=read();return JSON.stringify(now ?? null)===JSON.stringify(row) && JSON.stringify(this.route(destination) ?? null)===JSON.stringify(source ?? null) && this.authorizedDestination(row.destination);});
   }
   private queueResource(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',scope:string):void {
-    const serialized=JSON.stringify(e); const old=this.db.prepare('SELECT envelope,message_id,resource_key,resource_type FROM sdk_inbound_resources WHERE event_id=?').get(e.eventId) as {envelope:string;message_id:string;resource_key:string;resource_type:string}|undefined;
+    this.allowed(e.destination); const serialized=JSON.stringify(e); const old=this.db.prepare('SELECT envelope,message_id,resource_key,resource_type FROM sdk_inbound_resources WHERE event_id=?').get(e.eventId) as {envelope:string;message_id:string;resource_key:string;resource_type:string}|undefined;
     if(old) { const oldScope=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(e.eventId) as {scope:string}|undefined; if(old.envelope!==serialized || old.message_id!==messageId || old.resource_key!==key || old.resource_type!==type || oldScope?.scope!==scope) throw new Error('resource event conflict'); return; }
     this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT INTO sdk_inbound_resources VALUES (?,?,?,?,?)').run(e.eventId,serialized,messageId,key,type); this.db.prepare('INSERT INTO sdk_resource_scopes VALUES (?,?)').run(e.eventId,scope); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
   }
@@ -214,7 +219,7 @@ export class FeishuSdkPort implements FeishuPort {
       try {
         const e=JSON.parse(row.envelope) as TrustedEnvelope; this.allowed(e.destination); if(e.identity.source!=='feishu' || e.identity.subject!==this.owner) throw new ResourceRejected('authorization changed');
         const saved=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(row.event_id) as {scope:string}|undefined; if (!saved) throw new ResourceRejected('resource missing binding scope');
-        await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>(await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),handle,saved.scope);
+        await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>{this.allowed(e.destination);return (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream();},async (envelope,action,scope)=>{this.allowed(envelope.destination);return handle(envelope,action,scope);},saved.scope);
         this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('DELETE FROM sdk_inbound_resources WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_failures WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_scopes WHERE event_id=?').run(row.event_id); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
         try {this.onResourceHealth('healthy',null);} catch {}
       } catch(error) {
