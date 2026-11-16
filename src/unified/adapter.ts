@@ -71,6 +71,7 @@ export interface PlatformPort {
   seedControlGeneration?(ref: NativeSessionRef, minimum: number): void;
   list(cursor: string | null, limit: number): Promise<Page<Session>>;
   discoverExisting?(cursor:string|null,limit:number):Promise<Page<Session>>;
+  readAutoActivity?(ref:NativeSessionRef,watermark:number,observed:number):Promise<{status:'proven'|'unknown'|'future';snapshot?:SessionSnapshot;oldMessageIds?:string[];newMessageIds?:string[];oldTurns?:Turn[]}>;
   discoverRunning?(cursor: string | null, limit: number): Promise<Page<Session>>;
   discoverNewer?(watermark:number,cursor:string|null,limit:number):Promise<Page<Session>>;
   read(ref: NativeSessionRef): Promise<SessionSnapshot>;

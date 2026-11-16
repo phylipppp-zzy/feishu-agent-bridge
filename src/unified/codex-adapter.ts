@@ -15,6 +15,7 @@ const invalidNative = (): never => { throw contractError('temporarily_unavailabl
 /** Native identifiers in normalized objects are provider-local; core maps and persists them. */
 export class CodexAdapter implements PlatformPort {
   readonly provider = 'codex' as const;
+  private readonly existingCursors=new Map<string,number>();
   private discovery = new Map<string,{generation:number; loaded:Set<string>; phase:'loaded'|'list'; cursor:string|null; seen:Set<string>; buffer:Session[]; done:boolean; expires:number}>();
   private readonly recentDiscovery=new Map<string,{generation:number;watermark:number;cursor:string|null;seenCursors:Set<string>;seenIds:Set<string>;buffer:Session[];done:boolean;expires:number}>();
   private readonly owned = new Set<string>();
@@ -105,6 +106,26 @@ export class CodexAdapter implements PlatformPort {
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request'); const r = await this.transport.request('thread/list', { cursor, limit }) as Obj;
     if (!Array.isArray(r?.data) || !(r.nextCursor == null || typeof r.nextCursor === 'string')) return invalidNative(); return { items: r.data.map((t: Obj) => this.session(t)), nextCursor: r.nextCursor ?? null };
+  }
+  /** Existing thread listing is only a candidate index; it proves no turn activity. */
+  async discoverExisting(cursor:string|null,limit:number):Promise<{items:Session[];nextCursor:string|null;partialFailure?:boolean}> {
+    if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw contractError('invalid_request');const generation=this.transport.generation;if(cursor!==null && this.existingCursors.get(cursor)!==generation)throw contractError('snapshot_required');
+    const r=await this.transport.request('thread/list',{cursor,limit}) as Obj;if(!this.transport.connected||this.transport.generation!==generation || !Array.isArray(r?.data) || !(r.nextCursor==null || typeof r.nextCursor==='string'))return invalidNative();
+    if(cursor!==null)this.existingCursors.delete(cursor);if(typeof r.nextCursor==='string'){if(!r.nextCursor || r.nextCursor===cursor)throw contractError('snapshot_required');if(this.existingCursors.size>=1024)this.existingCursors.delete(this.existingCursors.keys().next().value!);this.existingCursors.set(r.nextCursor,generation);}const items:Session[]=[];let partialFailure=false;for(const raw of r.data)try{if(!raw || !isString(raw.id) || !Number.isSafeInteger(raw.createdAt) || raw.createdAt<=0 || raw.createdAt>8.64e12)throw Error('invalid');if(!['cli','vscode','appServer'].includes(raw.source) || raw.parentThreadId!=null)continue;items.push(this.session(raw));}catch{partialFailure=true;}return {items,nextCursor:r.nextCursor??null,...(partialFailure?{partialFailure:true}:{})};
+  }
+  /** One native snapshot provides both evidence and message-to-turn boundary. */
+  async readAutoActivity(ref:NativeSessionRef,watermark:number,observed:number):Promise<{status:'proven'|'unknown'|'future';snapshot?:SessionSnapshot;oldMessageIds?:string[];newMessageIds?:string[];oldTurns?:Turn[]}> {
+    const id=this.check(ref),generation=this.transport.generation;if(!Number.isSafeInteger(watermark)||!Number.isSafeInteger(observed)||watermark>=observed)return {status:'unknown'};
+    const r=await this.transport.request('thread/read',{threadId:id,includeTurns:true}) as Obj;if(!this.transport.connected||this.transport.generation!==generation)throw contractError('snapshot_required');const thread=r?.thread;
+    if(!thread || thread.id!==id || !['cli','vscode','appServer'].includes(thread.source) || thread.parentThreadId!=null || !Number.isSafeInteger(thread.createdAt) || thread.createdAt>watermark || !Array.isArray(thread.turns) || thread.turns.length>10000)return {status:'unknown'};
+    if(thread.turns.some((turn:Obj)=>Number.isSafeInteger(turn?.startedAt)&&turn.startedAt>observed))return {status:'future'};
+    const seenTurns=new Set<string>(),seenItems=new Set<string>(),oldTurns=new Set<string>(),newTurns=new Set<string>();let last=0,foundNew=false,total=0;
+    for(const turn of thread.turns){if(!turn || !isString(turn.id) || seenTurns.has(turn.id) || !Array.isArray(turn.items) || (turn.itemsView!==undefined && turn.itemsView!=='full') || !Number.isSafeInteger(turn.startedAt) || turn.startedAt<=0)return {status:'unknown'};seenTurns.add(turn.id);if(turn.startedAt>observed)return {status:'future'};if(turn.startedAt===watermark || turn.startedAt<last)return {status:'unknown'};last=turn.startedAt;if(turn.startedAt>watermark){if(turn.status!=='completed')return {status:'unknown'};foundNew=true;newTurns.add(turn.id);}else{if(foundNew || !['completed','failed','interrupted'].includes(turn.status))return {status:'unknown'};oldTurns.add(turn.id);}for(const item of turn.items){if(++total>50000 || !item || !isString(item.id) || seenItems.has(item.id))return {status:'unknown'};seenItems.add(item.id);}}
+    if(!foundNew)return {status:'unknown'};const session=this.session(thread),messages:Message[]=[];
+    for(const turn of thread.turns)for(const item of turn.items){const message=this.message(id,turn.id,item,true);if(message)messages.push(message);}
+    const oldMessageIds=messages.filter(m=>oldTurns.has(m.turnId)).map(m=>m.messageId),newMessageIds=messages.filter(m=>newTurns.has(m.turnId)).map(m=>m.messageId);
+    if(!messages.some(m=>newTurns.has(m.turnId)&&m.role==='assistant'&&m.final&&m.blocks.some(b=>b.type==='text'&&b.text.trim())))return {status:'unknown'};
+    return {status:'proven',snapshot:{session,messages,turns:thread.turns.filter((turn:Obj)=>newTurns.has(turn.id)).map((turn:Obj)=>this.turn(id,turn)),interactions:[],connectionGeneration:generation},oldMessageIds,newMessageIds,oldTurns:thread.turns.filter((turn:Obj)=>oldTurns.has(turn.id)).map((turn:Obj)=>this.turn(id,turn))};
   }
   /** Incremental bounded scan: loaded IDs are intersected with raw active list entries. */
   async discoverRunning(cursor:string|null, limit:number):Promise<{items:Session[];nextCursor:string|null;partialFailure?:boolean}> {
