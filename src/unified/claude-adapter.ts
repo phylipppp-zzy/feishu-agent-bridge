@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { query, listSessions, getSessionMessages, type Query, type Options, type SDKUserMessage, type CanUseTool, type SDKSessionInfo, type SessionMessage } from '@anthropic-ai/claude-agent-sdk';
-import { InputQueue, imageMediaType } from '../claude/runner.js';
+import { InputQueue } from '../claude/runner.js';
+import { imageMediaType } from '../image-media.js';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
 import { payloadDigest, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
 import { contractError } from './errors.js';

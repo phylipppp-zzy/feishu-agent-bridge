@@ -6,7 +6,7 @@ import { parseIncoming, parseCardAction } from '../feishu.js';
 import { toFeishuCard, parseFeishuAction, parseFeishuText } from './feishu-codec.js';
 import type { ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import type { ChannelCard } from './feishu-cards.js';
-import { imageMediaType } from '../claude/runner.js';
+import { imageMediaType } from '../image-media.js';
 import type { Readable } from 'node:stream';
 
 class ResourceRejected extends Error {}

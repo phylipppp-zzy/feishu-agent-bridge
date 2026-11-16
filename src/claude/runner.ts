@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type { ImageMediaType } from "../image-media.js";
+export { imageMediaType } from "../image-media.js";
 import { query as sdkQuery, type CanUseTool, type ModelInfo, type Options, type PermissionMode, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { idleDelayFor, type BackgroundWorkState } from "./runner-idle-policy.js";
 
@@ -16,16 +18,7 @@ export const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "
 export type FeishuPermissionMode = "default" | "acceptEdits" | "plan" | "auto";
 export const FEISHU_PERMISSION_MODES: readonly FeishuPermissionMode[] = ["default", "acceptEdits", "plan", "auto"];
 
-export interface ImageInput { mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp"; base64: string }
-
-/** The image type of `data` from its first bytes; null for anything Claude cannot read as an image. */
-export function imageMediaType(data: Buffer): ImageInput["mediaType"] | null {
-  if (data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
-  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "image/jpeg";
-  if (data.length >= 6 && /^GIF8[79]a$/.test(data.subarray(0, 6).toString("latin1"))) return "image/gif";
-  if (data.length >= 12 && data.subarray(0, 4).toString("latin1") === "RIFF" && data.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
-  return null;
-}
+export interface ImageInput { mediaType: ImageMediaType; base64: string }
 
 /** A queue the SDK reads as streaming input, which keeps the session open between turns. */
 export class InputQueue<T> implements AsyncIterable<T> {
