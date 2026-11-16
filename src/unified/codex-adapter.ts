@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
-import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
+import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
 import { contractError } from './errors.js';
 import { CodexTransport } from './codex-transport.js';
 
@@ -24,6 +24,8 @@ export class CodexAdapter implements PlatformPort {
   private nativeIndex = new Map<string, string>();
   private listeners = new Set<(event: PlatformObservation) => void>();
   private messages = new Map<string, Message>();
+  private readonly residualTurns=new Map<string,{generation:number;items:Set<string>;version:number;overflow:boolean}>();
+  private readonly residualQueries=new Map<string,Promise<TurnResidual>>();
   private sequence = 0;
   private settings = new Map<string, {model:string|null; effort?:string}>();
   constructor(readonly transport: CodexTransport, readonly hostId: string, readonly serviceId: string) {
@@ -91,6 +93,8 @@ export class CodexAdapter implements PlatformPort {
     }
     if (!thread || generation!==this.transport.generation) return;
     if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
+    if(m.method==='turn/started' && isString(p.turn?.id) && this.active.has(thread)) {const key=`${thread}\0${p.turn.id}`;if(this.residualTurns.get(key)?.generation!==generation){if(this.residualTurns.size>=1024) this.residualTurns.delete(this.residualTurns.keys().next().value!);this.residualTurns.set(key,{generation,items:new Set(),version:0,overflow:false});}}
+    if((m.method==='item/started' || m.method==='item/completed') && isString(p.turnId) && p.item?.type==='commandExecution' && isString(p.item?.id)) {const tracked=this.residualTurns.get(`${thread}\0${p.turnId}`);if(tracked?.generation===generation && !tracked.items.has(p.item.id)) {if(tracked.items.size>=10000) tracked.overflow=true;else tracked.items.add(p.item.id);tracked.version++;}}
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
       const turn = this.turn(thread,p.turn);
       this.emit({ type: 'turn', turn, ref: this.ref(thread) } as PlatformObservation); return;
@@ -165,6 +169,8 @@ export class CodexAdapter implements PlatformPort {
     guard.assertCurrent(); const response = await this.transport.request(mode === 'new' ? 'turn/start' : 'turn/steer', mode === 'new' ? { threadId: id, input, ...(this.settings.get(id) ?? {}) } : { threadId: id, expectedTurnId: turnId, input });
     const r = response as Obj; return ack(typeof r?.turn?.id === 'string' ? r.turn.id : typeof r?.turnId === 'string' ? r.turnId : null);
   }
+  async inspectTurnResidual(ref:NativeSessionRef,turnId:string):Promise<TurnResidual> {const key=JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId,turnId,this.transport.generation]);let work=this.residualQueries.get(key);if(!work){work=this.inspectTurnResidualOnce(ref,turnId,Date.now()+5000);this.residualQueries.set(key,work);void work.finally(()=>{if(this.residualQueries.get(key)===work)this.residualQueries.delete(key);}).catch(()=>{});}let timer:ReturnType<typeof setTimeout>|undefined;try {return await Promise.race([work,new Promise<TurnResidual>(resolve=>{timer=setTimeout(()=>resolve({status:'unknown',count:null,observedAt:null,complete:false,reason:'残留查询超时'}),5000);})]);}finally{if(timer)clearTimeout(timer);}}
+  private async inspectTurnResidualOnce(ref:NativeSessionRef,turnId:string,deadline:number):Promise<TurnResidual> {const id=this.check(ref),tracked=this.residualTurns.get(`${id}\0${turnId}`),generation=this.transport.generation; let observedAt:string|null=null; const matched=new Set<string>();const unknown=(reason:string):TurnResidual=>matched.size && observedAt ? {status:'running',count:matched.size,observedAt,complete:false,reason} : {status:'unknown',count:null,observedAt:null,complete:false,reason}; if(!isString(turnId) || !tracked || tracked.overflow || tracked.generation!==generation || !this.transport.connected) return unknown('缺少当前连接代次的完整轮次归属'); const version=tracked.version; let cursor:string|null=null;const seen=new Set<string>();try {for(let page=0;page<100;page++){if(Date.now()>=deadline)return unknown('残留查询超时');const result=await this.transport.request('thread/backgroundTerminals/list',{threadId:id,cursor,limit:100}) as Obj;if(Date.now()>=deadline)return unknown('残留查询超时');if(this.transport.generation!==generation || !this.transport.connected || this.residualTurns.get(`${id}\0${turnId}`)!==tracked || tracked.version!==version) return unknown('查询期间连接或归属发生变化');if(!Array.isArray(result?.data) || !(result.nextCursor==null || isString(result.nextCursor))) return unknown('残留查询返回格式无效');observedAt=new Date().toISOString();for(const item of result.data){if(!isString(item?.itemId)) return unknown('残留任务缺少身份');if(tracked.items.has(item.itemId))matched.add(item.itemId);}cursor=result.nextCursor??null;if(cursor===null){const count=matched.size;return {status:count?'running':'none',count,observedAt,complete:true,reason:count?'目标轮次已登记任务仍在运行，其他外部作业或后代未确认':'未发现目标轮次已登记残留；未知外部作业或后代未确认'};}if(seen.has(cursor)) return unknown('残留查询分页重复');seen.add(cursor);}return unknown('残留查询超过分页预算');}catch{return unknown('残留查询失败或不可用');} }
   async interrupt(ref: NativeSessionRef, turnId: string, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const id = this.check(ref); if (!this.active.has(id) || !this.transport.connected) throw contractError('control_conflict'); if (!isString(turnId)) throw contractError('invalid_request'); if (guard.expectedConnectionGeneration !== null && guard.expectedConnectionGeneration !== this.transport.generation) throw contractError('control_conflict'); guard.assertCurrent(); await this.transport.request('turn/interrupt', { threadId: id, turnId }); return ack(turnId); }
   async respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement> {
     const id = this.check(ref), req = this.requests.get(interaction.interactionId), i = req?.interaction;

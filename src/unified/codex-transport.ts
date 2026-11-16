@@ -75,7 +75,7 @@ export class CodexTransport {
         socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
         socket.addEventListener('error', () => { clearTimeout(timer); reject(contractError('temporarily_unavailable', 'connection failed')); }, { once: true });
       });
-      await this.request('initialize', { clientInfo: { name: 'unified-codex-adapter', version: '1' } });
+      await this.request('initialize', { clientInfo: { name: 'unified-codex-adapter', version: '1' }, capabilities:{experimentalApi:true} });
       this.notify('initialized', {}); this.success();
     } catch (e) { this.closed(socket, this.generation); socket.close(); throw e; }
   }

@@ -1,6 +1,6 @@
 import type { DirectoryListing } from '../claude/deliver.js';
 import type { ModelOption, ConfirmedSettings } from './contracts.js';
-import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event } from './contracts.js';
+import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual } from './contracts.js';
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
@@ -17,12 +17,15 @@ export interface UnifiedService {
   selectProjectFiles?(sessionId:string, args:string):Promise<Artifact[]>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
+  getTurn?(sessionId:string,turnId:string):Promise<Turn|null>;
+  hasStopRequest?(sessionId:string,turnId:string):Promise<boolean>;
   getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
   submitInput(request: SubmitInput): Promise<Operation>;
   listInteractions(sessionId: string, query: ListQuery): Promise<Page<Interaction>>;
   getInteraction(interactionId: string): Promise<Interaction>;
   resolveInteraction(request: ResolveInteraction): Promise<Operation>;
   interruptTurn(request: WriteRequest<{ turnId: string }>): Promise<Operation>;
+  inspectTurnResidual?(sessionId:string,turnId:string):Promise<TurnResidual>;
   cancelQueuedInput(request: WriteRequest<{ inputId: string }>): Promise<Operation>;
   getControlState(sessionId: string): Promise<ControlState>;
   requestControl(request: WriteRequest<{ owner: string; strategy: 'wait' | 'interrupt' }>): Promise<Operation>;
@@ -73,6 +76,7 @@ export interface PlatformPort {
   /** For input, nativeReference must be the resulting turn ID, or null if not provable. */
   input(ref: NativeSessionRef, mode: 'new' | 'steer', blocks: PlatformInputBlock[], guard: DispatchGuard, turnId?: string): Promise<PlatformAcknowledgement>;
   interrupt(ref: NativeSessionRef, turnId: string, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
+  inspectTurnResidual?(ref:NativeSessionRef,turnId:string):Promise<TurnResidual>;
   respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   onObservation(listener: (observation: PlatformObservation) => void): () => void;
   listProjectFiles?(ref:NativeSessionRef, directory:string, showHidden:boolean):Promise<DirectoryListing>;

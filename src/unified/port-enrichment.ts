@@ -116,6 +116,7 @@ export class EnrichedPort implements PlatformPort {
   async resume(ref:NativeSessionRef) { await this.writable(ref); return this.base.resume(ref); }
   create(...args:Parameters<PlatformPort['create']>) { return this.base.create(...args); }
   async input(...args:Parameters<PlatformPort['input']>) { await this.writable(args[0]); return this.base.input(...args); }
+  async inspectTurnResidual(ref:NativeSessionRef,turnId:string) {if(!this.base.inspectTurnResidual) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'此provider未提供可信残留查询'};return this.base.inspectTurnResidual(ref,turnId);}
   async interrupt(...args:Parameters<PlatformPort['interrupt']>) { await this.writable(args[0]); return this.base.interrupt(...args); }
   async respond(...args:Parameters<PlatformPort['respond']>) { await this.writable(args[0]); return this.base.respond(...args); }
   async control(...args:Parameters<PlatformPort['control']>) { await this.writable(args[0]); return this.base.control(...args); }

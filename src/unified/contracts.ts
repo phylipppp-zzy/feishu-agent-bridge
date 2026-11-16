@@ -29,6 +29,7 @@ export type Answer = { kind: 'question'; values: string[] } | { kind: 'approval'
 export interface ResolveInteraction { context: WriteContext; interactionId: string; expectedConnectionGeneration: number; answer: Answer; toolInputDigest: string | null }
 export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[] }
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
+export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
 export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[] }
 /** All collections and the cursor are read at one consistent event watermark. Interaction status includes delivery state. */
 export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; connectionGeneration?: number }
