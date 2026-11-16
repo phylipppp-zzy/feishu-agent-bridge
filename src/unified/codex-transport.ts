@@ -42,9 +42,12 @@ export class CodexTransport {
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void; timer: ReturnType<typeof setTimeout> }>();
   generation = 0;
   lastError: string | null = null;
+  onHealth:(status:'healthy'|'degraded',reason:string|null)=>void=()=>{};
+  private verified=false; private attempted=false;
   updatedAt = new Date().toISOString();
-  health() { return { component: 'codex-transport', status: this.connected ? (this.lastError ? 'degraded' as const : 'healthy' as const) : 'unreachable' as const, reason: this.connected ? this.lastError : (this.lastError ?? 'not connected'), backlog: this.pending.size, lastDeliveryAt: null, updatedAt: this.updatedAt }; }
-  private fault(reason:string) { this.lastError = reason; this.updatedAt = new Date().toISOString(); }
+  health() { return { component: 'codex-transport', status: !this.attempted ? 'unverified' as const : this.connected ? (this.lastError ? 'degraded' as const : this.verified ? 'healthy' as const : 'unverified' as const) : 'unreachable' as const, reason: this.connected ? this.lastError : (this.lastError ?? 'not connected'), backlog: this.pending.size, lastDeliveryAt: null, updatedAt: this.updatedAt }; }
+  private fault(reason:string) { this.lastError = reason; this.updatedAt = new Date().toISOString(); try {this.onHealth('degraded',reason);} catch {} }
+  private success() {this.verified=true;this.lastError=null;this.updatedAt=new Date().toISOString();try {this.onHealth('healthy',null);} catch {}}
   get connected(): boolean { return this.socket?.readyState === 1; }
   onMessage: (message: Wire, generation: number) => void = () => {};
   onDisconnect: (generation: number) => void = () => {};
@@ -55,13 +58,13 @@ export class CodexTransport {
   seedGeneration(minimum:number): void { if (!Number.isSafeInteger(minimum) || minimum < 0 || this.pending.size) throw contractError('busy','cannot seed active transport'); if (this.generation <= minimum) this.generation = minimum + (this.connected ? 1 : 0); }
   async connect(): Promise<void> {
     if (this.socket) throw contractError('busy', 'connection already active');
-    const socket = this.factory(this.endpoint); this.socket = socket; const generation = ++this.generation;
+    this.attempted=true; const socket = this.factory(this.endpoint); this.socket = socket; const generation = ++this.generation;
     socket.addEventListener('message', (event: Event) => {
       if (this.socket !== socket) return;
       let message: Wire; try { message = JSON.parse(String((event as MessageEvent).data)) as Wire; } catch { this.fault('invalid app-server message'); return; }
       if (typeof message.id === 'number' && !message.method && this.pending.has(message.id)) {
         const entry = this.pending.get(message.id)!; this.pending.delete(message.id); clearTimeout(entry.timer);
-        if ('error' in message) { this.fault('app-server rejected request'); entry.reject(contractError('temporarily_unavailable', 'app-server rejected request')); } else { this.lastError = null; this.updatedAt = new Date().toISOString(); entry.resolve(message.result); }
+        if ('error' in message) { this.fault('app-server rejected request'); entry.reject(contractError('temporarily_unavailable', 'app-server rejected request')); } else { this.success(); entry.resolve(message.result); }
       } else this.onMessage(message, this.generation);
     });
     socket.addEventListener('close', () => this.closed(socket, this.generation));
@@ -73,12 +76,12 @@ export class CodexTransport {
         socket.addEventListener('error', () => { clearTimeout(timer); reject(contractError('temporarily_unavailable', 'connection failed')); }, { once: true });
       });
       await this.request('initialize', { clientInfo: { name: 'unified-codex-adapter', version: '1' } });
-      this.notify('initialized', {}); this.lastError = null; this.updatedAt = new Date().toISOString();
+      this.notify('initialized', {}); this.success();
     } catch (e) { this.closed(socket, this.generation); socket.close(); throw e; }
   }
   private closed(socket: Socket, generation: number): void {
     if (this.socket !== socket) return;
-    this.socket = undefined; this.fault('connection closed');
+    this.socket = undefined; this.verified=false; this.fault('connection closed');
     for (const entry of this.pending.values()) { clearTimeout(entry.timer); entry.reject(contractError('outcome_unknown', 'connection lost after request was sent')); }
     this.pending.clear(); this.onDisconnect(generation);
   }

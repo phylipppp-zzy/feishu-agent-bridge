@@ -10,6 +10,8 @@ import { imageMediaType } from '../claude/runner.js';
 import type { Readable } from 'node:stream';
 
 class ResourceRejected extends Error {}
+class FeishuApiRejected extends Error { readonly deliveryKind='api_rejected'; constructor(readonly platformCode:number) {super('Feishu API rejected request');} }
+function rejectCode(code:unknown):void {if(typeof code==='number' && Number.isSafeInteger(code) && code!==0) throw new FeishuApiRejected(code);}
 class UnknownTopic extends Error {}
 class UnknownCardRoute extends Error {}
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
@@ -154,7 +156,7 @@ export class FeishuSdkPort implements FeishuPort {
     if (!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes) throw new Error('topic creation outcome unknown');
     await guard?.(); this.allowed(destination);
     const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content:JSON.stringify(toFeishuCard(card))}});
-    if(response.code || !response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
+    rejectCode(response.code); if(!response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
     const root=response.data.message_id; const key=`topic:${randomUUID()}`;
     this.routeGeneration++; this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId); this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key); this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
     return key;
@@ -162,20 +164,20 @@ export class FeishuSdkPort implements FeishuPort {
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
     await guard?.(); this.allowed(destination); const route=this.route(destination); const content=JSON.stringify(toFeishuCard(card));
     const response=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}});
-    if (response.code || !response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
+    rejectCode(response.code); if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
     this.remember(deliveryId,response.data.message_id,destination); return response.data.message_id;
   }
   async update(destination:string,messageId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     await guard?.(); this.allowed(destination); if(this.callbackDestination(this.route(destination)?.chat_id ?? destination,messageId)!==destination) throw new Error('message route mismatch');
     const response = await this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(toFeishuCard(card))}});
-    if (response.code) throw new Error('Feishu update failed or outcome unknown'); this.remember(deliveryId,messageId,destination);
+    rejectCode(response.code); this.remember(deliveryId,messageId,destination);
   }
   async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     this.allowed(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
     if (!uploaded?.file_key) throw new Error('Feishu upload failed or outcome unknown');
     await guard?.(); this.allowed(destination); const route=this.route(destination); const body=JSON.stringify({file_key:uploaded.file_key});
     const sent=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'file',content:body,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'file',content:body}});
-    if (sent.code || !sent.data?.message_id) throw new Error('Feishu file send failed or outcome unknown'); this.remember(deliveryId,sent.data.message_id,destination);
+    rejectCode(sent.code); if (!sent.data?.message_id) throw new Error('Feishu file send failed or outcome unknown'); this.remember(deliveryId,sent.data.message_id,destination);
   }
   async lookupDelivery(id:string):Promise<'sent'|'unknown'> { return this.db.prepare('SELECT id FROM sdk_deliveries WHERE id=? AND message_id IS NOT NULL').get(id) ? 'sent' : 'unknown'; }
   private dataVersion():number { const row=this.db.prepare('PRAGMA data_version').get() as {data_version:number};return row.data_version; }
@@ -204,6 +206,7 @@ export class FeishuSdkPort implements FeishuPort {
   resourceIssues(): Array<{eventId:string;state:string;attempts:number;reason:string}> {
     return this.db.prepare('SELECT event_id AS eventId,state,attempts,reason FROM sdk_resource_failures ORDER BY rowid').all() as Array<{eventId:string;state:string;attempts:number;reason:string}>;
   }
+  onResourceHealth:(status:'healthy'|'degraded',reason:string|null)=>void=()=>{};
   /** GET may safely repeat; per-item failures are persisted and never block later work. */
   async drainInbound(handle:(envelope:TrustedEnvelope,action:ChannelAction,scope?:string)=>Promise<unknown>):Promise<void> {
     const rows=this.db.prepare("SELECT r.* FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE f.event_id IS NULL OR (f.state='retry' AND f.next_attempt<=?) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file'}>;
@@ -213,12 +216,13 @@ export class FeishuSdkPort implements FeishuPort {
         const saved=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(row.event_id) as {scope:string}|undefined; if (!saved) throw new ResourceRejected('resource missing binding scope');
         await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>(await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),handle,saved.scope);
         this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('DELETE FROM sdk_inbound_resources WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_failures WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_scopes WHERE event_id=?').run(row.event_id); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
+        try {this.onResourceHealth('healthy',null);} catch {}
       } catch(error) {
         const previous=this.db.prepare('SELECT attempts FROM sdk_resource_failures WHERE event_id=?').get(row.event_id) as {attempts:number}|undefined;
         const attempts=(previous?.attempts ?? 0)+1; const permanent=error instanceof ResourceRejected;
         const state=permanent?'rejected':attempts>=3?'needs_review':'retry';
         const reason=permanent ? error.message : 'resource download or intake failed; outcome requires checking';
-        this.db.prepare('INSERT OR REPLACE INTO sdk_resource_failures VALUES (?,?,?,?,?)').run(row.event_id,state,attempts,reason,Date.now()+Math.min(30000,1000*2**(attempts-1)));
+        this.db.prepare('INSERT OR REPLACE INTO sdk_resource_failures VALUES (?,?,?,?,?)').run(row.event_id,state,attempts,reason,Date.now()+Math.min(30000,1000*2**(attempts-1)));try {this.onResourceHealth('degraded',permanent?'资源不符合接收条件':'资源读取或入库待核对');} catch {}
       }
     }
   }

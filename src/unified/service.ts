@@ -21,6 +21,7 @@ export class UnifiedCore implements UnifiedService {
   private readonly tails = new Map<string, Promise<unknown>>();
   private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
+  onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
   constructor(readonly store: UnifiedStore, providers: PlatformPort[], private readonly authorize: Authorize, private readonly authorizeBootstrap: (identity: WriteContext['identity'], provider: Provider) => boolean = () => false, private readonly mayDetach: (session: Session) => boolean = () => false, private readonly canDiscover?: (session: Session) => boolean, private readonly historyReader?: HistoryReader) {
     for (const port of providers) {
@@ -198,7 +199,7 @@ export class UnifiedCore implements UnifiedService {
   async readArtifact(sessionId: string, artifactId: string, contentVersion: string) { const s = this.store.getSession(sessionId); return this.store.stagedArtifact(sessionId,artifactId,contentVersion) ?? await this.port(s).readArtifact(s.native,artifactId,contentVersion); }
   async getConfirmedSettings(sessionId: string) { return this.store.confirmedSettings(sessionId); }
   async listModels(sessionId: string, query: ListQuery) { const s = this.store.getSession(sessionId); return page(await this.port(s).listModels(s.native),query); }
-  async health() { return [{component:'core',status:this.observationFailure || this.store.recoveryQuarantineCount() ? 'degraded' as const : 'healthy' as const,reason:this.observationFailure ?? (this.store.recoveryQuarantineCount() ? 'reconnect and explicitly attach quarantined sessions' : null),backlog:this.store.pendingOutbox().length,lastDeliveryAt:null,updatedAt:new Date().toISOString()}]; }
+  async health():ReturnType<UnifiedService['health']> { return [{component:'core',status:this.observationFailure || this.store.recoveryQuarantineCount() ? 'degraded' as const : 'healthy' as const,reason:this.observationFailure ?? (this.store.recoveryQuarantineCount() ? 'reconnect and explicitly attach quarantined sessions' : null),backlog:this.store.pendingOutbox().length,lastDeliveryAt:null,updatedAt:new Date().toISOString()}]; }
   /** Dispatch one persisted item; unknown/in-flight work is never automatically resent. */
   async dispatch(id: string): Promise<Operation> {
     const pending = this.store.getOutbox(id);
@@ -301,7 +302,7 @@ export class UnifiedCore implements UnifiedService {
     if (observation.type === 'message') {
       const m: Message = {...observation.message, sessionId:mapped.sessionId}; const generation=observation.connectionGeneration; if(generation!==undefined && generation!==this.store.connectionGeneration(mapped.sessionId)) return; const snapshot = this.store.snapshot(m.sessionId); const prior = snapshot.value.messages.find(x => x.messageId === m.messageId);
       const key=JSON.stringify([mapped.sessionId,generation,m.messageId]); const seen=this.messageObservations.get(key); if((seen!==undefined && m.revision<=seen) || (generation===undefined && prior && m.revision<=prior.revision) || (prior?.final && !m.final)) return; this.messageObservations.set(key,m.revision); if(prior && payloadDigest({...m,sequence:prior.sequence,revision:prior.revision})===payloadDigest(prior)) return;
-      this.store.putMessage(prior ? {...m,sequence:prior.sequence,revision:prior.revision+1} : {...m,sequence:Math.max(0,...snapshot.value.messages.map(x=>x.sequence))+1}, prior?.revision ?? null); return;
+      this.store.putMessage(prior ? {...m,sequence:prior.sequence,revision:prior.revision+1} : {...m,sequence:Math.max(0,...snapshot.value.messages.map(x=>x.sequence))+1}, prior?.revision ?? null); this.onAcceptedObservation?.(observation); return;
     }
     if (observation.type === 'interaction') {
       {
@@ -310,16 +311,16 @@ export class UnifiedCore implements UnifiedService {
         if (!prior) this.store.insertInteraction(i,observation.interaction);
         else if (i.status === 'expired' || i.status === 'cancelled') this.store.expireNativeInteraction(i.interactionId,i.connectionGeneration,i.nativeRequestId,i.status,i.nativeResult);
         else if (i.nativeResult) this.store.recordNativeResult(i.interactionId, i.connectionGeneration, i.nativeRequestId, i.nativeResult, i.status === 'resolved');
-        this.store.observeInteractionStatus(i.sessionId,i.turnId);
+        this.store.observeInteractionStatus(i.sessionId,i.turnId); const persisted=this.store.getInteraction(i.interactionId); if(persisted.status===i.status && (!prior || payloadDigest(prior)!==payloadDigest(persisted))) this.onAcceptedObservation?.({...observation,interaction:persisted});
       } return;
     }
     if (observation.type === 'event') {
-      const { schemaVersion: _v, sequence: _s, cursor: _c, ...event } = observation.event; const data = event.type === 'artifact.available' && event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? {...event.data,sessionId:mapped.sessionId} : event.data; this.store.appendEvent({...event,sessionId:mapped.sessionId,data}); return;
+      const { schemaVersion: _v, sequence: _s, cursor: _c, ...event } = observation.event; const data = event.type === 'artifact.available' && event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? {...event.data,sessionId:mapped.sessionId} : event.data; const before=this.store.snapshot(mapped.sessionId).cursor; this.store.appendEvent({...event,sessionId:mapped.sessionId,data}); if(this.store.snapshot(mapped.sessionId).cursor!==before) this.onAcceptedObservation?.(observation); return;
     }
     if (observation.type === 'session') {
       const next = {...observation.session, sessionId:mapped.sessionId, native:mapped.native};
       await this.serial(next.sessionId, async () => { const owner = randomUUID(); const generation = this.store.acquireDispatchLease(next.sessionId,owner,Date.now(),30000); if (generation === null) return fail('busy','control observation needs replay'); try { if(this.store.recoveryQuarantined(next.sessionId)) return; const current = this.store.getSession(next.sessionId); if (next.control.generation < current.control.generation) return fail('control_conflict'); const normalized = {...next, revision:current.revision}; if (JSON.stringify(normalized) !== JSON.stringify(current)) this.store.updateSession({...normalized,revision:current.revision+1},current.revision,current.control.generation); } finally { this.store.releaseDispatchLease(next.sessionId,owner,generation); } });
     }
-    if (observation.type === 'turn') await this.serial(mapped.sessionId,async () => { if (this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId)) return; this.store.observeTurn({...observation.turn,sessionId:mapped.sessionId}); });
+    if (observation.type === 'turn') await this.serial(mapped.sessionId,async () => { if (this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId)) return; const before=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); this.store.observeTurn({...observation.turn,sessionId:mapped.sessionId}); const persisted=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); if(persisted?.status===observation.turn.status && (!before || payloadDigest(before)!==payloadDigest(persisted))) this.onAcceptedObservation?.(observation); });
   }
 }

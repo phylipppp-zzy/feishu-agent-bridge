@@ -36,7 +36,7 @@ export interface UnifiedService {
   getOperation(operationId: string): Promise<Operation>;
   reconcile(operationId: string): Promise<Operation>;
   setNotificationSubscription(request: WriteRequest<{ enabled: boolean; eventTypes: string[] }>): Promise<Operation>;
-  health(): Promise<Array<{ backlog: number | null; lastDeliveryAt: string | null; component: string; status: 'healthy' | 'degraded' | 'unreachable'; updatedAt: string; reason: string | null }>>;
+  health(): Promise<Array<{ backlog: number | null; lastDeliveryAt: string | null; component: string; status: 'healthy' | 'degraded' | 'unreachable' | 'unverified'; updatedAt: string | null; reason: string | null; lastObservedAt?:string|null; lastSuccessAt?:string|null; lastFailureAt?:string|null; lastFailureReason?:string|null; unknown?:number|null }>>;
   archiveSession(request: WriteRequest<{ archived: boolean }>): Promise<Operation>;
 }
 /** Provider-facing boundary. Core owns authentication, CAS, durable receipts,
