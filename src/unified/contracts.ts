@@ -13,7 +13,7 @@ export interface WriteContext { operationId: string; idempotencyKey: string; tar
 export interface NativeSessionRef { provider: Provider; hostId: string; serviceId: string; nativeSessionId: string }
 export type RunStatus = 'idle' | 'running' | 'waiting_question' | 'waiting_approval' | 'interrupted' | 'failed' | 'unreachable' | 'read_only';
 export interface ControlState { serviceId: string; owner: string | null; input: 'available' | 'unavailable' | 'unknown'; generation: number; operationId: string | null; reason: string | null }
-export interface Session { sessionId: string; native: NativeSessionRef; project: string; title: string; status: RunStatus; revision: Revision; capabilities: Capabilities; control: ControlState }
+export interface Session { updatedAt?: string; sessionId: string; native: NativeSessionRef; project: string; title: string; status: RunStatus; revision: Revision; capabilities: Capabilities; control: ControlState }
 export interface Turn { turnId: string; sessionId: string; status: 'queued' | 'running' | 'completed' | 'interrupted' | 'failed'; inputId: string | null; startedAt: string | null; endedAt: string | null; model: string | null; outputIds: string[] }
 export type ContentBlock = { type: 'text'; text: string } | { type: 'artifact'; artifactId: string; contentVersion: string };
 export interface Message { messageId: string; sessionId: string; turnId: string; role: 'user' | 'assistant' | 'tool'; blocks: ContentBlock[]; sequence: number; revision: Revision; final: boolean; source: string }

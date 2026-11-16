@@ -5,7 +5,7 @@ import type { Interaction, Operation, Session } from './contracts.js';
 export interface ChannelCard { form?: QuestionForm; title: string; text: string; actions: Array<{ label: string; value: Record<string, unknown>; url?: string }> }
 export function sessionCard(session: Session): ChannelCard {
   return { title: session.title, text: `${session.native.provider} · ${session.project} · ${session.status}\n控制: ${session.control.input}`, actions: [
-    { label: '查看（只读）', value: { action: 'bind', sessionId: session.sessionId, mode:'read_only' } },
+    { label: '查看历史', value: { action: 'history' } },
     { label: '接入并续聊', value: { action: 'bind', sessionId: session.sessionId, mode:'interactive' } },
     { label: '会话控制', value: { action: 'panel', sessionId: session.sessionId } },
     { label: '查看文件', value: { action: 'artifacts', sessionId: session.sessionId } },

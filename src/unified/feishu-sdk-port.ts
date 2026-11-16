@@ -114,7 +114,7 @@ export class FeishuSdkPort implements FeishuPort {
     const route=this.db.prepare('SELECT chat_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string}|undefined;
     return !!route && this.destinations.has(route.chat_id);
   }
-  private allowed(destination:string):void { if (!this.authorizedDestination(destination)) throw new Error('destination unauthorized'); }
+  private allowed(destination:string):void { if(this.closing) throw new Error('SDK port closing'); if (!this.authorizedDestination(destination)) throw new Error('destination unauthorized'); }
   private route(destination:string):{chat_id:string;root_id:string}|undefined { return this.db.prepare('SELECT chat_id,root_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string;root_id:string}|undefined; }
   public resolveDestination(chatId:string,rootId?:string,parentId?:string,threadId?:string):string {
     if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
@@ -182,6 +182,12 @@ export class FeishuSdkPort implements FeishuPort {
     return messageAppLink(chat,delivery.message_id);
   }
   async lookupMessageId(id:string):Promise<string|null> { return (this.db.prepare('SELECT message_id FROM sdk_deliveries WHERE id=?').get(id) as {message_id:string|null}|undefined)?.message_id ?? null; }
+  async topicLinkForSession(destination:string,sessionId:string):Promise<string|null> {
+    this.allowed(destination); const chat=this.route(destination)?.chat_id ?? destination;
+    const row=this.db.prepare('SELECT destination,chat_id,root_id FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string;chat_id:string;root_id:string}|undefined;
+    if(!row) return null; this.allowed(row.destination);
+    return messageAppLink(row.chat_id,row.root_id);
+  }
   private queueResource(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',scope:string):void {
     const serialized=JSON.stringify(e); const old=this.db.prepare('SELECT envelope,message_id,resource_key,resource_type FROM sdk_inbound_resources WHERE event_id=?').get(e.eventId) as {envelope:string;message_id:string;resource_key:string;resource_type:string}|undefined;
     if(old) { const oldScope=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(e.eventId) as {scope:string}|undefined; if(old.envelope!==serialized || old.message_id!==messageId || old.resource_key!==key || old.resource_type!==type || oldScope?.scope!==scope) throw new Error('resource event conflict'); return; }

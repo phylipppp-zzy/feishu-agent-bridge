@@ -52,9 +52,12 @@ export class UnifiedCore implements UnifiedService {
   }
   private present(session: Session): Session { const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
   async listSessions(q: ListQuery) {
-    const mapped=this.store.listSessions().filter(s=>!this.store.isDetached(s.sessionId)).map(s=>this.present(s)); const all=[...mapped]; const known=new Set(mapped.map(s=>payloadDigest(s.native)));
-    if (this.canDiscover) for (const port of this.providers.values()) { let cursor:string|null=null; const seen=new Set<string>(); do { const found=await port.list(cursor,100); for (const item of found.items) { if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch'); const key=payloadDigest(item.native); if(known.has(key) || !this.canDiscover(item)) continue; known.add(key); const capabilities = Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities']; all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}}); } cursor=found.nextCursor; if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);} } while(cursor!==null); }
-    const search=q.search?.toLowerCase();return page(all.filter(s=>!search||`${s.title} ${s.project}`.toLowerCase().includes(search)),q);
+    const stored=this.store.listSessions(); const known=new Set(stored.map(s=>payloadDigest(s.native)));
+    const all=stored.filter(s=>!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))).map(s=>this.present(s));
+    if(this.canDiscover) for(const port of this.providers.values()) {let cursor:string|null=null;const seen=new Set<string>();do {const found=await port.list(cursor,100);for(const item of found.items) {if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');const key=payloadDigest(item.native);if(known.has(key)||!this.canDiscover(item))continue;known.add(key);const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});}cursor=found.nextCursor;if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}}while(cursor!==null);}
+    all.sort((a,b)=>payloadDigest(a.native).localeCompare(payloadDigest(b.native)));const search=q.search?.toLowerCase();const selected=page(all.filter(s=>!search||`${s.native.provider} ${s.title} ${s.project}`.toLowerCase().includes(search)),q);const items:Session[]=[];
+    for(const candidate of selected.items) {let current=this.store.findSession(candidate.native);if(!current) {try {this.store.insertSession(candidate);current=candidate;} catch(error) {current=this.store.findSession(candidate.native);if(!current)throw error;}} if(this.store.isDetached(current.sessionId) || (this.canDiscover && !this.canDiscover(current))) continue;items.push(this.present(current));}
+    return {items,nextCursor:selected.nextCursor};
   }
   async getSession(id: string) { return this.present(this.store.getSession(id)); }
   async getWorkState(id:string) { const session=this.store.getSession(id); return {runningTurns:this.store.listTurns(id).filter(t=>t.status==='running'),queuedInputs:this.store.queuedInputs(id),canArchive:typeof this.port(session).archive === 'function'}; }
@@ -63,12 +66,18 @@ export class UnifiedCore implements UnifiedService {
   async listInteractions(id: string, q: ListQuery) { return page(this.store.snapshot(id).value.interactions, q); }
   async getInteraction(id: string) { return this.store.getInteraction(id); }
   /** Trusted runtime polling for a read-only attachment; never resumes or acquires control. */
-  async refreshReadOnlySession(id: string): Promise<void> {
+  async refreshReadOnlySession(id: string): Promise<void> { return this.refreshHistory(id,false); }
+  /** Initial history baseline is read-only even when another binding has interactive control. */
+  async hydrateSessionHistory(id:string):Promise<void> { return this.refreshHistory(id,true); }
+  private async refreshHistory(id:string, allowInteractive:boolean):Promise<void> {
     try {
-      const current=this.store.getSession(id); if (current.control.input === 'available' || current.status !== 'read_only') return fail('busy','only read-only sessions can be refreshed');
+      const current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
       const observed=await this.port(current).read(current.native); if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project) return fail('invalid_request','provider returned wrong native session or project');
       if (observed.connectionGeneration !== undefined && observed.connectionGeneration < this.store.connectionGeneration(id)) return fail('control_conflict','stale connection generation');
       if ((observed.turns ?? []).some(t=>t.sessionId!==current.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
+      // Only refresh presentation metadata on the still-readonly, same native session.
+      const latest=this.store.getSession(id); if(latest.status==='read_only' && latest.control.input!=='available' && payloadDigest(latest.native)===payloadDigest(current.native) && latest.project===current.project) {const title=observed.session.title?.trim() || latest.title; const candidateTime=observed.session.updatedAt; const updatedAt=candidateTime && Number.isFinite(Date.parse(candidateTime)) && (!latest.updatedAt || !Number.isFinite(Date.parse(latest.updatedAt)) || Date.parse(candidateTime)>Date.parse(latest.updatedAt)) ? candidateTime : latest.updatedAt; if(title!==latest.title || updatedAt!==latest.updatedAt) {try {this.store.updateSession({...latest,title,...(updatedAt ? {updatedAt}:{}),revision:latest.revision+1},latest.revision,latest.control.generation);} catch(error) {const code=error instanceof StoreError ? error.detail.code : undefined;if(code!=='stale_revision' && code!=='control_conflict')throw error;}}}
+
       for (const native of observed.turns ?? []) this.store.putTurn({...native,sessionId:id});
       for (const native of observed.messages) { const snapshot=this.store.snapshot(id); const old=snapshot.value.messages.find(m=>m.messageId===native.messageId); const value={...native,sessionId:id,revision:old?.revision ?? native.revision}; if(old && payloadDigest(value)===payloadDigest(old)) continue; if(old?.final && !value.final) continue; this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null); }
     } catch (error) { this.observationFailure='read-only refresh failed'; throw error; }
@@ -92,7 +101,7 @@ export class UnifiedCore implements UnifiedService {
     const existingAttachment=this.store.findSession(ref);
     const quarantined=existingAttachment && this.store.recoveryQuarantined(existingAttachment.sessionId);
     if (quarantined && (request.payload.mode!=='interactive' || this.quarantinedHere.has(existingAttachment!.sessionId))) return fail('control_conflict','reconnect and explicitly attach to reconcile recovery quarantine');
-    if(!quarantined && existingAttachment && !this.store.isDetached(existingAttachment.sessionId) && (request.payload.mode==='read_only' || (request.payload.mode==='interactive' && existingAttachment.control.input==='available' && existingAttachment.status!=='read_only'))) {
+    if(!quarantined && existingAttachment && !this.store.isDetached(existingAttachment.sessionId) && ((request.payload.mode==='read_only' && existingAttachment.control.reason!=='discovered session is not attached') || (request.payload.mode==='interactive' && existingAttachment.control.input==='available' && existingAttachment.status!=='read_only'))) {
       if ((this.canDiscover && !this.canDiscover(existingAttachment)) || !this.authorize(request.context.identity,existingAttachment,'attachSession')) return fail('unauthorized');
       return this.store.reuseAttachedSession(request.context,existingAttachment,request.payload);
     }

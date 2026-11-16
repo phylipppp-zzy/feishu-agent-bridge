@@ -43,7 +43,7 @@ for (const provider of ['codex','claude'] as const) test(`${provider}: decorated
   } finally {await rm(dir,{recursive:true,force:true});}
 });
 
-test('base sessions take precedence and merged pages reject stale cursor',async()=>{
+test('base sessions take precedence and merged pages retain their snapshot',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'merged-')); try {
     const lines=(id:string)=>JSON.stringify({type:'session_meta',payload:{id,cwd:'/same'}})+'\n';
     await writeFile(join(dir,'a.jsonl'),lines('a'));await writeFile(join(dir,'b.jsonl'),lines('b'));
@@ -52,7 +52,7 @@ test('base sessions take precedence and merged pages reject stale cursor',async(
     const live:Session={...original,title:'live',status:'idle',control:{...original.control,input:'available'}};
     const base:any={provider:'codex',onObservation:()=>()=>{},list:async()=>({items:[live],nextCursor:null}),read:async()=>({session:live,messages:[],interactions:[]}),listArtifacts:async()=>[{artifactId:'native',sessionId:'a',name:'n',mediaType:'text/plain',size:1,contentVersion:'v'}],readArtifact:async()=>new Uint8Array([1])};
     const port=new EnrichedPort(base,cat,new ArtifactRegistry({}),()=>{});
-    try {const p=await port.list(null,1);assert.ok(p.nextCursor);const q=await port.list(p.nextCursor,1);assert.equal(p.items.length+q.items.length,2); assert.equal((await port.read(live.native)).session.title,'live');assert.equal((await port.listArtifacts(live.native))[0]?.artifactId,'native');assert.deepEqual(await port.readArtifact(live.native,'native','v'),new Uint8Array([1]));await writeFile(join(dir,'c.jsonl'),lines('c'));await assert.rejects(port.list(p.nextCursor,1),e=>(e as any).code==='snapshot_required');}finally{await port.close();}
+    try {const p=await port.list(null,1);assert.ok(p.nextCursor);const q=await port.list(p.nextCursor,1);assert.equal(p.items.length+q.items.length,2); assert.equal((await port.read(live.native)).session.title,'live');assert.equal((await port.listArtifacts(live.native))[0]?.artifactId,'native');assert.deepEqual(await port.readArtifact(live.native,'native','v'),new Uint8Array([1]));await writeFile(join(dir,'c.jsonl'),lines('c'));const stable=await port.list(p.nextCursor,1);assert.equal(stable.items.length,1);assert.equal(stable.nextCursor,null);const fresh=await port.list(null,10);assert.equal(fresh.items.length,3);assert.equal(fresh.items.find(x=>x.native.nativeSessionId==='a')?.title,'live');}finally{await port.close();}
   } finally {await rm(dir,{recursive:true,force:true});}
 });
 
