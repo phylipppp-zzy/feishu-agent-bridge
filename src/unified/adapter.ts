@@ -1,12 +1,14 @@
 import type { DirectoryListing } from '../claude/deliver.js';
 import type { ModelOption, ConfirmedSettings } from './contracts.js';
-import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual } from './contracts.js';
+import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
   listSessions(query: ListQuery): Promise<Page<Session>>;
+  unknownCreateProvider?(identity:{source:string;subject:string},destination:string,operationId:string):Promise<Provider|null>;
+  inspectUnknownCreateCandidates?(identity:{source:string;subject:string},destination:string,operationId:string,query:{cursor?:string;nativeId?:string}):Promise<{items:CandidateMetadata[];nextCursor:string|null;partial:boolean}>;
   getSession(sessionId: string): Promise<Session>;
   capabilities(sessionId: string): Promise<Capabilities>;
   attachSession(request: WriteRequest<{ provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' }>): Promise<Operation>;
@@ -66,6 +68,9 @@ export interface DispatchGuard { expectedControlGeneration: number; expectedConn
 export type PlatformInputBlock = {type:'text'; text:string} | {type:'artifact'; artifactId:string; contentVersion:string; name:string; mediaType:string; content:Uint8Array};
 export interface PlatformPort {
   readonly provider: Provider;
+  candidateGeneration?():number|null;
+  listCandidateIds?(cursor:string|null,limit:number):Promise<{items:string[];nextCursor:string|null;partial?:boolean}>;
+  readCandidateMetadata?(id:string):Promise<CandidateMetadata>;
   close?(): Promise<void>;
   seedConnectionGeneration?(minimum: number): void;
   seedControlGeneration?(ref: NativeSessionRef, minimum: number): void;

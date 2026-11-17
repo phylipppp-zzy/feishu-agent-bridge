@@ -19,6 +19,7 @@ function parseAction(value: unknown): ChannelAction {
   if (!object(value) || !str(value.action)) throw new Error('invalid card action');
   switch (value.action) {
     case 'panel': if ((value.sessionId === undefined || str(value.sessionId)) && (value.turnId === undefined || str(value.turnId)) && (value.inputId === undefined || str(value.inputId))) return {action:'panel',...(str(value.sessionId) ? {sessionId:value.sessionId}:{}),...(str(value.turnId) ? {turnId:value.turnId}:{}),...(str(value.inputId) ? {inputId:value.inputId}:{})}; break;
+    case 'inspect_unknown': if(str(value.operationId)&&(value.cursor===undefined||str(value.cursor))&&(value.nativeId===undefined||str(value.nativeId))&&!(value.cursor&&value.nativeId))return {action:'inspect_unknown',operationId:value.operationId,...(str(value.cursor)?{cursor:value.cursor}:{}),...(str(value.nativeId)?{nativeId:value.nativeId}:{})};break;
     case 'list': if ((value.cursor === undefined || str(value.cursor)) && (value.search === undefined || str(value.search))) return {action:'list',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(str(value.search) ? {search:value.search}:{})}; break;
     case 'history': if (value.cursor === undefined || str(value.cursor)) return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{})}; break;
     case 'upgrade': return {action:'upgrade'};
@@ -51,7 +52,7 @@ export function parseFeishuAction(value: unknown, formValues?: unknown): Channel
   if (object(value) && value.action === 'answer_form') { if (!str(value.bindingId) || !str(value.interactionId) || !counter(value.revision) || !counter(value.connectionGeneration) || !object(formValues) || JSON.stringify(formValues).length > 100_000) throw new Error('invalid question form callback'); return {action:'answer_form',bindingId:value.bindingId,interactionId:value.interactionId,revision:value.revision,connectionGeneration:value.connectionGeneration,fields:formValues}; }
   const action = parseAction(value);
   if (!object(value)) throw new Error('invalid card action');
-  if (!['bind','list','finish'].includes(action.action) && !str(value.bindingId)) throw new Error('missing binding identity');
+  if (!['bind','list','finish','inspect_unknown'].includes(action.action) && !str(value.bindingId)) throw new Error('missing binding identity');
   return {...action,...(str(value.bindingId) ? {bindingId:value.bindingId}:{})};
 }
 /** Commands work identically for either provider; text without a slash is an input. */
@@ -63,6 +64,7 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/help': return {action:'help'};
     case '/new': return {action:'new_help'};
     case '/sessions': return {action:'list'};
+    case '/candidates': if(parts.length===1||parts.length===2)return {action:'inspect_unknown',operationId:parts[0]!,...(parts[1]?{nativeId:parts[1]}:{})};break;
     case '/model': return parts.length === 0 ? {action:'legacy_model'} : parts.length === 2 ? {action:'legacy_model',model:parts[0]!,effort:parts[1]!} : {action:'legacy_model',invalid:true};
     case '/list': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/bind': if (parts[0] && (!parts[1] || parts[1] === 'read_only' || parts[1] === 'interactive')) return {action:'bind',sessionId:parts[0],...(parts[1] ? {mode:parts[1] as 'read_only'|'interactive'} : {})}; break;

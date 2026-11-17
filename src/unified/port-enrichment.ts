@@ -37,6 +37,9 @@ export class EnrichedPort implements PlatformPort {
       }
     });
   }
+  candidateGeneration(){return this.base.candidateGeneration?.()??null;}
+  async listCandidateIds(cursor:string|null,limit:number){if(!this.base.listCandidateIds)throw contractError('unsupported');return this.base.listCandidateIds(cursor,limit);}
+  async readCandidateMetadata(id:string){if(!this.base.readCandidateMetadata)throw contractError('unsupported');return this.base.readCandidateMetadata(id);}
   async drain(): Promise<void> { await this.work; }
   async close(): Promise<void> { this.closed = true; this.listSnapshots.clear(); this.listCursors.clear(); this.unsubscribe(); await this.drain(); await this.base.close?.(); }
   onObservation(f:(o:PlatformObservation)=>void):()=>void { this.listeners.add(f); return ()=>this.listeners.delete(f); }

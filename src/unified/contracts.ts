@@ -17,6 +17,7 @@ export interface Session { createdAt?: string; discoveryObservedAt?:string; upda
 export interface Turn { turnId: string; sessionId: string; status: 'queued' | 'running' | 'completed' | 'interrupted' | 'failed'; inputId: string | null; startedAt: string | null; endedAt: string | null; model: string | null; outputIds: string[] }
 export type ContentBlock = { type: 'text'; text: string } | { type: 'artifact'; artifactId: string; contentVersion: string };
 export interface Message { messageId: string; sessionId: string; turnId: string; role: 'user' | 'assistant' | 'tool'; blocks: ContentBlock[]; sequence: number; revision: Revision; final: boolean; source: string }
+export interface CandidateMetadata { native:NativeSessionRef; project:string; status:string; historyVerified:false; observedAt:string; connectionGeneration:number }
 export interface Artifact { artifactId: string; sessionId: string; name: string; mediaType: string; size: number; contentVersion: string }
 export type OperationStatus = 'received' | 'queued' | 'accepted' | 'completed' | 'failed' | 'unknown';
 export type OperationResult = {kind:'session'; sessionId:string} | {kind:'artifact'; artifactId:string; contentVersion:string} | {kind:'turn'; turnId:string; status:'completed'|'failed'|'interrupted'};

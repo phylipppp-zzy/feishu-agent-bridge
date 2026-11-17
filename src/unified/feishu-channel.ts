@@ -64,6 +64,7 @@ export type ChannelAction = (
  | { action: 'reconcile'; operationId: string }
  | { action: 'finish'; operationId: string }
  | { action: 'pending' }
+ | { action: 'inspect_unknown'; operationId:string; cursor?:string; nativeId?:string }
  | { action: 'health' }) & { bindingId?: string };
 
 /** Standalone channel database. Never opens core's tables. */
@@ -79,6 +80,7 @@ export class FeishuChannel {
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_health_facts (component TEXT PRIMARY KEY, observed_at TEXT NOT NULL, success_at TEXT, failure_at TEXT, failure_reason TEXT, status TEXT NOT NULL, reason TEXT)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_interaction_view (destination TEXT NOT NULL,session_id TEXT NOT NULL,interaction_id TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(destination,session_id,interaction_id))');
+    this.db.exec("CREATE TABLE IF NOT EXISTS channel_candidate_inbox_v1 (event_id TEXT PRIMARY KEY,envelope TEXT NOT NULL,action TEXT NOT NULL,scope TEXT NOT NULL,digest TEXT NOT NULL,state TEXT NOT NULL,result TEXT)");
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_pending_actors (operation_id TEXT PRIMARY KEY, envelope TEXT NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_operation_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, operation_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY(destination,session_id,binding_scope,operation_id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_operation_states (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, operation_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,operation_id))');
@@ -302,11 +304,13 @@ export class FeishuChannel {
     const target = a.action === 'bind' ? a.sessionId : bound;
     if (!await this.authorize(e.identity,e.destination,target)) throw new Error('unauthorized');
     await this.checkManager(e,a);
+    if(a.action==='inspect_unknown'){const action=JSON.stringify(a),envelope=JSON.stringify(e),digest=payloadDigest({destination:e.destination,identity:e.identity,action:JSON.parse(action)});this.db.exec('BEGIN IMMEDIATE');try{if(this.db.prepare('SELECT 1 FROM channel_inbox WHERE event_id=?').get(e.eventId))throw Error('idempotency conflict');const old=this.db.prepare('SELECT digest,state FROM channel_candidate_inbox_v1 WHERE event_id=?').get(e.eventId) as {digest:string;state:string}|undefined;if(old){if(old.digest!==digest)throw Error('idempotency conflict');this.db.exec('COMMIT');return {eventId:e.eventId,state:old.state};}if(this.actionScope(a,e.destination)!==capturedScope)throw Error('binding changed');this.db.prepare("INSERT INTO channel_candidate_inbox_v1 VALUES (?,?,?,?,?,'received',NULL)").run(e.eventId,envelope,action,capturedScope,digest);this.db.exec('COMMIT');return {eventId:e.eventId,state:'received'};}catch(error){this.db.exec('ROLLBACK');throw error;}}
     const serializedAction = JSON.stringify(a.action === 'attachment' ? {...a,content:Array.from(a.content)} : a);
     const digest = payloadDigest({destination:e.destination,identity:e.identity,action:JSON.parse(serializedAction)});
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const old = this.db.prepare('SELECT digest,state FROM channel_receipts WHERE event_id=?').get(e.eventId) as {digest:string;state:string} | undefined;
+      if(this.db.prepare('SELECT 1 FROM channel_candidate_inbox_v1 WHERE event_id=?').get(e.eventId))throw Error('idempotency conflict');
       if (old) { if (old.digest !== digest) throw new Error('idempotency conflict'); this.db.exec('COMMIT'); return {eventId:e.eventId,state:old.state}; }
       this.db.prepare("INSERT INTO channel_receipts VALUES (?,?,'received',NULL)").run(e.eventId,digest);
       if (this.actionScope(a,e.destination) !== capturedScope) throw new Error('binding changed during intake');
@@ -315,19 +319,20 @@ export class FeishuChannel {
       this.db.exec('COMMIT'); if(e.eventId.startsWith('card:')) {try {this.recordHealth('feishu_callback','healthy');} catch {}} return {eventId:e.eventId,state:'received'};
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
-  unknownInbox(): string[] { return (this.db.prepare("SELECT event_id FROM channel_inbox WHERE state='unknown' ORDER BY rowid").all() as Array<{event_id:string}>).map(x=>x.event_id); }
-  pendingInbox(): string[] { return (this.db.prepare("SELECT event_id FROM channel_inbox WHERE state='received' ORDER BY rowid").all() as Array<{event_id:string}>).map(x=>x.event_id); }
+  unknownInbox(): string[] { return [...(this.db.prepare("SELECT event_id FROM channel_inbox WHERE state='unknown' ORDER BY rowid").all() as Array<{event_id:string}>),...(this.db.prepare("SELECT event_id FROM channel_candidate_inbox_v1 WHERE state='unknown' ORDER BY rowid").all() as Array<{event_id:string}>)].map(x=>x.event_id); }
+  pendingInbox(): string[] { return [...(this.db.prepare("SELECT event_id FROM channel_inbox WHERE state='received' ORDER BY rowid").all() as Array<{event_id:string}>),...(this.db.prepare("SELECT event_id FROM channel_candidate_inbox_v1 WHERE state='received' ORDER BY rowid").all() as Array<{event_id:string}>)].map(x=>x.event_id); }
   /** A crash after execution begins remains unknown and requires reconciliation. */
   async drain(eventId: string): Promise<unknown> {
-    const pre = this.db.prepare('SELECT envelope FROM channel_inbox WHERE event_id=?').get(eventId) as {envelope:string} | undefined;
+    const pre = (this.db.prepare('SELECT envelope FROM channel_inbox WHERE event_id=?').get(eventId) ?? this.db.prepare('SELECT envelope FROM channel_candidate_inbox_v1 WHERE event_id=?').get(eventId)) as {envelope:string} | undefined;
     if (!pre) throw new Error('event not found');
     const destination = (JSON.parse(pre.envelope) as TrustedEnvelope).destination;
     const previous = this.destinationLocks.get(destination) ?? Promise.resolve();
     let release!: () => void; const lock = new Promise<void>(r => { release = r; });
     const tail = previous.then(() => lock); this.destinationLocks.set(destination,tail);
     await previous;
-    try { return await this.drainLocked(eventId); } finally { release(); if (this.destinationLocks.get(destination) === tail) this.destinationLocks.delete(destination); }
+    try { return this.db.prepare('SELECT 1 FROM channel_candidate_inbox_v1 WHERE event_id=?').get(eventId) ? await this.drainCandidate(eventId) : await this.drainLocked(eventId); } finally { release(); if (this.destinationLocks.get(destination) === tail) this.destinationLocks.delete(destination); }
   }
+  private async drainCandidate(eventId:string):Promise<unknown> {const row=this.db.prepare('SELECT * FROM channel_candidate_inbox_v1 WHERE event_id=?').get(eventId) as {envelope:string;action:string;scope:string;state:string;result:string|null}|undefined;if(!row)throw Error('event not found');if(row.state!=='received')return row.result?JSON.parse(row.result):{status:'unknown'};const e=JSON.parse(row.envelope) as TrustedEnvelope,a=JSON.parse(row.action) as ChannelAction,bound=this.binding(e.destination);if(row.scope!==this.bindingScope(e.destination)||!await this.authorize(e.identity,e.destination,bound)){this.db.prepare("UPDATE channel_candidate_inbox_v1 SET state='expired' WHERE event_id=? AND state='received'").run(eventId);return {status:'expired'};}if(!this.db.prepare("UPDATE channel_candidate_inbox_v1 SET state='unknown' WHERE event_id=? AND state='received'").run(eventId).changes)return {status:'unknown'};const effects={started:false};let result:unknown;try{result=await this.execute(e,a,bound,row.scope,effects);}catch(error){if(effects.started||row.scope!==this.bindingScope(e.destination)||!await this.authorize(e.identity,e.destination,bound)||row.scope!==this.bindingScope(e.destination))throw error;const guard=async()=>{if(row.scope!==this.bindingScope(e.destination)||!await this.authorize(e.identity,e.destination,bound)||row.scope!==this.bindingScope(e.destination))throw Error('binding changed or unauthorized');};await guard();effects.started=true;await this.deliver(e.destination,{title:'候选暂不可用',text:'无法读取候选元数据；请核对操作状态后重试。',actions:[]},`${eventId}:candidate-error`,guard);result={status:'unavailable'};}this.db.prepare("UPDATE channel_candidate_inbox_v1 SET state='completed',result=? WHERE event_id=? AND state='unknown'").run(JSON.stringify(result??null),eventId);return result;}
   private async drainLocked(eventId: string): Promise<unknown> {
     const row = this.db.prepare('SELECT envelope,action,state FROM channel_inbox WHERE event_id=?').get(eventId) as {envelope:string;action:string;state:string} | undefined;
     if (!row) throw new Error('event not found');
@@ -380,7 +385,8 @@ export class FeishuChannel {
     const reply = async (card: ChannelCard, suffix = 'reply', extraGuard?:()=>Promise<void>) => { const current=extraGuard ? async()=>{await guard();await extraGuard();await guard();} : guard; await current(); effects.started=true; return this.deliver(e.destination, card, `${e.eventId}:${suffix}`,current); };
     if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片和 UTF-8 文本附件。',size:'文本附件为空或超过 1 MiB，未提交。',encoding:'文本附件不是有效 UTF-8 或包含 NUL，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
     if (a.action === 'help' || a.action === 'new_help') { const text = a.action === 'help' ? '会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；中断当前回复：/stop；后台任务是否终止尚未确认。' : '请先选择 provider 和可信项目目录，再发送 /create <codex|claude> <项目目录>。创建完成后在新话题发送任务；目录须符合服务端允许范围。'; await reply({title:a.action === 'help' ? '帮助' : '新建会话',text,actions:[]}); return {status:'guidance'}; }
-    if (a.action === 'pending') { const pending = this.pendingOperations(e.destination); await reply({title:'待完成操作',text:pending.length ? '查询完成结果后继续' : '没有待完成操作',actions:pending.map(p=>({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}}))}); return pending; }
+    if (a.action === 'pending') { const pending=this.pendingOperations(e.destination),actions:ChannelCard['actions']=[];for(const p of pending){actions.push({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}});if(p.kind==='session'&&this.service.inspectUnknownCreateCandidates&&this.service.unknownCreateProvider){try{if(await this.service.unknownCreateProvider(e.identity,e.destination,p.operationId)==='codex')actions.push({label:'查看 Codex 候选',value:{action:'inspect_unknown',operationId:p.operationId}})}catch{}}}await reply({title:'待完成操作',text:pending.length ? `查询完成结果后继续。操作 ID：${pending.map(p=>p.operationId).join('、')}` : '没有待完成操作',actions});return pending; }
+    if(a.action==='inspect_unknown'){const row=this.db.prepare("SELECT p.destination,p.kind,p.state,s.scope,a.envelope FROM channel_pending p JOIN channel_pending_scope s ON s.operation_id=p.operation_id JOIN channel_pending_actors a ON a.operation_id=p.operation_id WHERE p.operation_id=?").get(a.operationId) as {destination:string;kind:string;state:string;scope:string;envelope:string}|undefined;const actor=row?JSON.parse(row.envelope) as TrustedEnvelope:null;if(!row||row.destination!==e.destination||row.kind!=='session'||row.state!=='pending'||row.scope!==executionScope||!actor||actor.identity.source!==e.identity.source||actor.identity.subject!==e.identity.subject||!this.service.inspectUnknownCreateCandidates)throw new Error('candidate inspection unavailable');await guard();const result=await this.service.inspectUnknownCreateCandidates(e.identity,e.destination,a.operationId,{...(a.cursor?{cursor:a.cursor}:{}),...(a.nativeId?{nativeId:a.nativeId}:{})});await guard();const lines=result.items.map(x=>`Codex ${JSON.stringify(x.native.hostId)}/${JSON.stringify(x.native.serviceId)} · ${x.native.nativeSessionId} · ${JSON.stringify(x.project)} · 观测状态 ${x.status}`);await reply({title:'Codex 候选元数据',text:`原创建结果仍未知；以下候选不代表该次创建成功，历史未验证。${result.partial?' 部分候选未能读取。':''}\n${lines.length?lines.join('\n'):'当前页没有可展示的候选。'}`,actions:result.nextCursor?[{label:'下一页',value:{action:'inspect_unknown',operationId:a.operationId,cursor:result.nextCursor}}]:[]});return result;}
     if (a.action === 'list') {
       const page=await this.service.listSessions({limit:5,...(a.search === undefined ? {} : {search:a.search}),...(a.cursor === undefined ? {} : {cursor:a.cursor})});
       const sessions=[]; for(const s of page.items) if(await this.authorize(e.identity,e.destination,s.sessionId)) sessions.push(s);
