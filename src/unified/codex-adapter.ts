@@ -1,3 +1,4 @@
+import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
 import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
@@ -180,8 +181,8 @@ export class CodexAdapter implements PlatformPort {
       if (!(b.content instanceof Uint8Array) || b.content.length === 0 || b.content.length > 10 * 1024 * 1024) throw contractError('invalid_request', 'invalid attachment size');
       const bytes = Buffer.from(b.content);
       if (b.mediaType === 'text/plain') {
-        let text: string; try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { throw contractError('invalid_request', 'invalid UTF-8 attachment'); }
-        return { type: 'text', text: `File content (${JSON.stringify(b.name)}):\n${text}`, text_elements: [] };
+        let text:string;try{text=textAttachmentBlock(b.name,bytes,10*1024*1024)}catch{throw contractError('invalid_request','invalid text attachment')}
+        return { type:'text',text,text_elements:[] };
       }
       const signature = b.mediaType === 'image/png' ? bytes.length >= 8 && bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])) : b.mediaType === 'image/jpeg' ? bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 : b.mediaType === 'image/gif' ? bytes.length >= 6 && ['GIF87a','GIF89a'].includes(bytes.subarray(0,6).toString()) : b.mediaType === 'image/webp' ? bytes.length >= 12 && bytes.subarray(0,4).toString() === 'RIFF' && bytes.subarray(8,12).toString() === 'WEBP' : null;
       if (signature === null) throw contractError('unsupported', 'unsupported attachment type');

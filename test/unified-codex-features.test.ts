@@ -43,3 +43,4 @@ test('catalog reasoning effort is validated and reaches only later new turns',as
  await assert.rejects(adapter.updateSettings(ref,{model:'m2',preferences:{reasoningEffort:'high',other:'x'}},guard),code('unsupported'));
  await adapter.updateSettings(ref,{model:'m2',preferences:{reasoningEffort:'high'}},guard); await adapter.input(ref,'new',[{type:'text',text:'next'}],guard); assert.equal(calls.at(-1)!.params.effort,'high');
 });
+test('existing direct Codex text attachments above 1 MiB remain supported',async()=>{const {adapter,calls}=setup();await adapter.create('/tmp',null);calls.length=0;const content=Buffer.alloc(1024*1024+1,65);await adapter.input(ref,'new',[{type:'artifact',artifactId:'a',contentVersion:'v',name:'large.txt',mediaType:'text/plain',content}],guard);assert.equal(calls.length,1);assert.equal(calls[0]!.params.input[0].text.length,'File content ("large.txt"):\n'.length+content.length)});

@@ -49,6 +49,7 @@ export type ChannelAction = (
  | { action: 'control'; owner: string; strategy: 'wait' | 'interrupt'; revision: number; controlGeneration: number; release?: boolean }
  | { action: 'artifacts'; sessionId?: string }
  | { action: 'file'; artifactId: string; contentVersion: string }
+ | { action: 'resource_rejected'; reason:'unsupported'|'size'|'encoding' }
  | { action: 'attachment'; name: string; mediaType: string; content: Uint8Array; mode: 'new' | 'queue' | 'steer' }
  | { action: 'models'; cursor?: string }
  | { action: 'legacy_model'; model?: string; effort?: string; invalid?: boolean }
@@ -294,7 +295,7 @@ export class FeishuChannel {
   async intake(e: TrustedEnvelope, a: ChannelAction, expectedScope?:string): Promise<{eventId:string;state:string}> {
     if (!e.eventId || !e.destination || !e.identity?.subject || !e.identity.source) throw new Error('invalid trusted envelope');
     const capturedScope = this.actionScope(a,e.destination);
-    if (expectedScope !== undefined && (a.action !== 'attachment' || capturedScope !== expectedScope)) throw new Error('binding changed');
+    if (expectedScope !== undefined && (!['attachment','resource_rejected'].includes(a.action) || capturedScope !== expectedScope)) throw new Error('binding changed');
     if (a.bindingId) { const row = this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(e.destination) as {binding_id:string} | undefined; if (!row || row.binding_id !== a.bindingId) throw new Error('binding changed'); }
     const bound = this.binding(e.destination);
     if (e.eventId.startsWith('card:') && a.action === 'bind' && bound && !a.bindingId) throw new Error('binding changed');
@@ -377,6 +378,7 @@ export class FeishuChannel {
   private async execute(e: TrustedEnvelope, a: ChannelAction, bound: string | null, executionScope:string, effects:{started:boolean}): Promise<unknown> {
     const guard = async () => { if(executionScope!==this.bindingScope(e.destination)) throw new BindingExpired('binding changed'); const allowed=await this.authorize(e.identity,e.destination,bound); if(executionScope!==this.bindingScope(e.destination)) throw new BindingExpired('binding changed'); if(!allowed) throw new ReadAuthorizationRevoked('unauthorized'); };
     const reply = async (card: ChannelCard, suffix = 'reply', extraGuard?:()=>Promise<void>) => { const current=extraGuard ? async()=>{await guard();await extraGuard();await guard();} : guard; await current(); effects.started=true; return this.deliver(e.destination, card, `${e.eventId}:${suffix}`,current); };
+    if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片和 UTF-8 文本附件。',size:'文本附件为空或超过 1 MiB，未提交。',encoding:'文本附件不是有效 UTF-8 或包含 NUL，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
     if (a.action === 'help' || a.action === 'new_help') { const text = a.action === 'help' ? '会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；中断当前回复：/stop；后台任务是否终止尚未确认。' : '请先选择 provider 和可信项目目录，再发送 /create <codex|claude> <项目目录>。创建完成后在新话题发送任务；目录须符合服务端允许范围。'; await reply({title:a.action === 'help' ? '帮助' : '新建会话',text,actions:[]}); return {status:'guidance'}; }
     if (a.action === 'pending') { const pending = this.pendingOperations(e.destination); await reply({title:'待完成操作',text:pending.length ? '查询完成结果后继续' : '没有待完成操作',actions:pending.map(p=>({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}}))}); return pending; }
     if (a.action === 'list') {
