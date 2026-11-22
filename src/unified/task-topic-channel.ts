@@ -588,6 +588,38 @@ export class TaskTopicChannel {
     return (this.db.prepare(sql).all(taskId) as unknown as TargetRow[]).map(toTarget);
   }
 
+  listActiveBindings(): TaskBindingRecord[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM task_bindings_v1 WHERE state = 'active' ORDER BY rowid")
+        .all() as unknown as BindingRow[]
+    ).map(toBinding);
+  }
+
+  listInteractionCards(): Array<{
+    taskId: string;
+    destination: string;
+    targetId: string;
+    sessionId: string;
+    interactionId: string;
+    revision: number;
+    messageId: string;
+  }> {
+    return this.db
+      .prepare(
+        'SELECT task_id AS taskId, destination, target_id AS targetId, session_id AS sessionId, interaction_id AS interactionId, revision, message_id AS messageId FROM task_interaction_cards_v1',
+      )
+      .all() as Array<{
+      taskId: string;
+      destination: string;
+      targetId: string;
+      sessionId: string;
+      interactionId: string;
+      revision: number;
+      messageId: string;
+    }>;
+  }
+
   getCursor(taskId: string, targetId: string, targetGeneration: number): TaskCursorRecord | null {
     const row = this.db
       .prepare(
@@ -1664,6 +1696,8 @@ export class TaskTopicChannel {
       } else if (a.action === 'artifacts') {
         const page = await this.service.listArtifacts(row.session_id, { limit: 100 });
         const label = providerTitlePrefix(target.provider);
+        const counts = new Map<string, number>();
+        for (const f of page.items) counts.set(f.name, (counts.get(f.name) ?? 0) + 1);
         await this.deliverCard(
           e.destination,
           row.task_id,
@@ -1672,7 +1706,7 @@ export class TaskTopicChannel {
             title: `${label} · 文件`,
             text: page.items.map((f) => `${f.name} (${f.contentVersion})`).join('\n') || '暂无文件。',
             actions: page.items.map((f) => ({
-              label: f.name,
+              label: (counts.get(f.name) ?? 0) > 1 ? `${f.name} (${f.contentVersion.slice(0, 8)})` : f.name,
               value: {
                 action: 'file',
                 taskId: row.task_id,

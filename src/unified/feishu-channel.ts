@@ -168,6 +168,9 @@ export class FeishuChannel {
     return !!current && current.accessMode==='interactive' && payloadDigest(current)===payloadDigest(binding) && await this.authorize(current.owner,current.destination,current.sessionId);
   }
   boundDestinations(): string[] { return (this.db.prepare('SELECT destination FROM channel_bindings ORDER BY destination').all() as Array<{destination:string}>).map(x=>x.destination); }
+  listInteractionCards(): Array<{destination:string;sessionId:string;interactionId:string;revision:number;messageId:string}> {
+    return this.db.prepare('SELECT destination,session_id AS sessionId,interaction_id AS interactionId,revision,message_id AS messageId FROM channel_interaction_cards').all() as Array<{destination:string;sessionId:string;interactionId:string;revision:number;messageId:string}>;
+  }
   private recordPendingActor(operationId:string,e:TrustedEnvelope):void {
     const value=JSON.stringify(e);this.db.prepare('INSERT OR IGNORE INTO channel_pending_actors VALUES (?,?)').run(operationId,value);
     const row=this.db.prepare('SELECT envelope FROM channel_pending_actors WHERE operation_id=?').get(operationId) as {envelope:string};if(row.envelope!==value) throw new Error('pending actor conflict');

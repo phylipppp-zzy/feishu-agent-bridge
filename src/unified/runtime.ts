@@ -18,15 +18,51 @@ import { TestLaneRuntime } from './test-lane.js';
 import { ArtifactRegistry } from './artifact-registry.js';
 import { EnrichedPort, nativeRefKey } from './port-enrichment.js';
 import { localFileLinks } from '../claude/deliver.js';
-import { payloadDigest, type Session, type Message, type Provider } from './contracts.js';
+import { payloadDigest, type Identity, type Session, type Message, type Provider } from './contracts.js';
 import { AgyAdapter } from './agy-adapter.js';
 import { AgyCatalog } from './agy-catalog.js';
 import { AgyQuotaClient } from './agy-quota.js';
 import { AgyAcpTransport } from './agy-transport.js';
 import { providerTitlePrefix } from './feishu-cards.js';
+import { DecisionSyncStore } from './decision-sync.js';
+import { PendingHub, type PendingQuery, type PendingSubmitPayload } from './pending-hub.js';
+import { TaskHandoffError, TaskHandoffService } from './task-handoff.js';
+import { TaskTopicChannel, TaskChannelError, type TaskAuthorize, type TaskChannelAction } from './task-topic-channel.js';
+import { WatchHub } from './watch-hub.js';
 
 export interface AgyRuntimeConfig { enabled?:boolean; serviceId:string; summariesDbPath?:string; brainDir?:string; binPath?:string; quotaCachePath?:string; sandbox?:boolean; geminiDir?:string; appDataDir?:string }
-export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string}; taskTopic?:{enabled:boolean}; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
+export interface WatchHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
+export interface PendingHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
+export interface DecisionSyncRuntimeConfig { enabled:boolean; dbPath?:string; markdownPath?:string; protectedReadOnlyPaths?:string[] }
+export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string}; taskTopic?:{enabled:boolean}; watchHub?:WatchHubRuntimeConfig; pendingHub?:PendingHubRuntimeConfig; decisionSync?:DecisionSyncRuntimeConfig; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
+export type RuntimeTrustedAction =
+  | ChannelAction
+  | TaskChannelAction
+  | {
+      action: 'confirm_handoff';
+      handoffId: string;
+      taskId: string;
+      previewDigest: string;
+      targetGeneration: number;
+      activeRevision: number;
+    }
+  | {
+      action: 'decision_answer';
+      decisionId: string;
+      expectedVersion: number;
+      expectedDigest: string;
+      selectedOptionId?: string | null;
+      freeText?: string | null;
+      rawUtterance?: string;
+      entry?: 'hub' | 'source';
+      bindingId?: string;
+    }
+  | {
+      action: 'pending_page';
+      cursor?: string;
+      category?: PendingQuery['category'];
+      provider?: PendingQuery['provider'];
+    };
 /** Pure validation: never reads environment, opens a database, connects or sends. */
 export function validateRuntimeConfig(c:RuntimeConfig):void {
   if (!c || ![c.coreDb,c.channelDb,c.ownerOpenId,c.hostId,c.claudeServiceId,c.codexServiceId,c.claudeStateDir,c.codexEndpoint].every(x=>typeof x==='string' && !!x.trim()) || !Array.isArray(c.allowedDestinations) || !c.allowedDestinations.length || !c.allowedDestinations.every(x=>typeof x==='string' && !!x.trim()) || c.coreDb===c.channelDb || c.channelDb===':memory:' || !Number.isSafeInteger(c.intervalMs) || c.intervalMs<100) throw new Error('invalid runtime configuration');
@@ -40,6 +76,24 @@ export function validateRuntimeConfig(c:RuntimeConfig):void {
     }
   }
   if(c.taskTopic && typeof c.taskTopic.enabled!=='boolean')throw new Error('invalid task topic configuration');
+  if (c.watchHub !== undefined) {
+    if (!c.watchHub || typeof c.watchHub !== 'object' || Array.isArray(c.watchHub) || typeof c.watchHub.enabled !== 'boolean') throw new Error('invalid watch hub configuration');
+    if (c.watchHub.destination !== undefined && typeof c.watchHub.destination !== 'string') throw new Error('invalid watch hub configuration');
+    if (c.watchHub.enabled && (!c.watchHub.destination?.trim() || !c.allowedDestinations.includes(c.watchHub.destination))) throw new Error('invalid watch hub configuration');
+    if (c.watchHub.dbPath !== undefined && (typeof c.watchHub.dbPath !== 'string' || !isAbsolute(c.watchHub.dbPath))) throw new Error('invalid watch hub configuration');
+  }
+  if (c.pendingHub !== undefined) {
+    if (!c.pendingHub || typeof c.pendingHub !== 'object' || Array.isArray(c.pendingHub) || typeof c.pendingHub.enabled !== 'boolean') throw new Error('invalid pending hub configuration');
+    if (c.pendingHub.destination !== undefined && typeof c.pendingHub.destination !== 'string') throw new Error('invalid pending hub configuration');
+    if (c.pendingHub.enabled && (!c.pendingHub.destination?.trim() || !c.allowedDestinations.includes(c.pendingHub.destination))) throw new Error('invalid pending hub configuration');
+    if (c.pendingHub.dbPath !== undefined && (typeof c.pendingHub.dbPath !== 'string' || !isAbsolute(c.pendingHub.dbPath))) throw new Error('invalid pending hub configuration');
+  }
+  if (c.decisionSync !== undefined) {
+    if (!c.decisionSync || typeof c.decisionSync !== 'object' || Array.isArray(c.decisionSync) || typeof c.decisionSync.enabled !== 'boolean') throw new Error('invalid decision sync configuration');
+    if (c.decisionSync.dbPath !== undefined && (typeof c.decisionSync.dbPath !== 'string' || !isAbsolute(c.decisionSync.dbPath))) throw new Error('invalid decision sync configuration');
+    if (c.decisionSync.markdownPath !== undefined && (typeof c.decisionSync.markdownPath !== 'string' || !isAbsolute(c.decisionSync.markdownPath))) throw new Error('invalid decision sync configuration');
+    if (c.decisionSync.protectedReadOnlyPaths !== undefined && (!Array.isArray(c.decisionSync.protectedReadOnlyPaths) || !c.decisionSync.protectedReadOnlyPaths.every(p => typeof p === 'string' && isAbsolute(p)))) throw new Error('invalid decision sync configuration');
+  }
   if(c.testLane && (!c.testLane.stateDir || !isAbsolute(c.testLane.stateDir) || (c.testLane.nativeClaude!==undefined && typeof c.testLane.nativeClaude!=='boolean') || (c.testLane.nativeCodex!==undefined && typeof c.testLane.nativeCodex!=='boolean') || (c.testLane.nativeTTLMinutes!==undefined && (!Number.isSafeInteger(c.testLane.nativeTTLMinutes)||c.testLane.nativeTTLMinutes<5||c.testLane.nativeTTLMinutes>120)))) throw new Error('invalid test lane state directory');
   for (const list of [c.allowedProjectRoots,c.outputRoots]) if (list !== undefined && (!Array.isArray(list) || !list.every(x=>typeof x==='string' && isAbsolute(x)))) throw new Error('invalid trusted roots');
   if (c.catalogSources !== undefined && (!Array.isArray(c.catalogSources) || !c.catalogSources.every(x=>x && (x.provider==='claude'||x.provider==='codex'||(x.provider==='agy' && !!c.agy)) && typeof x.directory==='string' && isAbsolute(x.directory) && typeof x.hostId==='string' && !!x.hostId.trim() && typeof x.serviceId==='string' && !!x.serviceId.trim()))) throw new Error('invalid catalog sources');
@@ -49,11 +103,21 @@ export function validateRuntimeConfig(c:RuntimeConfig):void {
   if (c.autoMirror && (typeof c.autoMirror.enabled!=='boolean' || (c.autoMirror.enabled && (!c.autoMirror.destination || !c.allowedDestinations.includes(c.autoMirror.destination))))) throw new Error('invalid auto mirror configuration');
   const url = new URL(c.codexEndpoint); if ((!['ws:','wss:'].includes(url.protocol) && c.codexEndpoint !== 'codex-proxy://default') || url.username || url.password) throw new Error('invalid Codex endpoint');
 }
+const resolveWatchHubDbPath=(config:RuntimeConfig):string => config.watchHub?.dbPath ?? join(dirname(resolve(config.channelDb)),'watch-hub.sqlite');
+const resolvePendingHubDbPath=(config:RuntimeConfig):string => config.pendingHub?.dbPath ?? join(dirname(resolve(config.channelDb)),'pending-hub.sqlite');
+const resolveDecisionSyncDbPath=(config:RuntimeConfig):string => config.decisionSync?.dbPath ?? join(dirname(resolve(config.channelDb)),'decision-sync.sqlite');
+
 /** The caller must ensure inbound envelopes originate from authenticated transport. */
 export class UnifiedRuntime {
   readonly store:UnifiedStore; readonly core:UnifiedCore; readonly channel:FeishuChannel;
-  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setInterval>|undefined; private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
-  constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
+  private _watchHub:WatchHub|undefined; private _pendingHub:PendingHub|undefined; private _decisionSync:DecisionSyncStore|undefined; private _taskChannel:TaskTopicChannel|undefined; private _taskHandoff:TaskHandoffService|undefined;
+  get watchHub():WatchHub|undefined { return this._watchHub; }
+  get pendingHub():PendingHub|undefined { return this._pendingHub; }
+  get decisionSync():DecisionSyncStore|undefined { return this._decisionSync; }
+  get taskChannel():TaskTopicChannel|undefined { return this._taskChannel; }
+  get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
+  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setInterval>|undefined; private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
+  constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
     const channelPath=resolve(config.channelDb); const canonical=existsSync(channelPath) ? realpathSync(channelPath) : join(realpathSync(dirname(channelPath)),basename(channelPath));
     this.lock=new DatabaseSync(`${canonical}.runtime-lock`);
@@ -62,6 +126,7 @@ export class UnifiedRuntime {
     try { if(config.historyArchive) { const data=readFileSync(config.historyArchive.manifestPath); if(createHash('sha256').update(data).digest('hex')!==config.historyArchive.manifestSha256) throw new Error('archive manifest hash mismatch'); archive=new HistoryArchive(config.historyArchive.root,JSON.parse(data.toString()) as MigrationManifest); } } catch(e) {this.lock.exec('ROLLBACK');this.lock.close();throw e;}
     const destinations = new Set(config.allowedDestinations);
     const owner = (identity:{source:string;subject:string}) => identity.source==='feishu' && identity.subject===config.ownerOpenId;
+    const ownerIdentity:Identity = { source: 'feishu', subject: config.ownerOpenId };
     try {
       this.store = new UnifiedStore(config.coreDb);
       this.restartPending=this.store.pendingOutbox();
@@ -69,13 +134,117 @@ export class UnifiedRuntime {
         const measuredPort=new Proxy(port,{get:(target,key)=>{const value=Reflect.get(target,key); if(typeof value!=='function') return value; if(['send','update','sendFile'].includes(String(key))) return async (...args:unknown[])=>{let guardFailed=false;const last=args.length-1; if(typeof args[last]==='function') {const guard=args[last] as ()=>Promise<void>;args[last]=async()=>{try {await guard();} catch(error) {guardFailed=true;throw error;}};} try {const result=await Reflect.apply(value,target,args); try {this.channel.recordHealth('feishu_delivery',(key==='send' && !result)?'unverified':'healthy',(key==='send' && !result)?'消息回执未确认':null);} catch {} return result;} catch(error) {const e=error && typeof error==='object' ? error as {deliveryKind?:unknown;platformCode?:unknown} : {}; const rejected=e.deliveryKind==='api_rejected' && typeof e.platformCode==='number' && Number.isSafeInteger(e.platformCode); const reason=guardFailed?'发送前权限或绑定变化':rejected?`平台拒绝（代码 ${e.platformCode}）`:'投递结果未知'; const deliveryId=args[key==='send'?2:3];try {if(typeof deliveryId==='string') this.channel.recordDeliveryDiagnostic(deliveryId,guardFailed?'guard_rejected':rejected?'api_rejected':'unknown',rejected?e.platformCode as number:null);} catch {} try {this.channel.recordHealth('feishu_delivery','degraded',reason);} catch {} throw error;}}; return value.bind(target);}}); try { this.channel = new FeishuChannel(this.core,measuredPort,async (identity,destination,sessionId)=>{ if(!owner(identity) || !(this.port.authorizedDestination?.(destination) ?? destinations.has(destination))) return false; if(!sessionId || !options.canDiscover) return true; try {return options.canDiscover(this.store.getSession(sessionId));} catch {return options.allowDiscovered?.(sessionId) ?? false;} },config.channelDb,undefined,options.requireReadonlyHydration === true); } catch(error) { this.core.close(); throw error; }
         this.core.validateSteerScope=(scope,sessionId)=>owner({source:scope.ownerSource,subject:scope.ownerSubject}) && (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) && this.channel.isCurrentSteerScope(scope,sessionId);
         this.core.presentSession=session=>this.channel.isAutoPrivateTitle(session.native) ? {...session,title:`${providerTitlePrefix(session.native.provider)} 会话 · ${payloadDigest(session.native).slice(0,8)}`} : session;
+        try {
+          if (config.decisionSync?.enabled) {
+            this._decisionSync = new DecisionSyncStore({
+              dbPath: resolveDecisionSyncDbPath(config),
+              ...(config.decisionSync.markdownPath !== undefined ? { defaultDocPath: config.decisionSync.markdownPath } : {}),
+              ...(config.decisionSync.protectedReadOnlyPaths !== undefined ? { protectedReadOnlyPaths: new Set(config.decisionSync.protectedReadOnlyPaths) } : {}),
+              authorizeActor: (actor) => owner(actor),
+            });
+          }
+          if (config.watchHub?.enabled) {
+            this._watchHub = new WatchHub({
+              dbPath: resolveWatchHubDbPath(config),
+              owner: ownerIdentity,
+              destination: config.watchHub.destination,
+              allowedDestinations: destinations,
+              port: measuredPort,
+              authorizeTarget: (id, dest) => owner(id) && (this.port.authorizedDestination?.(dest) ?? destinations.has(dest)),
+              resolveTopicLink: async (ref, targetDest) => {
+                const sessionId =
+                  ref.sessionId ??
+                  (ref.taskId && this._taskChannel
+                    ? (() => {
+                        const b = this._taskChannel.getBinding(ref.taskId);
+                        return b?.activeTargetId ? this._taskChannel.getTarget(ref.taskId, b.activeTargetId)?.sessionId : undefined;
+                      })()
+                    : undefined);
+                if (sessionId && this.port.topicLinkForSession) {
+                  return this.port.topicLinkForSession(targetDest, sessionId);
+                }
+                return null;
+              },
+            });
+          }
+          if (config.pendingHub?.enabled) {
+            this._pendingHub = new PendingHub({
+              dbPath: resolvePendingHubDbPath(config),
+              owner: ownerIdentity,
+              destination: config.pendingHub.destination,
+              service: this.core,
+              ...(this._decisionSync ? { decisionStore: this._decisionSync } : {}),
+              port: measuredPort,
+              authorize: async (identity, destination, targetId) => {
+                if (!owner(identity)) return false;
+                const root = this._pendingHub?.getRoot();
+                const isHubDest =
+                  destination === config.pendingHub!.destination ||
+                  (!!root?.topicDestination && destination === root.topicDestination);
+                const isTaskDest = !!this._taskChannel?.getBindingByDestination(destination);
+                const destOk =
+                  isHubDest ||
+                  isTaskDest ||
+                  (this.port.authorizedDestination
+                    ? this.port.authorizedDestination(destination)
+                    : destinations.has(destination) ||
+                      this.channel.boundDestinations().includes(destination) ||
+                      this._pendingHub?.getSourceDestination(targetId) === destination);
+                if (!destOk) return false;
+                if (!options.canDiscover) return true;
+                try {
+                  return options.canDiscover(this.store.getSession(targetId));
+                } catch {
+                  // targetId may be 'hub:text' or a decisionId rather than a core sessionId.
+                  return true;
+                }
+              },
+            });
+          }
+          if (config.taskTopic?.enabled) {
+            const authorizeTask: TaskAuthorize = async (identity, destination, sessionId) => {
+              if (!owner(identity)) return false;
+              const binding = this._taskChannel?.getBindingByDestination(destination);
+              const hasTaskLookup = typeof this.port.lookupTaskTopic === 'function';
+              const taskToken = hasTaskLookup ? this.port.lookupTaskTopic!(destination, config.ownerOpenId) : null;
+              const destOk = hasTaskLookup
+                ? !!taskToken
+                : (!!binding && binding.state === 'active') ||
+                  (this.port.authorizedDestination?.(destination) ?? destinations.has(destination));
+              if (!destOk) return false;
+              if (!sessionId || !options.canDiscover) return true;
+              try {
+                return options.canDiscover(this.store.getSession(sessionId));
+              } catch {
+                return options.allowDiscovered?.(sessionId) ?? false;
+              }
+            };
+            this._taskChannel = new TaskTopicChannel(this.core, measuredPort, authorizeTask, config.channelDb);
+            const handoffRoots = options.allowedProjectRoots ?? config.allowedProjectRoots;
+            this._taskHandoff = new TaskHandoffService(
+              this.core,
+              authorizeTask,
+              config.channelDb,
+              handoffRoots ? { allowedProjectRoots: handoffRoots } : {},
+            );
+          }
+        } catch (error) {
+          try { this._taskHandoff?.close(); } catch {}
+          try { this._taskChannel?.close(); } catch {}
+          try { this._pendingHub?.close(); } catch {}
+          try { this._watchHub?.close(); } catch {}
+          try { this._decisionSync?.close(); } catch {}
+          this.channel.close();
+          this.core.close();
+          throw error;
+        }
       } catch(error) { this.store.close(); throw error; }
     } catch(error) { this.lock.exec('ROLLBACK'); this.lock.close(); throw error; }
     const hasAgy=(config.agy !== undefined && config.agy.enabled !== false) || providers.some(p=>p.provider==='agy');
     const healthComponents=['core','feishu_delivery','feishu_callback','feishu_resources','codex_connection','codex_run','claude_connection','claude_run','claude_quota',...(hasAgy ? ['agy_connection','agy_run','agy_quota'] : []),'interaction_return'];
     for(const component of healthComponents) try {this.channel.invalidateHealth(component,'进程重启后尚未重新观测');} catch {}
     if('onResourceHealth' in port) (port as FeishuPort & {onResourceHealth:(status:'healthy'|'degraded',reason:string|null)=>void}).onResourceHealth=(status,reason)=>{try {this.channel.recordHealth('feishu_resources',status,reason);} catch {}};
-    this.core.onAcceptedObservation=o=>{if(this.closing || this.closed)return;const record=(component:string,status:'healthy'|'degraded'|'unverified',reason:string|null=null)=>{try {this.channel.recordHealth(component,status,reason);} catch {}}; const provider=o.ref.provider; if((provider==='claude' || provider==='agy') && o.type==='message' && o.message.role==='assistant') record(`${provider}_connection`,'healthy'); if(o.type==='turn' && ['completed','failed','interrupted'].includes(o.turn.status)) record(`${provider}_run`,o.turn.status==='completed'?'healthy':o.turn.status==='failed'?'degraded':'unverified',o.turn.status==='completed'?null:o.turn.status==='failed'?'运行失败':'本轮中断，结果未确认'); if(o.type==='event' && provider==='claude') {if(o.event.type==='provider.api_retry'){try {const session=this.store.findSession(o.ref);const turn=session && this.store.listTurns(session.sessionId).find(t=>t.turnId===o.event.objectId);if(!turn || !['completed','failed','interrupted'].includes(turn.status)){const d=o.event.data && typeof o.event.data==='object' ? o.event.data as {httpStatus?:unknown}:{};const code=typeof d.httpStatus==='number' && Number.isSafeInteger(d.httpStatus) && d.httpStatus>=100 && d.httpStatus<=599 ? d.httpStatus:null;this.channel.recordRetryHealth(code===null?'模型请求正在重试':`模型请求正在重试（HTTP ${code}）`,o.event.receivedAt);}} catch {}}if(o.event.type==='adapter.stream_failed'){record('claude_run','degraded','SDK流中断');record('claude_connection','degraded','SDK流中断');} if(o.event.type==='provider.usage_limit')record('claude_quota','degraded','服务报告额度限制'); if(o.event.type==='provider.usage_available')record('claude_quota','healthy');} if(o.type==='event' && provider==='agy') {if(o.event.type==='adapter.stream_failed'){record('agy_run','degraded','ACP流中断');record('agy_connection','degraded','ACP流中断');} if(o.event.type==='provider.usage_limit')record('agy_quota','degraded','服务报告额度限制'); if(o.event.type==='provider.usage_available')record('agy_quota','healthy');} if(o.type==='interaction') {const i=o.interaction;if(i.status==='answer_pending_delivery') record('interaction_return','unverified','答复已提交，原生结果待确认');else if(i.status==='resolved') record('interaction_return',i.nativeResult?.status==='accepted'?'healthy':'unverified',i.nativeResult?.status==='accepted'?null:'原生结果未确认');}};
+    this.core.onAcceptedObservation=o=>{if(this.closing || this.closed)return;const record=(component:string,status:'healthy'|'degraded'|'unverified',reason:string|null=null)=>{try {this.channel.recordHealth(component,status,reason);} catch {}}; const provider=o.ref.provider; if((provider==='claude' || provider==='agy') && o.type==='message' && o.message.role==='assistant') record(`${provider}_connection`,'healthy'); if(o.type==='turn' && ['completed','failed','interrupted'].includes(o.turn.status)) record(`${provider}_run`,o.turn.status==='completed'?'healthy':o.turn.status==='failed'?'degraded':'unverified',o.turn.status==='completed'?null:o.turn.status==='failed'?'运行失败':'本轮中断，结果未确认'); if(o.type==='event' && provider==='claude') {if(o.event.type==='provider.api_retry'){try {const session=this.store.findSession(o.ref);const turn=session && this.store.listTurns(session.sessionId).find(t=>t.turnId===o.event.objectId);if(!turn || !['completed','failed','interrupted'].includes(turn.status)){const d=o.event.data && typeof o.event.data==='object' ? o.event.data as {httpStatus?:unknown}:{};const code=typeof d.httpStatus==='number' && Number.isSafeInteger(d.httpStatus) && d.httpStatus>=100 && d.httpStatus<=599 ? d.httpStatus:null;this.channel.recordRetryHealth(code===null?'模型请求正在重试':`模型请求正在重试（HTTP ${code}）`,o.event.receivedAt);}} catch {}}if(o.event.type==='adapter.stream_failed'){record('claude_run','degraded','SDK流中断');record('claude_connection','degraded','SDK流中断');} if(o.event.type==='provider.usage_limit')record('claude_quota','degraded','服务报告额度限制'); if(o.event.type==='provider.usage_available')record('claude_quota','healthy');} if(o.type==='event' && provider==='agy') {if(o.event.type==='adapter.stream_failed'){record('agy_run','degraded','ACP流中断');record('agy_connection','degraded','ACP流中断');} if(o.event.type==='provider.usage_limit')record('agy_quota','degraded','服务报告额度限制'); if(o.event.type==='provider.usage_available')record('agy_quota','healthy');} if(o.type==='interaction') {const i=o.interaction;if(i.status==='answer_pending_delivery') record('interaction_return','unverified','答复已提交，原生结果待确认');else if(i.status==='resolved') record('interaction_return',i.nativeResult?.status==='accepted'?'healthy':'unverified',i.nativeResult?.status==='accepted'?null:'原生结果未确认');} if(this._pendingHub && (o.type==='interaction' || o.type==='connection')) {const task=this._pendingHub.handleObservation(o).catch(()=>{}); this.hubTasks.add(task); void task.finally(()=>{this.hubTasks.delete(task);});}};
     const coreHealth=this.core.health.bind(this.core);
     this.core.health=async()=>{ const base=(await coreHealth())[0]!;const h=this.health(); const interactions=this.store.interactionHealthCounts(); const deliveryUnknown=this.channel.unconfirmedDeliveryCount(); const names=healthComponents; return [...names.map(component=>{const f=this.channel.healthFact(component); const issues=component==='feishu_resources'?h.resourceIssues.length:component==='feishu_delivery'?deliveryUnknown:component==='feishu_callback'?h.unknownInbox:component==='interaction_return'?interactions.unknown:0; const status=component==='core' && base.status==='degraded'?'degraded' as const:issues?'degraded' as const:f.status; return {...f,component,status,reason:component==='core' && base.status==='degraded'?base.reason:issues?'存在未确认或失败记录':f.reason,backlog:component==='core'?base.backlog:component==='feishu_callback'?this.channel.pendingInbox().length:component==='feishu_resources'?h.resourceIssues.length:component==='interaction_return'?interactions.pending:null,unknown:component==='feishu_delivery'?deliveryUnknown:component==='feishu_callback'?h.unknownInbox:component==='feishu_resources'?h.resourceIssues.filter(x=>x.state!=='rejected').length:component==='interaction_return'?interactions.unknown:null,lastDeliveryAt:component==='feishu_delivery'?f.lastSuccessAt:null,updatedAt:f.lastObservedAt};}),{component:'runtime',status:h.status,reason:h.reason ?? (h.resourceIssues.length ? '资源待核对' : h.unknownInbox || h.unknownDeliveries ? '存在未知回执' : null),backlog:h.resourceIssues.length,lastDeliveryAt:null,updatedAt:null,lastObservedAt:null,lastSuccessAt:null,lastFailureAt:null,lastFailureReason:null,unknown:h.unknownInbox+h.unknownDeliveries}]; };
 
@@ -89,11 +258,103 @@ export class UnifiedRuntime {
     return {attempted,completed,failed,remaining:new Set(pending().map(b=>b.sessionId)).size};} finally {this.baselinePreparing=false;}
   }
   acceptsBackgroundWork():boolean { return !this.closed && !this.closing; }
-  async captureResourceScope(envelope:TrustedEnvelope):Promise<string> { if(this.closed || this.closing) throw new Error('closed'); const capture=this.channel.captureBindingScope(envelope); this.intakes.add(capture); try { return await capture; } finally { this.intakes.delete(capture); } }
-  async handleTrusted(envelope:TrustedEnvelope,action:ChannelAction):Promise<unknown> { if(this.closed || this.closing) throw new Error('closed'); const intake=this.channel.intake(envelope,action); this.intakes.add(intake); try { return await intake; } finally { this.intakes.delete(intake); } }
+  async captureResourceScope(envelope:TrustedEnvelope):Promise<string> {
+    if(this.closed || this.closing) throw new Error('closed');
+    const capture=this._taskChannel?.getBindingByDestination(envelope.destination)
+      ? this._taskChannel.captureResourceScope(envelope)
+      : this.channel.captureBindingScope(envelope);
+    this.intakes.add(capture);
+    try { return await capture; } finally { this.intakes.delete(capture); }
+  }
+  async handleTrusted(envelope:TrustedEnvelope,action:RuntimeTrustedAction):Promise<unknown> {
+    if(this.closed || this.closing) throw new Error('closed');
+    const intake=(async()=>{
+      if(this._taskHandoff && action.action==='confirm_handoff') {
+        const binding=this._taskChannel?.getBindingByDestination(envelope.destination);
+        if(this._taskChannel && (!binding || binding.taskId!==action.taskId)) {
+          throw new TaskHandoffError('stale_revision','task binding mismatch');
+        }
+        const draft=this._taskHandoff.getHandoff(action.handoffId);
+        if(draft && draft.activeRevision!==action.activeRevision) {
+          throw new TaskHandoffError('stale_revision','active revision mismatch');
+        }
+        return this._taskHandoff.confirmHandoff(
+          action.handoffId,
+          action.previewDigest,
+          action.targetGeneration,
+          envelope.identity,
+          envelope.eventId,
+        );
+      }
+      if(this._taskChannel && this._taskChannel.getBindingByDestination(envelope.destination)) {
+        if(action.action==='legacy_model') {
+          if(!action.model && !action.invalid) return this._taskChannel.intake(envelope,{action:'models'});
+          throw new TaskChannelError('invalid_request','use /models to switch target model');
+        }
+        return this._taskChannel.intake(envelope,action as TaskChannelAction);
+      }
+      if(this._pendingHub) {
+        const hubRoot=this._pendingHub.getRoot();
+        const hubBindingId=createHash('sha256').update('pending-hub:singleton').digest('hex').slice(0,16);
+        const inHubTopic=!!hubRoot?.topicDestination && hubRoot.topicDestination!==hubRoot.chatDestination && envelope.destination===hubRoot.topicDestination;
+        const meta=action as {entry?:unknown;bindingId?:unknown;sourceSessionId?:unknown};
+        const entry=meta.entry==='source' ? 'source' : meta.entry==='hub' ? 'hub' : undefined;
+        if(action.action==='decision_answer') {
+          const payload:PendingSubmitPayload={
+            kind:'decision',
+            decisionId:action.decisionId,
+            expectedVersion:action.expectedVersion,
+            expectedDigest:action.expectedDigest,
+            ...(action.selectedOptionId!==undefined ? {selectedOptionId:action.selectedOptionId} : {}),
+            ...(action.freeText!==undefined ? {freeText:action.freeText} : {}),
+            ...(action.rawUtterance!==undefined ? {rawUtterance:action.rawUtterance} : {}),
+          };
+          return entry==='source' ? this._pendingHub.submitFromSource(envelope,payload) : this._pendingHub.submitFromHub(envelope,payload);
+        }
+        if((action.action==='answer' || action.action==='answer_form') && (entry!==undefined || meta.bindingId===hubBindingId || inHubTopic)) {
+          const sourceSessionId=typeof meta.sourceSessionId==='string' && meta.sourceSessionId.trim()
+            ? meta.sourceSessionId
+            : (await this.core.getInteraction(action.interactionId)).sessionId;
+          const payload:PendingSubmitPayload=action.action==='answer_form'
+            ? {
+                kind:'question_form',
+                sourceSessionId,
+                interactionId:action.interactionId,
+                revision:action.revision,
+                connectionGeneration:action.connectionGeneration,
+                bindingId:typeof meta.bindingId==='string' ? meta.bindingId : '',
+                fields:action.fields,
+              }
+            : {
+                kind:'interaction',
+                sourceSessionId,
+                interactionId:action.interactionId,
+                revision:action.revision,
+                connectionGeneration:action.connectionGeneration,
+                answer:action.answer,
+                toolInputDigest:action.toolInputDigest,
+              };
+          return entry==='source' ? this._pendingHub.submitFromSource(envelope,payload) : this._pendingHub.submitFromHub(envelope,payload);
+        }
+        if(inHubTopic && action.action==='input') {
+          return this._pendingHub.handleHubText(envelope,action.text);
+        }
+        if(action.action==='pending_page' && (inHubTopic || envelope.destination===this.config.pendingHub!.destination)) {
+          return this._pendingHub.listPending({
+            ...(action.cursor!==undefined ? {cursor:action.cursor} : {}),
+            ...(action.category!==undefined ? {category:action.category} : {}),
+            ...(action.provider!==undefined ? {provider:action.provider} : {}),
+          });
+        }
+      }
+      return this.channel.intake(envelope,action as ChannelAction);
+    })();
+    this.intakes.add(intake);
+    try { return await intake; } finally { this.intakes.delete(intake); }
+  }
   async tick():Promise<void> {
     if (this.closed || this.closing || this.baselinePreparing) throw new Error('closed or baseline preparation active'); if (this.running) return this.running;
-    this.running = (async()=>{ let failed=false; try { await this.port.drainInbound?.((e,a,scope)=>this.channel.intake(e,a,scope)); for (const id of this.channel.pendingInbox()) { try { await this.channel.drain(id); } catch { failed=true; } } await this.core.dispatchPending(); await this.channel.advanceCompleted(); try {await this.options.refresh?.(this);} catch {failed=true;} for(const destination of this.channel.boundDestinations()) { try { const binding=this.channel.bindingsForRestore().find(b=>b.destination===destination); if(this.options.requireReadonlyHydration && binding?.accessMode==='read_only' && !this.channel.readonlyHydrated(destination,binding.sessionId)) continue; await this.channel.sync(destination); } catch(e) { if (!(e instanceof Error && e.message==='destination is not bound')) failed=true; } } if (failed) throw new Error('isolated work failed'); this.lastError=null; try {this.channel.recordHealth('core','healthy');} catch {} } catch { try {this.channel.recordHealth('core','degraded','调度或同步失败');} catch {} this.lastError='dispatch or synchronization failed; inspect persisted state before retry'; throw new Error(this.lastError); } })();
+    this.running = (async()=>{ let failed=false; try { await this.port.drainInbound?.((e,a,scope)=>this.channel.intake(e,a,scope)); for (const id of this.channel.pendingInbox()) { try { await this.channel.drain(id); } catch { failed=true; } } if(this._taskChannel) { for (const id of this._taskChannel.pendingInbox()) { try { await this._taskChannel.drain(id); } catch { failed=true; } } } await this.core.dispatchPending(); await this.channel.advanceCompleted(); try {await this.options.refresh?.(this);} catch {failed=true;} for(const destination of this.channel.boundDestinations()) { try { const binding=this.channel.bindingsForRestore().find(b=>b.destination===destination); if(this.options.requireReadonlyHydration && binding?.accessMode==='read_only' && !this.channel.readonlyHydrated(destination,binding.sessionId)) continue; await this.channel.sync(destination); } catch(e) { if (!(e instanceof Error && e.message==='destination is not bound')) failed=true; } } if(this._taskChannel) { for(const binding of this._taskChannel.listActiveBindings()) { try { const res=await this._taskChannel.syncTask(binding.taskId); if(res.failedTargets.length>0) failed=true; } catch { failed=true; } } } if(this._watchHub && this._watchHub.listOutbox().some(r=>r.state==='pending')) { try { await this._watchHub.flush(); } catch { failed=true; } } if(this._pendingHub) { try { for(const b of this.channel.bindingsForRestore()) { if(this._pendingHub.getSourceDestination(b.sessionId)!==b.destination) this._pendingHub.bindSourceSession(b.sessionId,b.destination); } if(this._taskChannel) { for(const b of this._taskChannel.listActiveBindings()) { for(const t of this._taskChannel.listTargets(b.taskId)) { if(t.accessMode==='interactive' && this._pendingHub.getSourceDestination(t.sessionId)!==b.destination) this._pendingHub.bindSourceSession(t.sessionId,b.destination); } } } const trackedCards=[...this.channel.listInteractionCards().map(c=>({destination:c.destination,sessionId:c.sessionId,interactionId:c.interactionId,messageId:c.messageId})),...(this._taskChannel?.listInteractionCards().map(c=>({destination:c.destination,sessionId:c.sessionId,interactionId:c.interactionId,messageId:c.messageId})) ?? [])]; for(const card of trackedCards) { try { const interaction=await this.core.getInteraction(card.interactionId); const session=await this.core.getSession(card.sessionId); if(interaction.status==='awaiting_answer' && session.status!=='read_only' && session.control.input==='available') { const existingRef=this._pendingHub.getRef(`interaction:${interaction.interactionId}`); if(!existingRef || (existingRef.card_active===1 && (existingRef.source_card_message_id!==card.messageId || existingRef.revision<interaction.revision))) { this._pendingHub.trackSourceCard({interactionId:interaction.interactionId,category:interaction.kind==='approval'?'approval':'question',provider:session.native.provider,sourceSessionId:card.sessionId,sourceDestination:card.destination,messageId:card.messageId,revision:interaction.revision,connectionGeneration:interaction.connectionGeneration}); } } } catch {} } await this._pendingHub.sync(); } catch { failed=true; } } if(this._decisionSync && this._decisionSync.listDocOutbox().some(r=>r.state==='pending_sync')) { try { this._decisionSync.retryPendingSyncs(); } catch { failed=true; } } if (failed) throw new Error('isolated work failed'); this.lastError=null; try {this.channel.recordHealth('core','healthy');} catch {} } catch { try {this.channel.recordHealth('core','degraded','调度或同步失败');} catch {} this.lastError='dispatch or synchronization failed; inspect persisted state before retry'; throw new Error(this.lastError); } })();
     try { await this.running; } finally { this.running=undefined; }
   }
   recordProviderConnection(provider:Provider,ready:boolean):void {try {this.channel.recordHealth(`${provider}_connection`,ready?'healthy':'degraded',ready?null:'连接不可用');} catch {}}
@@ -123,8 +384,8 @@ export class UnifiedRuntime {
   close():Promise<void> {
     if(this.closePromise) return this.closePromise;
     this.closing=true; if(this.timer) clearInterval(this.timer);
-    const running=this.running; const intakes=[...this.intakes];
-    this.closePromise=(async()=>{ await Promise.allSettled(intakes); await running?.catch(()=>{}); try { await Promise.all(this.providers.map(p=>p.close?.())); } finally { try { this.core.close(); this.channel.close(); this.store.close(); } finally { this.lock.exec('ROLLBACK'); this.lock.close(); this.options.cleanup?.(); this.closed=true; } } })();
+    const running=this.running; const intakes=[...this.intakes]; const hubTasks=[...this.hubTasks];
+    this.closePromise=(async()=>{ await Promise.allSettled(intakes); await running?.catch(()=>{}); await Promise.allSettled(hubTasks); try { await Promise.all(this.providers.map(p=>p.close?.())); } finally { try { try { this._taskHandoff?.close(); } catch {} try { this._taskChannel?.close(); } catch {} try { this._pendingHub?.close(); } catch {} try { this._watchHub?.close(); } catch {} try { this._decisionSync?.close(); } catch {} this.core.close(); this.channel.close(); this.store.close(); } finally { this.lock.exec('ROLLBACK'); this.lock.close(); this.options.cleanup?.(); this.closed=true; } } })();
     return this.closePromise;
   }
 }
@@ -135,7 +396,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   validateRuntimeConfig(config);
   if (!config.artifactStatePath || !config.catalogSources || !config.allowedProjectRoots || !config.outputRoots) throw new Error('explicit catalog, root and artifact state configuration required');
   const agyEnabled = config.agy !== undefined && config.agy.enabled !== false;
-  const persistent=[config.coreDb,config.channelDb,config.artifactStatePath,...(agyEnabled && config.agy?.quotaCachePath ? [config.agy.quotaCachePath] : [])].map(canonicalPath); if (new Set(persistent).size !== persistent.length) throw new Error('runtime state paths must be distinct');
+  const persistent=[config.coreDb,config.channelDb,config.artifactStatePath,...(agyEnabled && config.agy?.quotaCachePath ? [config.agy.quotaCachePath] : []),...(config.watchHub?.enabled ? [resolveWatchHubDbPath(config)] : []),...(config.pendingHub?.enabled ? [resolvePendingHubDbPath(config)] : []),...(config.decisionSync?.enabled ? [resolveDecisionSyncDbPath(config)] : [])].map(canonicalPath); if (new Set(persistent).size !== persistent.length) throw new Error('runtime state paths must be distinct');
   const projects=config.allowedProjectRoots.map(x=>realpathSync(x)), outputs=config.outputRoots.map(x=>realpathSync(x));
   const sources=config.catalogSources.map(s=>({...s,directory:realpathSync(s.directory)}));
   const serviceIdFor=(provider:Provider):string|undefined=>provider==='claude'?config.claudeServiceId:provider==='codex'?config.codexServiceId:agyEnabled?config.agy!.serviceId:undefined;
@@ -216,7 +477,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   const readOldClaude=(base:PlatformPort,ref:Session['native'])=>runBounded(()=>oldReadPending,p=>{oldReadPending=p;},2000,'old read pending','old read timed out',()=>base.read(ref));
   const listOldClaude=(base:PlatformPort,cursor:string|null)=>runBounded(()=>oldListPending,p=>{oldListPending=p;},2000,'old scan pending','old scan timed out',()=>{const call=base.discoverExisting?.bind(base) ?? base.list.bind(base);return call(cursor,1);});
   let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null; let agyAutoCursor:string|null=null; const recentCursors:Record<Provider,string|null>={codex:null,claude:null,agy:null}; const scopeByProvider:Record<Provider,Array<{root:string;watermark:number}>>={codex:[],claude:[],agy:[]}; const localCodexClock=config.codexEndpoint==='codex-proxy://default' || ['localhost','127.0.0.1','[::1]','::1'].includes(new URL(config.codexEndpoint).hostname);
-  try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,canInspectCandidate:(native,project)=>{try{return native.provider==='codex'&&native.hostId===config.hostId&&native.serviceId===config.codexServiceId&&sources.some(x=>x.provider==='codex'&&x.hostId===native.hostId&&x.serviceId===native.serviceId)&&isAbsolute(project)&&projects.some(root=>inside(realpathSync(project),root))}catch{return false}},allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
+  try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,canInspectCandidate:(native,project)=>{try{return native.provider==='codex'&&native.hostId===config.hostId&&native.serviceId===config.codexServiceId&&sources.some(x=>x.provider==='codex'&&x.hostId===native.hostId&&x.serviceId===native.serviceId)&&isAbsolute(project)&&projects.some(root=>inside(realpathSync(project),root))}catch{return false}},allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,allowedProjectRoots:config.allowedProjectRoots,cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
       let autoFailed=false;
       try {await r.channel.applyPendingAutoBaselines();} catch {autoFailed=true;}
       if(config.autoMirror?.enabled) {
@@ -265,6 +526,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
       // Native history reads may be expensive. Keep each polling cycle bounded so
       // an imported backlog cannot postpone new inbox work until all sessions refresh.
       const boundIds=new Set(r.channel.bindingsForRestore().map(binding=>binding.sessionId));
+      if(r.taskChannel) for(const b of r.taskChannel.listActiveBindings()) for(const t of r.taskChannel.listTargets(b.taskId)) boundIds.add(t.sessionId);
       const candidates=r.store.listSessions().filter(s=>!r.store.isDetached(s.sessionId) && trusted(s) && (boundIds.has(s.sessionId) || s.control.input==='available'));
       const count=Math.min(2,candidates.length), start=candidates.length ? refreshOffset%candidates.length : 0; let refreshFailed=false;
       refreshOffset=candidates.length ? (start+count)%candidates.length : 0;
@@ -294,7 +556,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
 export async function createLiveRuntime(config:RuntimeConfig, credentials:{appId:string;appSecret:string}, sdkDb:string) {
   validateRuntimeConfig(config);
   const agyEnabled = config.agy !== undefined && config.agy.enabled !== false;
-  const distinctCheck = [config.coreDb,config.channelDb,config.artifactStatePath,...(agyEnabled && config.agy?.quotaCachePath ? [config.agy.quotaCachePath] : [])].filter((x):x is string=>!!x);
+  const distinctCheck = [config.coreDb,config.channelDb,config.artifactStatePath,...(agyEnabled && config.agy?.quotaCachePath ? [config.agy.quotaCachePath] : []),...(config.watchHub?.enabled ? [resolveWatchHubDbPath(config)] : []),...(config.pendingHub?.enabled ? [resolvePendingHubDbPath(config)] : []),...(config.decisionSync?.enabled ? [resolveDecisionSyncDbPath(config)] : [])].filter((x):x is string=>!!x);
   if (!sdkDb || !isAbsolute(sdkDb) || distinctCheck.some(x=>canonicalPath(x)===canonicalPath(sdkDb))) throw new Error('distinct SDK database required');
   const transport=new CodexTransport(config.codexEndpoint); const claude=new ClaudeAdapter(config.hostId,config.claudeServiceId,config.claudeStateDir); const codex=new CodexAdapter(transport,config.hostId,config.codexServiceId);
   let agyCatalog:AgyCatalog|undefined, agyTransport:AgyAcpTransport|undefined, agyQuota:AgyQuotaClient|undefined, agyAdapter:AgyAdapter|undefined;

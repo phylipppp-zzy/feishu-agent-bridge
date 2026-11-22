@@ -1142,7 +1142,7 @@ export class PendingHub {
       const stamp = this.now();
 
       if (latest.source_card_message_id && latest.source_destination) {
-        const deliveryId = `pending-withdraw-src:${payloadDigest([latest.ref_id, latest.source_card_message_id])}`;
+        const deliveryId = `pending-withdraw-src:${payloadDigest([latest.ref_id, latest.source_card_message_id, latest.revision])}`;
         sourceUpdated = await this.updateOnce(
           latest.source_destination,
           latest.source_card_message_id,
@@ -1151,7 +1151,7 @@ export class PendingHub {
         );
       }
       if (latest.hub_card_message_id) {
-        const deliveryId = `pending-withdraw-hub:${payloadDigest([latest.ref_id, latest.hub_card_message_id])}`;
+        const deliveryId = `pending-withdraw-hub:${payloadDigest([latest.ref_id, latest.hub_card_message_id, latest.revision])}`;
         hubUpdated = await this.updateOnce(hubDest, latest.hub_card_message_id, withdrawnCard, deliveryId);
       }
 

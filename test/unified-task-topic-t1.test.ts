@@ -764,6 +764,83 @@ test('T1: cross-target interaction routing targets exact card targetId/sessionId
   }
 });
 
+test('T1: artifacts button list disambiguates multi-version filenames and keeps single-version names plain', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 't1-artifacts-ver-'));
+  const store = new UnifiedStore(join(dir, 'core.sqlite'));
+  const agy = makeFakeProviderPort('agy');
+  const sAgy = makeSession('agy', 'n-art', '/work/repo');
+  store.insertSession(sAgy);
+  agy.port.listArtifacts = async () => [
+    {
+      artifactId: 'art-dup',
+      sessionId: sAgy.sessionId,
+      name: 'report.md',
+      mediaType: 'text/markdown',
+      size: 10,
+      contentVersion: 'aaaa1111bbbb2222',
+    },
+    {
+      artifactId: 'art-dup',
+      sessionId: sAgy.sessionId,
+      name: 'report.md',
+      mediaType: 'text/markdown',
+      size: 12,
+      contentVersion: 'cccc3333dddd4444',
+    },
+    {
+      artifactId: 'art-single',
+      sessionId: sAgy.sessionId,
+      name: 'summary.txt',
+      mediaType: 'text/plain',
+      size: 5,
+      contentVersion: 'eeee5555ffff6666',
+    },
+  ];
+  const core = new UnifiedCore(store, [agy.port], (id) => id.subject === 'owner-1');
+  const feishu = makeFakeFeishuPort();
+  const taskChannel = new TaskTopicChannel(
+    core,
+    feishu.port,
+    async (id) => id.subject === 'owner-1',
+    join(dir, 'channel.sqlite'),
+  );
+
+  try {
+    taskChannel.registerTask({
+      taskId: 'task-art',
+      destination: 'topic:task-art',
+      rootGeneration: 1,
+      owner: OWNER,
+    });
+    await taskChannel.mountTarget({
+      taskId: 'task-art',
+      targetId: 't-agy',
+      sessionId: sAgy.sessionId,
+      native: sAgy.native,
+      accessMode: 'interactive',
+      owner: OWNER,
+      makeActive: true,
+    });
+
+    await taskChannel.handle(
+      { eventId: 'evt-artifacts', destination: 'topic:task-art', identity: OWNER },
+      { action: 'artifacts' },
+    );
+
+    const artCard = feishu.sent.at(-1)?.card;
+    assert.ok(artCard);
+    assert.deepEqual(
+      artCard.actions.map((a) => a.label),
+      ['report.md (aaaa1111)', 'report.md (cccc3333)', 'summary.txt'],
+    );
+  } finally {
+    taskChannel.close();
+    core.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('T1: 0090d1a rollback guard preserves co-located task_bindings/targets/inbox/cursors/handoffs and never leaks task events to old channel', async (t) => {
   const release = process.env.TASK_GUARD_RELEASE;
   if (!release) {

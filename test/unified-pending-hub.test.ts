@@ -869,3 +869,104 @@ test('restart never resurrects answered, expired, or old-generation permissions'
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('decision v1 -> v2 upgrade reusing card message IDs does not collide on second withdrawal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pending-rev-withdraw-'));
+  const store = new UnifiedStore(join(dir, 'core.sqlite'));
+  const { ports } = createProviderPorts();
+  const core = new UnifiedCore(store, ports, () => true);
+  const decisionStore = new DecisionSyncStore({ dbPath: join(dir, 'decisions.sqlite') });
+  const fake = createFakePendingPort();
+  const hub = new PendingHub({
+    dbPath: join(dir, 'hub.sqlite'),
+    owner,
+    destination: 'chat-main',
+    service: core,
+    decisionStore,
+    port: fake.port,
+  });
+
+  try {
+    const sess = makeSession('agy', 'dec-rev');
+    store.insertSession(sess);
+    store.setConnectionGeneration(sess.sessionId, 0, 1);
+    hub.bindSourceSession(sess.sessionId, 'topic:agy-dec-rev');
+
+    const v1 = decisionStore.createDecision({
+      decisionId: 'dec-upgrade-withdraw',
+      kind: 'business_decision',
+      title: '选择训练超参方案',
+      prompt: '请选择方案',
+      options: [{ id: 'opt1', label: '方案 1' }],
+      source: { system: 'planner', sessionId: sess.sessionId, destination: 'topic:agy-dec-rev' },
+    });
+
+    await hub.sync();
+    const refV1 = hub.getRef('decision:dec-upgrade-withdraw')!;
+    assert.equal(refV1.revision, 1);
+    assert.ok(refV1.source_card_message_id);
+    assert.ok(refV1.hub_card_message_id);
+
+    // Withdraw v1 cards
+    const ansV1 = await hub.submitFromHub(
+      { eventId: 'evt-v1-ans', destination: 'topic:pending-hub-1', identity: owner },
+      {
+        kind: 'decision',
+        decisionId: v1.decisionId,
+        expectedVersion: v1.version,
+        expectedDigest: v1.digest,
+        selectedOptionId: 'opt1',
+        cardMessageId: refV1.hub_card_message_id!,
+      },
+    );
+    assert.deepEqual(ansV1.withdrawnCards, { sourceUpdated: true, hubUpdated: true });
+    assert.equal(hub.getRef('decision:dec-upgrade-withdraw')?.card_active, 0);
+
+    // Upgrade decision to v2 (reuses existing source & hub card message IDs)
+    const v2 = decisionStore.updateDecision({
+      decisionId: v1.decisionId,
+      expectedVersion: v1.version,
+      prompt: '升级后的 v2 方案确认',
+      options: [{ id: 'opt2', label: '方案 2' }],
+    });
+    assert.equal(v2.version, 2);
+
+    await hub.sync();
+    const refV2 = hub.getRef('decision:dec-upgrade-withdraw')!;
+    assert.equal(refV2.revision, 2);
+    assert.equal(refV2.card_active, 1);
+    assert.equal(refV2.source_card_message_id, refV1.source_card_message_id);
+    assert.equal(refV2.hub_card_message_id, refV1.hub_card_message_id);
+
+    const updatesBeforeV2Withdraw = fake.updates.length;
+    const ansV2 = await hub.submitFromSource(
+      { eventId: 'evt-v2-ans', destination: 'topic:agy-dec-rev', identity: owner },
+      {
+        kind: 'decision',
+        decisionId: v2.decisionId,
+        expectedVersion: v2.version,
+        expectedDigest: v2.digest,
+        selectedOptionId: 'opt2',
+        cardMessageId: refV2.source_card_message_id!,
+      },
+    );
+    assert.deepEqual(ansV2.withdrawnCards, { sourceUpdated: true, hubUpdated: true });
+    assert.equal(hub.getRef('decision:dec-upgrade-withdraw')?.card_active, 0);
+
+    const v2WithdrawUpdates = fake.updates.slice(updatesBeforeV2Withdraw);
+    assert.equal(
+      v2WithdrawUpdates.some((u) => u.messageId === refV2.source_card_message_id && u.card.actions.length === 0),
+      true,
+    );
+    assert.equal(
+      v2WithdrawUpdates.some((u) => u.messageId === refV2.hub_card_message_id && u.card.actions.length === 0),
+      true,
+    );
+  } finally {
+    hub.close();
+    decisionStore.close();
+    core.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
