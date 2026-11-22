@@ -34,8 +34,8 @@ export class UnifiedCore implements UnifiedService {
       if (this.providers.has(port.provider)) throw new Error('duplicate provider');
       port.seedConnectionGeneration?.(store.maxConnectionGeneration());
       // Persisted control is not proof that this fresh provider connection holds a subscription.
-      if (port.provider === 'codex' && port.seedConnectionGeneration) for (const current of store.listSessions()) {
-        if (current.native.provider !== 'codex' || current.control.input !== 'available') continue;
+      if ((port.provider === 'codex' || port.provider === 'agy') && port.seedConnectionGeneration) for (const current of store.listSessions()) {
+        if (current.native.provider !== port.provider || current.control.input !== 'available') continue;
         const capabilities=Object.fromEntries(Object.entries(current.capabilities).map(([key,value])=>[key,key==='view' ? value : {status:'temporarily_unavailable',reason:'explicit resume required after provider restart'}])) as Session['capabilities'];
         store.updateSession({...current,status:'read_only',revision:current.revision+1,capabilities,control:{...current.control,owner:null,input:'unavailable',generation:current.control.generation+1,reason:'explicit resume required after provider restart'}},current.revision,current.control.generation);
       }
@@ -65,7 +65,7 @@ export class UnifiedCore implements UnifiedService {
     const stored=this.store.listSessions(); const known=new Set(stored.map(s=>payloadDigest(s.native)));
     const all=stored.filter(s=>!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))).map(s=>this.present(s));
     const unavailableProviders:Provider[]=[]; if(this.canDiscover) for(const port of this.providers.values()) {try {let cursor:string|null=null;const seen=new Set<string>();do {const found=await boundedProviderList(port,cursor);for(const item of found.items) {if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');const key=payloadDigest(item.native);if(known.has(key)||!this.canDiscover(item))continue;known.add(key);const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});}cursor=found.nextCursor;if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}}while(cursor!==null);this.setProviderAvailable(port.provider,true);} catch {unavailableProviders.push(port.provider);this.setProviderAvailable(port.provider,false);}}
-    all.sort((a,b)=>payloadDigest(a.native).localeCompare(payloadDigest(b.native)));const search=q.search?.toLowerCase();const selected=page(all.filter(s=>!search||`${s.native.provider} ${s.title} ${s.project}`.toLowerCase().includes(search)),q);const items:Session[]=[];
+    all.sort((a,b)=>payloadDigest(a.native).localeCompare(payloadDigest(b.native)));const search=q.search?.toLowerCase();const selected=page(all.filter(s=>(!q.provider||s.native.provider===q.provider)&&(!search||`${s.native.provider} ${s.native.provider==='agy'?'antigravity ':''}${s.title} ${s.project}`.toLowerCase().includes(search))),q);const items:Session[]=[];
     for(const candidate of selected.items) {let current=this.store.findSession(candidate.native);if(!current) {try {this.store.insertSession(candidate);current=candidate;} catch(error) {current=this.store.findSession(candidate.native);if(!current)throw error;}} if(this.store.isDetached(current.sessionId) || (this.canDiscover && !this.canDiscover(current))) continue;items.push(this.present(current));}
     return {items,nextCursor:selected.nextCursor,...(unavailableProviders.length?{unavailableProviders}:{})};
   }
@@ -107,7 +107,7 @@ export class UnifiedCore implements UnifiedService {
     if(this.unavailableProviders.has(request.payload.provider)) return fail('temporarily_unavailable','provider unavailable');
     return this.store.registerCreate(request.context,request.payload);
   }
-  async unknownCreateProvider(identity:{source:string;subject:string},destination:string,operationId:string):Promise<Provider|null>{try{const op=this.store.getOperation(operationId),out=this.store.getOutbox(operationId),provider=(out.payload as {provider?:unknown})?.provider;if(this.closed||(provider!=='codex'&&provider!=='claude')||!this.authorizeBootstrap(identity,provider)||out.context.identity.source!==identity.source||out.context.identity.subject!==identity.subject||out.context.targetId!==`new:${destination}`||out.kind!=='createSession'||op.action!=='createSession'||op.status!=='unknown')return null;return provider;}catch{return null;}}
+  async unknownCreateProvider(identity:{source:string;subject:string},destination:string,operationId:string):Promise<Provider|null>{try{const op=this.store.getOperation(operationId),out=this.store.getOutbox(operationId),provider=(out.payload as {provider?:unknown})?.provider;if(this.closed||(provider!=='codex'&&provider!=='claude'&&provider!=='agy')||!this.authorizeBootstrap(identity,provider)||out.context.identity.source!==identity.source||out.context.identity.subject!==identity.subject||out.context.targetId!==`new:${destination}`||out.kind!=='createSession'||op.action!=='createSession'||op.status!=='unknown')return null;return provider;}catch{return null;}}
   private readonly candidateReads=new Map<string,Promise<import('./contracts.js').CandidateMetadata>>();
   private candidateFlight:Promise<{items:import('./contracts.js').CandidateMetadata[];nextCursor:string|null;partial:boolean}>|undefined;
   async inspectUnknownCreateCandidates(identity:{source:string;subject:string},destination:string,operationId:string,query:{cursor?:string;nativeId?:string}):Promise<{items:import('./contracts.js').CandidateMetadata[];nextCursor:string|null;partial:boolean}>{
@@ -133,7 +133,7 @@ export class UnifiedCore implements UnifiedService {
     if ((this.canDiscover && !this.canDiscover(candidate)) || !this.authorize(request.context.identity,candidate,'attachSession')) return fail('unauthorized');
     let resumed = false; let attached = false;
     try {
-    if (request.payload.mode === 'interactive' && provider === 'codex') {
+    if (request.payload.mode === 'interactive' && (provider === 'codex' || provider === 'agy')) {
       if (existing) port.seedControlGeneration?.(ref,existing.control.generation);
       const receipt = await port.resume(ref);
       resumed = true;

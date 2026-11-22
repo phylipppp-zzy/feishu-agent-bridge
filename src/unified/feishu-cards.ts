@@ -1,10 +1,18 @@
 import type { QuestionForm } from './feishu-question-forms.js';
-import type { Interaction, Operation, Session } from './contracts.js';
+import type { Interaction, Operation, Provider, Session } from './contracts.js';
+
+export function providerDisplayLabel(provider: Provider): string {
+  return provider === 'agy' ? 'Antigravity (agy)' : provider;
+}
+
+export function providerTitlePrefix(provider: Provider): string {
+  return provider === 'codex' ? 'Codex' : provider === 'agy' ? 'Antigravity' : 'Claude';
+}
 
 /** Presentation-neutral cards; an injected transport converts these to Feishu SDK payloads. */
 export interface ChannelCard { form?: QuestionForm; title: string; text: string; actions: Array<{ label: string; value: Record<string, unknown>; url?: string }> }
 export function sessionCard(session: Session): ChannelCard {
-  return { title: session.title, text: `${session.native.provider} · ${session.project} · ${session.status}\n控制: ${session.control.input}`, actions: [
+  return { title: session.title, text: `${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}\n控制: ${session.control.input}`, actions: [
     { label: '查看历史', value: { action: 'history' } },
     { label: '接入并续聊', value: { action: 'bind', sessionId: session.sessionId, mode:'interactive' } },
     { label: '会话控制', value: { action: 'panel', sessionId: session.sessionId } },

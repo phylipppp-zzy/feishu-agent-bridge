@@ -1,0 +1,1289 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { AgyAdapter } from '../src/unified/agy-adapter.js';
+import { AgyCatalog } from '../src/unified/agy-catalog.js';
+import { AgyQuotaClient } from '../src/unified/agy-quota.js';
+import { AgyAcpTransport } from '../src/unified/agy-transport.js';
+import type { DispatchGuard, PlatformObservation, PlatformPort } from '../src/unified/adapter.js';
+import {
+  payloadDigest,
+  type Interaction,
+  type Message,
+  type NativeSessionRef,
+  type Provider,
+  type Session,
+  type Turn,
+} from '../src/unified/contracts.js';
+import { FeishuChannel, type ChannelAction, type FeishuPort, type TrustedEnvelope } from '../src/unified/feishu-channel.js';
+import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import { UnifiedCore } from '../src/unified/service.js';
+import { UnifiedStore } from '../src/unified/store.js';
+import {
+  createIntegratedRuntime,
+  createLiveRuntime,
+  validateRuntimeConfig,
+  type RuntimeConfig,
+} from '../src/unified/runtime.js';
+
+interface SummaryRowSeed {
+  conversation_id: string;
+  title?: string;
+  preview?: string;
+  step_count?: number;
+  status?: string;
+  source?: string;
+  project_id?: string;
+  last_modified_time?: string | null;
+  last_user_input_time?: string | null;
+  last_user_input_step_index?: number;
+  workspace_uris?: string;
+  nesting_depth?: number;
+  parent_conversation_id?: string;
+  agent_name?: string;
+  battle_id?: string;
+  winning_conversation_id?: string;
+  not_fully_idle?: number;
+  killed?: number;
+  app_data_dir?: string;
+  group_id?: string;
+}
+
+function createSummariesDb(dbPath: string, rows: SummaryRowSeed[]): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS conversation_summaries (
+        conversation_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT "",
+        preview TEXT NOT NULL DEFAULT "",
+        step_count INTEGER NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL,
+        workspace_uris TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT "",
+        source TEXT NOT NULL DEFAULT "",
+        project_id TEXT NOT NULL DEFAULT "",
+        agent_name TEXT NOT NULL DEFAULT "",
+        parent_conversation_id TEXT NOT NULL DEFAULT "",
+        nesting_depth INTEGER NOT NULL DEFAULT 0,
+        battle_id TEXT NOT NULL DEFAULT "",
+        winning_conversation_id TEXT NOT NULL DEFAULT "",
+        not_fully_idle numeric NOT NULL DEFAULT false,
+        killed numeric NOT NULL DEFAULT false,
+        last_user_input_time datetime NOT NULL,
+        last_user_input_step_index INTEGER NOT NULL DEFAULT -1,
+        app_data_dir TEXT NOT NULL DEFAULT "",
+        raw_summary BLOB,
+        group_id TEXT NOT NULL DEFAULT ""
+      );
+    `);
+    const insert = db.prepare(`
+      INSERT INTO conversation_summaries (
+        conversation_id, title, preview, step_count, last_modified_time,
+        workspace_uris, status, source, project_id, agent_name,
+        parent_conversation_id, nesting_depth, battle_id, winning_conversation_id,
+        not_fully_idle, killed, last_user_input_time, last_user_input_step_index,
+        app_data_dir, raw_summary, group_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const r of rows) {
+      insert.run(
+        r.conversation_id,
+        r.title ?? '',
+        r.preview ?? '',
+        r.step_count ?? 0,
+        r.last_modified_time ?? '2026-11-22 10:00:00.000000000+00:00',
+        r.workspace_uris ?? '[]',
+        r.status ?? 'CASCADE_RUN_STATUS_IDLE',
+        r.source ?? 'CORTEX_TRAJECTORY_SOURCE_CLI',
+        r.project_id ?? '',
+        r.agent_name ?? '',
+        r.parent_conversation_id ?? '',
+        r.nesting_depth ?? 0,
+        r.battle_id ?? '',
+        r.winning_conversation_id ?? '',
+        r.not_fully_idle ?? 0,
+        r.killed ?? 0,
+        r.last_user_input_time ?? '0001-01-01 00:00:00+00:00',
+        r.last_user_input_step_index ?? -1,
+        r.app_data_dir ?? 'antigravity',
+        null,
+        r.group_id ?? '',
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function jsonl(...lines: unknown[]): string {
+  return lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
+}
+
+async function writeTranscript(
+  brainDir: string,
+  convId: string,
+  compactSteps: unknown[],
+  fullSteps?: unknown[],
+): Promise<void> {
+  const logsDir = join(brainDir, convId, '.system_generated', 'logs');
+  await mkdir(logsDir, { recursive: true });
+  await writeFile(join(logsDir, 'transcript.jsonl'), jsonl(...compactSteps), 'utf8');
+  if (fullSteps) {
+    await writeFile(join(logsDir, 'transcript_full.jsonl'), jsonl(...fullSteps), 'utf8');
+  }
+}
+
+async function writeFakeAgyBinary(binPath: string, rpcLogPath: string, dropFlagPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+import { appendFileSync, existsSync, unlinkSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+
+const args = process.argv.slice(2);
+const rpcLogPath = ${JSON.stringify(rpcLogPath)};
+const dropFlagPath = ${JSON.stringify(dropFlagPath)};
+const log = (entry) => appendFileSync(rpcLogPath, JSON.stringify(entry) + '\\n');
+
+if (args.includes('/usage')) {
+  process.stdout.write(JSON.stringify({
+    status: 'SUCCESS',
+    command: {
+      data: {
+        groups: [{
+          name: 'Gemini',
+          buckets: [{ modelId: 'gemini-4-hydrogen', remainingFraction: 0.88, resetTime: 1893456000 }],
+        }],
+      },
+    },
+  }) + '\\n');
+  process.exit(0);
+}
+
+if (!args.includes('acp')) {
+  process.stderr.write('unexpected command: ' + args.join(' ') + '\\n');
+  process.exit(2);
+}
+
+let seq = 0;
+let srvReqId = 1000;
+const pendingServerReplies = new Map();
+const activePrompts = new Map();
+
+const writeMsg = (obj) => {
+  process.stdout.write(JSON.stringify(obj) + '\\n');
+};
+
+const sendServerRequest = (method, params) => {
+  const id = 'srv-' + (++srvReqId);
+  writeMsg({ jsonrpc: '2.0', id, method, params });
+  return new Promise((resolve, reject) => {
+    pendingServerReplies.set(id, { resolve, reject });
+  });
+};
+
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('line', async (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let msg;
+  try { msg = JSON.parse(trimmed); } catch { return; }
+
+  // Response to server->client request
+  if ((msg.id !== undefined && msg.method === undefined) && pendingServerReplies.has(msg.id)) {
+    const waiter = pendingServerReplies.get(msg.id);
+    pendingServerReplies.delete(msg.id);
+    if (msg.error) waiter.reject(msg.error);
+    else waiter.resolve(msg.result);
+    return;
+  }
+
+  const { id, method, params } = msg;
+  log({ method, params });
+
+  const reply = (result) => {
+    if (id !== undefined) writeMsg({ jsonrpc: '2.0', id, result });
+  };
+
+  if (method === 'initialize') {
+    reply({
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true },
+      agentInfo: { name: 'fake-agy', version: '1.5.14-test' },
+    });
+    return;
+  }
+
+  if (method === 'session/new') {
+    const sid = 'agy-live-' + (++seq);
+    reply({
+      sessionId: sid,
+      models: {
+        availableModels: [
+          { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen High' },
+          { modelId: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+        ],
+      },
+      configOptions: [{ id: 'thought_level', category: 'thought_level' }],
+    });
+    return;
+  }
+
+  if (method === 'session/load') {
+    reply({
+      sessionId: params.sessionId,
+      models: {
+        availableModels: [
+          { modelId: 'gemini-4-hydrogen', name: 'Gemini 4 Hydrogen' },
+          { modelId: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+        ],
+      },
+      configOptions: [{ id: 'thought_level', category: 'thought_level' }],
+    });
+    return;
+  }
+
+  if (method === 'session/set_model' || method === 'session/set_config_option' || method === 'session/close') {
+    reply({});
+    return;
+  }
+
+  if (method === 'session/cancel') {
+    const entry = activePrompts.get(params.sessionId);
+    if (entry) {
+      entry.cancelled = true;
+      activePrompts.delete(params.sessionId);
+      entry.finish({ stopReason: 'cancelled' });
+    }
+    reply({});
+    return;
+  }
+
+  if (method === 'session/prompt') {
+    const sid = params.sessionId;
+    const text = Array.isArray(params.prompt)
+      ? params.prompt.map((b) => (b && b.type === 'text' ? b.text : '')).join('\\n')
+      : '';
+
+    const emitChunk = (chunkText) => writeMsg({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: sid,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: chunkText },
+        },
+      },
+    });
+
+    if (text.includes('flow-allow') || text.includes('flow-deny')) {
+      emitChunk('Working...');
+      const permRes = await sendServerRequest('session/request_permission', {
+        sessionId: sid,
+        toolCall: { toolCallId: 'tc-perm-1', title: 'Run shell check', kind: 'execute' },
+        options: [
+          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+          { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
+        ],
+      });
+      log({ permissionReply: permRes });
+      const accepted = permRes?.outcome?.optionId === 'allow_once';
+      emitChunk(accepted ? ' Allowed!' : ' Denied!');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
+    if (text.includes('flow-elicit')) {
+      const elicitRes = await sendServerRequest('elicitation/create', {
+        sessionId: sid,
+        toolCallId: 'tc-elicit-1',
+        message: 'Confirm release target',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            env: { type: 'string', description: 'Target environment', enum: ['staging', 'prod'] },
+            note: { type: 'string', description: 'Deploy note' },
+          },
+        },
+      });
+      log({ elicitationReply: elicitRes });
+      emitChunk('Elicited:' + JSON.stringify(elicitRes?.content ?? {}));
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
+    if (text.includes('flow-drop')) {
+      void sendServerRequest('session/request_permission', {
+        sessionId: sid,
+        toolCall: { toolCallId: 'tc-drop-1', title: 'Pending before crash' },
+        options: [{ optionId: 'allow_once', kind: 'allow_once' }],
+      }).catch(() => {});
+      if (existsSync(dropFlagPath)) {
+        try { unlinkSync(dropFlagPath); } catch {}
+        setTimeout(() => process.exit(1), 60);
+      }
+      return;
+    }
+
+    if (text.includes('flow-cancel')) {
+      writeMsg({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: sid,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'tc-cancel-1',
+            title: 'Long command',
+            status: 'in_progress',
+          },
+        },
+      });
+      await new Promise((resolve) => {
+        activePrompts.set(sid, { cancelled: false, finish: resolve });
+      }).then((res) => reply(res));
+      return;
+    }
+
+    emitChunk('Echo:' + text);
+    reply({ stopReason: 'end_turn' });
+  }
+});
+`;
+  await writeFile(binPath, script, 'utf8');
+  await chmod(binPath, 0o755);
+}
+
+function makeGuard(expectedConnectionGeneration: number | null, current = true): DispatchGuard {
+  return {
+    expectedControlGeneration: 0,
+    expectedConnectionGeneration,
+    assertCurrent() {
+      if (!current) throw new Error('stale control guard');
+    },
+  };
+}
+
+function createFakeFeishuPort() {
+  let seq = 0;
+  let topicSeq = 0;
+  const routes = new Map<string, { chatId: string; sessionId: string }>();
+  const deliveries = new Map<string, string>();
+  const sentCards: Array<{ destination: string; card: ChannelCard; deliveryId: string; messageId: string }> = [];
+  const updatedCards: Array<{ destination: string; messageId: string; card: ChannelCard; deliveryId: string }> = [];
+  const topicCards: Array<{ chatId: string; topicDestination: string; sessionId: string; card: ChannelCard; deliveryId: string }> = [];
+  const authorized = new Set<string>(['chat-main']);
+
+  const port: FeishuPort & {
+    authorizedDestination: (d: string) => boolean;
+    onResourceHealth?: (status: 'healthy' | 'degraded', reason: string | null) => void;
+  } = {
+    authorizedDestination: (d) => authorized.has(d),
+    async createTopic(destination, sessionId, card, deliveryId, guard) {
+      await guard?.();
+      for (const [k, v] of routes) {
+        if (v.chatId === destination && v.sessionId === sessionId) return k;
+      }
+      const topicDest = `topic-${++topicSeq}`;
+      routes.set(topicDest, { chatId: destination, sessionId });
+      authorized.add(topicDest);
+      deliveries.set(deliveryId, topicDest);
+      topicCards.push({ chatId: destination, topicDestination: topicDest, sessionId, card, deliveryId });
+      return topicDest;
+    },
+    async send(destination, card, deliveryId, guard) {
+      await guard?.();
+      const messageId = `msg-${++seq}`;
+      deliveries.set(deliveryId, messageId);
+      sentCards.push({ destination, card, deliveryId, messageId });
+      return messageId;
+    },
+    async update(destination, messageId, card, deliveryId, guard) {
+      await guard?.();
+      deliveries.set(deliveryId, messageId);
+      updatedCards.push({ destination, messageId, card, deliveryId });
+    },
+    async sendFile(_destination, _name, _content, deliveryId, guard) {
+      await guard?.();
+      deliveries.set(deliveryId, `file-${++seq}`);
+    },
+    async lookupDelivery(id) {
+      return deliveries.has(id) ? 'sent' : 'unknown';
+    },
+  };
+
+  return { port, sentCards, updatedCards, topicCards, routes };
+}
+
+class MemoryMockPort implements PlatformPort {
+  readonly provider: Provider;
+  private readonly listeners = new Set<(o: PlatformObservation) => void>();
+  private readonly sessions = new Map<string, Session>();
+  private readonly messages = new Map<string, Message[]>();
+  private seq = 0;
+
+  constructor(
+    provider: 'claude' | 'codex',
+    private readonly hostId: string,
+    private readonly serviceId: string,
+    private readonly projectRoot: string,
+  ) {
+    this.provider = provider;
+  }
+
+  onObservation(listener: (o: PlatformObservation) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private emit(o: PlatformObservation): void {
+    for (const l of this.listeners) l(o);
+  }
+
+  seedSession(nativeSessionId: string, title: string, project = this.projectRoot): Session {
+    const native: NativeSessionRef = {
+      provider: this.provider,
+      hostId: this.hostId,
+      serviceId: this.serviceId,
+      nativeSessionId,
+    };
+    const now = new Date().toISOString();
+    const session: Session = {
+      sessionId: nativeSessionId,
+      native,
+      title,
+      project,
+      status: 'idle',
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+      capabilities: {
+        view: { status: 'available' },
+        send: { status: 'available' },
+        queue: { status: 'unsupported', reason: 'mock' },
+        steer: { status: this.provider === 'codex' ? 'available' : 'unsupported', reason: 'codex only' },
+        answer: { status: 'available' },
+        approve: { status: 'available' },
+        interrupt: { status: 'available' },
+        handoff: { status: 'unsupported', reason: 'mock' },
+        files: { status: 'available' },
+        config: { status: 'available' },
+      },
+      control: {
+        serviceId: this.serviceId,
+        owner: null,
+        input: 'available',
+        generation: 0,
+        operationId: null,
+        reason: null,
+      },
+    };
+    this.sessions.set(nativeSessionId, session);
+    this.messages.set(nativeSessionId, []);
+    return session;
+  }
+
+  async list() {
+    return { items: [...this.sessions.values()], nextCursor: null };
+  }
+
+  async discoverRunning() {
+    return { items: [], nextCursor: null };
+  }
+
+  async read(ref: NativeSessionRef) {
+    const session = this.sessions.get(ref.nativeSessionId);
+    if (!session) throw new Error(`missing session ${ref.nativeSessionId}`);
+    return {
+      session,
+      messages: this.messages.get(ref.nativeSessionId) ?? [],
+      turns: [],
+      interactions: [],
+      connectionGeneration: 1,
+    };
+  }
+
+  async create(cwd: string, _model: string | null) {
+    const id = `${this.provider}-created-${++this.seq}`;
+    const s = this.seedSession(id, `${this.provider} ${id}`, cwd);
+    return { status: 'submitted' as const, nativeReference: id, createdSession: s, connectionGeneration: 1 };
+  }
+
+  async resume(ref: NativeSessionRef) {
+    return { status: 'submitted' as const, nativeReference: ref.nativeSessionId, connectionGeneration: 1 };
+  }
+
+  async input(ref: NativeSessionRef, _mode: 'new' | 'steer', blocks: Array<{ type: 'text'; text: string } | { type: 'artifact' }>) {
+    const turnId = `turn-${++this.seq}`;
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '[file]')).join(' ');
+    const reply: Message = {
+      messageId: `m-${++this.seq}`,
+      sessionId: ref.nativeSessionId,
+      turnId,
+      role: 'assistant',
+      blocks: [{ type: 'text', text: `${this.provider} reply: ${text}` }],
+      sequence: this.seq,
+      revision: 1,
+      final: true,
+      source: this.provider,
+    };
+    const arr = this.messages.get(ref.nativeSessionId) ?? [];
+    arr.push(reply);
+    this.messages.set(ref.nativeSessionId, arr);
+    const turn: Turn = {
+      turnId,
+      sessionId: ref.nativeSessionId,
+      status: 'completed',
+      inputId: turnId,
+      startedAt: new Date().toISOString(),
+      endedAt: new Date().toISOString(),
+      model: null,
+      outputIds: [reply.messageId],
+    };
+    this.emit({ type: 'message', ref, message: reply, connectionGeneration: 1 });
+    this.emit({ type: 'turn', ref, turn, connectionGeneration: 1 });
+    return { status: 'submitted' as const, nativeReference: turnId, connectionGeneration: 1 };
+  }
+
+  async interrupt(_ref: NativeSessionRef, turnId: string) {
+    return { status: 'submitted' as const, nativeReference: turnId };
+  }
+  async respond() {
+    return { status: 'submitted' as const, nativeReference: null };
+  }
+  async control(_ref: NativeSessionRef, _action: 'acquire' | 'release') {
+    return { status: 'submitted' as const, nativeReference: null };
+  }
+  async listArtifacts() {
+    return [];
+  }
+  async readArtifact(): Promise<Uint8Array> {
+    throw new Error('no artifacts');
+  }
+  async listModels() {
+    return [{ id: `${this.provider}-default`, label: `${this.provider} default`, reasoningEfforts: ['medium'] }];
+  }
+  async updateSettings() {
+    return { status: 'submitted' as const, nativeReference: null, settingsApplied: true as const };
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 4000, msg = 'condition timed out'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(predicate(), msg);
+}
+
+test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfill, permission/elicitation, stale generation, cancel, resume', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-adapter-e2e-'));
+  try {
+    const projectDir = join(root, 'workspace', 'proj-1');
+    const outsideDir = join(root, 'outside');
+    const brainDir = join(root, 'brain');
+    const dbPath = join(root, 'conversation_summaries.db');
+    const binPath = join(root, 'fake-agy.mjs');
+    const rpcLogPath = join(root, 'rpc-log.jsonl');
+    const dropFlagPath = join(root, 'drop-once.flag');
+
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    await mkdir(brainDir, { recursive: true });
+    await writeFile(rpcLogPath, '', 'utf8');
+    await writeFile(dropFlagPath, '1', 'utf8');
+    await writeFakeAgyBinary(binPath, rpcLogPath, dropFlagPath);
+
+    const topId = 'conv-top-001';
+    createSummariesDb(dbPath, [
+      {
+        conversation_id: topId,
+        title: 'Inspect Agy Repo',
+        step_count: 2,
+        status: 'CASCADE_RUN_STATUS_IDLE',
+        last_modified_time: '2026-11-22T10:05:00Z',
+        last_user_input_time: '2026-11-22T10:00:00Z',
+        workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]),
+        nesting_depth: 0,
+        parent_conversation_id: '',
+        agent_name: '',
+      },
+      {
+        conversation_id: 'conv-sub-001',
+        nesting_depth: 1,
+        parent_conversation_id: topId,
+        agent_name: 'worker-a',
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]),
+      },
+      {
+        conversation_id: 'conv-outside-001',
+        title: 'Untrusted outside workspace',
+        nesting_depth: 0,
+        workspace_uris: JSON.stringify([pathToFileURL(outsideDir).href]),
+      },
+    ]);
+
+    const fullReply = 'FULL_ASSISTANT_CONTENT_' + 'Z'.repeat(500);
+    await writeTranscript(
+      brainDir,
+      topId,
+      [
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-22T10:00:01Z',
+          content: '<USER_REQUEST>\nSummarize repo architecture\n</USER_REQUEST>',
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T10:00:05Z',
+          model: 'gemini-4-hydrogen-xhigh',
+          content: 'FULL_ASSISTANT_CONTENT_<truncated>',
+          truncated_fields: ['content'],
+        },
+      ],
+      [
+        { step_index: 0, content: '<USER_REQUEST>\nSummarize repo architecture\n</USER_REQUEST>' },
+        { step_index: 1, content: fullReply },
+      ],
+    );
+
+    const artifactDir = join(brainDir, topId);
+    await writeFile(join(artifactDir, 'report.md'), '# Architecture Report\nAll checks passed.\n', 'utf8');
+    await writeFile(join(artifactDir, '.system_generated', 'internal.md'), 'SECRET INTERNAL', 'utf8');
+
+    const transport = new AgyAcpTransport({ agyBin: binPath, connectTimeoutMs: 3000, requestTimeoutMs: 5000 });
+    const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [join(root, 'workspace')] });
+    const quota = new AgyQuotaClient({ agyBin: binPath });
+    const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc-1', quota);
+    try {
+
+    const observed: PlatformObservation[] = [];
+    adapter.onObservation((obs) => observed.push(obs));
+
+    // 1. Read-only discovery & subagent retention & honest boundary
+    const listed = await adapter.list(null, 20);
+    assert.equal(listed.items.length, 1);
+    const roSession = listed.items[0]!;
+    assert.equal(roSession.native.nativeSessionId, topId);
+    assert.match(roSession.title, /1 subagent|1 个子任务|1 子代理|subagent/i);
+    assert.equal(roSession.capabilities.view.status, 'available');
+    assert.equal(roSession.capabilities.send.status, 'unsupported');
+    assert.equal(roSession.capabilities.answer.status, 'unsupported');
+    assert.equal(roSession.capabilities.approve.status, 'unsupported');
+    assert.equal((adapter as PlatformPort).archive, undefined);
+
+    const newer = await adapter.discoverNewer(Date.parse('2026-11-22T09:00:00Z'), null, 10);
+    assert.equal(newer.items.length, 1);
+    const existing = await adapter.discoverExisting(null, 10);
+    assert.equal(existing.items.length, 1);
+    const running = await adapter.discoverRunning(null, 10);
+    assert.equal(running.items.length, 1); // has 1 active subagent, not nesting_depth > 0 itself
+
+    // Transcript read + truncated_fields backfill + artifact whitelist
+    const snapRo = await adapter.read({
+      provider: 'agy',
+      hostId: 'host-1',
+      serviceId: 'agy-svc-1',
+      nativeSessionId: topId,
+    });
+    assert.equal(snapRo.messages.length, 2);
+    assert.equal(snapRo.messages[0]!.role, 'user');
+    assert.deepEqual(snapRo.messages[1]!.blocks, [{ type: 'text', text: fullReply }]);
+
+    const artifacts = await adapter.listArtifacts(roSession.native);
+    assert.deepEqual(artifacts.map((a) => a.name), ['report.md']);
+    const bytes = await adapter.readArtifact(roSession.native, artifacts[0]!.artifactId, artifacts[0]!.contentVersion);
+    assert.match(Buffer.from(bytes).toString('utf8'), /Architecture Report/);
+
+    // 2. Connect ACP -> create -> models/updateSettings (effort stripping)
+    await transport.connect();
+    const gen1 = transport.connectionGeneration;
+    assert.ok(gen1 >= 1);
+
+    const createdAck = await adapter.create(projectDir, 'gemini-4-hydrogen-high');
+    assert.equal(createdAck.status, 'submitted');
+    assert.equal(createdAck.nativeReference, 'agy-live-1');
+    const liveRef = createdAck.createdSession!.native;
+
+    const models = await adapter.listModels(liveRef);
+    assert.ok(models.some((m) => m.id === 'gemini-4-hydrogen' && m.reasoningEfforts?.includes('xhigh')));
+    assert.ok(!models.some((m) => /-high$/i.test(m.id)));
+
+    const updAck = await adapter.updateSettings(liveRef, { model: 'gemini-4-hydrogen-xhigh', preferences: {} }, makeGuard(gen1));
+    assert.equal(updAck.settingsApplied, true);
+
+    // 3. Reject steer input
+    await assert.rejects(
+      () => adapter.input(liveRef, 'steer', [{ type: 'text', text: 'noop' }], makeGuard(gen1)),
+      (err: unknown) => typeof err === 'object' && err !== null && (err as { code?: string }).code === 'unsupported',
+    );
+
+    // 4. Streaming input + permission allow
+    const turn1Idx = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-allow' }], makeGuard(gen1));
+    await waitFor(
+      () =>
+        observed.slice(turn1Idx).some(
+          (o) => o.type === 'interaction' && o.interaction.kind === 'approval' && o.interaction.status === 'awaiting_answer',
+        ),
+      3000,
+      'expected approval interaction',
+    );
+    const permAllowInt = observed
+      .slice(turn1Idx)
+      .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> =>
+        o.type === 'interaction' && o.interaction.kind === 'approval' && o.interaction.status === 'awaiting_answer',
+      )!.interaction;
+
+    await adapter.respond(liveRef, permAllowInt, { kind: 'approval', scope: 'this_request', decision: 'allow' }, makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(turn1Idx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
+      3000,
+      'expected completed turn after allow',
+    );
+    const partials = observed.slice(turn1Idx).filter((o): o is Extract<PlatformObservation, { type: 'message' }> => o.type === 'message' && !o.message.final);
+    const finals = observed.slice(turn1Idx).filter((o): o is Extract<PlatformObservation, { type: 'message' }> => o.type === 'message' && o.message.final && o.message.role === 'assistant');
+    assert.ok(partials.length >= 1, 'expected partial streaming message');
+    assert.equal(finals.length, 1);
+    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /Working\.\.\.\s*Allowed!/);
+
+    // 5. Permission deny
+    const turnDenyIdx = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-deny' }], makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(turnDenyIdx).some((o) => o.type === 'interaction' && o.interaction.kind === 'approval'),
+      3000,
+    );
+    const permDenyInt = observed
+      .slice(turnDenyIdx)
+      .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
+    await adapter.respond(liveRef, permDenyInt, { kind: 'approval', scope: 'this_request', decision: 'deny' }, makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(turnDenyIdx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
+      3000,
+    );
+
+    // 6. Elicitation Q&A
+    const turnElicitIdx = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-elicit' }], makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(turnElicitIdx).some((o) => o.type === 'interaction' && o.interaction.kind === 'question_group'),
+      3000,
+      'expected elicitation question_group',
+    );
+    const elicitInt = observed
+      .slice(turnElicitIdx)
+      .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'question_group')!.interaction;
+    await adapter.respond(
+      liveRef,
+      elicitInt,
+      { kind: 'question_group', answers: { env: ['prod'], note: ['ship it'] } },
+      makeGuard(gen1),
+    );
+    await waitFor(
+      () => observed.slice(turnElicitIdx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
+      3000,
+    );
+
+    // 7. Interrupt + honest TurnResidual
+    const turnCancelIdx = observed.length;
+    const cancelAck = await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-cancel' }], makeGuard(gen1));
+    const cancelTurnId = cancelAck.nativeReference!;
+    await waitFor(
+      () => observed.slice(turnCancelIdx).some((o) => o.type === 'turn' && o.turn.status === 'running'),
+      2000,
+    );
+    // Allow tool_call notification to arrive before inspecting residual
+    await new Promise((r) => setTimeout(r, 80));
+    const residualRunning = await adapter.inspectTurnResidual(liveRef, cancelTurnId);
+    assert.equal(residualRunning.complete, false);
+    assert.ok(residualRunning.status === 'running' || residualRunning.status === 'unknown');
+
+    await adapter.interrupt(liveRef, cancelTurnId, makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(turnCancelIdx).some((o) => o.type === 'turn' && o.turn.status === 'interrupted'),
+      3000,
+    );
+
+    // 8. Drop connection -> stale generation respond rejected -> reconnect -> resume original ID (no fork)
+    const turnDropIdx = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-drop' }], makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(turnDropIdx).some((o) => o.type === 'interaction' && o.interaction.kind === 'approval'),
+      3000,
+    );
+    const staleInteraction: Interaction = observed
+      .slice(turnDropIdx)
+      .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
+
+    // Wait for child process unexpected crash & reconnect
+    await waitFor(() => !transport.connected, 3000, 'expected transport disconnect after crash');
+    await transport.connect();
+    const gen2 = transport.connectionGeneration;
+    assert.ok(gen2 > gen1, 'reconnect must increment connectionGeneration');
+
+    await assert.rejects(
+      () => adapter.respond(liveRef, staleInteraction, { kind: 'approval', scope: 'this_request', decision: 'allow' }, makeGuard(gen1)),
+      (err: unknown) => typeof err === 'object' && err !== null && (err as { code?: string }).code === 'interaction_expired',
+    );
+
+    const resumedAck = await adapter.resume(liveRef);
+    assert.equal(resumedAck.nativeReference, 'agy-live-1', 'resume must load original ID without forking');
+    assert.equal(resumedAck.connectionGeneration, gen2);
+
+    // Verify RPC log stripped effort suffix and sent expected payloads
+    const rpcEntries = (await readFile(rpcLogPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const setModelCalls = rpcEntries.filter((e) => e.method === 'session/set_model');
+    assert.ok(setModelCalls.length >= 2);
+    for (const call of setModelCalls) {
+      assert.equal((call.params as { modelId: string }).modelId, 'gemini-4-hydrogen');
+    }
+    const setCfgCalls = rpcEntries.filter((e) => e.method === 'session/set_config_option');
+    assert.ok(setCfgCalls.some((c) => (c.params as { value: string }).value === 'xhigh'));
+    assert.ok(rpcEntries.some((e) => (e.permissionReply as { outcome?: { optionId?: string } })?.outcome?.optionId === 'reject_once'));
+    assert.ok(
+      rpcEntries.some(
+        (e) =>
+          (e.elicitationReply as { action?: string; content?: { env?: string; note?: string } })?.action === 'accept' &&
+          (e.elicitationReply as { content?: { env?: string } })?.content?.env === 'prod',
+      ),
+    );
+
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('UnifiedRuntime + FeishuChannel auto-mirrors top-level agy session, blocks subagents, enforces brain artifact allowlist', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-runtime-auto-'));
+  try {
+    const projectDir = join(root, 'projects', 'app');
+    const claudeDir = join(root, 'claude-state');
+    const codexDir = join(root, 'codex-state');
+    const brainDir = join(root, 'brain');
+    const dbPath = join(root, 'conversation_summaries.db');
+    const binPath = join(root, 'fake-agy.mjs');
+    const rpcLogPath = join(root, 'rpc-log.jsonl');
+    const dropFlagPath = join(root, 'drop.flag');
+
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(claudeDir, { recursive: true });
+    await mkdir(codexDir, { recursive: true });
+    await mkdir(brainDir, { recursive: true });
+    await writeFakeAgyBinary(binPath, rpcLogPath, dropFlagPath);
+
+    // Start runtime cleanly with empty DB first to initialize watermarks
+    createSummariesDb(dbPath, []);
+
+    const cfg: RuntimeConfig = {
+      coreDb: join(root, 'core.sqlite'),
+      channelDb: join(root, 'channel.sqlite'),
+      ownerOpenId: 'ou_owner',
+      allowedDestinations: ['chat-main'],
+      hostId: 'host-1',
+      claudeServiceId: 'claude-svc',
+      codexServiceId: 'codex-svc',
+      claudeStateDir: claudeDir,
+      codexEndpoint: 'codex-proxy://default',
+      intervalMs: 60_000,
+      allowedProjectRoots: [projectDir],
+      outputRoots: [projectDir],
+      artifactStatePath: join(root, 'artifacts.json'),
+      catalogSources: [
+        { provider: 'claude', hostId: 'host-1', serviceId: 'claude-svc', directory: claudeDir },
+        { provider: 'codex', hostId: 'host-1', serviceId: 'codex-svc', directory: codexDir },
+      ],
+      autoMirror: { enabled: true, destination: 'chat-main' },
+      agy: {
+        enabled: true,
+        serviceId: 'agy-svc',
+        summariesDbPath: dbPath,
+        brainDir,
+        binPath,
+      },
+    };
+    validateRuntimeConfig(cfg);
+
+    const { port, topicCards } = createFakeFeishuPort();
+    const claudeMock = new MemoryMockPort('claude', 'host-1', 'claude-svc', projectDir);
+    const codexMock = new MemoryMockPort('codex', 'host-1', 'codex-svc', projectDir);
+    const agyCatalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [projectDir] });
+    const agyTransport = new AgyAcpTransport({ agyBin: binPath });
+    const agyAdapter = new AgyAdapter(agyTransport, agyCatalog, 'host-1', 'agy-svc');
+
+    const runtime = await createIntegratedRuntime(cfg, port, [claudeMock, codexMock, agyAdapter]);
+    try {
+      // Seed 1 top-level post-watermark agy session + 1 nesting_depth>0 worker subagent
+      const futureMs = Date.now() + 20;
+      await new Promise((r) => setTimeout(r, 30));
+      const createdAtIso = new Date(futureMs).toISOString();
+      const modifiedIso = new Date(futureMs + 5).toISOString();
+
+      const topId = 'agy-auto-top-1';
+      const subId = 'agy-auto-sub-1';
+      createSummariesDb(dbPath, [
+        {
+          conversation_id: topId,
+          title: 'Auto Mirrored Agy Session',
+          step_count: 2,
+          status: 'CASCADE_RUN_STATUS_IDLE',
+          last_modified_time: modifiedIso,
+          last_user_input_time: createdAtIso,
+          workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]),
+          nesting_depth: 0,
+          parent_conversation_id: '',
+          agent_name: '',
+        },
+        {
+          conversation_id: subId,
+          title: 'Worker Subagent Must Never Mirror',
+          step_count: 1,
+          status: 'CASCADE_RUN_STATUS_RUNNING',
+          last_modified_time: modifiedIso,
+          last_user_input_time: createdAtIso,
+          workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]),
+          nesting_depth: 1,
+          parent_conversation_id: topId,
+          agent_name: 'worker',
+        },
+      ]);
+
+      await writeTranscript(brainDir, topId, [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: createdAtIso, content: 'Auto hello' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: modifiedIso, content: 'Auto world' },
+      ]);
+      await writeTranscript(brainDir, subId, [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: createdAtIso, content: 'Sub hello' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: modifiedIso, content: 'Sub world' },
+      ]);
+
+      const outsideFile = join(root, 'outside-secret.md');
+      await writeFile(outsideFile, 'TOP SECRET OUTSIDE', 'utf8');
+      await writeFile(join(brainDir, topId, 'report.md'), '# Top Report\nVerified.\n', 'utf8');
+      await writeFile(join(brainDir, topId, '.system_generated', 'internal.md'), 'DO NOT READ', 'utf8');
+      await symlink(outsideFile, join(brainDir, topId, 'escape.md'));
+
+      // Tick twice so discovery, binding, and baseline readonly hydration complete
+      await runtime.tick();
+      await runtime.tick();
+
+      assert.equal(topicCards.length, 1, 'must mirror strictly 1 topic for top-level agy session and 0 for subagent');
+      const mirroredSessionId = topicCards[0]!.sessionId;
+      const storedSessions = runtime.store.listSessions();
+      assert.equal(storedSessions.length, 1);
+      assert.equal(storedSessions[0]!.native.nativeSessionId, topId);
+      assert.ok(!storedSessions.some((s) => s.native.nativeSessionId === subId));
+
+      // Verify independent agy watermark table exists & legacy tables are untouched
+      const chanDb = new DatabaseSync(cfg.channelDb);
+      try {
+        const agyMarks = chanDb.prepare('SELECT root, watermark FROM channel_auto_agy_scope_watermarks').all() as Array<{ root: string; watermark: number }>;
+        const codexMarks = chanDb.prepare('SELECT root, watermark FROM channel_auto_scope_watermarks').all() as Array<{ root: string; watermark: number }>;
+        const claudeMarks = chanDb.prepare('SELECT root, watermark FROM channel_auto_claude_scope_watermarks').all() as Array<{ root: string; watermark: number }>;
+        assert.equal(agyMarks.length, 1);
+        assert.equal(codexMarks.length, 1);
+        assert.equal(claudeMarks.length, 1);
+      } finally {
+        chanDb.close();
+      }
+
+      // Verify artifact allowlist & exclusion via UnifiedCore
+      const listRes = await runtime.core.listArtifacts(mirroredSessionId, { limit: 20 });
+      assert.deepEqual(listRes.items.map((a) => a.name), ['report.md']);
+      const reportBytes = await runtime.core.readArtifact(mirroredSessionId, listRes.items[0]!.artifactId, listRes.items[0]!.contentVersion);
+      assert.match(Buffer.from(reportBytes).toString('utf8'), /Top Report/);
+
+      // Excluded .system_generated or bogus artifact IDs must fail
+      const blockedId = payloadDigest([topId, join(brainDir, topId, '.system_generated', 'internal.md')]);
+      await assert.rejects(() => runtime.core.readArtifact(mirroredSessionId, blockedId, 'v1'));
+    } finally {
+      await runtime.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Three-backend coexistence (/sessions, /new, /create, /health) & createLiveRuntime integration', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-three-backend-'));
+  try {
+    const projectDir = join(root, 'proj');
+    const claudeDir = join(root, 'claude');
+    const codexDir = join(root, 'codex');
+    const brainDir = join(root, 'brain');
+    const dbPath = join(root, 'conversation_summaries.db');
+    const binPath = join(root, 'fake-agy.mjs');
+    const rpcLogPath = join(root, 'rpc.jsonl');
+    const dropFlagPath = join(root, 'drop.flag');
+
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(claudeDir, { recursive: true });
+    await mkdir(codexDir, { recursive: true });
+    await mkdir(brainDir, { recursive: true });
+    await writeFakeAgyBinary(binPath, rpcLogPath, dropFlagPath);
+    createSummariesDb(dbPath, [
+      {
+        conversation_id: 'agy-ro-coexist-1',
+        title: 'Agy Existing Work',
+        step_count: 1,
+        last_modified_time: '2026-11-22T11:00:00Z',
+        workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]),
+        nesting_depth: 0,
+      },
+    ]);
+
+    const { port, sentCards, topicCards } = createFakeFeishuPort();
+    const store = new UnifiedStore(join(root, 'core.sqlite'));
+    const claude = new MemoryMockPort('claude', 'host-1', 'claude-svc', projectDir);
+    const codex = new MemoryMockPort('codex', 'host-1', 'codex-svc', projectDir);
+    claude.seedSession('claude-1', 'Claude Task');
+    codex.seedSession('codex-1', 'Codex Task');
+
+    const agyTransport = new AgyAcpTransport({ agyBin: binPath });
+    const agyCatalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [projectDir] });
+    const agyQuota = new AgyQuotaClient({ agyBin: binPath });
+    const agy = new AgyAdapter(agyTransport, agyCatalog, 'host-1', 'agy-svc', agyQuota);
+    let core: UnifiedCore | undefined;
+    let channel: FeishuChannel | undefined;
+
+    try {
+      await agyTransport.connect();
+      core = new UnifiedCore(store, [claude, codex, agy], () => true, () => true, () => false, () => true);
+      channel = new FeishuChannel(core, port, async () => true, join(root, 'channel.sqlite'));
+      const ownerId = { source: 'feishu', subject: 'ou_owner' };
+      const sendCmd = async (eventId: string, destination: string, action: ChannelAction) => {
+        await channel!.handle({ eventId, destination, identity: ownerId }, action);
+      };
+
+      // 1. /new guidance mentions codex / claude / agy & includes Antigravity filter button
+      await sendCmd('ev-new', 'chat-main', { action: 'new_help' });
+      const newCard = sentCards.at(-1)!.card;
+      assert.match(newCard.text, /agy/);
+      assert.match(newCard.text, /Antigravity/);
+      assert.ok(newCard.actions.some((a) => a.value.search === 'agy'));
+
+      // 2. /sessions lists all 3 backends cleanly, and filtering by agy/antigravity isolates agy sessions
+      await sendCmd('ev-list-all', 'chat-main', { action: 'list' });
+      const listAllCard = sentCards.at(-1)!.card;
+      assert.match(listAllCard.text, /Claude Task/);
+      assert.match(listAllCard.text, /Codex Task/);
+      assert.match(listAllCard.text, /Agy Existing Work/);
+      assert.match(listAllCard.text, /Antigravity \(agy\)/);
+      assert.ok(listAllCard.actions.some((a) => a.label === 'Antigravity'));
+
+      await sendCmd('ev-list-agy', 'chat-main', { action: 'list', search: 'antigravity' });
+      const listAgyCard = sentCards.at(-1)!.card;
+      assert.match(listAgyCard.text, /Agy Existing Work/);
+      assert.doesNotMatch(listAgyCard.text, /Claude Task/);
+      assert.doesNotMatch(listAgyCard.text, /Codex Task/);
+
+      await sendCmd('ev-list-codex-filter', 'chat-main', { action: 'list', provider: 'codex', search: 'codex' });
+      const listCodexCard = sentCards.at(-1)!.card;
+      assert.match(listCodexCard.text, /Codex Task/);
+      assert.doesNotMatch(listCodexCard.text, /Agy Existing Work/);
+      assert.ok(listCodexCard.actions.some((a) => a.label === '全部'));
+      assert.ok(listCodexCard.actions.some((a) => a.label === 'Antigravity'));
+
+      // 3. /create agy <project> spawns real interactive agy topic & runs turn
+      await sendCmd('ev-create-agy', 'chat-main', { action: 'create', provider: 'agy', project: projectDir, model: 'gemini-4-hydrogen' });
+      await core.dispatchPending();
+      await channel.advanceCompleted();
+      assert.ok(topicCards.some((t) => /Antigravity/.test(t.card.text)), 'created agy session topic card must display Antigravity');
+      await channel.sync(topicCards.at(-1)!.topicDestination);
+
+      // 4. /health Feishu card Chinese rendering via fake FeishuPort on integrated three-backend runtime
+      await agyTransport.close();
+      const healthCfg: RuntimeConfig = {
+        coreDb: join(root, 'health-core.sqlite'),
+        channelDb: join(root, 'health-channel.sqlite'),
+        ownerOpenId: 'ou_owner',
+        allowedDestinations: ['chat-main'],
+        hostId: 'host-1',
+        claudeServiceId: 'claude-svc',
+        codexServiceId: 'codex-svc',
+        claudeStateDir: claudeDir,
+        codexEndpoint: 'codex-proxy://default',
+        intervalMs: 60_000,
+        allowedProjectRoots: [projectDir],
+        outputRoots: [projectDir],
+        artifactStatePath: join(root, 'health-artifacts.json'),
+        catalogSources: [
+          { provider: 'claude', hostId: 'host-1', serviceId: 'claude-svc', directory: claudeDir },
+          { provider: 'codex', hostId: 'host-1', serviceId: 'codex-svc', directory: codexDir },
+        ],
+        agy: {
+          enabled: true,
+          serviceId: 'agy-svc',
+          summariesDbPath: dbPath,
+          brainDir,
+          binPath,
+          quotaCachePath: join(root, 'health-agy-quota.json'),
+        },
+      };
+      const { port: healthPort, sentCards: healthCards } = createFakeFeishuPort();
+      const healthClaude = new MemoryMockPort('claude', 'host-1', 'claude-svc', projectDir);
+      const healthCodex = new MemoryMockPort('codex', 'host-1', 'codex-svc', projectDir);
+      const healthAgyCatalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [projectDir] });
+      const healthAgyTransport = new AgyAcpTransport({ agyBin: binPath });
+      const healthAgyQuota = new AgyQuotaClient({ agyBin: binPath });
+      const healthAgy = new AgyAdapter(healthAgyTransport, healthAgyCatalog, 'host-1', 'agy-svc', healthAgyQuota);
+      const healthRuntime = await createIntegratedRuntime(healthCfg, healthPort, [healthClaude, healthCodex, healthAgy]);
+      try {
+        await healthRuntime.handleTrusted(
+          { eventId: 'ev-health-card', destination: 'chat-main', identity: ownerId },
+          { action: 'health' },
+        );
+        await healthRuntime.tick();
+        const healthCard = healthCards.at(-1)?.card;
+        assert.ok(healthCard, 'fake FeishuPort must capture rendered /health card');
+        assert.equal(healthCard.title, '健康状态');
+        assert.match(healthCard.text, /Antigravity连接/);
+        assert.match(healthCard.text, /Antigravity运行/);
+        assert.match(healthCard.text, /Antigravity额度/);
+        assert.match(healthCard.text, /Codex连接/);
+        assert.match(healthCard.text, /Claude SDK事件流/);
+      } finally {
+        await healthRuntime.close();
+      }
+
+      // 5. createLiveRuntime constructs, exposes agy health layers with isolated Codex down, and closes cleanly (no network calls)
+      const liveCfg: RuntimeConfig = {
+        coreDb: join(root, 'live-core.sqlite'),
+        channelDb: join(root, 'live-channel.sqlite'),
+        ownerOpenId: 'ou_owner',
+        allowedDestinations: ['chat-main'],
+        hostId: 'host-1',
+        claudeServiceId: 'claude-svc',
+        codexServiceId: 'codex-svc',
+        claudeStateDir: claudeDir,
+        codexEndpoint: 'ws://127.0.0.1:1', // unreachable port tests provider startup isolation
+        intervalMs: 60_000,
+        allowedProjectRoots: [projectDir],
+        outputRoots: [projectDir],
+        artifactStatePath: join(root, 'live-artifacts.json'),
+        catalogSources: [
+          { provider: 'claude', hostId: 'host-1', serviceId: 'claude-svc', directory: claudeDir },
+          { provider: 'codex', hostId: 'host-1', serviceId: 'codex-svc', directory: codexDir },
+        ],
+        agy: {
+          enabled: true,
+          serviceId: 'agy-svc',
+          summariesDbPath: dbPath,
+          brainDir,
+          binPath,
+          quotaCachePath: join(root, 'agy-quota.json'),
+        },
+      };
+
+      const live = await createLiveRuntime(
+        liveCfg,
+        { appId: 'cli_test', appSecret: 'secret_test' },
+        join(root, 'live-sdk.sqlite'),
+      );
+      try {
+        const rows = await live.runtime.core.health();
+        assert.ok(rows.some((r) => r.component === 'agy_connection'));
+        assert.ok(rows.some((r) => r.component === 'agy_run'));
+        assert.ok(rows.some((r) => r.component === 'agy_quota'));
+      } finally {
+        await live.close();
+      }
+    } finally {
+      channel?.close();
+      await agy.close();
+      core?.close();
+      store.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Backward compatibility: legacy RuntimeConfig without agy or with agy.enabled=false validates and omits agy health rows', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-compat-'));
+  try {
+    const projectDir = join(root, 'proj');
+    const claudeDir = join(root, 'claude');
+    const codexDir = join(root, 'codex');
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(claudeDir, { recursive: true });
+    await mkdir(codexDir, { recursive: true });
+
+    const baseCfg: RuntimeConfig = {
+      coreDb: join(root, 'core.sqlite'),
+      channelDb: join(root, 'channel.sqlite'),
+      ownerOpenId: 'ou_owner',
+      allowedDestinations: ['chat-main'],
+      hostId: 'host-1',
+      claudeServiceId: 'claude-svc',
+      codexServiceId: 'codex-svc',
+      claudeStateDir: claudeDir,
+      codexEndpoint: 'codex-proxy://default',
+      intervalMs: 60_000,
+      allowedProjectRoots: [projectDir],
+      outputRoots: [projectDir],
+      artifactStatePath: join(root, 'artifacts.json'),
+      catalogSources: [
+        { provider: 'claude', hostId: 'host-1', serviceId: 'claude-svc', directory: claudeDir },
+        { provider: 'codex', hostId: 'host-1', serviceId: 'codex-svc', directory: codexDir },
+      ],
+    };
+
+    // Omitted config.agy
+    validateRuntimeConfig(baseCfg);
+    const { port } = createFakeFeishuPort();
+    const claude = new MemoryMockPort('claude', 'host-1', 'claude-svc', projectDir);
+    const codex = new MemoryMockPort('codex', 'host-1', 'codex-svc', projectDir);
+    const runtime1 = await createIntegratedRuntime(baseCfg, port, [claude, codex]);
+    try {
+      await runtime1.tick();
+      const healthRows = await runtime1.core.health();
+      assert.equal(healthRows.some((r) => r.component.startsWith('agy_')), false);
+      assert.equal(healthRows.find((r) => r.component === 'core')?.status, 'healthy');
+    } finally {
+      await runtime1.close();
+    }
+
+    // Explicit enabled: false in config.agy
+    const disabledCfg: RuntimeConfig = {
+      ...baseCfg,
+      coreDb: join(root, 'core2.sqlite'),
+      channelDb: join(root, 'channel2.sqlite'),
+      artifactStatePath: join(root, 'artifacts2.json'),
+      agy: { enabled: false, serviceId: 'agy-disabled', binPath: '/nonexistent/agy' },
+    };
+    validateRuntimeConfig(disabledCfg);
+    const liveDisabled = await createLiveRuntime(
+      disabledCfg,
+      { appId: 'cli_test', appSecret: 'secret_test' },
+      join(root, 'sdk2.sqlite'),
+    );
+    try {
+      const disabledRows = await liveDisabled.runtime.core.health();
+      assert.equal(disabledRows.some((r) => r.component.startsWith('agy_')), false);
+      assert.notEqual(disabledRows.find((r) => r.component === 'runtime')?.status, 'degraded');
+    } finally {
+      await liveDisabled.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

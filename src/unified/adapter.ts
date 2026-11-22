@@ -2,7 +2,7 @@ import type { DirectoryListing } from '../claude/deliver.js';
 import type { ModelOption, ConfirmedSettings } from './contracts.js';
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
-export interface ListQuery { cursor?: string; limit: number; search?: string; stable?: boolean }
+export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {

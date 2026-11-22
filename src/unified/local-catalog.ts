@@ -73,7 +73,7 @@ export class LocalCatalog {
         next.set(key,{ref,path,snapshot});
       }
     };
-    for (const root of this.roots) await walk(root,root.directory);
+    for (const root of this.roots) if (root.provider === 'claude' || root.provider === 'codex') await walk(root,root.directory);
     this.entries = next;
   }
   list(limit: number, cursor?: string, search = ''): Page<SessionSnapshot['session']> {

@@ -1021,7 +1021,13 @@ export async function readAgyTranscript(
           (typeof row.type !== 'string' || typeof candidate.type !== 'string' || candidate.type === row.type)
         ) {
           for (const field of truncatedFields) {
-            if (candidate[field] !== undefined) {
+            if (
+              field !== '__proto__' &&
+              field !== 'constructor' &&
+              field !== 'prototype' &&
+              Object.prototype.hasOwnProperty.call(candidate, field) &&
+              candidate[field] !== undefined
+            ) {
               row[field] = candidate[field];
               resolvedFromFull = true;
             }

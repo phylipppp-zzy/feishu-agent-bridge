@@ -538,11 +538,20 @@ export class AgyAcpTransport {
     if (!Number.isSafeInteger(minimum) || minimum < 0) {
       throw contractError('invalid_request', 'minimum generation must be a non-negative integer');
     }
-    if (this.child !== null || this.connectingPromise !== null || this.pending.size > 0) {
+    if (
+      this.closing ||
+      this.connectingPromise !== null ||
+      this.pending.size > 0 ||
+      this.pendingServerRequests.size > 0 ||
+      (this.child !== null && !this.connected)
+    ) {
       throw contractError('busy', 'cannot seed active transport');
     }
-    if (this._connectionGeneration < minimum) {
-      this._connectionGeneration = minimum;
+    if (this._connectionGeneration <= minimum) {
+      this._connectionGeneration = minimum + (this.connected ? 1 : 0);
+      if (this.connected) {
+        this.activeGeneration = this._connectionGeneration;
+      }
     }
   }
 

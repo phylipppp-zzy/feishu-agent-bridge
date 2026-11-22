@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { contractError, type ContractError } from './errors.js';
 
 export const SCHEMA_VERSION = 1 as const;
-export type Provider = 'claude' | 'codex';
+export type Provider = 'claude' | 'codex' | 'agy';
 export type Revision = number;
 export type CapabilityName = 'view' | 'send' | 'queue' | 'steer' | 'answer' | 'approve' | 'interrupt' | 'handoff' | 'files' | 'config';
 export type Capability = { status: 'available' } | { status: 'unsupported' | 'temporarily_unavailable'; reason: string };
