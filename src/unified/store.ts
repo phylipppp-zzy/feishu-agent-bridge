@@ -44,6 +44,7 @@ export class UnifiedStore {
       CREATE TABLE IF NOT EXISTS native_interactions(id TEXT PRIMARY KEY REFERENCES interactions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS outbox(operation_id TEXT PRIMARY KEY REFERENCES operations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, context TEXT NOT NULL, connection_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','in_flight','unknown','done','cancelled')));
+      CREATE TABLE IF NOT EXISTS steer_outbox_v1(operation_id TEXT PRIMARY KEY REFERENCES operations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, context TEXT NOT NULL, connection_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','in_flight','unknown','done','cancelled')));
       CREATE TABLE IF NOT EXISTS notification_preferences(session_id TEXT PRIMARY KEY REFERENCES sessions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS event_keys(event_id TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL, value TEXT NOT NULL, UNIQUE(session_id, seq));
@@ -235,7 +236,7 @@ export class UnifiedStore {
   hasUnsettledInput(sessionId: string, exceptId: string): boolean { const rows = this.db.prepare("SELECT operation_id,context FROM outbox WHERE kind='submitInput' AND state IN ('in_flight','unknown')").all() as Record<string,unknown>[]; return rows.some(row => row.operation_id !== exceptId && parse<WriteContext>(row.context).targetId === sessionId); }
   interactionHealthCounts():{pending:number;unknown:number} {const row=this.db.prepare("SELECT COALESCE(SUM(CASE WHEN json_extract(value,'$.status')='answer_pending_delivery' THEN 1 ELSE 0 END),0) AS pending, COALESCE(SUM(CASE WHEN json_extract(value,'$.status')='answer_pending_delivery' OR (json_extract(value,'$.status')='resolved' AND json_extract(value,'$.nativeResult.status')='unknown') THEN 1 ELSE 0 END),0) AS unknown FROM interactions").get() as {pending:number;unknown:number};return {pending:Number(row.pending),unknown:Number(row.unknown)};}
   hasStopRequest(sessionId:string,turnId:string):boolean {return !!this.db.prepare("SELECT 1 FROM outbox WHERE kind='interruptTurn' AND state IN ('in_flight','unknown','done') AND json_extract(context,'$.targetId')=? AND json_extract(payload,'$.turnId')=? LIMIT 1").get(sessionId,turnId);}
-  pendingOutbox(): string[] { return (this.db.prepare("SELECT operation_id FROM outbox WHERE state='pending' ORDER BY rowid").all() as Record<string, unknown>[]).map(r => String(r.operation_id)); }
+  pendingOutbox(): string[] { return (this.db.prepare("SELECT o.id FROM operations o WHERE EXISTS(SELECT 1 FROM outbox x WHERE x.operation_id=o.id AND x.state='pending') OR EXISTS(SELECT 1 FROM steer_outbox_v1 x WHERE x.operation_id=o.id AND x.state='pending') ORDER BY o.rowid").all() as Record<string, unknown>[]).map(r => String(r.id)); }
   notificationPreference(id: string): { enabled: boolean; eventTypes: string[] } | null { this.session(id); const row = this.row('SELECT value FROM notification_preferences WHERE session_id=?', id); return row ? parse(row.value) : null; }
   /** Preference and operation receipt are committed together; no provider RPC is involved. */
   setNotificationPreference(context: WriteContext, value: { enabled: boolean; eventTypes: string[] }): Operation { return this.transaction(() => {
@@ -313,6 +314,20 @@ export class UnifiedStore {
     if (action === 'interruptTurn' && !this.listTurns(context.targetId).some(t=>t.turnId === (payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
     return this.receipt(context, action, existing.digest, payload);
   }); }
+  /** Keep steer intents outside the legacy dispatcher; registration fences the captured turn. */
+  registerSteer(request: import('./contracts.js').SubmitInput): Operation { return this.transaction(() => {
+    const {context,requiredTurnId,expectedConnectionGeneration}=request;
+    const existing=this.existing(context,'submitInput',request); if(existing.operation)return existing.operation;
+    const session=this.session(context.targetId), turns=this.listTurns(context.targetId).filter(t=>t.status==='running');
+    if(session.revision!==context.expectedRevision)return fail('stale_revision');
+    if(session.control.generation!==context.controlGeneration || session.control.input!=='available')return fail('control_conflict');
+    if(this.connectionGeneration(context.targetId)!==expectedConnectionGeneration || turns.length!==1 || turns[0]?.turnId!==requiredTurnId)return fail('interaction_expired','captured turn or connection changed');
+    const operation:Operation={operationId:context.operationId,idempotencyKey:context.idempotencyKey,targetId:context.targetId,action:'submitInput',payloadDigest:existing.digest,status:'received',revision:0,error:null};
+    this.run('INSERT INTO operations(id,idem,digest,value) VALUES(?,?,?,?)',operation.operationId,operation.idempotencyKey,existing.digest,JSON.stringify(operation));
+    this.run("INSERT INTO steer_outbox_v1 VALUES(?,?,?,?,?,'pending')",operation.operationId,'submitInput',JSON.stringify(request),JSON.stringify(context),expectedConnectionGeneration!);
+    this.eventFor(context.targetId,operation.operationId,0,'operation.received',operation.operationId,operation);return operation;
+  }); }
+  completeSteer(id:string):Operation {return this.transaction(()=>{const out=this.getOutbox(id),op=this.getOperation(id);if(this.outboxTable(id)!=='steer_outbox_v1'||out.state!=='in_flight'||op.status!=='received')return fail('invalid_request');const accepted:Operation={...op,status:'accepted',revision:op.revision+1,error:null};this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(accepted),id);this.eventFor(op.targetId,id,accepted.revision,'operation.accepted',id,accepted);const done:Operation={...accepted,status:'completed',revision:accepted.revision+1};this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(done),id);this.run("UPDATE steer_outbox_v1 SET state='done' WHERE operation_id=?",id);this.eventFor(op.targetId,id,done.revision,'operation.completed',id,done);return done;});}
   /** The bridge CAS registers an intent, not a claim that the native request accepted it. */
   resolveInteraction(request: ResolveInteraction, now = Date.now()): Operation { return this.transaction(() => {
     const { context } = request; const existing = this.existing(context, 'resolveInteraction', request); if (existing.operation) return existing.operation;
@@ -357,10 +372,11 @@ export class UnifiedStore {
     }
     return updated;
   }); }
-  getOutbox(id: string): { kind: string; payload: unknown; context: WriteContext; connectionGeneration: number; state: string } { const r = this.row('SELECT kind,payload,context,connection_generation,state FROM outbox WHERE operation_id=?', id); if (!r) return fail('invalid_request', 'unknown outbox'); return { kind: String(r.kind), payload: parse(r.payload), context: parse<WriteContext>(r.context), connectionGeneration: Number(r.connection_generation), state: String(r.state) }; }
+  private outboxTable(id:string):'outbox'|'steer_outbox_v1' { return this.row('SELECT operation_id FROM steer_outbox_v1 WHERE operation_id=?',id)?'steer_outbox_v1':'outbox'; }
+  getOutbox(id: string): { kind: string; payload: unknown; context: WriteContext; connectionGeneration: number; state: string } { const r = this.row(`SELECT kind,payload,context,connection_generation,state FROM ${this.outboxTable(id)} WHERE operation_id=?`, id); if (!r) return fail('invalid_request', 'unknown outbox'); return { kind: String(r.kind), payload: parse(r.payload), context: parse<WriteContext>(r.context), connectionGeneration: Number(r.connection_generation), state: String(r.state) }; }
   /** SQLite serializes claim and generation changes; native submission still requires an adapter-side final fence. */
   claimOutbox(id: string, now = Date.now()): boolean { return this.transaction(() => {
-    const row = this.row('SELECT kind,payload,context,connection_generation,state FROM outbox WHERE operation_id=?', id);
+    const table=this.outboxTable(id); const row = this.row(`SELECT kind,payload,context,connection_generation,state FROM ${table} WHERE operation_id=?`, id);
     if (!row || row.state !== 'pending') return false;
     const context = parse<WriteContext>(row.context);
     const session = this.row('SELECT control_generation,connection_generation FROM sessions WHERE id=?', context.targetId);
@@ -369,18 +385,19 @@ export class UnifiedStore {
       const req = parse<ResolveInteraction>(row.payload); const interaction = this.getInteraction(req.interactionId);
       valid = interaction.sessionId === context.targetId && interaction.connectionGeneration === req.expectedConnectionGeneration && interaction.status === 'answer_pending_delivery' && interaction.nativeResult === null && Number.isFinite(now) && (interaction.expiresAt === null || (Number.isFinite(Date.parse(interaction.expiresAt)) && Date.parse(interaction.expiresAt) > now));
     }
+    if(valid && table==='steer_outbox_v1') {const req=parse<import('./contracts.js').SubmitInput>(row.payload),turns=this.listTurns(context.targetId).filter(t=>t.status==='running');valid=req.mode==='steer' && turns.length===1 && turns[0]?.turnId===req.requiredTurnId && Number(row.connection_generation)===req.expectedConnectionGeneration;}
     if (!valid) { this.cancelPending(id); return false; }
-    this.run("UPDATE outbox SET state='in_flight' WHERE operation_id=?", id); return true;
+    this.run(`UPDATE ${table} SET state='in_flight' WHERE operation_id=?`, id); return true;
   }); }
   /** Pending at restart is not proof of a currently authorized delivery context. */
   failUnreboundPending(ids:string[]):void { this.transaction(()=>{ for(const id of ids) { const out=this.getOutbox(id); if(out.state!=='pending') continue; if(this.row('SELECT id FROM sessions WHERE id=?',out.context.targetId)) {this.cancelPending(id);continue;} const op=this.getOperation(id); if(canTransitionOperation(op.status,'failed')) {const next:Operation={...op,status:'failed',revision:op.revision+1,error:contractError('control_conflict','restart requires a new authorized request')};this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id);this.run("UPDATE outbox SET state='cancelled' WHERE operation_id=?",id);} } }); }
   private cancelPending(id: string): void {
-    this.run("UPDATE outbox SET state='cancelled' WHERE operation_id=? AND state='pending'", id);
+    this.run(`UPDATE ${this.outboxTable(id)} SET state='cancelled' WHERE operation_id=? AND state='pending'`, id);
     const op = this.getOperation(id);
     if (canTransitionOperation(op.status, 'failed')) { const next: Operation = { ...op, status: 'failed', revision: op.revision + 1, error: op.action === 'resolveInteraction' ? contractError('interaction_expired', 'delivery context no longer valid') : contractError('control_conflict', 'request was not executed; submit again after control is restored') }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id); this.eventFor(op.targetId, id, next.revision, 'operation.failed', id, next); }
   }
   private invalidateDeliveries(sessionId: string, expireInteractions: boolean): void {
-    const rows = this.db.prepare("SELECT operation_id,state,context FROM outbox WHERE state IN ('pending','in_flight')").all() as Record<string, unknown>[];
+    const rows = this.db.prepare("SELECT operation_id,state,context FROM outbox WHERE state IN ('pending','in_flight') UNION ALL SELECT operation_id,state,context FROM steer_outbox_v1 WHERE state IN ('pending','in_flight')").all() as Record<string, unknown>[];
     for (const row of rows) if (parse<WriteContext>(row.context).targetId === sessionId) {
       if (row.state === 'pending') this.cancelPending(String(row.operation_id)); else this.markUnknownInTransaction(String(row.operation_id));
     }
@@ -396,11 +413,11 @@ export class UnifiedStore {
   }
   /** Only recover work whose dispatch lease has expired; active workers remain untouched. */
   recoverAbandonedInFlight(now = Date.now()): Operation[] { return this.transaction(() => {
-    const rows = this.db.prepare("SELECT operation_id,context FROM outbox WHERE state='in_flight'").all() as Record<string,unknown>[]; const recovered: Operation[] = [];
+    const rows = this.db.prepare("SELECT operation_id,context FROM outbox WHERE state='in_flight' UNION ALL SELECT operation_id,context FROM steer_outbox_v1 WHERE state='in_flight'").all() as Record<string,unknown>[]; const recovered: Operation[] = [];
     for (const row of rows) { const op = this.getOperation(String(row.operation_id)); if (op.status === 'accepted') continue; const context = parse<WriteContext>(row.context); const lease = this.row('SELECT expires FROM dispatch_leases WHERE session_id=?',context.targetId); if (!lease || Number(lease.expires) <= now) recovered.push(this.markUnknownInTransaction(String(row.operation_id))); } return recovered;
   }); }
   recoverInFlight(): Operation[] { return this.transaction(() => {
-    const rows = this.db.prepare("SELECT operation_id FROM outbox WHERE state='in_flight'").all() as Record<string, unknown>[];
+    const rows = this.db.prepare("SELECT operation_id FROM outbox WHERE state='in_flight' UNION ALL SELECT operation_id FROM steer_outbox_v1 WHERE state='in_flight'").all() as Record<string, unknown>[];
     return rows.map(row => this.markUnknownInTransaction(String(row.operation_id)));
   }); }
   markDeliveryUnknown(id: string): Operation { return this.transaction(() => this.markUnknownInTransaction(id)); }
@@ -408,12 +425,12 @@ export class UnifiedStore {
     const out = this.getOutbox(id); if (out.state !== 'in_flight' && out.state !== 'unknown') return fail('invalid_request', 'delivery was not in flight');
     const op = this.getOperation(id); if (op.status !== 'unknown' && !canTransitionOperation(op.status, 'unknown')) return fail('invalid_request', 'invalid operation transition');
     const next: Operation = op.status === 'unknown' ? op : { ...op, status: 'unknown', revision: op.revision + 1, error: contractError('outcome_unknown') };
-    this.run("UPDATE outbox SET state='unknown' WHERE operation_id=?", id); this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id); if (next !== op && this.row('SELECT id FROM sessions WHERE id=?',op.targetId)) this.eventFor(op.targetId, id, next.revision, 'operation.unknown', id, next); return next;
+    this.run(`UPDATE ${this.outboxTable(id)} SET state='unknown' WHERE operation_id=?`, id); this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id); if (next !== op && this.row('SELECT id FROM sessions WHERE id=?',op.targetId)) this.eventFor(op.targetId, id, next.revision, 'operation.unknown', id, next); return next;
   }
   reconcileOperation(id: string, status: Extract<OperationStatus, 'accepted' | 'completed' | 'failed'>, error: ContractError | null = null): Operation { return this.transaction(() => {
     const op = this.getOperation(id); if (!canTransitionOperation(op.status, status)) return fail('invalid_request', 'invalid operation transition');
     const next: Operation = { ...op, status, revision: op.revision + 1, error }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id);
-    this.run('UPDATE outbox SET state=? WHERE operation_id=?', status === 'accepted' ? 'in_flight' : 'done', id); this.eventFor(op.targetId, id, next.revision, `operation.${status}`, id, next); return next;
+    this.run(`UPDATE ${this.outboxTable(id)} SET state=? WHERE operation_id=?`, status === 'accepted' ? 'in_flight' : 'done', id); this.eventFor(op.targetId, id, next.revision, `operation.${status}`, id, next); return next;
   }); }
   private eventFor(sessionId: string, objectId: string, revision: number, type: string, operationId: string | null, data: unknown): void {
     const now = new Date().toISOString();

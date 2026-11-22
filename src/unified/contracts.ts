@@ -28,7 +28,7 @@ export type Interaction = InteractionBase & ({ kind: 'question'; prompt: string;
 export type NativeResult = { status: 'accepted'; source: string; answer: Answer | null } | { status: 'unknown'; source: string } | { status: 'rejected'; reason: string };
 export type Answer = { kind: 'question'; values: string[] } | { kind: 'approval'; decision: 'allow' | 'deny'; scope: string } | { kind: 'question_group'; answers: Record<string, string[]> };
 export interface ResolveInteraction { context: WriteContext; interactionId: string; expectedConnectionGeneration: number; answer: Answer; toolInputDigest: string | null }
-export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[] }
+export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?:{destination:string;bindingScope:string;ownerSource:string;ownerSubject:string} }
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
 export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
 export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[]; partialFailure?:boolean }
@@ -48,6 +48,8 @@ export function validateWriteContext(x: WriteContext): Validation<WriteContext> 
 export function validateSubmitInput(x: SubmitInput): Validation<SubmitInput> {
   const context = validateWriteContext(x?.context); if (!context.ok) return context;
   if (!['new', 'queue', 'steer'].includes(x.mode) || !Array.isArray(x.blocks) || x.blocks.length === 0 || !x.blocks.every(b => b && (b.type === 'text' ? nonempty(b.text) : b.type === 'artifact' && nonempty(b.artifactId) && nonempty(b.contentVersion)))) return fail('invalid input blocks or mode');
+  if (x.mode === 'steer' && (!nonempty(x.requiredTurnId) || !counter(x.expectedConnectionGeneration))) return fail('steer requires a captured turn and connection generation');
+  if (x.channelScope && (!nonempty(x.channelScope.destination) || !nonempty(x.channelScope.bindingScope) || !nonempty(x.channelScope.ownerSource) || !nonempty(x.channelScope.ownerSubject) || x.channelScope.ownerSource!==x.context.identity.source || x.channelScope.ownerSubject!==x.context.identity.subject)) return fail('invalid channel scope');
   return { ok: true, value: x };
 }
 /** Compare against the authoritative interaction before atomic registration. The caller must separately authenticate identity and compare controlGeneration against the current session control in the same transaction. */

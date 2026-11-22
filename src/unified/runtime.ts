@@ -52,6 +52,7 @@ export class UnifiedRuntime {
       this.restartPending=this.store.pendingOutbox();
       try { this.core = new UnifiedCore(this.store,providers,(identity,session)=>owner(identity) && (!options.canDiscover || options.canDiscover(session)),(identity)=>owner(identity),()=>false,options.canDiscover,archive,options.canInspectCandidate);
         const measuredPort=new Proxy(port,{get:(target,key)=>{const value=Reflect.get(target,key); if(typeof value!=='function') return value; if(['send','update','sendFile'].includes(String(key))) return async (...args:unknown[])=>{let guardFailed=false;const last=args.length-1; if(typeof args[last]==='function') {const guard=args[last] as ()=>Promise<void>;args[last]=async()=>{try {await guard();} catch(error) {guardFailed=true;throw error;}};} try {const result=await Reflect.apply(value,target,args); try {this.channel.recordHealth('feishu_delivery',(key==='send' && !result)?'unverified':'healthy',(key==='send' && !result)?'消息回执未确认':null);} catch {} return result;} catch(error) {const e=error && typeof error==='object' ? error as {deliveryKind?:unknown;platformCode?:unknown} : {}; const rejected=e.deliveryKind==='api_rejected' && typeof e.platformCode==='number' && Number.isSafeInteger(e.platformCode); const reason=guardFailed?'发送前权限或绑定变化':rejected?`平台拒绝（代码 ${e.platformCode}）`:'投递结果未知'; const deliveryId=args[key==='send'?2:3];try {if(typeof deliveryId==='string') this.channel.recordDeliveryDiagnostic(deliveryId,guardFailed?'guard_rejected':rejected?'api_rejected':'unknown',rejected?e.platformCode as number:null);} catch {} try {this.channel.recordHealth('feishu_delivery','degraded',reason);} catch {} throw error;}}; return value.bind(target);}}); try { this.channel = new FeishuChannel(this.core,measuredPort,async (identity,destination,sessionId)=>{ if(!owner(identity) || !(this.port.authorizedDestination?.(destination) ?? destinations.has(destination))) return false; if(!sessionId || !options.canDiscover) return true; try {return options.canDiscover(this.store.getSession(sessionId));} catch {return options.allowDiscovered?.(sessionId) ?? false;} },config.channelDb,undefined,options.requireReadonlyHydration === true); } catch(error) { this.core.close(); throw error; }
+        this.core.validateSteerScope=(scope,sessionId)=>owner({source:scope.ownerSource,subject:scope.ownerSubject}) && (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) && this.channel.isCurrentSteerScope(scope,sessionId);
         this.core.presentSession=session=>this.channel.isAutoPrivateTitle(session.native) ? {...session,title:`${session.native.provider==='codex'?'Codex':'Claude'} 会话 · ${payloadDigest(session.native).slice(0,8)}`} : session;
       } catch(error) { this.store.close(); throw error; }
     } catch(error) { this.lock.exec('ROLLBACK'); this.lock.close(); throw error; }
@@ -254,7 +255,9 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
         }
         } catch {refreshFailed=true;}
       }
-      if(enrichmentError || refreshFailed || autoFailed) throw new Error('session refresh or artifact observation failed');
+      // Consume and reset on report so between-tick async errors are never dropped, while clean subsequent ticks can recover.
+      const hadEnrichmentError=enrichmentError; enrichmentError=false;
+      if(hadEnrichmentError || refreshFailed || autoFailed) throw new Error('session refresh or artifact observation failed');
     }});
   } catch(error) {stateLock.exec('ROLLBACK');stateLock.close();await Promise.all(ports.map(p=>p.close()));throw error;}
   activeRuntime=runtime;

@@ -26,6 +26,7 @@ export class UnifiedCore implements UnifiedService {
   private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
   private closed=false;
+  validateSteerScope?: (scope:NonNullable<SubmitInput['channelScope']>,sessionId:string)=>boolean;
   onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
   constructor(readonly store: UnifiedStore, providers: PlatformPort[], private readonly authorize: Authorize, private readonly authorizeBootstrap: (identity: WriteContext['identity'], provider: Provider) => boolean = () => false, private readonly mayDetach: (session: Session) => boolean = () => false, private readonly canDiscover?: (session: Session) => boolean, private readonly historyReader?: HistoryReader,private readonly canInspectCandidate?:(native:Session['native'],project:string)=>boolean) {
@@ -199,12 +200,23 @@ export class UnifiedCore implements UnifiedService {
   async submitInput(request: SubmitInput): Promise<Operation> {
     const valid = validateSubmitInput(request); if (!valid.ok) throw new StoreError(valid.error);
     const s = this.check(request.context, 'submitInput');
+    if(request.mode==='steer' && s.native.provider!=='codex')return fail('unsupported','steer is available only for Codex');
+    if(request.mode==='steer' && request.channelScope && !this.validateSteerScope?.(request.channelScope,s.sessionId)) return fail('control_conflict','binding changed');
     const prior = this.store.findIdempotent(request.context, 'submitInput', request); if (prior) return prior;
     const capability = request.mode === 'new' ? 'send' : request.mode;
     if (this.present(s).capabilities[capability].status !== 'available') return fail('unsupported', `${capability} unavailable`);
     if (s.control.input !== 'available') return fail('control_conflict');
     for (const block of request.blocks) if (block.type === 'artifact' && !this.store.stagedArtifact(s.sessionId,block.artifactId,block.contentVersion)) return fail('invalid_request','artifact is not staged for this session');
+    if(request.mode==='steer') return this.store.registerSteer(request);
     return this.store.registerOperation(request.context, 'submitInput', request);
+  }
+  async captureSteer(identity:{source:string;subject:string},sessionId:string) {
+    const session=this.store.getSession(sessionId);
+    if(this.closed || !this.authorize(identity,session,'submitInput') || this.unavailableProviders.has(session.native.provider) || this.store.isDetached(sessionId) || this.store.recoveryQuarantined(sessionId))return fail('unauthorized');
+    if(session.native.provider!=='codex' || session.control.input!=='available' || this.present(session).capabilities.steer.status!=='available')return fail('unsupported','steer unavailable');
+    const turns=this.store.listTurns(sessionId).filter(t=>t.status==='running');
+    if(turns.length!==1)return fail('busy','one running turn is required');
+    return {turnId:turns[0]!.turnId,connectionGeneration:this.store.connectionGeneration(sessionId),controlGeneration:session.control.generation};
   }
   async resolveInteraction(request: ResolveInteraction) { this.check(request.context, 'resolveInteraction'); return this.store.resolveInteraction(request); }
   async inspectTurnResidual(sessionId:string,turnId:string) {const s=this.store.getSession(sessionId);const turn=this.store.listTurns(sessionId).find(t=>t.turnId===turnId);if(!turn || turn.status!=='interrupted') return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'轮次尚未确认中断'};const port=this.port(s);if(!port.inspectTurnResidual) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'此provider未提供可信残留查询'};try {const result=await port.inspectTurnResidual(s.native,turnId); if(!['running','none','unknown'].includes(result.status) || typeof result.complete!=='boolean' || (result.count!==null && (!Number.isSafeInteger(result.count) || result.count<0)) || (result.observedAt!==null && !Number.isFinite(Date.parse(result.observedAt)))) throw Error('invalid residual result'); if(result.status==='unknown' || result.count===null || !result.observedAt) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'查询失败或连接归属不完整'}; if(!result.complete) return result.status==='running' && result.count>0 ? {...result,reason:'至少有已登记任务仍在运行；查询不完整，其他外部作业或后代未确认'} : {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'查询失败或连接归属不完整'}; if((result.status==='none' && result.count!==0) || (result.status==='running' && result.count===0)) throw Error('invalid residual count');return {...result,reason:result.status==='running'?'目标轮次已登记任务仍在运行；未知外部作业或后代未确认':'未发现目标轮次已登记残留；未知外部作业或后代未确认'};} catch {return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'残留查询不可用'};} }
@@ -245,10 +257,12 @@ export class UnifiedCore implements UnifiedService {
       const out = this.store.getOutbox(id);
       if (out.state !== 'pending') return this.store.getOperation(id);
       const session = this.check(out.context, out.kind);
+      if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const scope=(out.payload as SubmitInput).channelScope;if(scope && !this.validateSteerScope?.(scope,session.sessionId))return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));}
       const earlier = out.kind === 'submitInput' ? this.store.pendingOutbox().find(other => { const candidate = this.store.getOutbox(other); return candidate.context.targetId === session.sessionId && candidate.kind === 'submitInput'; }) : id;
       if (earlier !== id) return fail('busy', 'earlier input awaits dispatch');
       if (out.kind === 'submitInput') { const barrier=this.store.settingsBarrier(session.sessionId); if(barrier) return fail(barrier === 'unknown' ? 'outcome_unknown' : 'busy','settings must be reconciled before input'); }
       if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(session.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.snapshot(session.sessionId).value.interactions.some(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery') || this.store.hasUnsettledInput(session.sessionId,id))) return this.store.getOperation(id);
+      if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || this.store.connectionGeneration(session.sessionId)!==input.expectedConnectionGeneration)return this.store.reconcileOperation(id,'failed',contractError('interaction_expired','captured turn changed'));}
       if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return this.store.reconcileOperation(id,'failed',contractError('busy','turn is no longer running'));
       if (!this.store.claimOutbox(id)) return this.store.getOperation(id);
       const originalInteraction = out.kind === 'resolveInteraction' ? this.store.getInteraction((out.payload as ResolveInteraction).interactionId) : null;
@@ -256,23 +270,26 @@ export class UnifiedCore implements UnifiedService {
       const guard: DispatchGuard = {
         expectedControlGeneration: out.context.controlGeneration, expectedConnectionGeneration: out.connectionGeneration,
         assertCurrent: () => {
+          if(this.closed) return fail('control_conflict','core closed');
           this.store.assertDispatchLease(session.sessionId, owner, generation);
-          guarded = true;
           const current = this.store.getSession(session.sessionId);
           if (!this.authorize(out.context.identity,current,out.kind) || this.store.isDetached(session.sessionId) || this.store.recoveryQuarantined(session.sessionId)) return fail('unauthorized');
           if (current.control.generation !== out.context.controlGeneration || (out.kind !== 'requestControl' && current.control.input !== 'available')) return fail('control_conflict');
           if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration) return fail('interaction_expired');
+          if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const scope=(out.payload as SubmitInput).channelScope;if(scope && !this.validateSteerScope?.(scope,session.sessionId))return fail('control_conflict','binding changed');}
+          if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || input.expectedConnectionGeneration!==out.connectionGeneration)return fail('interaction_expired','captured turn changed');}
           if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.snapshot(session.sessionId).value.interactions.some(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery') || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
           if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
           if (originalInteraction) {
             const now = this.store.getInteraction(originalInteraction.interactionId);
             if (now.revision !== originalInteraction.revision || now.status !== 'answer_pending_delivery' || now.nativeRequestId !== originalInteraction.nativeRequestId || now.nativeResult !== null || (now.expiresAt !== null && Date.parse(now.expiresAt) <= Date.now())) return fail('interaction_expired');
           }
+          guarded = true;
         },
       };
       try {
         const port = this.port(session); let nativeReference: string | null = null;
-        if (out.kind === 'submitInput') { const setting = this.store.confirmedSettings(session.sessionId); if(setting){const restored=await port.updateSettings(session.native,{model:setting.model,preferences:setting.preferences},guard);if(restored.settingsApplied!==true) return this.store.markDeliveryUnknown(id);} const input = out.payload as SubmitInput; const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; }); nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard)).nativeReference; }
+        if (out.kind === 'submitInput') { const input = out.payload as SubmitInput; const setting = input.mode==='steer'?null:this.store.confirmedSettings(session.sessionId); if(setting){const restored=await port.updateSettings(session.native,{model:setting.model,preferences:setting.preferences},guard);if(restored.settingsApplied!==true) return this.store.markDeliveryUnknown(id);} const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; }); nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard,input.requiredTurnId)).nativeReference; }
         else if (out.kind === 'resolveInteraction') { const req = out.payload as ResolveInteraction; await port.respond(session.native, this.store.getNativeInteraction(req.interactionId), req.answer, guard); }
         else if (out.kind === 'archiveSession') { if (!port.archive) return this.store.reconcileOperation(id,'failed',contractError('unsupported')); await port.archive(session.native,(out.payload as {archived:boolean}).archived,guard); }
         else if (out.kind === 'updateSessionSettings') { const settings=out.payload as {model:string|null;preferences:Record<string,string>}; const receipt=await port.updateSettings(session.native,settings,guard); if (guarded && receipt.settingsApplied === true && this.store.getOutbox(id).state === 'in_flight') return this.store.confirmSettings(id,settings); }
@@ -283,9 +300,11 @@ export class UnifiedCore implements UnifiedService {
         if (!guarded && this.store.getOutbox(id).state === 'in_flight') return this.store.markDeliveryUnknown(id);
         // An observation or control change can invalidate an in-flight submission.
         if (this.store.getOutbox(id).state !== 'in_flight') return this.store.getOperation(id);
+        if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {if(nativeReference!==(out.payload as SubmitInput).requiredTurnId)return this.store.markDeliveryUnknown(id);return this.store.completeSteer(id);}
         return this.store.acceptSubmission(id,nativeReference);
       } catch (error) {
-        if (!guarded && error && typeof error === 'object' && 'code' in error) { const code=(error as {code:unknown}).code; if (code === 'unsupported' || code === 'invalid_request') return this.store.reconcileOperation(id,'failed',contractError(code)); }
+        if(!guarded && error instanceof StoreError && out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer' && ['busy','control_conflict','interaction_expired','unauthorized'].includes(error.detail.code))return this.store.reconcileOperation(id,'failed',error.detail);
+        if (!guarded && error && typeof error === 'object' && 'code' in error) { const code=(error as {code:unknown}).code; if (code === 'unsupported' || code === 'invalid_request' || (out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer' && (code==='busy'||code==='control_conflict'||code==='interaction_expired'||code==='unauthorized'))) return this.store.reconcileOperation(id,'failed',contractError(code)); }
         // The transport may have written before losing its acknowledgement.
         return this.store.markDeliveryUnknown(id);
       }

@@ -24,6 +24,7 @@ export interface UnifiedService {
   hasStopRequest?(sessionId:string,turnId:string):Promise<boolean>;
   getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
   submitInput(request: SubmitInput): Promise<Operation>;
+  captureSteer?(identity:{source:string;subject:string},sessionId:string):Promise<{turnId:string;connectionGeneration:number;controlGeneration:number}>;
   listInteractions(sessionId: string, query: ListQuery): Promise<Page<Interaction>>;
   getInteraction(interactionId: string): Promise<Interaction>;
   resolveInteraction(request: ResolveInteraction): Promise<Operation>;
