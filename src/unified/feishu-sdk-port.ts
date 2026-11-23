@@ -16,6 +16,19 @@ import type { Readable } from 'node:stream';
 class ResourceRejected extends Error {}
 class FeishuApiRejected extends Error { readonly deliveryKind='api_rejected'; constructor(readonly platformCode:number) {super('Feishu API rejected request');} }
 function rejectCode(code:unknown):void {if(typeof code==='number' && Number.isSafeInteger(code) && code!==0) throw new FeishuApiRejected(code);}
+function requiresCardSchemaV2(value: unknown): boolean {
+  const failure = value as { code?: unknown; msg?: unknown; response?: { data?: { code?: unknown; msg?: unknown } } } | null;
+  const { code, msg } = failure?.response?.data ?? failure ?? {};
+  return code === 200830 || code === '200830' ||
+    ((code === 230099 || code === '230099') && typeof msg === 'string' && /\bErrCode:\s*200830\b/.test(msg));
+}
+function topicRootSchemaV2(card: ChannelCard): object {
+  return {
+    schema: '2.0',
+    header: { title: { tag: 'plain_text', content: card.title } },
+    body: { elements: [{ tag: 'div', text: { tag: 'plain_text', content: card.text } }] },
+  };
+}
 class UnknownTopic extends Error {}
 class TaskPendingRoute extends Error {}
 class UnknownCardRoute extends Error {}
@@ -113,6 +126,7 @@ export class FeishuSdkPort implements FeishuPort {
   private routeGeneration=0;
   private readonly linkCache=new Map<string,{url:string;expires:number}>();
   private readonly linkFlights=new Map<string,Promise<string|null>>();
+  private readonly schemaV2TopicRoots = new Set<string>();
   private dbClosed = false;
   constructor(credentials: {appId:string; appSecret:string}, dbPath:string, private readonly destinations: ReadonlySet<string>, private readonly owner:string,private readonly taskEnabled=false,private readonly taskTopicRuntimeEnabled=false) {
     if (!credentials.appId || !credentials.appSecret || !destinations.size || !owner) throw new Error('missing SDK configuration');
@@ -228,6 +242,7 @@ export class FeishuSdkPort implements FeishuPort {
     } catch(e) {this.migrationAbort();throw e;}
   }
   public isTopicDestination(destination:string):boolean { return !!this.route(destination); }
+  public rootMessageId(destination: string): string | null { return this.route(destination)?.root_id ?? null; }
   public chatDestination(destination:string):string | null { return this.route(destination)?.chat_id ?? null; }
   public reassignTopic(destination:string,sessionId:string):void { this.allowed(destination); this.routeGeneration++; if (!this.route(destination)) throw new Error('topic required'); this.db.prepare('UPDATE sdk_topic_routes SET session_id=? WHERE destination=?').run(sessionId,destination); }
   private laneReserved(destination:string):boolean { return !!this.db.prepare('SELECT 1 FROM sdk_lane_registry WHERE destination=?').get(destination); }
@@ -295,8 +310,25 @@ export class FeishuSdkPort implements FeishuPort {
   }
   async update(destination:string,messageId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     await guard?.(); this.allowedTaskOrProduction(destination); if(this.callbackDestination(this.route(destination)?.chat_id ?? destination,messageId)!==destination) throw new Error('message route mismatch');
-    const response = await this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(toFeishuCard(card))}});
-    rejectCode(response.code); this.remember(deliveryId,messageId,destination);
+    const isTitlePatch = deliveryId.startsWith('topic-title:') && this.route(destination)?.root_id === messageId &&
+      !card.form && !card.table && card.actions.length === 0;
+    const useV2 = isTitlePatch && this.schemaV2TopicRoots.has(messageId);
+    const patch = (content: object) => this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(content)}});
+    const response = await patch(useV2 ? topicRootSchemaV2(card) : toFeishuCard(card)).catch(error => {
+      if (!isTitlePatch || useV2 || !requiresCardSchemaV2(error)) throw error;
+      return null;
+    });
+    if (isTitlePatch && !useV2 && (response === null || requiresCardSchemaV2(response))) {
+      this.schemaV2TopicRoots.add(messageId);
+      await guard?.();
+      this.allowedTaskOrProduction(destination);
+      const route = this.route(destination);
+      if (route?.root_id !== messageId || this.callbackDestination(route.chat_id,messageId) !== destination) throw new Error('message route mismatch');
+      rejectCode((await patch(topicRootSchemaV2(card))).code);
+    } else {
+      rejectCode(response?.code);
+    }
+    this.remember(deliveryId,messageId,destination);
   }
   async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     this.allowedTaskOrProduction(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});

@@ -37,6 +37,12 @@ import {
   type TaskTargetRecord,
 } from './types.js';
 
+const REJECTED_OPERATION_ACTIONS: Readonly<Record<string, string>> = {
+  input: 'submitInput', attachment: 'submitInput', stop: 'interruptTurn',
+  settings: 'updateSessionSettings', cancel: 'cancelQueuedInput', control: 'requestControl',
+  answer: 'resolveInteraction', answer_form: 'resolveInteraction',
+};
+
 export interface TaskDeliverDeps {
   db: DatabaseSync;
   port: FeishuPort;
@@ -665,7 +671,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
           operationId: eventId,
           idempotencyKey: eventId,
           targetId: row.session_id,
-          action: a.action,
+          action: REJECTED_OPERATION_ACTIONS[a.action] ?? a.action,
           payloadDigest: row.action_digest,
           status: 'failed',
           revision: 0,

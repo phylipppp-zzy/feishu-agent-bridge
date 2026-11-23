@@ -1,3 +1,4 @@
+import {deriveTitleFromInputBlocks} from '../session-title.js';
 import { randomUUID } from 'node:crypto';
 import type {
   DispatchGuard,
@@ -29,7 +30,6 @@ import {
   buildPromptBlocks,
   DEFAULT_AGY_MODELS,
   DEFAULT_PROMPT_TIMEOUT_MS,
-  deriveTitleFromInputBlocks,
   findEffortConfigId,
   formatSessionTitle,
   isGenericAgyTitle,
@@ -269,7 +269,7 @@ export class AgyAdapter implements PlatformPort {
     const project = summary?.project || liveMeta?.cwd || '';
     const subagentCount = summary?.subagentCount ?? 0;
     const summaryTitle = summary?.title && !isGenericAgyTitle(summary.title, id) ? summary.title : '';
-    const baseTitle = summaryTitle || liveMeta?.title || summary?.title || `Antigravity 会话 · ${id.slice(0, 8)}`;
+    const baseTitle = (liveMeta?.nativeTitle && liveMeta.title) || summaryTitle || liveMeta?.title || summary?.title || `Antigravity 会话 · ${id.slice(0, 8)}`;
     const title = formatSessionTitle(baseTitle, subagentCount);
     const updatedAt = summary?.lastModifiedAt ?? liveMeta?.updatedAt ?? undefined;
     const createdAt = createdAtOverride ?? liveMeta?.createdAt ?? undefined;
@@ -373,6 +373,7 @@ export class AgyAdapter implements PlatformPort {
     const meta: LiveSessionMeta = {
       cwd,
       title: existing?.title ?? fallbackTitle,
+      ...(existing?.nativeTitle && {nativeTitle: true}),
       updatedAt: new Date().toISOString(),
       ...(existing?.createdAt ? { createdAt: existing.createdAt } : {}),
       ...(existing?.models ? { models: existing.models } : {}),

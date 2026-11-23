@@ -24,6 +24,10 @@ test('SDK input guarded; tool approval denial and native result are separately o
   const reject = { ...f.guard, assertCurrent() { throw Error('stale'); } };
   await assert.rejects(f.adapter.input(ref, 'new', [{ type: 'text', text: 'hello' }], reject));
   await f.adapter.input(ref, 'new', [{ type: 'text', text: 'hello' }], f.guard);
+  const titleUpdates = f.events.filter(event => event.type === 'session');
+  assert.deepEqual(titleUpdates.map(event => [event.session.title, event.session.status]), [['hello', 'running']]);
+  assert.equal((await f.adapter.read(ref)).session.title, 'hello');
+  assert.equal((await f.adapter.list(null, 10)).items[0]?.title, 'hello');
   assert.equal((await f.prompt[Symbol.asyncIterator]().next()).value.message.content, 'hello');
   const ac = new AbortController(); const decision = f.options.canUseTool('Bash', { command: 'echo hi' }, { signal: ac.signal, toolUseID: 'tool1' });
   const i: Interaction = f.events.at(-1).interaction; assert.equal(i.kind, 'approval');

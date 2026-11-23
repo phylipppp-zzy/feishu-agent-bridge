@@ -16,6 +16,7 @@ import {
   extractSchemaChoices,
   extractTextFromUpdateContent,
   findEffortConfigId,
+  isGenericAgyTitle,
   isRecord,
   isString,
   type ActiveTurnState,
@@ -212,7 +213,13 @@ export function handleAcpNotification(
 
   if (kind === 'session_info_update' && isString(update.title)) {
     const meta = ctx.knownSessions.get(sessionId);
-    if (meta) meta.title = update.title;
+    if (!meta) return;
+    const summary = ctx.catalog.get(sessionId);
+    const generic = isGenericAgyTitle(update.title, sessionId);
+    if (generic && (!isGenericAgyTitle(meta.title, sessionId) || !isGenericAgyTitle(summary?.title, sessionId))) return;
+    meta.title = update.title;
+    meta.nativeTitle = !generic;
+    ctx.emit({type: 'session', ref, session: ctx.buildSession(sessionId, summary ?? null, meta)});
     return;
   }
 

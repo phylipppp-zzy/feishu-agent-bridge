@@ -1,3 +1,4 @@
+import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
 import { query, listSessions, getSessionMessages, type Query, type Options, type SDKUserMessage, type CanUseTool, type SDKSessionInfo, type SessionMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -11,7 +12,7 @@ import { ClaudeResidualObservation } from './claude-residual.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
 type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
-type Live = { completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
+type Live = { title?: string; completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
 const safeNumber = (n: unknown): number | null => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
@@ -48,7 +49,7 @@ export class ClaudeAdapter implements PlatformPort {
     const live = this.lives.get(info.sessionId); const pending = live && [...live.pending.values()].some(p => p.interaction.status === 'awaiting_answer');
     const timestamp = info.lastModified; const updatedAt = typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8.64e15 ? new Date(timestamp).toISOString() : undefined;
     const createdAt=Number.isSafeInteger(info.createdAt) && info.createdAt!>0 && info.createdAt!<=8.64e15 ? new Date(info.createdAt!).toISOString() : undefined;
-    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: info.sessionId, native: this.ref(info.sessionId), project: info.cwd ?? '', title: info.customTitle?.trim() || info.summary?.trim() || '', status: live ? pending ? 'waiting_approval' : live.turn ? 'running' : 'idle' : 'read_only', revision: 0, capabilities: live ? liveCaps : readCaps, control: { serviceId: this.serviceId, owner: null, input: live ? 'available' : 'unavailable', generation: 0, operationId: null, reason: live ? null : 'external native session is read-only' } };
+    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: info.sessionId, native: this.ref(info.sessionId), project: info.cwd ?? '', title: info.customTitle?.trim() || info.summary?.trim() || live?.title || '', status: live ? pending ? 'waiting_approval' : live.turn ? 'running' : 'idle' : 'read_only', revision: 0, capabilities: live ? liveCaps : readCaps, control: { serviceId: this.serviceId, owner: null, input: live ? 'available' : 'unavailable', generation: 0, operationId: null, reason: live ? null : 'external native session is read-only' } };
   }
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
     const offset = cursor === null ? 0 : Number(cursor); if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request');
@@ -147,6 +148,14 @@ export class ClaudeAdapter implements PlatformPort {
     const content: Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'; data: string } }> = [];
     for (const block of blocks) { if (block.type === 'text') content.push({ type: 'text', text: block.text }); else { const data = Buffer.from(block.content); if(block.mediaType==='text/plain'){let text:string;try{text=textAttachmentBlock(block.name,data)}catch{throw contractError('invalid_request','invalid text attachment')}content.push({type:'text',text});continue;} const media = imageMediaType(data); if (!media || media !== block.mediaType) throw contractError('unsupported', 'only verified PNG, JPEG, GIF and WebP images are supported'); content.push({ type: 'image', source: { type: 'base64', media_type: media, data: data.toString('base64') } }); } }
     const id = randomUUID(); guard.assertCurrent(); live.residual.beginTurn(id);live.turn = id; live.turnModel = live.model; live.queue.push({ type: 'user', uuid: id, parent_tool_use_id: null, message: { role: 'user', content: content.length === 1 && content[0]!.type === 'text' ? content[0]!.text : content } });
+    const info = this.known.get(live.id) ?? {sessionId: live.id, cwd: live.cwd, summary: '', lastModified: 0};
+    if (!live.title && !info.customTitle?.trim() && !info.summary?.trim()) {
+      const title = deriveTitleFromInputBlocks(blocks);
+      if (title) {
+        live.title = title;
+        this.emit({type: 'session', ref, session: this.session(info)});
+      }
+    }
     const message: Message = { messageId: id, sessionId: live.id, turnId: id, role: 'user', blocks: blocks.map(b => b.type === 'text' ? b : { type: 'artifact', artifactId: b.artifactId, contentVersion: b.contentVersion }), sequence: ++this.sequence, revision: 1, final: true, source: 'claude' }; live.messages.push(message); this.emit({ type: 'message', ref, message,connectionGeneration:live.generation }); this.emit({ type: 'turn', ref, connectionGeneration:live.generation, turn: { turnId: id, sessionId: live.id, status: 'running', inputId: id, startedAt: new Date().toISOString(), endedAt: null, model: live.model, outputIds: [] } }); return ack(id);
   }
   async inspectTurnResidual(ref:NativeSessionRef,turnId:string) {const id=this.check(ref);const live=this.lives.get(id);if(this.closed||!live||!this.owned.get(id))return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'外部或已断开会话没有当前可信任务观察'};return live.residual.inspect(turnId);}

@@ -63,3 +63,40 @@ test('created-order old page ends recent scan without traversing historical back
 test('recent discovery handles duplicate and out-of-order pages without repeating identities',async()=>{const {sockets,transport,adapter}=setup();await transport.connect();try{const now=Math.floor(Date.now()/1000),base={cwd:'/work',status:{type:'idle'},parentThreadId:null,source:'cli'};const p=adapter.discoverNewer(now-10,null,1);let req=sockets[0]!.sent.at(-1);sockets[0]!.message({id:req.id,result:{data:[{...base,id:'one',createdAt:now-1}],nextCursor:'page2'}});const first=await p;assert.equal(first.items[0]?.native.nativeSessionId,'one');assert.ok(first.nextCursor);const q=adapter.discoverNewer(now-10,first.nextCursor,1);req=sockets[0]!.sent.at(-1);sockets[0]!.message({id:req.id,result:{data:[{...base,id:'old',createdAt:now-20},{...base,id:'one',createdAt:now-1},{...base,id:'two',createdAt:now-2}],nextCursor:null}});const second=await q;assert.deepEqual(second.items.map(x=>x.native.nativeSessionId),['two']);assert.equal(second.nextCursor,null);}finally{transport.close()}});
 test('recent discovery reaches 10001st new item without cursor expiry or unbounded identity history',async()=>{const originalNow=Date.now;let now=originalNow(),calls=0;Date.now=()=>now;const created=Math.floor(now/1000)-1,watermark=created-10;const transport:any={connected:true,generation:1,onMessage:()=>{},onDisconnect:()=>{},async request(method:string,params:any){assert.equal(method,'thread/list');calls++;const offset=params.cursor?Number(params.cursor):0;const data=Array.from({length:Math.min(100,10001-offset)},(_,i)=>({id:`n${offset+i}`,cwd:'/work',status:{type:'idle'},source:'cli',parentThreadId:null,createdAt:created}));return {data,nextCursor:offset+100<10001?String(offset+100):null}}};const adapter=new CodexAdapter(transport,'h','s');try{let cursor:string|null=null,count=0,last='';do {const page=await adapter.discoverNewer(watermark,cursor,1);count+=page.items.length;last=page.items.at(-1)?.native.nativeSessionId ?? last;cursor=page.nextCursor;now+=100;}while(cursor!==null && count<10010);assert.equal(count,10001);assert.equal(last,'n10000');assert.equal(calls,101);}finally{Date.now=originalNow}});
 test('bad new item metadata is isolated while later good item is returned',async()=>{const now=Math.floor(Date.now()/1000),transport:any={connected:true,generation:1,onMessage:()=>{},onDisconnect:()=>{},async request(){return {data:[{id:'bad',cwd:4,status:{type:'idle'},source:'cli',parentThreadId:null,createdAt:now-1},{id:'good',cwd:'/work',status:{type:'idle'},source:'cli',parentThreadId:null,createdAt:now-1}],nextCursor:null}}};const adapter=new CodexAdapter(transport,'h','s');const page=await adapter.discoverNewer(now-10,null,2);assert.equal(page.partialFailure,true);assert.deepEqual(page.items.map(s=>s.native.nativeSessionId),['good']);});
+
+for (const completedBeforeAck of [false, true]) {
+  test(`Codex first input and native rename preserve the latest turn status (early completion: ${completedBeforeAck})`, async () => {
+    const {transport, adapter, sockets, events} = setup();
+    try {
+      await transport.connect();
+      const socket = sockets[0]!;
+      const creation = adapter.create('/work', null);
+      socket.message({id: socket.sent.at(-1).id, result: {thread: {id: 't', cwd: '/work', status: {type: 'idle'}}}});
+      await creation;
+      const input = adapter.input(ref, 'new', [{type: 'text', text: '\n  查看   进展\n第二行'}], guard);
+      const startId = socket.sent.at(-1).id;
+      if (completedBeforeAck) {
+        socket.message({method: 'turn/completed', params: {threadId: 't', turn: {id: 'turn', status: 'completed'}}});
+      }
+      socket.message({id: startId, result: {turn: {id: 'turn'}}});
+      await input;
+      const lastSession = () => {
+        const event = events.at(-1);
+        assert.equal(event?.type, 'session');
+        return [event.session.title, event.session.status];
+      };
+      assert.deepEqual(lastSession(), ['查看 进展', completedBeforeAck ? 'idle' : 'running']);
+      socket.message({method: 'turn/started', params: {threadId: 't', turn: {id: 'next', status: 'inProgress'}}});
+      socket.message({method: 'thread/name/updated', params: {threadId: 't', threadName: '新的名称'}});
+      assert.deepEqual(lastSession(), ['新的名称', 'running']);
+      socket.message({method: 'turn/completed', params: {threadId: 't', turn: {id: 'next', status: 'completed'}}});
+      socket.message({method: 'thread/name/updated', params: {threadId: 't', threadName: '归档前检查'}});
+      assert.deepEqual(lastSession(), ['归档前检查', 'idle']);
+      socket.message({method: 'turn/completed', params: {threadId: 't', turn: {id: 'final', status: 'interrupted'}}});
+      socket.message({method: 'thread/name/updated', params: {threadId: 't', threadName: '保留中断状态'}});
+      assert.deepEqual(lastSession(), ['保留中断状态', 'interrupted']);
+    } finally {
+      transport.close();
+    }
+  });
+}

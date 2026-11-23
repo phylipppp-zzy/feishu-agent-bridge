@@ -13,5 +13,39 @@ for(const split of [false,true]) test(`ordinary input sends only reply with ${sp
 test('no-output success has one completion while errors, unknowns, quota and queue remain visible',async()=>{const x=setup();try{await x.bind();x.store.putTurn(x.turn('running'));x.store.putTurn(x.turn('completed'));await x.channel.sync('topic');assert.equal(x.sends.length,1);assert.match(x.sends[0].text,/运行已完成/);x.sends.length=0;x.event('bad','operation.failed',{action:'submitInput',status:'failed',error:{code:'busy'},operationId:'bad'});x.event('unknown','operation.unknown',{action:'resolveInteraction',status:'unknown',error:null,operationId:'u'});x.event('quota','provider.usage_limit',{status:'rejected'});await x.channel.sync('topic');assert.equal(x.sends.length,3);assert.ok(x.sends.some(c=>c.text.includes('失败')));assert.ok(x.sends.some(c=>c.text.includes('结果未知')));assert.ok(x.sends.some(c=>c.title==='额度提示'));await x.channel.handle(x.env('queue'),{action:'input',mode:'queue',text:'later'});assert.match(x.sends.at(-1).text,/已排队|等待处理/);assert.ok(x.sends.at(-1).actions.some((a:any)=>a.value.action==='panel'));}finally{x.close()}});
 test('approval uses one card and patches it when answered, without duplicate waiting or success cards',async()=>{const x=setup();try{await x.bind();const interaction:any={interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'n',connectionGeneration:1,revision:0,status:'awaiting_answer',expiresAt:null,toolInputDigest:'digest',nativeResult:null,kind:'approval',tool:'tool',action:'write',scope:'test'};x.store.insertInteraction(interaction);await x.channel.sync('topic');assert.equal(x.sends.length,1);const card=x.sends[0];assert.equal(card.title,'审批');assert.equal(card.actions.length,2);await x.channel.handle(x.env('answer'),card.actions[0].value as any);assert.equal(x.sends.length,1);assert.equal(x.updates.length,1);assert.equal(x.updates[0].card.actions.length,0);await x.channel.sync('topic');assert.equal(x.sends.length,1);}finally{x.close()}});
 
-test('same-turn failure appears once and non-input operation completion is retained',async()=>{const x=setup();try{await x.bind();x.event('bad','operation.failed',{action:'submitInput',status:'failed',error:{code:'busy'},operationId:'bad',result:{kind:'turn',turnId:'t',status:'failed'}});x.event('turn-failed','turn.updated',{turnId:'t',status:'failed'});x.event('session-failed','session.updated',{status:'failed'});x.event('settings-done','operation.completed',{action:'updateSessionSettings',status:'completed',operationId:'settings',error:null});await x.channel.sync('topic');assert.equal(x.sends.filter(c=>c.text.includes('失败')).length,1);assert.ok(x.sends.some(c=>c.text.includes('更新设置') && c.text.includes('已完成')));}finally{x.close()}});
+test('same-turn failure appears once and ordinary attach and settings completions stay quiet', async () => {
+  const x = setup();
+  try {
+    await x.bind();
+    x.event('bad','operation.failed',{action:'submitInput',status:'failed',error:{code:'busy'},operationId:'bad',result:{kind:'turn',turnId:'t',status:'failed'}});
+    x.event('turn-failed','turn.updated',{turnId:'t',status:'failed'});
+    x.event('session-failed','session.updated',{status:'failed'});
+    for (const action of ['attachSession','updateSessionSettings']) {
+      x.event(action,'operation.completed',{action,status:'completed',operationId:action,error:null});
+    }
+    await x.channel.sync('topic');
+    assert.equal(x.sends.length,1);
+    assert.match(x.sends[0].text,/失败/);
+  } finally { x.close(); }
+});
+
+for (const action of ['attachSession','updateSessionSettings']) {
+  test(`confirmed ${action} updates the existing unknown receipt`, async () => {
+    const x = setup();
+    try {
+      await x.bind();
+      x.event('unknown','operation.unknown',{action,status:'unknown',operationId:'op',error:null});
+      await x.channel.sync('topic');
+      assert.equal(x.sends.length,1);
+      assert.equal(x.sends[0].actions[0].value.action,'reconcile');
+      x.event('completed','operation.completed',{action,status:'completed',operationId:'op',error:null});
+      await x.channel.sync('topic');
+      await x.channel.sync('topic');
+      assert.equal(x.sends.length,1);
+      assert.equal(x.updates.length,1);
+      assert.equal(x.updates[0].id,'m1');
+      assert.match(x.updates[0].card.text,/已完成/);
+    } finally { x.close(); }
+  });
+}
 test('external waiting without a visible interaction still notifies',async()=>{const x=setup();try{await x.bind();const current=x.store.getSession('s');x.store.updateSession({...current,status:'waiting_approval',revision:current.revision+1},current.revision,current.control.generation);await x.channel.sync('topic');assert.equal(x.sends.filter(c=>c.text.includes('等待审批')).length,1);}finally{x.close()}});

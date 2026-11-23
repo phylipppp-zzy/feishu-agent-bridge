@@ -1,3 +1,4 @@
+import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
@@ -22,6 +23,7 @@ export class CodexAdapter implements PlatformPort {
   private readonly owned = new Set<string>();
   private readonly active = new Set<string>();
   private readonly controlEpoch = new Map<string, number>();
+  private readonly awaitingFirstInput = new WeakSet<Obj>();
   private readonly knownSessions = new Map<string, Obj>();
   private requests = new Map<string, NativeRequest>();
   private nativeIndex = new Map<string, string>();
@@ -45,16 +47,22 @@ export class CodexAdapter implements PlatformPort {
   seedControlGeneration(ref:NativeSessionRef, minimum:number): void { const id=this.check(ref); if (!Number.isSafeInteger(minimum) || minimum < 0 || this.active.has(id) || [...this.requests.values()].some(r=>r.interaction.sessionId===id && r.interaction.status!=='resolved' && r.interaction.status!=='expired')) throw contractError('busy','session has active native state'); this.controlEpoch.set(id,Math.max(minimum,this.controlEpoch.get(id) ?? 0)); }
   private ref(id: string): NativeSessionRef { return { provider: 'codex', hostId: this.hostId, serviceId: this.serviceId, nativeSessionId: id }; }
   private check(ref: NativeSessionRef): string { if (ref.provider !== 'codex' || ref.hostId !== this.hostId || ref.serviceId !== this.serviceId || !isString(ref.nativeSessionId)) throw contractError('invalid_request', 'native session reference mismatch'); return ref.nativeSessionId; }
+  hasActiveNativeSession(ref: NativeSessionRef): boolean {
+    return ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
+      && this.transport.connected && this.active.has(ref.nativeSessionId);
+  }
   onObservation(listener: (event: PlatformObservation) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private emit(event: PlatformObservation): void { for (const fn of this.listeners) fn(event); }
   private emitInteraction(interaction: Interaction): void { this.emit({ type: 'interaction', interaction, ref: this.ref(interaction.sessionId) } as PlatformObservation); }
   private key(generation: number, id: string | number): string { return `${generation}:${typeof id}:${id}`; }
   private session(t: Obj): Session {
     if (!t || typeof t !== 'object' || !isString(t.id) || typeof t.cwd !== 'string' || !t.status || typeof t.status.type !== 'string') return invalidNative();
-    const status = t.status.type === 'idle' ? 'idle' : t.status.type === 'active' ? 'running' : t.status.type === 'systemError' ? 'failed' : 'unreachable';
+    const threadStates: Record<string, Session['status']> = {idle: 'idle', active: 'running', systemError: 'failed', interrupted: 'interrupted'};
+    const status = threadStates[t.status.type] ?? 'unreachable';
     const active = this.active.has(t.id) && this.transport.connected; const available = {status:'available' as const}; const liveCaps: Capabilities = {...caps,send:available,queue:available,answer:available,approve:available,interrupt:available,handoff:available,config:available};
     const timestamp = t.updatedAt; const updatedAt = typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8.64e12 ? new Date(timestamp * 1000).toISOString() : undefined; const ct=t.createdAt; const createdAt=Number.isSafeInteger(ct) && ct>0 && ct<=8.64e12 && ['cli','vscode','appServer'].includes(t.source) && t.parentThreadId==null ? new Date(ct*1000).toISOString() : undefined;
-    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: t.id, native: this.ref(t.id), project: t.cwd, title: typeof t.name === 'string' && t.name ? t.name : typeof t.preview === 'string' ? t.preview : '', status: active ? status : 'read_only', revision: 0, capabilities: active ? liveCaps : this.owned.has(t.id) && this.transport.connected ? {...caps,handoff:available} : caps, control: { serviceId: this.serviceId, owner: active ? this.serviceId : null, input: active ? 'available' : 'unavailable', generation: this.controlEpoch.get(t.id) ?? 0, operationId: null, reason: active ? null : 'session not held by this adapter connection' } };
+    const title = (isString(t.name) && t.name.trim()) || this.knownSessions.get(t.id)?.name || t.preview;
+    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: t.id, native: this.ref(t.id), project: t.cwd, title: typeof title === 'string' ? title : '', status: active ? status : 'read_only', revision: 0, capabilities: active ? liveCaps : this.owned.has(t.id) && this.transport.connected ? {...caps,handoff:available} : caps, control: { serviceId: this.serviceId, owner: active ? this.serviceId : null, input: active ? 'available' : 'unavailable', generation: this.controlEpoch.get(t.id) ?? 0, operationId: null, reason: active ? null : 'session not held by this adapter connection' } };
   }
   private message(thread: string, turn: string, item: Obj, final: boolean): Message | undefined {
     if (!item || typeof item !== 'object' || !isString(item.id)) return;
@@ -95,11 +103,24 @@ export class CodexAdapter implements PlatformPort {
       const req: NativeRequest = { id: m.id, generation, interaction }; this.requests.set(id, req); this.nativeIndex.set(this.key(generation, m.id), id); this.emitInteraction(interaction); return;
     }
     if (!thread || generation!==this.transport.generation) return;
+    const info = this.knownSessions.get(thread);
+    if (m.method === 'thread/name/updated' && info) {
+      const name = p.threadName ?? p.thread_name ?? p.name;
+      if (typeof name === 'string' && name.trim() && name !== info.name) {
+        info.name = name.trim();
+        this.emit({type: 'session', ref: this.ref(thread), session: this.session(info)});
+      }
+      return;
+    }
     if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
     if(m.method==='turn/started' && isString(p.turn?.id) && this.active.has(thread)) {const key=`${thread}\0${p.turn.id}`;if(this.residualTurns.get(key)?.generation!==generation){if(this.residualTurns.size>=1024) this.residualTurns.delete(this.residualTurns.keys().next().value!);this.residualTurns.set(key,{generation,items:new Set(),version:0,overflow:false});}}
     if((m.method==='item/started' || m.method==='item/completed') && isString(p.turnId) && p.item?.type==='commandExecution' && isString(p.item?.id)) {const tracked=this.residualTurns.get(`${thread}\0${p.turnId}`);if(tracked?.generation===generation && !tracked.items.has(p.item.id)) {if(tracked.items.size>=10000) tracked.overflow=true;else tracked.items.add(p.item.id);tracked.version++;}}
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
       const turn = this.turn(thread,p.turn);
+      if (info) {
+        const threadStates = {running: 'active', failed: 'systemError', interrupted: 'interrupted', completed: 'idle', queued: 'idle'};
+        info.status = {type: threadStates[turn.status]};
+      }
       this.emit({ type: 'turn', turn, ref: this.ref(thread) } as PlatformObservation); return;
     }
     if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread), connectionGeneration:generation } as PlatformObservation); }
@@ -177,7 +198,7 @@ export class CodexAdapter implements PlatformPort {
     this.knownSessions.set(id,r.thread); this.owned.add(id); this.active.add(id); this.controlEpoch.set(id,(this.controlEpoch.get(id) ?? 0)+1);
     return {...ack(id),connectionGeneration:this.transport.generation};
   }
-  async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { const r = await this.transport.request('thread/start', { cwd, model }) as Obj; if (!isString(r?.thread?.id)) return invalidNative(); this.knownSessions.set(r.thread.id,r.thread); this.owned.add(r.thread.id); this.active.add(r.thread.id); this.controlEpoch.set(r.thread.id,0); return {status:'submitted',nativeReference:r.thread.id,createdSession:this.session(r.thread),connectionGeneration:this.transport.generation}; }
+  async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { const r = await this.transport.request('thread/start', { cwd, model }) as Obj; if (!isString(r?.thread?.id)) return invalidNative(); this.knownSessions.set(r.thread.id,r.thread); this.awaitingFirstInput.add(r.thread); this.owned.add(r.thread.id); this.active.add(r.thread.id); this.controlEpoch.set(r.thread.id,0); return {status:'submitted',nativeReference:r.thread.id,createdSession:this.session(r.thread),connectionGeneration:this.transport.generation}; }
   async input(ref: NativeSessionRef, mode: 'new' | 'steer', blocks: PlatformInputBlock[], guard: DispatchGuard, turnId?: string): Promise<PlatformAcknowledgement> {
     const id = this.check(ref); if (!this.active.has(id) || !this.transport.connected) throw contractError('control_conflict', 'session is not subscribed'); if (!blocks.length) throw contractError('invalid_request');
     const input = blocks.map(b => {
@@ -195,8 +216,20 @@ export class CodexAdapter implements PlatformPort {
     });
     if (mode === 'steer' && !turnId) throw contractError('invalid_request');
     if (guard.expectedConnectionGeneration !== null && guard.expectedConnectionGeneration !== this.transport.generation) throw contractError('control_conflict');
+    const info = this.knownSessions.get(id);
+    const previousStatus = info?.status;
     guard.assertCurrent(); const response = await this.transport.request(mode === 'new' ? 'turn/start' : 'turn/steer', mode === 'new' ? { threadId: id, input, ...(this.settings.get(id) ?? {}) } : { threadId: id, expectedTurnId: turnId, input });
-    const r = response as Obj; const returned=typeof r?.turn?.id === 'string' ? r.turn.id : typeof r?.turnId === 'string' ? r.turnId : null; if(mode==='steer' && returned!==turnId) throw contractError('outcome_unknown','steer acknowledgement did not identify the captured turn'); return ack(returned);
+    const r = response as Obj; const returned=typeof r?.turn?.id === 'string' ? r.turn.id : typeof r?.turnId === 'string' ? r.turnId : null; if(mode==='steer' && returned!==turnId) throw contractError('outcome_unknown','steer acknowledgement did not identify the captured turn');
+    if (mode === 'new' && info && this.awaitingFirstInput.delete(info) && this.active.has(id) && this.knownSessions.get(id) === info) {
+      const title = this.session(info).title.trim() ? null : deriveTitleFromInputBlocks(blocks);
+      if (title) {
+        info.name = title;
+        // A turn notification can arrive before the start acknowledgement.
+        if (info.status === previousStatus) info.status = {type: 'active'};
+        this.emit({type: 'session', ref, session: this.session(info)});
+      }
+    }
+    return ack(returned);
   }
   async inspectTurnResidual(ref:NativeSessionRef,turnId:string):Promise<TurnResidual> {const key=JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId,turnId,this.transport.generation]);let work=this.residualQueries.get(key);if(!work){work=this.inspectTurnResidualOnce(ref,turnId,Date.now()+5000);this.residualQueries.set(key,work);void work.finally(()=>{if(this.residualQueries.get(key)===work)this.residualQueries.delete(key);}).catch(()=>{});}let timer:ReturnType<typeof setTimeout>|undefined;try {return await Promise.race([work,new Promise<TurnResidual>(resolve=>{timer=setTimeout(()=>resolve({status:'unknown',count:null,observedAt:null,complete:false,reason:'残留查询超时'}),5000);})]);}finally{if(timer)clearTimeout(timer);}}
   private async inspectTurnResidualOnce(ref:NativeSessionRef,turnId:string,deadline:number):Promise<TurnResidual> {const id=this.check(ref),tracked=this.residualTurns.get(`${id}\0${turnId}`),generation=this.transport.generation; let observedAt:string|null=null; const matched=new Set<string>();const unknown=(reason:string):TurnResidual=>matched.size && observedAt ? {status:'running',count:matched.size,observedAt,complete:false,reason} : {status:'unknown',count:null,observedAt:null,complete:false,reason}; if(!isString(turnId) || !tracked || tracked.overflow || tracked.generation!==generation || !this.transport.connected) return unknown('缺少当前连接代次的完整轮次归属'); const version=tracked.version; let cursor:string|null=null;const seen=new Set<string>();try {for(let page=0;page<100;page++){if(Date.now()>=deadline)return unknown('残留查询超时');const result=await this.transport.request('thread/backgroundTerminals/list',{threadId:id,cursor,limit:100}) as Obj;if(Date.now()>=deadline)return unknown('残留查询超时');if(this.transport.generation!==generation || !this.transport.connected || this.residualTurns.get(`${id}\0${turnId}`)!==tracked || tracked.version!==version) return unknown('查询期间连接或归属发生变化');if(!Array.isArray(result?.data) || !(result.nextCursor==null || isString(result.nextCursor))) return unknown('残留查询返回格式无效');observedAt=new Date().toISOString();for(const item of result.data){if(!isString(item?.itemId)) return unknown('残留任务缺少身份');if(tracked.items.has(item.itemId))matched.add(item.itemId);}cursor=result.nextCursor??null;if(cursor===null){const count=matched.size;return {status:count?'running':'none',count,observedAt,complete:true,reason:count?'目标轮次已登记任务仍在运行，其他外部作业或后代未确认':'未发现目标轮次已登记残留；未知外部作业或后代未确认'};}if(seen.has(cursor)) return unknown('残留查询分页重复');seen.add(cursor);}return unknown('残留查询超过分页预算');}catch{return unknown('残留查询失败或不可用');} }

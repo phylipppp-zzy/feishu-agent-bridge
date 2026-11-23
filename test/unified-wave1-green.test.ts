@@ -693,7 +693,7 @@ test('Wave1 Item 5: AgyAdapter updates generic title from first user prompt and 
     const core = new UnifiedCore(store, [adapter], () => true, () => true);
 
     try {
-      // 1. Short multi-line prompt -> collapsed single-line title, persisted in UnifiedCore, second prompt does NOT overwrite
+      // 1. Short multi-line prompt -> title from first non-empty line, persisted in UnifiedCore, second prompt does NOT overwrite
       const createOp = await core.createSession({
         context: {
           operationId: 'op-c1',
@@ -732,9 +732,9 @@ test('Wave1 Item 5: AgyAdapter updates generic title from first user prompt and 
           o.type === 'session' && o.ref.nativeSessionId === uuid1,
       );
       assert.equal(sessionObs.length, 1);
-      assert.equal(sessionObs[0]?.session.title, 'Fix core health degraded bug');
-      assert.equal((await core.getSession(sid1)).title, 'Fix core health degraded bug');
-      assert.equal((await adapter.read(sBefore.native)).session.title, 'Fix core health degraded bug');
+      assert.equal(sessionObs[0]?.session.title, 'Fix core');
+      assert.equal((await core.getSession(sid1)).title, 'Fix core');
+      assert.equal((await adapter.read(sBefore.native)).session.title, 'Fix core');
 
       // Wait for prompt completion then send a second prompt -> title must stay unchanged
       await new Promise((r) => setTimeout(r, 20));
@@ -753,7 +753,7 @@ test('Wave1 Item 5: AgyAdapter updates generic title from first user prompt and 
       });
       await core.dispatch(inputOp2.operationId);
       await new Promise((r) => setImmediate(r));
-      assert.equal((await core.getSession(sid1)).title, 'Fix core health degraded bug');
+      assert.equal((await core.getSession(sid1)).title, 'Fix core');
 
       // 2. Long prompt (>48 chars) -> truncated to <= 48 chars
       const ack2 = await adapter.create(project, null);
@@ -791,6 +791,14 @@ test('Wave1 Item 5: AgyAdapter updates generic title from first user prompt and 
       await adapter.resume(realRef);
       await adapter.input(realRef, 'new', [{ type: 'text', text: 'New prompt must not replace existing real title' }], guard2);
       assert.equal((await adapter.read(realRef)).session.title, 'Existing Named Session');
+      const rename = (title: string) => fakeTransport.onNotification?.({
+        generation: 1, method: 'session/update',
+        params: {sessionId: realId, update: {sessionUpdate: 'session_info_update', title}},
+      });
+      rename('原生改名');
+      assert.ok(observations.some(o => o.type === 'session' && o.session.title === '原生改名'));
+      rename('Antigravity 会话 · 11112222');
+      assert.equal((await adapter.read(realRef)).session.title, '原生改名');
     } finally {
       core.close();
       store.close();

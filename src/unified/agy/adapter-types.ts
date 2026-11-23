@@ -1,3 +1,4 @@
+import {isGenericSessionTitle} from '../session-title.js';
 import type {
   PlatformAcknowledgement,
   PlatformInputBlock,
@@ -46,7 +47,6 @@ export const LIST_SNAPSHOT_TTL_MS = 120_000;
 export const MAX_LIST_SNAPSHOTS = 8;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 export const EFFORT_SUFFIX_RE = /^(.*?)(?:-tiered)?-(low|medium|high|xhigh|max)$/i;
-export const GENERIC_AGY_TITLE_RE = /^Antigravity 会话 · [0-9a-f]{8}$/i;
 
 const available = { status: 'available' as const };
 const unsupported = (reason: string) => ({ status: 'unsupported' as const, reason });
@@ -82,6 +82,7 @@ export type Obj = Record<string, unknown>;
 export type LiveSessionMeta = {
   cwd: string;
   title: string;
+  nativeTitle?: boolean;
   updatedAt?: string;
   createdAt?: string;
   models?: ModelOption[];
@@ -171,22 +172,7 @@ export const ack = (nativeReference: string | null = null): PlatformAcknowledgem
 });
 
 export function isGenericAgyTitle(title: string | undefined, sessionId: string): boolean {
-  const trimmed = title?.trim() ?? '';
-  if (!trimmed) return true;
-  if (GENERIC_AGY_TITLE_RE.test(trimmed)) return true;
-  return trimmed === `Antigravity 会话 · ${sessionId.slice(0, 8)}`;
-}
-
-export function deriveTitleFromInputBlocks(blocks: readonly PlatformInputBlock[], maxLen = 48): string | null {
-  for (const block of blocks) {
-    if (block.type !== 'text') continue;
-    const collapsed = block.text.replace(/\s+/g, ' ').trim();
-    if (!collapsed) continue;
-    const chars = [...collapsed];
-    if (chars.length <= maxLen) return collapsed;
-    return `${chars.slice(0, maxLen - 1).join('').trimEnd()}…`;
-  }
-  return null;
+  return isGenericSessionTitle(title) || title?.trim() === `Antigravity 会话 · ${sessionId.slice(0, 8)}`;
 }
 
 /** Strip trailing effort suffix (e.g. `-xhigh`, `-tiered-xhigh`) before passing model ID to CLI/ACP. */

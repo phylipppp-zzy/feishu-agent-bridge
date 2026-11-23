@@ -96,10 +96,15 @@ export class EnrichedPort implements PlatformPort {
   }
   async read(ref:NativeSessionRef) {
     if (ref.provider !== this.provider) throw contractError('invalid_request');
-    const base = await this.allBase(); if (base.some(s=>nativeRefKey(s.native)===nativeRefKey(ref))) return this.base.read(ref);
+    if (await this.isProviderSession(ref)) return this.base.read(ref);
     await this.catalog.refresh(); try { return this.catalog.read(ref); } catch { throw contractError('invalid_request','session not found'); }
   }
-  private async isExternal(ref:NativeSessionRef):Promise<boolean> { const base=await this.allBase(); if (base.some(s=>nativeRefKey(s.native)===nativeRefKey(ref))) return false; await this.catalog.refresh(); try { this.catalog.read(ref); return true; } catch { throw contractError('invalid_request','session not found'); } }
+  private async isProviderSession(ref: NativeSessionRef): Promise<boolean> {
+    if (this.base.hasActiveNativeSession?.(ref)) return true;
+    const key = nativeRefKey(ref);
+    return (await this.allBase()).some(session => nativeRefKey(session.native) === key);
+  }
+  private async isExternal(ref:NativeSessionRef):Promise<boolean> { if (await this.isProviderSession(ref)) return false; await this.catalog.refresh(); try { this.catalog.read(ref); return true; } catch { throw contractError('invalid_request','session not found'); } }
   private async writable(ref:NativeSessionRef):Promise<void> { if (await this.isExternal(ref)) throw contractError('unsupported','external session is read-only'); }
   async listProjectFiles(ref:NativeSessionRef,directory:string,showHidden:boolean) { await this.read(ref); const root=this.registry.getProjectRoot(ref); if(!root) throw contractError('unsupported'); return listSafeProjectDirectory(directory,root,showHidden); }
   async selectProjectFiles(ref:NativeSessionRef,args:string):Promise<Artifact[]> { await this.read(ref); const root=this.registry.getProjectRoot(ref); if(!root) throw contractError('unsupported'); const selection=await selectSafeProjectFiles(root,args); const result:Artifact[]=[]; for(const file of selection) {const artifact=await this.registry.register(nativeRefKey(ref),file.path,'application/octet-stream',true); if(artifact.contentVersion!==file.digest) throw contractError('invalid_request','selected file changed'); result.push(artifact);} return result; }

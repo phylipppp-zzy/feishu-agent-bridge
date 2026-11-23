@@ -557,6 +557,10 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   };
   const namespace=(ref:Session['native'],provider:PlatformPort['provider']):boolean=>ref.provider===provider && ref.hostId===config.hostId && ref.serviceId===serviceIdFor(provider) && !!ref.nativeSessionId;
   const secured=(base:PlatformPort):PlatformPort=>new Proxy(base, {get(target,key) {
+    if (key==='hasActiveNativeSession') return (ref: Session['native']) => {
+      const session = pinned.get(nativeRefKey(ref));
+      return namespace(ref,target.provider) && !!session && trusted(session) && target.hasActiveNativeSession?.(ref) === true;
+    };
     if(key==='list') return async (cursor:string|null,limit:number)=>{ const page=await target.list(cursor,limit); return {...page,items:page.items.filter(s=>{if(!namespace(s.native,target.provider)) {enrichmentError=true;return false;} if(!trusted(s)) return false; const ok=pin(s); if(!ok) enrichmentError=true; return ok;})}; };
     if(key==='read') return async (ref:Session['native'])=>{ if(!namespace(ref,target.provider)) throw contractError('invalid_request','provider namespace mismatch'); const snapshot=await target.read(ref); if(payloadDigest(snapshot.session.native)!==payloadDigest(ref) || !pin(snapshot.session)) throw contractError('invalid_request','provider session metadata mismatch'); return snapshot; };
     if(key==='onObservation') return (listener:(o:PlatformObservation)=>void)=>target.onObservation(o=>{

@@ -76,6 +76,8 @@ export interface PlatformPort {
   close?(): Promise<void>;
   seedConnectionGeneration?(minimum: number): void;
   seedControlGeneration?(ref: NativeSessionRef, minimum: number): void;
+  /** A live provider connection holds this exact ref, even when native listing omits it. */
+  hasActiveNativeSession?(ref: NativeSessionRef): boolean;
   list(cursor: string | null, limit: number): Promise<Page<Session>>;
   discoverExisting?(cursor:string|null,limit:number):Promise<Page<Session>>;
   readAutoActivity?(ref:NativeSessionRef,watermark:number,observed:number):Promise<{status:'proven'|'unknown'|'future';snapshot?:SessionSnapshot;oldMessageIds?:string[];newMessageIds?:string[];oldTurns?:Turn[]}>;
