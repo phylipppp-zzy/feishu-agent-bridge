@@ -28,6 +28,8 @@ import { DecisionSyncStore } from './decision-sync.js';
 import { PendingHub, type PendingQuery, type PendingSubmitPayload } from './pending-hub.js';
 import { TaskHandoffError, TaskHandoffService } from './task-handoff.js';
 import { TaskTopicChannel, TaskChannelError, type TaskAuthorize, type TaskChannelAction } from './task-topic-channel.js';
+import type { TaskTopicToken } from './task-topic-store.js';
+import { handleTaskControlAction, isTaskControlAction } from './task-topic/control-plane.js';
 import { WatchHub } from './watch-hub.js';
 
 export interface AgyRuntimeConfig { enabled?:boolean; serviceId:string; summariesDbPath?:string; brainDir?:string; binPath?:string; quotaCachePath?:string; sandbox?:boolean; geminiDir?:string; appDataDir?:string }
@@ -124,7 +126,7 @@ export class UnifiedRuntime {
   get decisionSync():DecisionSyncStore|undefined { return this._decisionSync; }
   get taskChannel():TaskTopicChannel|undefined { return this._taskChannel; }
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
-  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
+  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
   constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
     const channelPath=resolve(config.channelDb); const canonical=existsSync(channelPath) ? realpathSync(channelPath) : join(realpathSync(dirname(channelPath)),basename(channelPath));
@@ -140,7 +142,7 @@ export class UnifiedRuntime {
       this.restartPending=this.store.pendingOutbox();
       try { this.core = new UnifiedCore(this.store,providers,(identity,session)=>owner(identity) && (!options.canDiscover || options.canDiscover(session)),(identity)=>owner(identity),()=>false,options.canDiscover,archive,options.canInspectCandidate);
         const defaultCreateProject = options.allowedProjectRoots?.[0] ?? config.allowedProjectRoots?.[0];
-        const measuredPort=new Proxy(port,{get:(target,key)=>{const value=Reflect.get(target,key); if(typeof value!=='function') return value; if(['send','update','sendFile'].includes(String(key))) return async (...args:unknown[])=>{let guardFailed=false;const last=args.length-1; if(typeof args[last]==='function') {const guard=args[last] as ()=>Promise<void>;args[last]=async()=>{try {await guard();} catch(error) {guardFailed=true;throw error;}};} try {const result=await Reflect.apply(value,target,args); try {this.channel.recordHealth('feishu_delivery',(key==='send' && !result)?'unverified':'healthy',(key==='send' && !result)?'消息回执未确认':null);} catch {} return result;} catch(error) {const e=error && typeof error==='object' ? error as {deliveryKind?:unknown;platformCode?:unknown} : {}; const rejected=e.deliveryKind==='api_rejected' && typeof e.platformCode==='number' && Number.isSafeInteger(e.platformCode); const reason=guardFailed?'发送前权限或绑定变化':rejected?`平台拒绝（代码 ${e.platformCode}）`:'投递结果未知'; const deliveryId=args[key==='send'?2:3];try {if(typeof deliveryId==='string') this.channel.recordDeliveryDiagnostic(deliveryId,guardFailed?'guard_rejected':rejected?'api_rejected':'unknown',rejected?e.platformCode as number:null);} catch {} try {this.channel.recordHealth('feishu_delivery','degraded',reason);} catch {} throw error;}}; return value.bind(target);}}); try { this.channel = new FeishuChannel(this.core,measuredPort,async (identity,destination,sessionId)=>{ if(!owner(identity) || !(this.port.authorizedDestination?.(destination) ?? destinations.has(destination))) return false; if(!sessionId || !options.canDiscover) return true; try {return options.canDiscover(this.store.getSession(sessionId));} catch {return options.allowDiscovered?.(sessionId) ?? false;} },config.channelDb,undefined,options.requireReadonlyHydration === true,defaultCreateProject ? { defaultCreateProject } : {}); } catch(error) { this.core.close(); throw error; }
+        const measuredPort=new Proxy(port,{get:(target,key)=>{const value=Reflect.get(target,key); if(typeof value!=='function') return value; if(['send','update','sendFile'].includes(String(key))) return async (...args:unknown[])=>{let guardFailed=false;const last=args.length-1; if(typeof args[last]==='function') {const guard=args[last] as ()=>Promise<void>;args[last]=async()=>{try {await guard();} catch(error) {guardFailed=true;throw error;}};} try {const result=await Reflect.apply(value,target,args); try {this.channel.recordHealth('feishu_delivery',(key==='send' && !result)?'unverified':'healthy',(key==='send' && !result)?'消息回执未确认':null);} catch {} return result;} catch(error) {const e=error && typeof error==='object' ? error as {deliveryKind?:unknown;platformCode?:unknown} : {}; const rejected=e.deliveryKind==='api_rejected' && typeof e.platformCode==='number' && Number.isSafeInteger(e.platformCode); const reason=guardFailed?'发送前权限或绑定变化':rejected?`平台拒绝（代码 ${e.platformCode}）`:'投递结果未知'; const deliveryId=args[key==='send'?2:3];try {if(typeof deliveryId==='string') this.channel.recordDeliveryDiagnostic(deliveryId,guardFailed?'guard_rejected':rejected?'api_rejected':'unknown',rejected?e.platformCode as number:null);} catch {} try {this.channel.recordHealth('feishu_delivery','degraded',reason);} catch {} throw error;}}; return value.bind(target);}}); this.sendPort=measuredPort; try { this.channel = new FeishuChannel(this.core,measuredPort,async (identity,destination,sessionId)=>{ if(!owner(identity) || !(this.port.authorizedDestination?.(destination) ?? destinations.has(destination))) return false; if(!sessionId || !options.canDiscover) return true; try {return options.canDiscover(this.store.getSession(sessionId));} catch {return options.allowDiscovered?.(sessionId) ?? false;} },config.channelDb,undefined,options.requireReadonlyHydration === true,defaultCreateProject ? { defaultCreateProject } : {}); } catch(error) { this.core.close(); throw error; }
         this.core.validateSteerScope=(scope,sessionId)=>owner({source:scope.ownerSource,subject:scope.ownerSubject}) && (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) && this.channel.isCurrentSteerScope(scope,sessionId);
         const showAutoTitles = config.autoMirror?.showTitles === true;
         this.core.presentSession=session=>(!showAutoTitles && this.channel.isAutoPrivateTitle(session.native)) ? {...session,title:`${providerTitlePrefix(session.native.provider)} 会话 · ${payloadDigest(session.native).slice(0,8)}`} : session;
@@ -162,6 +164,19 @@ export class UnifiedRuntime {
               port: measuredPort,
               authorizeTarget: (id, dest) => owner(id) && (this.port.authorizedDestination?.(dest) ?? destinations.has(dest)),
               resolveTopicLink: async (ref, targetDest) => {
+                if (ref.taskId && this.port.topicLinkForTask) {
+                  const taskUrl = await this.port.topicLinkForTask(targetDest, ref.taskId);
+                  if (taskUrl) return taskUrl;
+                }
+                if (ref.sessionId && this._taskChannel && this.port.topicLinkForTask) {
+                  const taskBinding = this._taskChannel.listActiveBindings().find((b) =>
+                    this._taskChannel!.listTargets(b.taskId).some((t) => t.sessionId === ref.sessionId),
+                  );
+                  if (taskBinding) {
+                    const taskUrl = await this.port.topicLinkForTask(targetDest, taskBinding.taskId);
+                    if (taskUrl) return taskUrl;
+                  }
+                }
                 const sessionId =
                   ref.sessionId ??
                   (ref.taskId && this._taskChannel
@@ -185,6 +200,24 @@ export class UnifiedRuntime {
               service: this.core,
               ...(this._decisionSync ? { decisionStore: this._decisionSync } : {}),
               port: measuredPort,
+              resolveTopicLink: async (sessionId, hubDest) => {
+                if (this._taskChannel && this.port.topicLinkForTask) {
+                  const sourceDest = this._pendingHub?.getSourceDestination(sessionId);
+                  const taskBinding =
+                    (sourceDest ? this._taskChannel.getBindingByDestination(sourceDest) : null) ??
+                    this._taskChannel.listActiveBindings().find((b) =>
+                      this._taskChannel!.listTargets(b.taskId).some((t) => t.sessionId === sessionId),
+                    );
+                  if (taskBinding) {
+                    const taskUrl = await this.port.topicLinkForTask(hubDest, taskBinding.taskId);
+                    if (taskUrl) return taskUrl;
+                  }
+                }
+                if (this.port.topicLinkForSession) {
+                  return this.port.topicLinkForSession(hubDest, sessionId);
+                }
+                return null;
+              },
               authorize: async (identity, destination, targetId) => {
                 if (!owner(identity)) return false;
                 const root = this._pendingHub?.getRoot();
@@ -280,6 +313,22 @@ export class UnifiedRuntime {
     if(this.closed || this.closing) throw new Error('closed');
     this.lastActivityAt=Date.now();
     const intake=(async()=>{
+      if(isTaskControlAction(action)) {
+        return handleTaskControlAction(
+          {
+            core: this.core,
+            port: this.port,
+            sendPort: this.sendPort,
+            allowedDestinations: new Set(this.config.allowedDestinations),
+            isOwner: (identity) => identity.source === 'feishu' && identity.subject === this.config.ownerOpenId,
+            taskTopicEnabled: this.config.taskTopic?.enabled === true,
+            ...(this._taskChannel ? { taskChannel: this._taskChannel } : {}),
+            ...(this._taskHandoff ? { taskHandoff: this._taskHandoff } : {}),
+          },
+          envelope,
+          action,
+        );
+      }
       if(this._taskHandoff && action.action==='confirm_handoff') {
         const binding=this._taskChannel?.getBindingByDestination(envelope.destination);
         if(this._taskChannel && (!binding || binding.taskId!==action.taskId)) {

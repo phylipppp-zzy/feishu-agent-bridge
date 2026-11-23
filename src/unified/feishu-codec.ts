@@ -341,6 +341,17 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/health': return {action:'health'};
     case '/upgrade': return {action:'upgrade'};
     case '/unbind': return {action:'unbind'};
+    case '/task': {
+      if (parts.length === 0) return {action:'task_panel'};
+      if (parts[0] === 'mount') {
+        if (parts[1] && parts.length <= 3 && (!parts[2] || parts[2] === 'read_only' || parts[2] === 'interactive')) {
+          return {action:'task_mount',sessionId:parts[1],...(parts[2] ? {mode:parts[2] as 'read_only'|'interactive'} : {})};
+        }
+        break;
+      }
+      return {action:'task_create',title:rest};
+    }
+    case '/handoff': if (parts.length === 1 && parts[0]) return {action:'handoff_preview',targetId:parts[0]}; break;
     case '/finish': if (rest) return {action:'finish',operationId:rest}; break;
     case '/reconcile': if (rest) return {action:'reconcile',operationId:rest}; break;
   }

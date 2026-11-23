@@ -26,6 +26,7 @@ export interface FeishuPort {
   lookupMessageId?(deliveryId: string): Promise<string | null>;
   fileMessageLink?(destination:string,sessionId:string,deliveryId:string): Promise<string | null>;
   topicLinkForSession?(destination:string,sessionId:string):Promise<string | null>;
+  topicLinkForTask?(destination:string,taskId:string):Promise<string | null>;
 }
 class BindingManagementDenied extends Error {}
 class BindingExpired extends Error {}
@@ -68,6 +69,10 @@ export type ChannelAction = (
  | { action: 'finish'; operationId: string }
  | { action: 'pending' }
  | { action: 'inspect_unknown'; operationId:string; cursor?:string; nativeId?:string }
+ | { action: 'task_create'; title: string }
+ | { action: 'task_mount'; sessionId: string; mode?: 'read_only' | 'interactive' }
+ | { action: 'task_panel' }
+ | { action: 'handoff_preview'; targetId: string }
  | { action: 'health' }) & { bindingId?: string };
 
 /** Standalone channel database. Never opens core's tables. */
@@ -461,6 +466,7 @@ export class FeishuChannel {
       return this.deliver(e.destination, card, `${e.eventId}:${suffix}`, current);
     };
     if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片和 UTF-8 文本附件。',size:'文本附件为空或超过 1 MiB，未提交。',encoding:'文本附件不是有效 UTF-8 或包含 NUL，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
+    if (a.action === 'task_create' || a.action === 'task_mount' || a.action === 'task_panel' || a.action === 'handoff_preview') { throw contractError('unsupported', 'action is unavailable for this destination'); }
     if (a.action === 'help') { await reply({title:'帮助',text:'会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；Codex 当前唯一运行轮追加输入：/steer 内容；中断当前回复：/stop；后台任务是否终止尚未确认。',actions:[]}); return {status:'guidance'}; }
     if (a.action === 'new_help') {
       const defaultProject = this.channelOptions.defaultCreateProject?.trim() || undefined;
