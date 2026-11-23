@@ -8,6 +8,8 @@ import { contractError } from './errors.js';
 import { questionForm, decodeQuestionForm } from './feishu-question-forms.js';
 import { sessionListCard } from './session-list-card.js';
 import { interactionCard, operationCard, providerDisplayLabel, sessionCard, type ChannelCard } from './feishu-cards.js';
+import { buildHealthCard } from './health-card.js';
+import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
 
 /** Identity and destination must come from an authenticated, verified transport envelope. */
 export interface TrustedEnvelope { eventId: string; destination: string; identity: Identity; cardMessageId?: string }
@@ -29,11 +31,6 @@ class BindingManagementDenied extends Error {}
 class BindingExpired extends Error {}
 class ReadAuthorizationRevoked extends Error {}
 class FileCommandError extends Error {}
-function formatHumanSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 export type AuthorizeBindingAdmin = (identity: Identity, destination: string, sessionId: string) => Promise<boolean>;
 export type Authorize = (identity: Identity, destination: string, sessionId: string | null) => Promise<boolean>;
 export type ChannelAction = (
@@ -501,90 +498,7 @@ export class FeishuChannel {
     }
     if (a.action === 'health') {
       const health = await this.service.health();
-      const labels:Record<string,string>={core:'核心',runtime:'本机调度概况',feishu_delivery:'飞书投递',feishu_callback:'飞书回调与入站',feishu_resources:'飞书资源',codex_connection:'Codex连接',codex_run:'Codex运行',claude_connection:'Claude SDK事件流',claude_run:'Claude运行',claude_quota:'Claude额度',agy_connection:'Antigravity连接',agy_run:'Antigravity运行',agy_quota:'Antigravity额度',interaction_return:'问题回传'};
-      const states:Record<string,string>={healthy:'正常',degraded:'异常或待核对',unreachable:'不可连接',unverified:'尚未触发'};
-      const reasonMap:Record<string,string>={
-        'dispatch or synchronization failed; inspect persisted state before retry':'存在同步或调度异常，请检查本机状态',
-        'connection closed':'连接曾断开',
-        'not connected':'尚未连接',
-        'transport error':'连接传输异常',
-        'response timed out':'响应超时',
-        'send failed':'消息发送失败',
-        'app-server rejected request':'服务端拒绝请求',
-        'invalid app-server message':'服务端消息格式无效',
-        'reconnect and explicitly attach quarantined sessions':'存在隔离会话，请重新连接并手动恢复',
-        'one or more sessions could not be restored; inspect before retry':'部分会话恢复失败，请检查后再试',
-        'binding recovery failed; inspect before retry':'绑定恢复失败，请检查后再试',
-        'normalized observation could not be persisted; replay required':'观测记录落盘失败，需要重放',
-        'read-only refresh failed':'只读会话刷新失败',
-        'restart recovery failed; inspect session before retry':'重启恢复失败，请检查会话后再试',
-        'restart recovery failed; subscription released; reconciliation required':'重启恢复失败，订阅已释放，需人工核对',
-        'restart recovery failed; subscription release outcome unknown':'重启恢复失败，订阅释放结果未知',
-      };
-      const formatTime = (iso: string | null | undefined): string | null => {
-        if (!iso) return null;
-        const ms = Date.parse(iso);
-        if (!Number.isFinite(ms)) return null;
-        const bj = new Date(ms + 8 * 3600 * 1000);
-        if (!Number.isFinite(bj.getTime())) return null;
-        return bj.toISOString().slice(5, 16).replace('T', ' ');
-      };
-      const translateReason = (reason: string | null | undefined): string | null => reason ? (reasonMap[reason] ?? reason) : null;
-      const labelOf = (component: string): string => labels[component] ?? component;
-      const attention: string[] = [];
-      const normal: string[] = [];
-      const unverified: string[] = [];
-      const attentionRows: string[][] = [];
-      const normalRows: string[][] = [];
-      for (const h of health) {
-        const label = labelOf(h.component);
-        if (h.status === 'healthy') {
-          const success = formatTime(h.lastSuccessAt);
-          const observed = formatTime(h.lastObservedAt);
-          const timeText = success ? `（最近成功 ${success}）` : observed ? `（最近观测 ${observed}）` : '';
-          normal.push(`- ${label}：正常${timeText}`);
-          const detailText = success ? `最近成功 ${success}` : observed ? `最近观测 ${observed}` : '—';
-          normalRows.push([label, `✅ ${states.healthy}`, detailText]);
-        } else if (h.status === 'unverified') {
-          unverified.push(label);
-        } else {
-          const state = states[h.status] ?? h.status;
-          const icon = h.status === 'unreachable' ? '❌' : '⚠️';
-          const reason = translateReason(h.reason ?? h.lastFailureReason);
-          const details: string[] = [];
-          const success = formatTime(h.lastSuccessAt);
-          const failure = formatTime(h.lastFailureAt);
-          if (success) details.push(`最近成功 ${success}`);
-          if (failure) details.push(`最近失败 ${failure}`);
-          if (typeof h.unknown === 'number' && h.unknown > 0) details.push(`待核对 ${h.unknown}`);
-          if (typeof h.backlog === 'number' && h.backlog > 0) details.push(`积压 ${h.backlog}`);
-          attention.push(`- ${label}：${state}${reason ? `（${reason}）` : ''}${details.length ? `；${details.join('；')}` : ''}`);
-          const rowDetails = [...(reason ? [reason] : []), ...details];
-          attentionRows.push([label, `${icon} ${state}`, rowDetails.length ? rowDetails.join('；') : '—']);
-        }
-      }
-      const sections: string[] = [];
-      if (attention.length) sections.push(`【需关注】\n${attention.join('\n')}`);
-      if (normal.length) sections.push(`【正常】\n${normal.join('\n')}`);
-      if (unverified.length) sections.push(`【尚未触发】\n${unverified.join('、')}`);
-      const rows = [...attentionRows, ...normalRows];
-      const table = rows.length || unverified.length
-        ? {
-            columns: [
-              { header: '组件', weight: 2 },
-              { header: '状态', weight: 1 },
-              { header: '最近动态 / 说明', weight: 3 },
-            ],
-            rows,
-            ...(unverified.length ? { footer: `⚪ 尚未触发：${unverified.join('、')}` } : {}),
-          }
-        : undefined;
-      await reply({
-        title:'健康状态',
-        text:sections.length ? sections.join('\n\n') : '暂无健康状态记录。',
-        ...(table ? { table } : {}),
-        actions:[],
-      });
+      await reply(buildHealthCard(health));
       return health;
     }
     if (a.action === 'bind' && a.mode === 'interactive') {
@@ -702,25 +616,7 @@ export class FeishuChannel {
     if (a.action === 'project_files') {
       if (!this.service.listProjectFiles) throw new Error('project browsing unavailable');
       const listing = await this.service.listProjectFiles(bound, a.directory, a.showHidden);
-      let text: string;
-      if (listing.kind === 'error') {
-        text = listing.message;
-      } else if (listing.kind === 'file') {
-        text = `${listing.entry.name} (${formatHumanSize(listing.entry.size)})`;
-      } else {
-        const sorted = [...listing.entries].sort((x, y) =>
-          x.kind === y.kind ? x.name.localeCompare(y.name) : x.kind === 'dir' ? -1 : 1,
-        );
-        const treeLines = sorted.map((x, idx) => {
-          const branch = idx === sorted.length - 1 ? '└──' : '├──';
-          return x.kind === 'dir'
-            ? `${branch} ${x.name}/`
-            : `${branch} ${x.name} (${formatHumanSize(x.size)})`;
-        });
-        const body = treeLines.length ? treeLines.join('\n') : '(空目录)';
-        text = `📁 ${listing.path}\n${body}\n显示 ${listing.entries.length}/${listing.total} 项，隐藏 ${listing.hidden} 项`;
-      }
-      await reply({ title: '项目目录', text, actions: [] });
+      await reply(buildProjectFilesCard(listing));
       return listing;
     }
     if (a.action === 'deliver_files') { if(!this.service.selectProjectFiles) throw new Error('file selection unavailable'); const scope=executionScope; await guard(); let files:Awaited<ReturnType<NonNullable<UnifiedService['selectProjectFiles']>>>; try {files=await this.service.selectProjectFiles(bound,a.args);} catch {throw new FileCommandError('文件选择失败：仅支持项目内路径和 *、?、[]、** 模式；凭据、符号链接、超限或不可读文件不会发送。');} if(files.length>20 || files.reduce((n,f)=>n+f.size,0)>20*1024*1024) throw new FileCommandError('文件数量超过 20 个或总大小超过 20 MiB，未发送。'); const contents:Uint8Array[]=[]; for(const f of files) {await guard();contents.push(await this.service.readArtifact(bound,f.artifactId,f.contentVersion));} await guard(); const results=[]; for(let i=0;i<files.length;i++) {const f=files[i]!; const id=`file:v2:${payloadDigest([scope,e.destination,bound,f.artifactId,f.contentVersion])}`; await guard(); if(this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {effects.started=true;await this.port.sendFile(e.destination,f.name,contents[i]!,id,guard);this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);results.push({name:f.name,status:'sent'});} else {const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null;await guard();results.push({name:f.name,status:url?'located':'unknown',url});}} await reply({title:'文件发送结果',text:results.map(r=>`${r.name}: ${r.status}`).join('\n'),actions:results.filter(r=>r.url).map(r=>({label:`定位 ${r.name}`,value:{},url:r.url!}))}); return results; }
@@ -739,97 +635,12 @@ export class FeishuChannel {
     if (a.action === 'artifacts') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
       const rawItems = await this.listAllArtifacts(bound);
-      const deduped: import('./contracts.js').Artifact[] = [];
-      const seenVersions = new Set<string>();
-      for (const item of rawItems) {
-        const pathKey = item.relativePath || item.name;
-        const dedupKey = `${pathKey}\0${item.contentVersion}`;
-        if (seenVersions.has(dedupKey)) continue;
-        seenVersions.add(dedupKey);
-        deduped.push(item);
-      }
-      const normalizeRel = (item: import('./contracts.js').Artifact): string =>
-        (item.relativePath || item.name).replace(/\\/g, '/').replace(/^\.\//, '');
-      const splitRel = (item: import('./contracts.js').Artifact): { dir: string; filename: string; pathKey: string } => {
-        const rel = normalizeRel(item);
-        const slash = rel.lastIndexOf('/');
-        return {
-          dir: slash >= 0 ? rel.slice(0, slash) || '.' : '.',
-          filename: slash >= 0 ? rel.slice(slash + 1) || item.name : rel,
-          pathKey: item.relativePath || item.name,
-        };
-      };
-      const pathCounts = new Map<string, number>();
-      const byDir = new Map<string, import('./contracts.js').Artifact[]>();
-      for (const item of deduped) {
-        const { dir, pathKey } = splitRel(item);
-        pathCounts.set(pathKey, (pathCounts.get(pathKey) ?? 0) + 1);
-        const list = byDir.get(dir) ?? [];
-        list.push(item);
-        byDir.set(dir, list);
-      }
-      const sortedDirs = [...byDir.keys()].sort((x, y) => (x === '.' ? -1 : y === '.' ? 1 : x.localeCompare(y)));
-      const ordered = sortedDirs.flatMap((dir) => byDir.get(dir)!);
-
-      const PAGE_SIZE = 8;
-      const total = ordered.length;
-      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-      const parsedCursor = a.cursor !== undefined ? Number(a.cursor) : 0;
-      const rawOffset = Number.isSafeInteger(parsedCursor) && parsedCursor >= 0 ? parsedCursor : 0;
-      const maxOffset = total === 0 ? 0 : Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE;
-      const offset = Math.min(rawOffset, maxOffset);
-      const pageItems = ordered.slice(offset, offset + PAGE_SIZE);
-      const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
-      const prevCursor = offset > 0 ? String(Math.max(0, offset - PAGE_SIZE)) : null;
-      const nextCursor = offset + PAGE_SIZE < total ? String(offset + PAGE_SIZE) : null;
-
-      const truncateLabel = (name: string, max: number): string => {
-        const chars = [...name];
-        return chars.length > max ? `${chars.slice(0, Math.max(1, max - 1)).join('')}…` : name;
-      };
-
-      const projectDir = session.project || '未知';
-      const headerLines = [`默认目录：${projectDir}`];
-      const actions: ChannelCard['actions'] = [];
-      let text: string;
-      if (total === 0) {
-        text = `默认目录：${projectDir}\n\n暂无可下载文件。\n提示：如需浏览项目目录，可发送 /ls 或 /ls <子目录>。`;
-      } else {
-        if (totalPages > 1) headerLines.push(`共 ${total} 个文件（第 ${currentPage}/${totalPages} 页）`);
-        const pageGroups: Array<{ dir: string; entries: Array<{ item: import('./contracts.js').Artifact; num: number; filename: string; pathKey: string }> }> = [];
-        for (const [idx, item] of pageItems.entries()) {
-          const { dir, filename, pathKey } = splitRel(item);
-          const num = idx + 1;
-          let group = pageGroups.find((g) => g.dir === dir);
-          if (!group) {
-            group = { dir, entries: [] };
-            pageGroups.push(group);
-          }
-          group.entries.push({ item, num, filename, pathKey });
-          const needsHash = (pathCounts.get(pathKey) ?? 0) > 1;
-          const label = needsHash
-            ? `${num}. ${truncateLabel(filename, 14)} (${item.contentVersion.slice(0, 6)})`
-            : `${num}. ${truncateLabel(filename, 20)}`;
-          actions.push({ label, value: { action: 'file', artifactId: item.artifactId, contentVersion: item.contentVersion } });
-        }
-        if (prevCursor !== null) {
-          actions.push({ label: '上一页', value: { action: 'artifacts', ...(a.sessionId ? { sessionId: a.sessionId } : {}), cursor: prevCursor } });
-        }
-        if (nextCursor !== null) {
-          actions.push({ label: '下一页', value: { action: 'artifacts', ...(a.sessionId ? { sessionId: a.sessionId } : {}), cursor: nextCursor } });
-        }
-        const treeLines: string[] = [];
-        for (const group of pageGroups) {
-          treeLines.push(`📁 ${group.dir === '.' ? './' : `${group.dir}/`}`);
-          for (const [entryIdx, entry] of group.entries.entries()) {
-            const branch = entryIdx === group.entries.length - 1 ? '└──' : '├──';
-            const hashSuffix = (pathCounts.get(entry.pathKey) ?? 0) > 1 ? ` · ${entry.item.contentVersion.slice(0, 6)}` : '';
-            treeLines.push(`${branch} ${entry.num}. ${entry.filename} (${formatHumanSize(entry.item.size)})${hashSuffix}`);
-          }
-        }
-        text = `${headerLines.join('\n')}\n\n${treeLines.join('\n')}`;
-      }
-      await replyOrUpdate({ title: '文件', text, actions });
+      const { card, items: pageItems, nextCursor } = buildArtifactTreeCard(rawItems, {
+        projectDir: session.project,
+        ...(a.cursor !== undefined ? { cursor: a.cursor } : {}),
+        ...(a.sessionId !== undefined ? { sessionId: a.sessionId } : {}),
+      });
+      await replyOrUpdate(card);
       return { items: pageItems, nextCursor };
     }
     if (a.action === 'file') {
