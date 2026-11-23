@@ -18,6 +18,49 @@ const AGY_CURATED_ORDER: ReadonlyArray<{ id: string; tag: string }> = [
 
 const AGY_CURATED_RANK = new Map(AGY_CURATED_ORDER.map((item, idx) => [item.id, idx]));
 const AGY_CURATED_TAG = new Map(AGY_CURATED_ORDER.map((item) => [item.id, item.tag]));
+const MAX_AGY_PRESET_BUTTONS = 8;
+
+interface AgyPresetGroup {
+  match: (model: ModelOption, baseLabel: string) => boolean;
+  presets: ReadonlyArray<{ effort: string; tag?: string }>;
+}
+
+const AGY_CURATED_PRESETS: ReadonlyArray<AgyPresetGroup> = [
+  {
+    match: (m, base) => m.id === 'gemini-4-carbon' || /^gemini\s+4\s+carbon\b/i.test(base),
+    presets: [
+      { effort: 'high', tag: '深度推理' },
+      { effort: 'medium', tag: '均衡' },
+    ],
+  },
+  {
+    match: (m, base) => m.id === 'gemini-4-neon' || /^gemini\s+4\s+neon\b/i.test(base),
+    presets: [{ effort: 'medium', tag: '均衡推荐' }],
+  },
+  {
+    match: (m, base) => m.id === 'gemini-4-hydrogen' || /^gemini\s+4\s+hydrogen\b/i.test(base),
+    presets: [
+      { effort: 'low', tag: '轻量快速' },
+      { effort: 'medium', tag: '标准' },
+    ],
+  },
+  {
+    match: (m, base) => /^claude[-_ ]opus[-_ ]5[-._ ]5\b/i.test(m.id) || /^claude\s+opus\s+5\.5\b/i.test(base),
+    presets: [{ effort: 'medium' }],
+  },
+  {
+    match: (m, base) => /^claude[-_ ]sonnet[-_ ]5[-._ ]5\b/i.test(m.id) || /^claude\s+sonnet\s+5\.5\b/i.test(base),
+    presets: [{ effort: 'medium' }],
+  },
+];
+
+export function stripEffortSuffix(label: string): string {
+  return label.replace(/\s*\((?:minimal|low|medium|high|xhigh)\)\s*$/i, '').trim();
+}
+
+function isLegacyGemini3Model(model: ModelOption, baseLabel: string): boolean {
+  return /^gemini[-_ ]3(?:\b|[-._])/i.test(model.id) || /^gemini\s+3(?:\b|\.)/i.test(baseLabel);
+}
 
 export function buildMainHelpCard(): ChannelCard {
   return {
@@ -144,10 +187,89 @@ export function sortCuratedModels(provider: Provider, items: readonly ModelOptio
 
 export function formatCuratedModelLabel(provider: Provider, model: ModelOption): string {
   if (provider === 'agy') {
+    const base = stripEffortSuffix(model.label);
     const tag = AGY_CURATED_TAG.get(model.id);
-    if (tag) return `${model.label} · ${tag}`;
+    if (tag) return `${base} · ${tag}`;
+    return base;
   }
   return model.label;
+}
+
+function buildAgyPresetActions(
+  ordered: readonly ModelOption[],
+  revision: number,
+  controlGeneration: number,
+  scopeExtra: Record<string, unknown>,
+): ChannelCard['actions'] {
+  const actions: ChannelCard['actions'] = [];
+  const usedModelIds = new Set<string>();
+
+  for (const group of AGY_CURATED_PRESETS) {
+    if (actions.length >= MAX_AGY_PRESET_BUTTONS) break;
+    const match = ordered.find((m) => {
+      if (usedModelIds.has(m.id)) return false;
+      const base = stripEffortSuffix(m.label);
+      return !isLegacyGemini3Model(m, base) && group.match(m, base);
+    });
+    if (!match) continue;
+    usedModelIds.add(match.id);
+    const base = stripEffortSuffix(match.label);
+    const efforts = match.reasoningEfforts ?? [];
+
+    if (efforts.length === 0) {
+      const firstTag = group.presets[0]?.tag;
+      actions.push({
+        label: firstTag ? `${base} · ${firstTag}` : base,
+        value: {
+          action: 'settings',
+          model: match.id,
+          preferences: {},
+          revision,
+          controlGeneration,
+          ...scopeExtra,
+        },
+      });
+      continue;
+    }
+
+    for (const preset of group.presets) {
+      if (actions.length >= MAX_AGY_PRESET_BUTTONS) break;
+      if (!efforts.includes(preset.effort)) continue;
+      actions.push({
+        label: preset.tag ? `${base} · ${preset.tag}` : base,
+        value: {
+          action: 'settings',
+          model: match.id,
+          preferences: { reasoningEffort: preset.effort },
+          revision,
+          controlGeneration,
+          ...scopeExtra,
+        },
+      });
+    }
+  }
+
+  if (actions.length === 0) {
+    for (const m of ordered) {
+      if (actions.length >= MAX_AGY_PRESET_BUTTONS) break;
+      const base = stripEffortSuffix(m.label);
+      if (isLegacyGemini3Model(m, base)) continue;
+      const effort = m.reasoningEfforts?.includes('medium') ? 'medium' : m.reasoningEfforts?.[0];
+      actions.push({
+        label: effort ? `${base} / ${effort}` : base,
+        value: {
+          action: 'settings',
+          model: m.id,
+          preferences: effort ? { reasoningEffort: effort } : {},
+          revision,
+          controlGeneration,
+          ...scopeExtra,
+        },
+      });
+    }
+  }
+
+  return actions.slice(0, MAX_AGY_PRESET_BUTTONS);
 }
 
 export function buildModelsCard(options: {
@@ -166,34 +288,40 @@ export function buildModelsCard(options: {
   const actions: ChannelCard['actions'] = [];
 
   if (!options.readOnly) {
-    for (const m of ordered) {
-      const displayLabel = formatCuratedModelLabel(options.provider, m);
-      if (m.reasoningEfforts?.length) {
-        for (const effort of m.reasoningEfforts) {
+    if (options.provider === 'agy') {
+      actions.push(
+        ...buildAgyPresetActions(ordered, options.revision, options.controlGeneration, scopeExtra),
+      );
+    } else {
+      for (const m of ordered) {
+        const displayLabel = formatCuratedModelLabel(options.provider, m);
+        if (m.reasoningEfforts?.length) {
+          for (const effort of m.reasoningEfforts) {
+            actions.push({
+              label: `${displayLabel} / ${effort}`,
+              value: {
+                action: 'settings',
+                model: m.id,
+                preferences: { reasoningEffort: effort },
+                revision: options.revision,
+                controlGeneration: options.controlGeneration,
+                ...scopeExtra,
+              },
+            });
+          }
+        } else {
           actions.push({
-            label: `${displayLabel} / ${effort}`,
+            label: displayLabel,
             value: {
               action: 'settings',
               model: m.id,
-              preferences: { reasoningEffort: effort },
+              preferences: {},
               revision: options.revision,
               controlGeneration: options.controlGeneration,
               ...scopeExtra,
             },
           });
         }
-      } else {
-        actions.push({
-          label: displayLabel,
-          value: {
-            action: 'settings',
-            model: m.id,
-            preferences: {},
-            revision: options.revision,
-            controlGeneration: options.controlGeneration,
-            ...scopeExtra,
-          },
-        });
       }
     }
   }
@@ -221,11 +349,22 @@ export function buildModelsCard(options: {
     lines.push('当前目标为只读模式，无法切换模型。');
   }
   if (ordered.length) {
-    for (const m of ordered) {
-      const displayLabel = formatCuratedModelLabel(options.provider, m);
+    if (options.provider === 'agy') {
+      const visible = ordered.filter((m) => !isLegacyGemini3Model(m, stripEffortSuffix(m.label)));
+      const summaryItems = visible.length ? visible : ordered;
       lines.push(
-        `${displayLabel}${m.reasoningEfforts?.length ? '：' + m.reasoningEfforts.join('、') : ''}`,
+        `常用模型：${summaryItems.map((m) => formatCuratedModelLabel('agy', m)).join(' · ')}`,
       );
+      if (!options.readOnly) {
+        lines.push('点击下方预设按钮快速切换；如需其他模型或强度，可发送 /model <模型ID> <强度>。');
+      }
+    } else {
+      for (const m of ordered) {
+        const displayLabel = formatCuratedModelLabel(options.provider, m);
+        lines.push(
+          `${displayLabel}${m.reasoningEfforts?.length ? '：' + m.reasoningEfforts.join('、') : ''}`,
+        );
+      }
     }
   } else {
     lines.push('暂无可选模型。');

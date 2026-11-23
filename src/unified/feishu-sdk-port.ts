@@ -73,15 +73,28 @@ export function parseSdkCardCallback<T extends RuntimeTrustedAction = ChannelAct
   if (a.openId !== owner) throw new Error('unauthorized');
   return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseFeishuAction<T>(a.value,a.formValues)};
 }
+const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target']);
+function isAlreadyHandledCardError(error: unknown): boolean {
+  const obj = typeof error === 'object' && error !== null ? (error as { code?: unknown; detail?: unknown }) : null;
+  const code = obj && 'code' in obj ? String(obj.code ?? '') : '';
+  const detail = obj && typeof obj.detail === 'object' && obj.detail !== null ? (obj.detail as { code?: unknown }) : null;
+  const detailCode = detail && 'code' in detail ? String(detail.code ?? '') : '';
+  const msg = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  return /stale_revision|stale_active_revision|interaction_expired|decision is already answered|decision has already been answered|already been answered|already resolved|already answered|handoff already submitted/.test(
+    `${code} ${detailCode} ${msg}`.toLowerCase(),
+  );
+}
 /** Old or malformed cards are guidance only; their untrusted values never reach the channel. */
-export async function handleSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:T)=>Promise<unknown>):Promise<{toast:{type:'info';content:string}} | undefined> {
+export async function handleSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:T)=>Promise<unknown>):Promise<{toast:{type:'info'|'success';content:string}} | undefined> {
   const a=parseCardAction(data); if (!a || !a.eventId) return undefined;
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:T;
   try { action=parseFeishuAction<T>(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
   let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof TaskPendingRoute ? {toast:{type:'info',content:'任务话题待核查，写入暂不可用。'}} : error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownTestRoute ? {toast:{type:'info',content:'测试话题创建结果待核查，请联系管理员。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
   const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})};
-  try {await handle(envelope,action);} catch {return {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};} return undefined;
+  try {await handle(envelope,action);} catch (error) {return isAlreadyHandledCardError(error) ? {toast:{type:'info',content:'该项已处理完成，无需重复操作。'}} : {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};}
+  if (CONFIRM_TOAST_ACTIONS.has(action.action)) return {toast:{type:'success',content:'已确认'}};
+  return undefined;
 }
 export type TestLaneToken={rootId:string;destination:string;appId:string;chatId:string;owner:string;laneId:string;namespace:string;generation:number;provider:'codex'|'claude'};
 type TestLaneHandler={handle:(e:TrustedEnvelope,a:ChannelAction,token:TestLaneToken)=>Promise<unknown>;capture:(e:TrustedEnvelope,token:TestLaneToken)=>Promise<string>};
@@ -112,7 +125,7 @@ export class FeishuSdkPort implements FeishuPort {
   /** Only a local, constrained operator can create either mock provider root. */
   /** Explicitly enabled, owner-scoped task creation; no implicit topic creation. */
   createTaskTopic(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {if(!this.taskEnabled||this.closing) return Promise.reject(new Error('task topic unavailable'));const flight=this.createTaskTopicOnce(chatId,taskId,operationId,owner);this.testCreates.add(flight);void flight.finally(()=>{this.testCreates.delete(flight);if(this.closeRequested&&!this.testCreates.size&&!this.dbClosed){this.dbClosed=true;this.db.close();}}).catch(()=>{});return flight;}
-  private async createTaskTopicOnce(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {const claim=this.taskStore.claim(chatId,taskId,operationId,owner);if(claim.existing)return claim.existing;const rootText=this.taskTopicRuntimeEnabled?'任务话题已建立，可发送 /task mount <sessionId> 挂载后端，或通过面板切换目标。':'任务话题已建立，目标功能待启用。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务话题',text:rootText,actions:[]}))}});if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.taskStore.rejected(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw Error('task creation outcome unknown');const token=this.taskStore.record(chatId,taskId,operationId,response.data.message_id,response.data.thread_id??null,this.closing);if(!token)throw Error('task topic created and closed');return token;}
+  private async createTaskTopicOnce(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {const claim=this.taskStore.claim(chatId,taskId,operationId,owner);if(claim.existing)return claim.existing;const rootText=this.taskTopicRuntimeEnabled?'任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。':'任务话题已建立，目标功能待启用。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务话题',text:rootText,actions:[]}))}});if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.taskStore.rejected(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw Error('task creation outcome unknown');const token=this.taskStore.record(chatId,taskId,operationId,response.data.message_id,response.data.thread_id??null,this.closing);if(!token)throw Error('task topic created and closed');return token;}
   recoverKnownTaskTopic(chatId:string,taskId:string,operationId:string,owner:string):TaskTopicToken|null {if(!this.taskEnabled||this.closing)throw Error('task topic unavailable');return this.taskStore.finishKnown(chatId,taskId,operationId,owner);}
   lookupTaskTopic(destination:string,owner:string):TaskTopicToken|null {if(!this.taskEnabled||this.closing||owner!==this.owner)return null;return this.taskStore.lookup(destination);}
   closeTaskTopic(token:TaskTopicToken,owner:string):void {if(!this.taskEnabled||this.closing)throw Error('task topic unavailable');this.taskStore.close(token,owner);this.routeGeneration++;}

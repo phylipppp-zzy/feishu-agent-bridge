@@ -281,7 +281,7 @@ test('E2E: /task create -> /task mount -> /task panel -> /handoff -> confirm_han
     const rootCard = JSON.parse(sdk.created[0]!.content);
     assert.equal(
       rootCard.elements[0].text.content,
-      '任务话题已建立，可发送 /task mount <sessionId> 挂载后端，或通过面板切换目标。',
+      '任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。',
     );
     // Confirmation card in main group has clickable topic link button
     const confirmCard = JSON.parse(sdk.created[1]!.content);

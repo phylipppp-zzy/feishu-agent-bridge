@@ -724,7 +724,7 @@ test('FeishuSdkPort forwards task topic messages and callbacks when taskTopicRun
             targetId: 't-codex',
           }),
         );
-        assert.equal(cbToast, undefined);
+        assert.deepEqual(cbToast, { toast: { type: 'success', content: '已确认' } });
         assert.equal(forwarded.length, 2);
         assert.equal(forwarded[1]!.e.destination, token.destination);
         assert.equal(forwarded[1]!.e.cardMessageId, cardMsgId);
@@ -955,7 +955,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
         .find((a) => a.value.action === 'switch_target' && a.value.targetId === 't-agy')!.value;
 
       const switchRes = await invokeCallback('cb-switch-agy', panelMsgId, switchAgyBtn);
-      assert.equal(switchRes.callbackResult, undefined);
+      assert.deepEqual(switchRes.callbackResult, { toast: { type: 'success', content: '已确认' } });
       await runtime.tick();
       assert.equal(runtime.taskChannel!.getBinding(taskToken.taskId)!.activeTargetId, 't-agy');
 
@@ -1010,7 +1010,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       );
       const previewBtn = JSON.parse(mock.sentCards.get(previewCardMsgId)!.content).elements[1].actions[0].value;
       const handoffRes = await invokeCallback('cb-confirm-hoff', previewCardMsgId, previewBtn);
-      assert.equal(handoffRes.callbackResult, undefined);
+      assert.deepEqual(handoffRes.callbackResult, { toast: { type: 'success', content: '已确认' } });
       assert.equal((handoffRes.capturedResult as { status: string }).status, 'submitted');
       await runtime.tick();
       assert.equal(agy.inputs.length, 1);
@@ -1055,7 +1055,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       assert.equal(dec1ApproveBtn.action, 'decision_answer');
 
       const decRes = await invokeCallback('cb-dec-1', dec1Ref.hub_card_message_id, dec1ApproveBtn);
-      assert.equal(decRes.callbackResult, undefined);
+      assert.deepEqual(decRes.callbackResult, { toast: { type: 'success', content: '已确认' } });
       assert.equal(runtime.decisionSync!.getDecision('DEC-E2E-1').status, 'answered');
       await runtime.tick();
       assert.match(readFileSync(syncDoc, 'utf8'), /DEC-E2E-1[\s\S]*已登记答复: yes/);

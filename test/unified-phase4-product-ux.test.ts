@@ -17,8 +17,12 @@ import {
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
 import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js';
 import { parseFeishuAction, parseFeishuText } from '../src/unified/feishu-codec.js';
-import { FeishuSdkPort } from '../src/unified/feishu-sdk-port.js';
+import { FeishuSdkPort, handleSdkCardCallback } from '../src/unified/feishu-sdk-port.js';
+import { contractError } from '../src/unified/errors.js';
+import { buildModelsCard } from '../src/unified/help-cards.js';
 import { UnifiedRuntime, type RuntimeConfig, type RuntimeTrustedAction } from '../src/unified/runtime.js';
+import { StoreError } from '../src/unified/store.js';
+import { TaskChannelError } from '../src/unified/task-topic/types.js';
 
 const OWNER_ID = 'owner-p4';
 const OWNER = { source: 'feishu', subject: OWNER_ID };
@@ -578,6 +582,202 @@ test('scripts/wave2-operator.mjs rejects 0644 config file and requires 0600', ()
     );
     assert.equal(out.ok, true);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildModelsCard for agy declutters 10 models x 5 efforts into <=8 curated presets without effort duplication or Gemini 3', () => {
+  const allEfforts = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+  const liveAgyModels: ModelOption[] = [
+    { id: 'gemini-3-8-flash', label: 'Gemini 3.8 Flash (Medium)', reasoningEfforts: allEfforts },
+    { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash Lite (Low)', reasoningEfforts: allEfforts },
+    { id: 'gemini-4-argon', label: 'Gemini 4 Argon (Medium)', reasoningEfforts: allEfforts },
+    { id: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Medium)', reasoningEfforts: allEfforts },
+    { id: 'gemini-4-neon', label: 'Gemini 4 Neon (High)', reasoningEfforts: allEfforts },
+    { id: 'gemini-4-carbon', label: 'Gemini 4 Carbon (High)', reasoningEfforts: allEfforts },
+    { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 (Medium)', reasoningEfforts: allEfforts },
+    { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (High)', reasoningEfforts: allEfforts },
+    { id: 'gpt-5-3-codex', label: 'GPT 5.3 Codex (Medium)', reasoningEfforts: allEfforts },
+    { id: 'o4-mini', label: 'O4 Mini (Low)', reasoningEfforts: allEfforts },
+  ];
+
+  const card = buildModelsCard({
+    provider: 'agy',
+    items: liveAgyModels,
+    confirmed: null,
+    revision: 3,
+    controlGeneration: 2,
+  });
+
+  const settingsBtns = card.actions.filter((a) => a.value.action === 'settings');
+  assert.ok(settingsBtns.length > 0 && settingsBtns.length <= 8, `expected <=8 preset buttons, got ${settingsBtns.length}`);
+  assert.deepEqual(
+    settingsBtns.map((b) => ({
+      label: b.label,
+      model: b.value.model,
+      effort: (b.value.preferences as Record<string, string>).reasoningEffort,
+    })),
+    [
+      { label: 'Gemini 4 Carbon · 深度推理', model: 'gemini-4-carbon', effort: 'high' },
+      { label: 'Gemini 4 Carbon · 均衡', model: 'gemini-4-carbon', effort: 'medium' },
+      { label: 'Gemini 4 Neon · 均衡推荐', model: 'gemini-4-neon', effort: 'medium' },
+      { label: 'Gemini 4 Hydrogen · 轻量快速', model: 'gemini-4-hydrogen', effort: 'low' },
+      { label: 'Gemini 4 Hydrogen · 标准', model: 'gemini-4-hydrogen', effort: 'medium' },
+      { label: 'Claude Opus 5.5', model: 'claude-opus-5-5', effort: 'medium' },
+      { label: 'Claude Sonnet 5.5', model: 'claude-sonnet-5-5', effort: 'medium' },
+    ],
+  );
+  for (const btn of settingsBtns) {
+    assert.doesNotMatch(btn.label, /\((?:minimal|low|medium|high|xhigh)\)/i);
+    assert.doesNotMatch(btn.label, /Gemini 3/i);
+  }
+  assert.doesNotMatch(card.text, /\((?:minimal|low|medium|high|xhigh)\)/i);
+  assert.doesNotMatch(card.text, /Gemini 3/i);
+  assert.match(card.text, /\/model <模型ID> <强度>/);
+});
+
+test('handleSdkCardCallback returns friendly toast on already-handled errors and success toast on decision_answer', async () => {
+  const makeCardEvt = (eventId: string, value: Record<string, unknown>) =>
+    ({
+      event_id: eventId,
+      context: { open_message_id: 'om_card_1', open_chat_id: 'chat-main' },
+      operator: { open_id: OWNER_ID },
+      action: { tag: 'button', value },
+    }) as Parameters<typeof handleSdkCardCallback>[0];
+
+  const decisionValue = {
+    action: 'decision_answer',
+    decisionId: 'DEC-1',
+    expectedVersion: 1,
+    expectedDigest: 'abc123',
+    selectedOptionId: 'yes',
+  };
+
+  // 1. Success on decision_answer returns success toast
+  const okRes = await handleSdkCardCallback(
+    makeCardEvt('ev-ok-dec', decisionValue),
+    OWNER_ID,
+    new Set(['chat-main']),
+    () => 'chat-main',
+    async () => ({ status: 'answered' }),
+  );
+  assert.deepEqual(okRes, { toast: { type: 'success', content: '已确认' } });
+
+  // 2. stale_revision (including real StoreError nested detail.code), TaskChannelError(stale_active_revision),
+  //    already-answered, and handoff-already-submitted errors return friendly info toast
+  for (const err of [
+    Object.assign(new Error('revision mismatch'), { code: 'stale_revision' }),
+    Object.assign(new Error('expired'), { code: 'interaction_expired' }),
+    new StoreError(contractError('stale_revision', 'decision has already been answered')),
+    new StoreError(contractError('stale_revision', 'expected version 1, got 2')),
+    new TaskChannelError('stale_active_revision', 'active_revision mismatch'),
+    new Error('decision is already answered'),
+    new Error('interaction already resolved'),
+    new Error('handoff already submitted with different key or parameters'),
+  ]) {
+    const res = await handleSdkCardCallback(
+      makeCardEvt(`ev-handled-${err.message}`, decisionValue),
+      OWNER_ID,
+      new Set(['chat-main']),
+      () => 'chat-main',
+      async () => {
+        throw err;
+      },
+    );
+    assert.deepEqual(res, { toast: { type: 'info', content: '该项已处理完成，无需重复操作。' } });
+  }
+
+  // 3. Unknown error preserves safe unconfirmed toast
+  const unknownRes = await handleSdkCardCallback(
+    makeCardEvt('ev-unknown-err', decisionValue),
+    OWNER_ID,
+    new Set(['chat-main']),
+    () => 'chat-main',
+    async () => {
+      throw new Error('ECONNRESET');
+    },
+  );
+  assert.deepEqual(unknownRes, { toast: { type: 'info', content: '操作状态未确认，请查看会话状态后再操作。' } });
+});
+
+test('handleSdkCardCallback -> runtime.handleTrusted double-click on already-answered decision card returns friendly info toast', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'feishu-p4-dec-doubleclick-'));
+  const projectDir = join(dir, 'proj');
+  mkdirSync(projectDir, { recursive: true });
+  const sdk = makeMockSdkClient('chat-main');
+  const port = new FeishuSdkPort(
+    { appId: APP_ID, appSecret: 'secret' },
+    join(dir, 'sdk.sqlite'),
+    new Set(['chat-main']),
+    OWNER_ID,
+    true,
+    true,
+  );
+  (port as unknown as { client: unknown }).client = sdk.client;
+
+  const claude = makeFakeProvider('claude', 'host-1', 'svc-claude', projectDir);
+  const cfg: RuntimeConfig = {
+    ...makeConfig(dir, projectDir),
+    pendingHub: {
+      enabled: true,
+      destination: 'chat-main',
+      dbPath: join(dir, 'pending-hub.sqlite'),
+    },
+  };
+  const runtime = new UnifiedRuntime(cfg, port, [claude.port]);
+  try {
+    const decision = runtime.decisionSync!.createDecision({
+      decisionId: 'DEC-DOUBLE-CLICK-1',
+      kind: 'business_decision',
+      title: '发布确认',
+      prompt: '是否发布当前版本？',
+      options: [
+        { id: 'yes', label: '同意' },
+        { id: 'no', label: '拒绝' },
+      ],
+      source: { system: 'planner' },
+    });
+    await runtime.tick();
+    const hubDest = runtime.pendingHub!.getRoot()?.topicDestination ?? 'chat-main';
+
+    const cardValue = {
+      action: 'decision_answer',
+      decisionId: decision.decisionId,
+      expectedVersion: decision.version,
+      expectedDigest: decision.digest,
+      selectedOptionId: 'yes',
+    };
+    const makeCardEvt = (eventId: string) =>
+      ({
+        event_id: eventId,
+        context: { open_message_id: 'om_dec_card_1', open_chat_id: 'chat-main' },
+        operator: { open_id: OWNER_ID },
+        action: { tag: 'button', value: cardValue },
+      }) as Parameters<typeof handleSdkCardCallback>[0];
+
+    // First click succeeds with confirmation toast
+    const firstToast = await handleSdkCardCallback<RuntimeTrustedAction>(
+      makeCardEvt('ev-dec-click-1'),
+      OWNER_ID,
+      new Set(['chat-main']),
+      () => hubDest,
+      (env, act) => runtime.handleTrusted(env, act),
+    );
+    assert.deepEqual(firstToast, { toast: { type: 'success', content: '已确认' } });
+    assert.equal(runtime.decisionSync!.getDecision(decision.decisionId).status, 'answered');
+
+    // Second click with a new eventId hits real StoreError('stale_revision', 'decision has already been answered')
+    const secondToast = await handleSdkCardCallback<RuntimeTrustedAction>(
+      makeCardEvt('ev-dec-click-2'),
+      OWNER_ID,
+      new Set(['chat-main']),
+      () => hubDest,
+      (env, act) => runtime.handleTrusted(env, act),
+    );
+    assert.deepEqual(secondToast, { toast: { type: 'info', content: '该项已处理完成，无需重复操作。' } });
+  } finally {
+    await runtime.close();
+    port.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
