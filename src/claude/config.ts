@@ -23,6 +23,10 @@ export interface ClaudeBridgeConfig {
   syncDirs: string[];
   scanIntervalMs: number;
   livenessIntervalMs: number;
+  /** Explicit opt-in to serving Claude PermissionRequest hooks over a local Unix socket. */
+  permissionHookEnabled?: boolean;
+  /** Explicit opt-in to route session reminders into a dedicated subscription topic. */
+  reminderSubscriptionEnabled?: boolean;
 }
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -37,6 +41,14 @@ function positiveInteger(env: NodeJS.ProcessEnv, name: string, fallback: number)
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
   return value;
+}
+
+function booleanSetting(env: NodeJS.ProcessEnv, name: string, fallback = false): boolean {
+  const raw = env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  throw new Error(`${name} must be one of 1/0, true/false, yes/no or on/off`);
 }
 
 /**
@@ -74,5 +86,7 @@ export function loadClaudeConfig(env: NodeJS.ProcessEnv = process.env): ClaudeBr
     syncDirs: parseSyncDirs(env.SYNC_DIRS, home),
     scanIntervalMs: positiveInteger(env, "SCAN_INTERVAL_MS", 10_000),
     livenessIntervalMs: positiveInteger(env, "LIVENESS_INTERVAL_MS", 30_000),
+    permissionHookEnabled: booleanSetting(env, "PERMISSION_HOOK_ENABLED"),
+    reminderSubscriptionEnabled: booleanSetting(env, "REMINDER_SUBSCRIPTION_ENABLED"),
   };
 }

@@ -1,12 +1,32 @@
 import { access } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { configureCardUi } from "../card-kit.js";
 import { FeishuClient } from "../feishu.js";
 import { installSafeLogging } from "../safe-log.js";
-import { loadClaudeConfig } from "./config.js";
+import { loadClaudeConfig, type ClaudeBridgeConfig } from "./config.js";
 import { ClaudeBridgeDatabase } from "./db.js";
 import { ClaudeRuntime } from "./runtime.js";
+import { createPermissionHookServer, type PermissionApprovalHandler, type PermissionHookServer } from "./permission-hook.js";
+
+export type PermissionHookServerFactory = (options: Parameters<typeof createPermissionHookServer>[0]) => PermissionHookServer;
+
+/** Starts the private IPC hook only when explicitly enabled; its permissions affect only this child directory. */
+export async function startPermissionHookServerIfEnabled(
+  config: Pick<ClaudeBridgeConfig, "permissionHookEnabled" | "stateDir">,
+  onRequest: PermissionApprovalHandler,
+  factory: PermissionHookServerFactory = createPermissionHookServer,
+): Promise<PermissionHookServer | null> {
+  if (!config.permissionHookEnabled) return null;
+  const service = factory({ stateDir: join(config.stateDir, "permission-hook"), onRequest });
+  try { await service.start(); }
+  catch (error) {
+    await service.stop().catch(() => undefined);
+    throw error;
+  }
+  return service;
+}
 
 async function main(): Promise<void> {
   const config = loadClaudeConfig();
@@ -30,18 +50,32 @@ async function main(): Promise<void> {
   const db = new ClaudeBridgeDatabase(config.stateDir);
   const feishu = new FeishuClient(config.appId, config.appSecret);
   const runtime = new ClaudeRuntime(config, db, feishu);
-  console.log(`Claude transcripts: ${config.claudeHome}/projects; state: ${config.stateDir}`);
-  if (!db.getSetting("feishu.chat_id")) console.log("Binding is required. Send /bind <FEISHU_BIND_TOKEN> in the new private group.");
-  await runtime.start();
+  let permissionHook: PermissionHookServer | null = null;
+  try {
+    permissionHook = await startPermissionHookServerIfEnabled(config, (request, signal) => runtime.handlePermissionHookRequest(request, signal));
+    console.log(`Claude transcripts: ${config.claudeHome}/projects; state: ${config.stateDir}`);
+    if (!db.getSetting("feishu.chat_id")) console.log("Binding is required. Send /bind <FEISHU_BIND_TOKEN> in the new private group.");
+    await runtime.start();
+  } catch (error) {
+    await permissionHook?.stop().catch(() => undefined);
+    await runtime.stop().catch(() => undefined);
+    try { feishu.close(); }
+    finally { db.close(); }
+    throw error;
+  }
 
   let stopping = false;
   const stop = async (signal: string) => {
     if (stopping) return;
     stopping = true;
     console.log(`Stopping on ${signal}`);
-    await runtime.stop();
-    feishu.close();
-    db.close();
+    try { await permissionHook?.stop(); }
+    catch (error) { console.error("Permission hook service failed to stop", error); }
+    try { await runtime.stop(); }
+    finally {
+      try { feishu.close(); }
+      finally { db.close(); }
+    }
   };
   process.on("SIGINT", () => void stop("SIGINT").finally(() => process.exit(0)));
   process.on("SIGTERM", () => void stop("SIGTERM").finally(() => process.exit(0)));
@@ -54,7 +88,9 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack : error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack : error);
+    process.exitCode = 1;
+  });
+}

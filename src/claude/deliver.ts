@@ -29,6 +29,63 @@ export interface DeliverySelection {
   skipped: Array<{ label: string; reason: string }>;
 }
 
+export interface LocalFileLink {
+  label: string;
+  path: string;
+  version: string;
+  sentAppLink?: string;
+  references: Array<{ label: string; href: string }>;
+}
+
+/** Metadata version used by a card callback; the file is re-resolved and compared when tapped. */
+export function deliverableVersion(info: { size: number; mtimeMs: number; ino: number | bigint }): string {
+  return `${info.size}:${info.mtimeMs}:${info.ino}`;
+}
+
+function localLinkPath(href: string): string | null {
+  const stripLine = (value: string) => value.replace(/#L\d+(?:-L?\d+)?$/i, "").replace(/:\d+(?::\d+)?$/, "");
+  try {
+    if (href.startsWith("file:")) {
+      const url = new URL(href);
+      if (url.protocol !== "file:" || (url.hostname && url.hostname !== "localhost")) return null;
+      return stripLine(decodeURIComponent(url.pathname));
+    }
+  } catch { return null; }
+  if (/^[a-z][a-z\d+.-]*:/i.test(href) || href.startsWith("#")) return null;
+  return stripLine(href);
+}
+
+/** Finds markdown links to local files that are safe to offer as callback buttons. */
+export async function localFileLinks(text: string, cwd: string | null, allowedRoot: string): Promise<LocalFileLink[]> {
+  const result: LocalFileLink[] = [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(/\[([^\]]{1,100})\]\(([^\s)]+)(?:\s+"[^"]*")?\)/g)) {
+    const path = localLinkPath(match[2]!);
+    if (!path) continue;
+    try {
+      const candidate = resolve(cwd ?? allowedRoot, path);
+      const candidateInfo = await stat(candidate);
+      if (!candidateInfo.isFile()) continue;
+      const selection = await selectDeliverables([path], cwd, allowedRoot);
+      const file = selection.files[0];
+      if (!file) continue;
+      const info = await stat(file.path);
+      const version = deliverableVersion(info);
+      const existing = result.find((item) => item.path === file.path && item.version === version);
+      const reference = { label: match[1]!, href: match[2]! };
+      if (existing) {
+        if (!existing.references.some((item) => item.href === reference.href)) existing.references.push(reference);
+        continue;
+      }
+      if (seen.has(file.path)) continue;
+      seen.add(file.path);
+      result.push({ label: match[1]!, path: file.path, version, references: [reference] });
+      if (result.length >= 8) return result;
+    } catch { /* missing, unreadable, or changed links do not fail rendering */ }
+  }
+  return result;
+}
+
 /** Paths separated by spaces; a path containing spaces is written in double quotes. */
 export function deliverArguments(args: string): string[] {
   return [...args.matchAll(/"([^"]+)"|(\S+)/g)].map((match) => match[1] ?? match[2]!);

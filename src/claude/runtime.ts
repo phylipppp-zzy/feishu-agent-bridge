@@ -2,19 +2,25 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import type { CanUseTool, PermissionResult, PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, PermissionRequestHookInput, PermissionResult, PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
 import { shorten } from "../card-kit.js";
 import { isRetryableTransportError } from "../inbound-events.js";
 import { isExpiredFeishuMessage } from "../safe-log.js";
+import { messageAppLink } from "../feishu.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingBotMenuAction, IncomingCardAction, IncomingFeishuMessage } from "../types.js";
 import { CARD_TEXT_LIMIT, claudeCleanupCard, claudeCleanupResultCard, claudeCommandMenuCard, claudeDeliverCard, claudeHelpCard, claudeListCard, claudeHomeCard,
-  claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudeOpenedCard, claudePermissionCard, claudePlanCard,
+  claudeFileSentCard, claudeInteractionDoneCard, claudeLocalBusyCard, claudeModeCard, claudeModelCard, claudeNewSessionCard, claudeNewTaskCard, claudeNoticeCard, claudeOpenedCard, claudePermissionCard, claudePlanCard,
   claudeQuestionCard, claudeRecentCard, claudeRootCard, claudeStartedCard, claudeTurnCard, displayPath, promptLine, scopeLabel, sessionTitle, sourceLabel, transcriptMarkdown,
   turnMarkdown, turnText, type LiveState } from "./cards.js";
 import { inSyncScope, type ClaudeBridgeConfig } from "./config.js";
 import { reduceTranscript, type TurnView } from "./conversation.js";
 import type { ClaudeBridgeDatabase, ClaudeSession } from "./db.js";
-import { deliverArguments, listDirectory, selectDeliverables } from "./deliver.js";
+import { deliverableVersion, deliverArguments, listDirectory, localFileLinks, selectDeliverables } from "./deliver.js";
+import { renderReminder } from "./notification-subscriptions.js";
+import { deliverBacklogSummary, type BacklogEntry } from "./backlog-summary.js";
+import { sendCardWithRenderFallback, updateCardWithRenderFallback } from "./render-fallback.js";
+import { RemotePermissionApprovals } from "./remote-permission-approvals.js";
+import { permissionInputDigest, type PermissionHookReply, type PermissionHookRequest } from "./permission-hook.js";
 import { SlowCardActions } from "../card-actions.js";
 import { markFeishuActivity } from "./feishu-activity.js";
 import { isTranscriptPath, projectFolderName, readTranscriptEvents, sessionProjectDir, TranscriptImporter, transcriptSessionId } from "./importer.js";
@@ -65,6 +71,13 @@ function recallFailure(error: unknown): string {
 }
 
 function textHash(text: string): string { return createHash("sha256").update(text).digest("hex"); }
+function stableUuid(text: string): string {
+  const hex = textHash(text).slice(0, 32).split("");
+  hex[12] = "4";
+  hex[16] = ((Number.parseInt(hex[16]!, 16) & 3) | 8).toString(16);
+  const value = hex.join("");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
 /** Element ids are new in every build of a card; the content is what matters. */
 function cardContentHash(card: CardDefinition): string { return textHash(JSON.stringify(card).replace(/"element_id":"[^"]*"/g, "")); }
 function errorText(error: unknown): string { return (error instanceof Error ? error.message : String(error)).slice(0, 300); }
@@ -128,10 +141,14 @@ export class ClaudeRuntime {
   private readonly rootHashes = new Map<string, string>();
   private readonly runners = new Map<string, RunnerEntry>();
   private readonly interactions = new InteractionRegistry();
+  private readonly remoteApprovals: RemotePermissionApprovals;
   /** Messages waiting for a turn running in VS Code or a terminal to end, by nonce. */
   private readonly localWaits = new Map<string, { sessionId: string; inputs: FeishuInput[]; expiresAt: number; cardMessageId: string | null }>();
   /** Exports and deliveries in progress, so a repeated tap does not send everything twice. */
   private readonly busy = new Set<string>();
+  /** Body-link actions leave the source turn card intact and post their result in its topic. */
+  private readonly linkedFileActions = new Set<string>();
+  private notificationSubscriptionInFlight: Promise<{ rootMessageId: string; chatId: string } | null> | null = null;
   /** Card taps whose work may outlast Feishu's three-second callback window. */
   private readonly slowActions: SlowCardActions;
   private readonly drafts = new Map<string, { input: FeishuInput; expiresAt: number }>();
@@ -150,6 +167,17 @@ export class ClaudeRuntime {
     private readonly queryFactory?: QueryFactory,
   ) {
     this.projectsDir = join(config.claudeHome, "projects");
+    this.remoteApprovals = new RemotePermissionApprovals({
+      replyCard: async (rootId, candidate, options) => {
+        const messageId = await feishu.replyCard(rootId, candidate, options);
+        const session = db.getSessionByRoot(rootId);
+        if (session) db.recordSentMessage(session.sessionId, messageId);
+        return messageId;
+      },
+      // A rejected approval-card update must fail closed; posting a replacement would leave the
+      // old nonce visible while the FSM binds the new phase to the original message ID.
+      updateCard: (messageId, candidate) => feishu.updateCard(messageId, candidate),
+    });
     this.slowActions = new SlowCardActions(feishu, (key, error) => this.fail("slow_card_action", { key }, error), config.cardSettleMs);
     this.importer = new TranscriptImporter({
       projectsDir: this.projectsDir,
@@ -183,6 +211,7 @@ export class ClaudeRuntime {
     for (const timer of this.renderTimers.values()) clearTimeout(timer);
     this.renderTimers.clear();
     await this.stopRunners();
+    await this.remoteApprovals.stop();
     await this.importer.stopWatching();
     await this.presence.stop();
     await Promise.allSettled(this.renderQueues.values());
@@ -196,6 +225,33 @@ export class ClaudeRuntime {
   /** Sessions outside SYNC_DIRS are read for their working directory only and never shown in Feishu. */
   private inScope(cwd: string | null): boolean { return inSyncScope(cwd, this.config.syncDirs); }
 
+  /** Local permission socket handler. The caller's transcript_path is deliberately never opened. */
+  async handlePermissionHookRequest(request: PermissionHookRequest, signal: AbortSignal): Promise<PermissionHookReply> {
+    const deny = (message: string): PermissionHookReply => ({ requestId: request.requestId, inputDigest: request.inputDigest,
+      input: request.input, decision: { behavior: "deny", message } });
+    let input: PermissionRequestHookInput;
+    try { input = structuredClone(request.input); } catch { return deny("权限请求无法安全复制，已拒绝。"); }
+    if (signal.aborted || permissionInputDigest(input) !== request.inputDigest) return deny("权限请求已取消或摘要不匹配，已拒绝。");
+    const session = this.db.getSession(input.session_id);
+    if (this.paused() || !session || !session.rootMessageId || !session.chatId || session.chatId !== this.boundChatId() || !this.inScope(session.cwd)) {
+      return deny("会话不存在、未绑定当前群聊或不在同步范围，已拒绝。");
+    }
+    let actualCwd: string;
+    try { actualCwd = await realpath(input.cwd); } catch { return deny("会话工作目录无法验证，已拒绝。"); }
+    let expectedCwd: string;
+    try { expectedCwd = await realpath(session.cwd ?? ""); } catch { return deny("已记录的会话工作目录不可用，已拒绝。"); }
+    if (actualCwd !== expectedCwd || !this.inScope(actualCwd)) return deny("权限请求工作目录与已同步会话不匹配，已拒绝。");
+    const toolInput = input.tool_input;
+    if (typeof toolInput !== "object" || toolInput === null || Array.isArray(toolInput)) return deny("工具参数无法验证，已拒绝。");
+    const result = await this.remoteApprovals.request({ sessionId: session.sessionId, rootMessageId: session.rootMessageId,
+      toolName: input.tool_name, input: structuredClone(toolInput), openId: this.boundOpenId() ?? "", chatId: session.chatId,
+      title: null, reason: null }, signal);
+    const decision = result.behavior === "allow"
+      ? { behavior: "allow" as const, ...(result.updatedInput ? { updatedInput: result.updatedInput } : {}), ...(result.updatedPermissions ? { updatedPermissions: result.updatedPermissions } : {}) }
+      : { behavior: "deny" as const, message: result.message, ...(result.interrupt !== undefined ? { interrupt: result.interrupt } : {}) };
+    return { requestId: request.requestId, inputDigest: request.inputDigest, input, decision };
+  }
+
   private fail(operation: string, detail: Record<string, unknown>, error: unknown): void {
     this.db.recordFailure(operation, detail, error);
     console.error(`Claude bridge ${operation} failed`, detail, error);
@@ -204,6 +260,8 @@ export class ClaudeRuntime {
   /** First full pass after start or binding: index sessions, then apply hook states that arrived meanwhile. */
   private bootstrap(): Promise<void> {
     this.bootstrapping ??= (async () => {
+      try { await this.ensureNotificationSubscription(); }
+      catch (error) { this.fail("notification_subscription_start", {}, error); }
       await this.syncAll();
       await this.reconcileTopics();
       await this.presence.scan();
@@ -244,9 +302,18 @@ export class ClaudeRuntime {
     return id;
   }
   private async topicCard(sessionId: string, rootId: string, card: CardDefinition): Promise<string> {
-    const id = await this.feishu.replyCard(rootId, card);
-    this.db.recordSentMessage(sessionId, id);
-    return id;
+    const record = await sendCardWithRenderFallback(card, (candidate) => this.feishu.replyCard(rootId, candidate));
+    for (const id of record.messageIds) this.db.recordSentMessage(sessionId, id);
+    if (record.degraded) this.fail("card_render_fallback", { sessionId }, new Error("Feishu rejected card content; posted readable text fallback."));
+    return record.messageIds.at(-1)!;
+  }
+  private async updateTopicCard(sessionId: string, rootId: string, messageId: string, card: CardDefinition): Promise<string> {
+    const record = await updateCardWithRenderFallback(messageId, card,
+      (id, candidate) => this.feishu.updateCard(id, candidate),
+      (candidate) => this.feishu.replyCard(rootId, candidate));
+    for (const id of record.messageIds) this.db.recordSentMessage(sessionId, id);
+    if (record.degraded) this.fail("card_render_fallback", { sessionId }, new Error("Feishu rejected card update; posted readable text fallback."));
+    return record.messageIds.at(-1)!;
   }
   private async topicFile(sessionId: string, rootId: string, name: string, data: Buffer): Promise<string> {
     const id = await this.feishu.replyFile(rootId, name, data);
@@ -271,9 +338,68 @@ export class ClaudeRuntime {
     } catch (error) { this.fail("topic_notice", { sessionId }, error); }
   }
 
+  private async ensureNotificationSubscription(): Promise<{ rootMessageId: string; chatId: string } | null> {
+    if (!this.config.reminderSubscriptionEnabled) return null;
+    const chatId = this.boundChatId();
+    if (!chatId) return null;
+    const savedChat = this.db.getSetting("notification.subscription.chat_id");
+    const savedRoot = this.db.getSetting("notification.subscription.root_message_id");
+    if (savedChat === chatId && savedRoot) return { rootMessageId: savedRoot, chatId };
+    this.notificationSubscriptionInFlight ??= (async () => {
+      const currentChat = this.boundChatId();
+      if (currentChat !== chatId) return null;
+      const currentSavedChat = this.db.getSetting("notification.subscription.chat_id");
+      const currentSavedRoot = this.db.getSetting("notification.subscription.root_message_id");
+      if (currentSavedChat === chatId && currentSavedRoot) return { rootMessageId: currentSavedRoot, chatId };
+      const root = await this.feishu.createSessionRoot(chatId, "Claude 提醒订阅", "等待你处理的会话提醒会集中发到这里。普通对话和命令仍留在各自的话题。",
+        claudeNoticeCard("Claude 提醒订阅", "等待你处理的会话提醒会集中发到这里。源会话链接可直接返回原话题。"));
+      this.db.setSetting("notification.subscription.chat_id", chatId);
+      this.db.setSetting("notification.subscription.root_message_id", root.messageId);
+      return { rootMessageId: root.messageId, chatId };
+    })().finally(() => { this.notificationSubscriptionInFlight = null; });
+    return this.notificationSubscriptionInFlight;
+  }
+
+  /** Only explicit waiting/StopFailure events use this route; other notices stay in their session topic. */
+  private async routeSessionReminder(session: ClaudeSession, reminderId: string, text: string): Promise<boolean> {
+    const claim = this.db.claimReminderDelivery(session.sessionId, reminderId);
+    if (claim === "sent") return true;
+    if (claim !== "claimed") return false;
+    let firstError: unknown = null;
+    try {
+      if (this.config.reminderSubscriptionEnabled) {
+        const subscription = await this.ensureNotificationSubscription();
+        if (!subscription) throw new Error("notification subscription has no bound group");
+        const messageId = await this.feishu.replyText(subscription.rootMessageId, renderReminder({
+          reminderId, sourceSessionId: session.sessionId, sourceTitle: sessionTitle(session), sourceAppLink: session.rootAppLink, text,
+        }));
+        if (!messageId) throw new Error("Feishu reminder reply returned no message ID");
+        this.db.completeReminderDelivery(session.sessionId, reminderId, messageId, "subscription");
+        this.db.recordSentMessage(session.sessionId, messageId);
+        return true;
+      }
+    } catch (error) {
+      firstError = error;
+      this.db.failReminderDelivery(session.sessionId, reminderId, error);
+      this.fail("reminder_subscription", { sessionId: session.sessionId, reminderId }, error);
+    }
+    if (!this.config.reminderSubscriptionEnabled && firstError === null) this.db.failReminderDelivery(session.sessionId, reminderId, "subscription disabled; source-topic route selected");
+    try {
+      if (!session.rootMessageId) throw new Error("source session has no topic for reminder fallback");
+      const messageId = await this.topicText(session.sessionId, session.rootMessageId, text);
+      this.db.completeReminderDelivery(session.sessionId, reminderId, messageId, "source_topic");
+      return true;
+    } catch (fallbackError) {
+      const primaryText = firstError instanceof Error ? firstError.message : (firstError ? String(firstError) : "subscription disabled");
+      this.db.exhaustReminderDelivery(session.sessionId, reminderId, new Error(`subscription: ${primaryText}; source-topic fallback: ${errorText(fallbackError)}`));
+      this.fail("reminder_fallback", { sessionId: session.sessionId, reminderId, primaryError: firstError instanceof Error ? firstError.message : String(firstError ?? "subscription disabled") }, fallbackError);
+      return false;
+    }
+  }
+
   /** Updates a root card; one too old for Feishu to edit is left as it is instead of failing every render. */
   private async updateRootCard(session: ClaudeSession, card: CardDefinition): Promise<void> {
-    try { await this.feishu.updateCard(session.rootMessageId!, card); }
+    try { await this.updateTopicCard(session.sessionId, session.rootMessageId!, session.rootMessageId!, card); }
     catch (error) { if (!isExpiredFeishuMessage(error)) throw error; }
   }
 
@@ -453,23 +579,60 @@ export class ClaudeRuntime {
     return { ...view, blocks: [...view.blocks, { key: "live", kind: "text", text: `${text} ▍` }] };
   }
 
-  /** Sends a turn card; if Feishu rejects the folded tool panel, falls back to plain lines for good. */
-  private async sendTurnCard(sessionId: string, rootId: string, turn: TurnView, stale: boolean): Promise<{ messageId: string; hash: string }> {
+  private async fileLinksFor(session: ClaudeSession, turnId: string, text: string) {
+    const links = await localFileLinks(text, session.cwd, this.config.allowedRoot);
+    const chatId = session.chatId;
+    const rootId = session.rootMessageId;
+    if (!chatId || !rootId) return links;
+    const currentReferences = new Set(links.flatMap((link) => link.references.map((reference) => reference.href)));
+    const current = links.map((link) => {
+      const delivery = this.db.getFileDelivery(session.sessionId, turnId, link.path, link.version, chatId, rootId);
+      return delivery?.status === "sent" && delivery.fileMessageId
+        ? { ...link, sentAppLink: messageAppLink(chatId, delivery.fileMessageId) }
+        : link;
+    });
+    for (const delivery of this.db.fileDeliveriesForTurn(session.sessionId, turnId, chatId, rootId)) {
+      const oldReferences = delivery.sourceRefs.filter((reference) => !currentReferences.has(reference.href));
+      if (!oldReferences.length) continue;
+      current.push({ label: oldReferences[0]!.label, path: delivery.path, version: delivery.version,
+        references: oldReferences, sentAppLink: messageAppLink(chatId, delivery.fileMessageId) });
+      for (const reference of oldReferences) currentReferences.add(reference.href);
+    }
+    return current;
+  }
+
+  private async refreshTurnFileLinks(session: ClaudeSession, turnId: string, sourceCardId: string): Promise<boolean> {
+    const turn = this.db.getTurn(session.sessionId, turnId);
+    if (!turn || turn.cardMessageId !== sourceCardId || !session.rootMessageId) return false;
+    const stale = this.staleTurn(turn.view, session);
     const simple = this.simpleCards();
-    try { return { messageId: await this.topicCard(sessionId, rootId, claudeTurnCard(turn, { simpleTools: simple, stale })), hash: this.cardHash(turn, simple, stale) }; }
+    const fileLinks = await this.fileLinksFor(session, turnId, turnText(turn.view));
+    if (!fileLinks.some((link) => link.sentAppLink)) return false;
+    const updatedId = await this.updateTopicCard(session.sessionId, session.rootMessageId, sourceCardId,
+      claudeTurnCard(turn.view, { simpleTools: simple, stale, sessionId: session.sessionId, turnId, fileLinks }));
+    this.db.setTurnCard(session.sessionId, turnId, updatedId, this.cardHash(turn.view, simple, stale, fileLinks));
+    return true;
+  }
+
+  /** Sends a turn card; if Feishu rejects the folded tool panel, falls back to plain lines for good. */
+  private async sendTurnCard(session: ClaudeSession, rootId: string, turn: TurnView, stale: boolean): Promise<{ messageId: string; hash: string }> {
+    const sessionId = session.sessionId;
+    const simple = this.simpleCards();
+    const fileLinks = await this.fileLinksFor(session, turn.turnId, turnText(turn));
+    try { return { messageId: await this.topicCard(sessionId, rootId, claudeTurnCard(turn, { simpleTools: simple, stale, sessionId, turnId: turn.turnId, fileLinks })), hash: this.cardHash(turn, simple, stale, fileLinks) }; }
     catch (error) {
       if (simple || isRetryableTransportError(error)) throw error;
       // Switch for good only when the same card without the folded panel is accepted.
-      const messageId = await this.topicCard(sessionId, rootId, claudeTurnCard(turn, { simpleTools: true, stale }));
+      const messageId = await this.topicCard(sessionId, rootId, claudeTurnCard(turn, { simpleTools: true, stale, sessionId, turnId: turn.turnId, fileLinks }));
       this.db.setSetting("cards.simple_tools", "1");
       this.fail("collapsible_panel", {}, error);
-      return { messageId, hash: this.cardHash(turn, true, stale) };
+      return { messageId, hash: this.cardHash(turn, true, stale, fileLinks) };
     }
   }
 
-  private cardHash(turn: TurnView, simple: boolean, stale: boolean): string {
+  private cardHash(turn: TurnView, simple: boolean, stale: boolean, fileLinks: readonly { path: string; version: string }[] = []): string {
     // Element ids change per build, so the hash covers the content rather than the card JSON.
-    return textHash(JSON.stringify({ simple, stale, status: turn.status, durationMs: turn.durationMs, blocks: turn.blocks, omitted: turn.omittedTools }));
+    return textHash(JSON.stringify({ simple, stale, status: turn.status, durationMs: turn.durationMs, blocks: turn.blocks, omitted: turn.omittedTools, fileLinks }));
   }
 
   private async renderNow(sessionId: string): Promise<void> {
@@ -497,10 +660,36 @@ export class ClaudeRuntime {
       session = this.db.getSession(sessionId)!;
     }
     const rootId = session.rootMessageId!;
+    const ended = turns.filter((turn) => turn.view.status !== "running" && !turn.cardMessageId);
+    if (ended.length >= 10) {
+      const entries: BacklogEntry[] = ended.map((turn) => ({ status: "ended", id: turn.turnId,
+        title: `${sessionTitle(session)} · ${promptLine(turn.view) || turn.turnId}`,
+        body: turnMarkdown(session, turn.view), source: session.rootAppLink ?? session.cwd ?? session.sessionId }));
+      const batchId = textHash(`${sessionId}:${ended.map((turn) => turn.turnId).join("\n")}`);
+      this.db.createBacklogBatch(batchId, sessionId, rootId, ended.map((turn) => turn.turnId), entries);
+    }
+    for (const batch of this.db.backlogBatches(sessionId)) {
+      const entries = Array.isArray(batch.entries) ? batch.entries as BacklogEntry[] : [];
+      try {
+        const delivery = await deliverBacklogSummary(entries, this.feishu, batch.rootMessageId, new Date(batch.createdAtMs), {
+          ...(batch.cardMessageId ? { cardMessageId: batch.cardMessageId } : {}),
+          ...(batch.markdownMessageId ? { markdownMessageId: batch.markdownMessageId } : {}),
+          cardUuid: stableUuid(`${batch.batchId}:card`),
+          markdownUuid: stableUuid(`${batch.batchId}:markdown`),
+          onCardMessage: (messageId) => { this.db.setBacklogCardMessage(batch.batchId, messageId); this.db.recordSentMessage(sessionId, messageId); },
+        });
+        if (delivery) {
+          this.db.setBacklogMarkdownMessage(batch.batchId, delivery.markdownMessageId);
+          this.db.recordSentMessage(sessionId, delivery.markdownMessageId);
+        }
+      } catch (error) { this.fail("backlog_summary", { sessionId, batchId: batch.batchId }, error); }
+    }
+    const archived = new Set(this.db.backlogMemberTurnIds(sessionId));
+    const visibleTurns = turns.filter((turn) => !archived.has(turn.turnId));
     const simple = this.simpleCards();
     const live = this.runners.get(sessionId);
     let deferMs = 0;
-    for (const turn of turns) {
+    for (const turn of visibleTurns) {
       const view = this.withLiveText(turn.view, live);
       const stale = this.staleTurn(view, session);
       if (!turn.cardMessageId) {
@@ -508,15 +697,17 @@ export class ClaudeRuntime {
           const line = promptLine(view);
           if (line) this.db.setTurnPromptMessage(sessionId, turn.turnId, await this.topicText(sessionId, rootId, line));
         }
-        const sent = await this.sendTurnCard(sessionId, rootId, view, stale);
+        const sent = await this.sendTurnCard(session, rootId, view, stale);
         this.db.setTurnCard(sessionId, turn.turnId, sent.messageId, sent.hash);
       } else {
-        const hash = this.cardHash(view, simple, stale);
+        const fileLinks = await this.fileLinksFor(session, view.turnId, turnText(view));
+        const hash = this.cardHash(view, simple, stale, fileLinks);
         if (hash !== turn.renderedHash) {
           const wait = turn.renderedAtMs + CARD_UPDATE_INTERVAL_MS - Date.now();
           if (wait > 0 && view.status === "running" && !stale) { deferMs = Math.max(deferMs, wait); continue; }
-          await this.feishu.updateCard(turn.cardMessageId, claudeTurnCard(view, { simpleTools: simple, stale }));
-          this.db.setTurnCard(sessionId, turn.turnId, turn.cardMessageId, hash);
+          const updatedId = await this.updateTopicCard(sessionId, rootId, turn.cardMessageId,
+            claudeTurnCard(view, { simpleTools: simple, stale, sessionId, turnId: view.turnId, fileLinks }));
+          this.db.setTurnCard(sessionId, turn.turnId, updatedId, hash);
         }
       }
       if (view.status !== "running" && !turn.attachmentMessageId && turnText(view).length > CARD_TEXT_LIMIT) {
@@ -574,16 +765,16 @@ export class ClaudeRuntime {
     if (!session?.rootMessageId || !this.inScope(session.cwd)) return;
     const fresh = session.presenceAtMs === record.at && session.waitingNotifiedAtMs < record.at && record.at >= Date.now() - WAITING_NOTICE_MAX_AGE_MS;
     if (record.state === "waiting" && fresh) {
-      this.db.setWaitingNotified(session.sessionId, record.at);
-      await this.topicText(session.sessionId, session.rootMessageId, `⏳ 这个会话在${sourceLabel(session.entrypoint)}中等待你处理${record.message ? `：${record.message}` : "。"}`)
+      const delivered = await this.routeSessionReminder(session, `waiting:${record.at}`, `⏳ 这个会话在${sourceLabel(session.entrypoint)}中等待你处理${record.message ? `：${record.message}` : "。"}`)
         .catch((error) => this.fail("waiting_notice", { sessionId: session.sessionId }, error));
+      if (delivered) this.db.setWaitingNotified(session.sessionId, record.at);
     }
     // A turn ended by an API error (such as a usage limit) looks like a finished turn; nothing resumes it on its own.
     if (record.event === "StopFailure" && fresh) {
-      this.db.setWaitingNotified(session.sessionId, record.at);
-      await this.topicText(session.sessionId, session.rootMessageId,
+      const delivered = await this.routeSessionReminder(session, `stop-failure:${record.at}`,
         `⚠️ 这个会话在${sourceLabel(session.entrypoint)}中因 API 报错停下了${record.message ? `：${record.message}` : "。"}\n不会自动继续，处理后发消息让它接着做。`)
         .catch((error) => this.fail("failure_notice", { sessionId: session.sessionId }, error));
+      if (delivered) this.db.setWaitingNotified(session.sessionId, record.at);
     }
     await this.renderSession(session.sessionId);
   }
@@ -606,6 +797,7 @@ export class ClaudeRuntime {
     const entry = this.runners.get(sessionId);
     if (!entry || entry.closing) return null;
     if (this.interactions.has(sessionId)) return "waiting";
+    if (this.remoteApprovals.hasSession(sessionId)) return "waiting";
     return entry.runner.busy ? "running" : "idle";
   }
 
@@ -639,7 +831,7 @@ export class ClaudeRuntime {
     const entry = { takeover, startedAtMs: Date.now(), yieldWhenIdle: false, restartWhenIdle: false, closing: false, idleTimer: null, livePrompt: null, liveText: "" } as Omit<RunnerEntry, "runner"> as RunnerEntry;
     entry.runner = new SessionRunner({
       sessionId, mode: options.mode, ...(options.forkFrom ? { forkFrom: options.forkFrom } : {}), cwd: options.cwd, claudeBin: this.config.claudeBin,
-      permissionMode: this.feishuMode(session), model: session.prefModel, effort: effortLevel(session.prefEffort),
+      permissionMode: this.feishuMode(session), model: session.prefModel, effort: effortLevel(session.prefEffort), knownIdleDelayMs: this.config.runnerIdleMs,
     }, {
       onPrompt: (uuid) => { entry.livePrompt = uuid; entry.liveText = ""; },
       onLiveText: (text, uuid) => {
@@ -650,6 +842,11 @@ export class ClaudeRuntime {
       onTurnEnd: (result) => this.onTurnEnd(sessionId, entry, result),
       canUseTool: (toolName, input, request) => this.requestPermission(sessionId, toolName, input, request),
       onClosed: (error) => this.onRunnerClosed(sessionId, entry, error),
+      onActivityChange: () => {
+        if (this.runners.get(sessionId) !== entry || entry.closing) return;
+        if (entry.runner.idleDelayMs === null) this.clearIdle(entry);
+        else this.armIdle(sessionId, entry);
+      },
     }, this.queryFactory);
     this.runners.set(sessionId, entry);
     entry.runner.start();
@@ -659,15 +856,18 @@ export class ClaudeRuntime {
 
   private armIdle(sessionId: string, entry: RunnerEntry): void {
     this.clearIdle(entry);
+    const delayMs = entry.runner.idleDelayMs;
+    if (delayMs === null) return;
     entry.idleTimer = setTimeout(() => {
       entry.idleTimer = null;
-      if (entry.runner.busy || this.interactions.has(sessionId)) return;
+      if (this.runners.get(sessionId) !== entry || entry.runner.idleDelayMs === null || entry.runner.busy
+        || this.interactions.has(sessionId) || this.remoteApprovals.hasSession(sessionId)) return;
       entry.closing = true;
       entry.runner.close();
       // A process that does not exit when its input ends is stopped.
       setTimeout(() => { if (this.runners.get(sessionId) === entry) entry.runner.terminate(); }, 30_000).unref();
       this.refreshRoot(sessionId);
-    }, this.config.runnerIdleMs);
+    }, delayMs);
     entry.idleTimer.unref();
   }
 
@@ -698,6 +898,7 @@ export class ClaudeRuntime {
   private onRunnerClosed(sessionId: string, entry: RunnerEntry, error: unknown): void {
     if (this.runners.get(sessionId) === entry) this.runners.delete(sessionId);
     this.clearIdle(entry);
+    void this.remoteApprovals.cancelSession(sessionId, "Claude Code 进程已结束，审批请求已拒绝。");
     for (const interaction of this.interactions.cancelSession(sessionId, "Claude Code 进程已结束")) {
       void this.resolveInteractionCard(interaction, "已取消", "grey", "Claude Code 进程已结束。");
     }
@@ -715,6 +916,7 @@ export class ClaudeRuntime {
     for (const [sessionId, entry] of entries) {
       this.clearIdle(entry);
       this.interactions.cancelSession(sessionId, "桥接服务正在停止");
+      await this.remoteApprovals.cancelSession(sessionId, "桥接服务正在停止，审批请求已拒绝。");
       // An interrupted turn is recorded as such, instead of ending without any record.
       if (entry.runner.busy) await withTimeout(entry.runner.interrupt(), 3_000).catch(() => undefined);
       entry.closing = true;
@@ -1004,6 +1206,7 @@ export class ClaudeRuntime {
       for (const interaction of this.interactions.cancelSession(session.sessionId, "用户停止了这一轮")) {
         void this.resolveInteractionCard(interaction, "已取消", "grey", "这一轮已停止。");
       }
+      await this.remoteApprovals.cancelSession(session.sessionId, "用户停止了这一轮，审批请求已拒绝。");
       return "已停止这一轮。";
     }
     if (session.presenceState === "running" || session.presenceState === "waiting") return `这一轮在${sourceLabel(session.entrypoint)}中运行，请在那里停止。`;
@@ -1064,6 +1267,54 @@ export class ClaudeRuntime {
     const turns = reduceTranscript(sessionId, null, events).touched;
     const name = `${sessionTitle(session).slice(0, 30).replace(/[\\/:*?"<>|\s]+/g, "_")}-${sessionId.slice(0, 8)}.md`;
     await this.topicFile(sessionId, session.rootMessageId, name, Buffer.from(transcriptMarkdown(session, turns)));
+  }
+
+  private async deliverLinkedFile(session: ClaudeSession, turnId: string, sourceCardId: string, path: string, expectedVersion: string): Promise<CardDefinition> {
+    const chatId = this.boundChatId();
+    const rootId = session.rootMessageId;
+    if (!chatId || !rootId || session.chatId !== chatId) return claudeNoticeCard("无法发送", "会话话题已失效或不属于当前绑定群。", "red");
+    const turn = this.db.getTurn(session.sessionId, turnId);
+    if (!turn || turn.cardMessageId !== sourceCardId) return claudeNoticeCard("文件按钮已失效", "请从当前回合卡片重新操作。", "orange");
+    // Check successful mappings before touching the filesystem: old cards still locate the
+    // original message if their local file has since been edited or removed.
+    const mapped = this.db.getFileDelivery(session.sessionId, turnId, path, expectedVersion, chatId, rootId);
+    if (mapped?.status === "sent" && mapped.fileMessageId) {
+      const metadata = await this.feishu.getMessageMetadata(mapped.fileMessageId).catch(() => null);
+      return claudeFileSentCard(basename(path), metadata?.appLink ?? messageAppLink(chatId, mapped.fileMessageId));
+    }
+    if (mapped?.status === "sending") return claudeNoticeCard("正在发送", "这个文件版本已在发送中，请稍后再试。", "blue");
+    const link = (await localFileLinks(turnText(turn.view), session.cwd, this.config.allowedRoot))
+      .find((item) => item.path === path && item.version === expectedVersion);
+    if (!link) return claudeNoticeCard("文件链接已失效", "文件内容或版本已经变化，请等待回合卡片刷新后再点。", "orange");
+    const selected = await selectDeliverables([path], session.cwd, this.config.allowedRoot);
+    const file = selected.files.find((item) => item.path === path);
+    if (!file) return claudeNoticeCard("文件链接已失效", selected.skipped[0]?.reason ?? "文件已不存在或不允许发送。", "orange");
+    const before = await stat(file.path);
+    if (deliverableVersion(before) !== expectedVersion) return claudeNoticeCard("文件链接已失效", "文件自生成卡片后发生变化，请等待会话卡片刷新后再点。", "orange");
+    // Only read after callback identity/chat checks and all path/credential checks above.
+    const data = await readFile(file.path);
+    const after = await stat(file.path);
+    if (deliverableVersion(after) !== expectedVersion) return claudeNoticeCard("文件链接已失效", "读取期间文件发生变化，请等待卡片刷新后重试。", "orange");
+    const contentHash = createHash("sha256").update(data).digest("hex");
+    const uuidHash = createHash("sha256").update(`${session.sessionId}\0${file.path}\0${expectedVersion}\0${contentHash}\0${chatId}\0${rootId}`).digest("hex").slice(0, 32);
+    const requestUuid = `${uuidHash.slice(0, 8)}-${uuidHash.slice(8, 12)}-5${uuidHash.slice(13, 16)}-a${uuidHash.slice(17, 20)}-${uuidHash.slice(20, 32)}`;
+    const claim = this.db.claimFileDelivery(session.sessionId, turnId, file.path, expectedVersion, link.references, chatId, rootId, requestUuid);
+    if (claim === "sent") {
+      const sent = this.db.getFileDelivery(session.sessionId, turnId, file.path, expectedVersion, chatId, rootId)!;
+      const metadata = sent.fileMessageId ? await this.feishu.getMessageMetadata(sent.fileMessageId).catch(() => null) : null;
+      return claudeFileSentCard(basename(file.path), sent.fileMessageId ? metadata?.appLink ?? messageAppLink(chatId, sent.fileMessageId) : null);
+    }
+    if (claim === "sending") return claudeNoticeCard("正在发送", "这个文件版本已在发送中，请稍后再试。", "blue");
+    try {
+      const messageId = await this.feishu.replyFile(rootId, basename(file.path), data, { uuid: requestUuid });
+      if (!messageId) throw new Error("Feishu file reply returned no message ID");
+      this.db.completeFileDelivery(session.sessionId, turnId, file.path, expectedVersion, contentHash, chatId, rootId, messageId);
+      const metadata = await this.feishu.getMessageMetadata(messageId).catch(() => null);
+      return claudeFileSentCard(basename(file.path), metadata?.appLink ?? messageAppLink(chatId, messageId));
+    } catch (error) {
+      this.db.failFileDelivery(session.sessionId, turnId, file.path, expectedVersion, chatId, rootId, error);
+      throw error;
+    }
   }
 
   /** `/deliver <paths…>`: a card listing the files, then each file as an image or file message in the topic. */
@@ -1223,6 +1474,12 @@ export class ClaudeRuntime {
     if (this.paused()) { await reply("同步已暂停，恢复同步后才能从飞书继续对话（控制台“恢复同步”，或在群主消息中发送 /resume-sync）。"); return; }
     const interaction = this.interactions.forSession(session.sessionId);
     if (interaction && command) { await this.answerByText(interaction, command); return; }
+    if (this.remoteApprovals.hasSession(session.sessionId) && command) {
+      await this.remoteApprovals.cancelSession(session.sessionId, `用户在话题中回复：${command.slice(0, 300)}`);
+      await reply("当前工具请求已拒绝。请在电脑侧处理，或重新发起操作。");
+      this.refreshRoot(session.sessionId);
+      return;
+    }
     const later = command.startsWith(">>");
     const text = later ? command.slice(2).trim() : command;
     if (!text && !message.imageKeys.length) return;
@@ -1270,6 +1527,10 @@ export class ClaudeRuntime {
 
   private async handleCardAction(event: IncomingCardAction): Promise<CardActionOutcome> {
     if (event.openId !== this.boundOpenId() || event.chatId !== this.boundChatId()) return { delivery: "none" };
+    if (event.action.startsWith("remote_permission_")) {
+      const remote = await this.remoteApprovals.handleAction(event);
+      if (remote.handled) return remote.outcome;
+    }
     const value = (key: string) => typeof event.value[key] === "string" ? event.value[key] as string : "";
     const form = (key: string) => typeof event.formValues[key] === "string" ? (event.formValues[key] as string).trim() : "";
     const sessionId = value("sessionId");
@@ -1336,6 +1597,34 @@ export class ClaudeRuntime {
           await this.deliverFiles(session, [path]);
           return listing("已发送，文件在话题末尾。");
         }, () => claudeListCard(session, { kind: "error", message: "发送失败，详见话题里的提示。" }));
+      }
+      case "deliver_link": {
+        const path = value("path");
+        const version = value("version");
+        const turnId = value("turnId");
+        const session = this.db.getSession(sessionId);
+        if (!session || !path || !version || !turnId) return expired();
+        const key = `deliver-link:${sessionId}:${path}:${version}`;
+        if (this.linkedFileActions.has(key)) return { delivery: "toast", text: "正在处理，请稍候。", level: "info" };
+        this.linkedFileActions.add(key);
+        void (async () => {
+          let result: CardDefinition;
+          try { result = await this.deliverLinkedFile(session, turnId, event.openMessageId, path, version); }
+          catch (error) {
+            this.fail("deliver_link", { sessionId, path }, error);
+            result = claudeNoticeCard("发送失败", `没有记录为已发送，可再次点击原按钮重试。\n${errorText(error).slice(0, 160)}`, "red");
+          }
+          try {
+            const delivery = this.db.getFileDelivery(sessionId, turnId, path, version, session.chatId ?? "", session.rootMessageId ?? "");
+            const refreshed = delivery?.status === "sent"
+              ? await this.refreshTurnFileLinks(session, turnId, event.openMessageId)
+              : false;
+            if (!refreshed) await this.topicCard(sessionId, session.rootMessageId!, result);
+          }
+          catch (error) { this.fail("deliver_link_result", { sessionId }, error); }
+          finally { this.linkedFileActions.delete(key); }
+        })();
+        return { delivery: "toast", text: "正在校验并发送；完成结果会追加在本话题中。", level: "info" };
       }
       case "export_session": {
         const session = this.db.getSession(sessionId);

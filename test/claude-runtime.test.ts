@@ -5,9 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { configureCardUi } from "../src/card-kit.js";
 import type { ClaudeBridgeConfig } from "../src/claude/config.js";
-import { ClaudeBridgeDatabase } from "../src/claude/db.js";
+import { ClaudeBridgeDatabase, type ClaudeSession } from "../src/claude/db.js";
 import { projectFolderName } from "../src/claude/importer.js";
 import { ClaudeRuntime } from "../src/claude/runtime.js";
+import { permissionInputDigest, type PermissionHookRequest } from "../src/claude/permission-hook.js";
 import type { CardActionOutcome, CardDefinition, FeishuPort, IncomingFeishuMessage } from "../src/types.js";
 
 /** A callback outcome whose card, if any, can be read without narrowing first. */
@@ -31,16 +32,23 @@ class FakeFeishu implements FeishuPort {
   sent: Array<{ kind: "text" | "card"; text?: string; card?: CardDefinition }> = [];
   updated: Array<{ id: string; card: CardDefinition }> = [];
   rejectCard: ((card: CardDefinition) => boolean) | null = null;
+  failReplyTextRoots = new Set<string>();
+  failReplyFileRoots = new Set<string>();
+  failAllReplyFiles = false;
+  rootCreateDelay = 0;
+  failRootTitles = new Set<string>();
   private sequence = 0;
   private next(prefix: string): string { return `${prefix}-${++this.sequence}`; }
   async start(): Promise<void> {}
-  async createSessionRoot(chatId: string, _title: string, _detail: string, card?: CardDefinition) {
+  async createSessionRoot(chatId: string, title: string, _detail: string, card?: CardDefinition) {
+    if (this.rootCreateDelay) await new Promise((resolve) => setTimeout(resolve, this.rootCreateDelay));
+    if (this.failRootTitles.has(title)) throw new Error("mock root creation failure");
     const id = this.next("root");
     this.roots.push({ id, card });
     return { messageId: id, appLink: `https://example.test/${id}`, chatId, threadId: `thread-${id}` };
   }
-  async replyText(root: string, text: string): Promise<string> { const id = this.next("text"); this.replies.push({ root, kind: "text", id, text }); return id; }
-  async replyFile(root: string, name: string, data: Buffer): Promise<string> { const id = this.next("file"); this.replies.push({ root, kind: "file", id, name, data }); return id; }
+  async replyText(root: string, text: string): Promise<string> { if (this.failReplyTextRoots.has(root)) throw new Error("mock text delivery failure"); const id = this.next("text"); this.replies.push({ root, kind: "text", id, text }); return id; }
+  async replyFile(root: string, name: string, data: Buffer): Promise<string> { if (this.failAllReplyFiles || this.failReplyFileRoots.has(root)) throw new Error("mock file delivery failure"); const id = this.next("file"); this.replies.push({ root, kind: "file", id, name, data }); return id; }
   async replyImage(root: string, data: Buffer): Promise<string> { const id = this.next("image"); this.replies.push({ root, kind: "image", id, data }); return id; }
   async replyCard(root: string, card: CardDefinition): Promise<string> {
     if (this.rejectCard?.(card)) throw new Error("Feishu API 230099: card content is invalid");
@@ -359,11 +367,10 @@ test("a stalled turn is shown as unfinished, and a rejected tool panel falls bac
     await writeFile(env.path(RECENT), jsonl([prompt(RECENT, "r-p1", now - 2 * HOUR, "跑训练"), toolUse(RECENT, "r-t1", now - 2 * HOUR + MINUTE, "toolu_9", "python train.py")]));
     await env.bind();
     const cards = env.feishu.repliesTo(env.db.getSession(RECENT)!.rootMessageId!).filter((item) => item.kind === "card");
-    assert.equal(cards.length, 1);
+    assert.equal(cards.length, 2, "the rejected logical turn card is preserved as two readable fallback cards");
     assert.equal(title(cards[0]?.card), "Claude · 未完成");
-    assert.match(JSON.stringify(cards[0]?.card), /执行记录（1 项）/);
-    assert.doesNotMatch(JSON.stringify(cards[0]?.card), /collapsible_panel/);
-    assert.equal(env.db.getSetting("cards.simple_tools"), "1");
+    assert.match(JSON.stringify(cards.map((item) => item.card)), /执行记录（1 项）/);
+    assert.doesNotMatch(JSON.stringify(cards.map((item) => item.card)), /collapsible_panel/);
   } finally { await env.cleanup(); }
 });
 
@@ -823,6 +830,7 @@ test("an idle process exits and the next reply resumes the session; a crash is r
     await env.runtime.onFeishuMessage(env.message({ rootId: root, mentionedBot: false, text: "第一轮" }));
     const first = env.queries[0]!;
     first.result([(await first.nextMessage(1)).uuid!]);
+    first.emit({ type: "system", subtype: "background_tasks_changed", tasks: [], session_id: RECENT });
     // After RUNNER_IDLE_MS the input ends and the process exits; the root card no longer shows it.
     await waitUntil(() => rootCardOf(env, root).includes("飞书中已连接（空闲）") || !rootCardOf(env, root).includes("飞书中"));
     await waitUntil(() => !rootCardOf(env, root).includes("飞书中"));
@@ -851,5 +859,209 @@ test("a session continues in the directory it was started in, not where its shel
     assert.equal(session.cwd, env.project);
     await env.runtime.onFeishuMessage(env.message({ rootId: session.rootMessageId!, mentionedBot: false, text: "继续" }));
     assert.equal(env.queries[0]!.options.cwd, env.project);
+  } finally { await env.cleanup(); }
+});
+
+test("concurrent reminder sources create one subscription root", async () => {
+  const env = await setup("claude-reminder-concurrent-", [], { reminderSubscriptionEnabled: true });
+  try {
+    const now = Date.now();
+    for (const id of [RECENT, FRESH]) await writeFile(env.path(id), jsonl(atCwd([prompt(id, `${id}-p`, now - HOUR, "问题"), reply(id, `${id}-a`, now - HOUR + MINUTE, "回答")], env.project)));
+    await env.bind();
+    env.db.deleteSetting("notification.subscription.chat_id");
+    env.db.deleteSetting("notification.subscription.root_message_id");
+    env.feishu.rootCreateDelay = 25;
+    const internals = env.runtime as unknown as { routeSessionReminder(session: NonNullable<ReturnType<typeof env.db.getSession>>, id: string, text: string): Promise<boolean> };
+    const results = await Promise.all([RECENT, FRESH].map((id) => internals.routeSessionReminder(env.db.getSession(id)!, `waiting:${id}`, "等待处理")));
+    assert.deepEqual(results, [true, true]);
+    assert.equal(env.feishu.roots.filter((root) => title(root.card) === "Claude 提醒订阅").length, 2,
+      "one initial subscription root plus one replacement root after clearing the saved mapping");
+  } finally { await env.cleanup(); }
+});
+
+test("an optional subscription root failure does not block session sync", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const env = await setup("claude-reminder-start-failure-", [], { reminderSubscriptionEnabled: true });
+  try {
+    env.feishu.failRootTitles.add("Claude 提醒订阅");
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "start-p", now - MINUTE, "同步继续"), reply(RECENT, "start-a", now, "完成")], env.project)));
+    await env.bind();
+    assert.ok(env.db.getSession(RECENT)?.rootMessageId);
+    assert.ok(env.feishu.roots.some((root) => root.id === env.db.getSession(RECENT)?.rootMessageId));
+    assert.equal(env.feishu.roots.some((root) => title(root.card) === "Claude 提醒订阅"), false);
+  } finally { await env.cleanup(); }
+});
+
+test("reminder fallback success is persisted and a replay does not send again", async () => {
+  const env = await setup("claude-reminder-fallback-", [], { reminderSubscriptionEnabled: true });
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "rem-p", now - HOUR, "问题"), reply(RECENT, "rem-a", now - HOUR + MINUTE, "回答")], env.project)));
+    await env.bind();
+    const session = env.db.getSession(RECENT)!;
+    const subscription = env.feishu.roots.find((root) => title(root.card) === "Claude 提醒订阅")!;
+    env.feishu.failReplyTextRoots.add(subscription.id);
+    const internals = env.runtime as unknown as { routeSessionReminder(session: ClaudeSession, id: string, text: string): Promise<boolean> };
+    assert.equal(await internals.routeSessionReminder(session, "waiting:123", "等待处理"), true);
+    const sourceReplies = env.feishu.repliesTo(session.rootMessageId!).length;
+    assert.equal(env.db.getReminderDelivery(RECENT, "waiting:123")?.status, "sent");
+    assert.equal(await internals.routeSessionReminder(session, "waiting:123", "等待处理"), true);
+    assert.equal(env.feishu.repliesTo(session.rootMessageId!).length, sourceReplies);
+    const row = env.db.db.prepare("SELECT destination FROM reminder_deliveries WHERE session_id=? AND reminder_id=?").get(RECENT, "waiting:123") as { destination: string };
+    assert.equal(row.destination, "source_topic");
+  } finally { await env.cleanup(); }
+});
+
+test("failed subscription and fallback delivery retain failure evidence and stop replays", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const env = await setup("claude-reminder-failed-", [], { reminderSubscriptionEnabled: true });
+  try {
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "fail-p", now - HOUR, "问题"), reply(RECENT, "fail-a", now - HOUR + MINUTE, "回答")], env.project)));
+    await env.bind();
+    const session = env.db.getSession(RECENT)!;
+    const subscription = env.feishu.roots.find((root) => title(root.card) === "Claude 提醒订阅")!;
+    env.feishu.failReplyTextRoots.add(subscription.id);
+    env.feishu.failReplyTextRoots.add(session.rootMessageId!);
+    const internals = env.runtime as unknown as { routeSessionReminder(session: ClaudeSession, id: string, text: string): Promise<boolean> };
+    const before = env.feishu.replies.length;
+    assert.equal(await internals.routeSessionReminder(session, "waiting:456", "等待处理"), false);
+    assert.equal(env.db.getReminderDelivery(RECENT, "waiting:456")?.status, "permanent_failed");
+    const evidence = env.db.db.prepare("SELECT error FROM reminder_deliveries WHERE session_id=? AND reminder_id=?").get(RECENT, "waiting:456") as { error: string };
+    assert.match(evidence.error, /mock text delivery failure/);
+    assert.equal(await internals.routeSessionReminder(session, "waiting:456", "等待处理"), false);
+    assert.equal(env.feishu.replies.length, before);
+  } finally { await env.cleanup(); }
+});
+
+test("ended backlog turns share one durable summary while a running turn stays individual", async () => {
+  const env = await setup("claude-backlog-runtime-");
+  try {
+    const now = Date.now();
+    const backlog = Array.from({ length: 10 }, (_, index) => [
+      prompt(RECENT, `bg-p${index + 1}`, now - (30 - index * 2) * 10_000, `积压问题${index + 1}`),
+      reply(RECENT, `bg-a${index + 1}`, now - (29 - index * 2) * 10_000, `积压回答${index + 1}`),
+    ]).flat();
+    await writeFile(env.path(RECENT), jsonl([...backlog,
+      prompt(RECENT, "bg-p11", now - 10_000, "仍在运行的问题"), toolUse(RECENT, "bg-t11", now - 5_000, "toolu_bg", "python train.py")]));
+    await env.bind();
+    const session = env.db.getSession(RECENT)!;
+    const replies = env.feishu.repliesTo(session.rootMessageId!);
+    const cards = replies.filter((item) => item.kind === "card");
+    const files = replies.filter((item) => item.kind === "file");
+    assert.equal(cards.length, 2, "one backlog summary card plus the still-running turn card");
+    assert.match(title(cards[0]?.card), /待处理积压 · 10 项/);
+    assert.match(title(cards[1]?.card), /进行中/);
+    assert.equal(files.length, 1);
+    assert.match(files[0]?.data?.toString("utf8") ?? "", /积压问题1[\s\S]*积压回答1[\s\S]*积压问题10[\s\S]*积压回答10/);
+    const batches = env.db.backlogBatches(RECENT);
+    assert.equal(batches.length, 0, "a completed batch is no longer queued for delivery");
+    assert.equal(env.db.backlogMemberTurnIds(RECENT).length, 10);
+    assert.deepEqual(env.db.turnsToRender(RECENT).map((turn) => turn.turnId), ["bg-p11"]);
+  } finally { await env.cleanup(); }
+});
+
+test("a small number of ended turns still render as individual turns", async () => {
+  const env = await setup("claude-backlog-small-");
+  try {
+    const now = Date.now();
+    const records = Array.from({ length: 3 }, (_, index) => [
+      prompt(RECENT, `sm-p${index + 1}`, now - (8 - index * 2) * MINUTE, `普通问题${index + 1}`),
+      reply(RECENT, `sm-a${index + 1}`, now - (7 - index * 2) * MINUTE, `普通回答${index + 1}`),
+    ]).flat();
+    await writeFile(env.path(RECENT), jsonl(records));
+    await env.bind();
+    const root = env.db.getSession(RECENT)!.rootMessageId!;
+    assert.equal(env.db.backlogMemberTurnIds(RECENT).length, 0);
+    assert.deepEqual(env.feishu.repliesTo(root).filter((item) => item.kind === "card").map((item) => title(item.card)), [
+      "Claude · 已完成 · 用时 1分", "Claude · 已完成 · 用时 1分", "Claude · 已完成 · 用时 1分",
+    ]);
+  } finally { await env.cleanup(); }
+});
+
+test("backlog retries a failed markdown attachment without duplicating its persisted card", async () => {
+  const env = await setup("claude-backlog-retry-");
+  try {
+    const now = Date.now();
+    const records = Array.from({ length: 10 }, (_, index) => [
+      prompt(RECENT, `br-p${index + 1}`, now - (30 - index * 2) * 10_000, `失败重试${index + 1}`),
+      reply(RECENT, `br-a${index + 1}`, now - (29 - index * 2) * 10_000, `完整回答${index + 1}`),
+    ]).flat();
+    await writeFile(env.path(RECENT), jsonl(records));
+    env.feishu.failAllReplyFiles = true;
+    await env.bind();
+    const session = env.db.getSession(RECENT)!;
+    const batch = env.db.backlogBatches(RECENT)[0];
+    assert.ok(batch?.cardMessageId);
+    assert.equal(batch.markdownMessageId, null);
+    const summaryCardsBefore = env.feishu.repliesTo(session.rootMessageId!).filter((item) => item.kind === "card" && title(item.card).startsWith("待处理积压")).length;
+    assert.equal(summaryCardsBefore, 1);
+    env.feishu.failAllReplyFiles = false;
+    // Retry explicitly against the persisted topic.
+    await env.runtime.renderSession(RECENT);
+    assert.equal(env.feishu.repliesTo(session.rootMessageId!).filter((item) => item.kind === "card" && title(item.card).startsWith("待处理积压")).length, 1);
+    assert.equal(env.db.backlogBatches(RECENT).length, 0);
+    assert.equal(env.feishu.repliesTo(session.rootMessageId!).filter((item) => item.kind === "card" && title(item.card).startsWith("待处理积压")).length, 1);
+    assert.equal(env.feishu.repliesTo(session.rootMessageId!).filter((item) => item.kind === "file").length, 1);
+  } finally { await env.cleanup(); }
+});
+
+test("permission socket requests require a known in-scope session and never use transcript_path", async () => {
+  const env = await setup("claude-runtime-hook-scope-");
+  try {
+    env.config.syncDirs = [env.project];
+    const now = Date.now();
+    await writeFile(env.path(RECENT), jsonl(atCwd([prompt(RECENT, "hook-p", now - MINUTE, "权限测试"), reply(RECENT, "hook-a", now, "已索引")], env.project)));
+    await env.bind();
+    const internals = env.runtime as unknown as { handlePermissionHookRequest(request: PermissionHookRequest, signal: AbortSignal): Promise<PermissionHookRequest & { decision: { behavior: string } }> };
+    const makeRequest = (sessionId: string): PermissionHookRequest => {
+      const input = { hook_event_name: "PermissionRequest" as const, session_id: sessionId, cwd: env.project,
+        transcript_path: "/etc/passwd", tool_name: "Read", tool_input: { file_path: join(env.project, "README.md") } };
+      return { requestId: "4bf8c110-c1f4-407c-a0ea-665359376ba8", inputDigest: permissionInputDigest(input), input };
+    };
+    const unknown = await internals.handlePermissionHookRequest(makeRequest("dddddddd-dddd-4ddd-8ddd-dddddddddddd"), new AbortController().signal);
+    assert.equal(unknown.decision.behavior, "deny");
+    const liveRequest = makeRequest(RECENT);
+    const pending = internals.handlePermissionHookRequest(liveRequest, new AbortController().signal);
+    await waitUntil(() => env.feishu.replies.some((item) => item.kind === "card" && title(item.card).startsWith("工具审批")));
+    const approval = env.feishu.replies.find((item) => item.kind === "card" && title(item.card).startsWith("工具审批"))!.card;
+    const findButton = (value: unknown, target: string): { action: string; value: Record<string, unknown> } | null => {
+      if (!value || typeof value !== "object") return null;
+      if (Array.isArray(value)) { for (const child of value) { const found = findButton(child, target); if (found) return found; } return null; }
+      const object = value as Record<string, unknown>;
+      if (object.action === target && object.value && typeof object.value === "object") return object as { action: string; value: Record<string, unknown> };
+      if (Array.isArray(object.behaviors)) for (const behavior of object.behaviors) {
+        if (behavior && typeof behavior === "object") {
+          const item = behavior as Record<string, unknown>;
+          if (item.type === "callback" && item.value && typeof item.value === "object"
+            && (item.value as Record<string, unknown>).action === target) return { action: target, value: item.value as Record<string, unknown> };
+        }
+      }
+      for (const child of Object.values(object)) { const found = findButton(child, target); if (found) return found; }
+      return null;
+    };
+    const approvalMessage = env.feishu.replies.find((item) => item.card === approval)!;
+    const review = findButton(approval, "remote_permission_review");
+    if (review) {
+      await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: approvalMessage.id, action: review.action, value: review.value, formValues: {} });
+      await waitUntil(() => env.feishu.updated.some((item) => item.id === approvalMessage.id && title(item.card).includes("最终确认")));
+      const confirmation = env.feishu.updated.find((item) => item.id === approvalMessage.id && title(item.card).includes("最终确认"))!.card;
+      const confirm = findButton(confirmation, "remote_permission_confirm");
+      assert.ok(confirm);
+      const outcome = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: approvalMessage.id, action: confirm.action, value: confirm.value, formValues: {} });
+      assert.equal(outcome.delivery, "toast");
+    } else {
+      const allow = findButton(approval, "remote_permission_allow");
+      assert.ok(allow);
+      const outcome = await env.runtime.onCardAction({ openId: "user-1", chatId: "chat-1", openMessageId: approvalMessage.id, action: allow.action, value: allow.value, formValues: {} });
+      assert.equal(outcome.delivery, "toast");
+    }
+    const allowed = await pending;
+    assert.equal(allowed.decision.behavior, "allow");
+    assert.deepEqual((allowed.decision as { updatedInput?: unknown }).updatedInput, { file_path: join(env.project, "README.md") });
+    env.db.setSetting("sync.paused", "1");
+    const paused = await internals.handlePermissionHookRequest(makeRequest(RECENT), new AbortController().signal);
+    assert.equal(paused.decision.behavior, "deny");
   } finally { await env.cleanup(); }
 });
