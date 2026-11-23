@@ -75,6 +75,7 @@ const PENDING_QUERY_PROVIDERS = new Set(['all', 'claude', 'codex', 'agy', 'decis
 const WAVE2_BINDING_EXEMPT_ACTIONS = new Set([
   'bind',
   'list',
+  'new_help',
   'finish',
   'inspect_unknown',
   'create',
@@ -166,6 +167,7 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     case 'panel': if ((value.sessionId === undefined || str(value.sessionId)) && (value.turnId === undefined || str(value.turnId)) && (value.inputId === undefined || str(value.inputId))) return {action:'panel',...(str(value.sessionId) ? {sessionId:value.sessionId}:{}),...(str(value.turnId) ? {turnId:value.turnId}:{}),...(str(value.inputId) ? {inputId:value.inputId}:{})}; break;
     case 'inspect_unknown': if(str(value.operationId)&&(value.cursor===undefined||str(value.cursor))&&(value.nativeId===undefined||str(value.nativeId))&&!(value.cursor&&value.nativeId))return {action:'inspect_unknown',operationId:value.operationId,...(str(value.cursor)?{cursor:value.cursor}:{}),...(str(value.nativeId)?{nativeId:value.nativeId}:{})};break;
     case 'list': if ((value.cursor === undefined || str(value.cursor)) && (value.search === undefined || str(value.search)) && (value.provider === undefined || value.provider === 'all' || value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy')) return {action:'list',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(str(value.search) ? {search:value.search}:{}),...(value.provider !== undefined ? {provider:value.provider}:{})}; break;
+    case 'new_help': return {action:'new_help'};
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
@@ -305,7 +307,15 @@ export function parseFeishuText(text: string): ChannelAction {
   if (!input.startsWith('/')) return {action:'input',text:input,mode:'new'};
   const [command, ...parts] = input.split(/\s+/); const rest = parts.join(' ');
   switch (command) {
-    case '/help': return {action:'help'};
+    case '/help': {
+      if (parts.length === 0) return {action:'help'};
+      if (parts.length === 1 && parts[0] === 'admin') return {action:'help',scope:'admin'};
+      break;
+    }
+    case '/swarm': {
+      const prompt = input.slice(command!.length).trim();
+      return {action:'swarm',prompt,rawText:input};
+    }
     case '/new': return {action:'new_help'};
     case '/sessions': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/candidates': if(parts.length===1||parts.length===2)return {action:'inspect_unknown',operationId:parts[0]!,...(parts[1]?{nativeId:parts[1]}:{})};break;

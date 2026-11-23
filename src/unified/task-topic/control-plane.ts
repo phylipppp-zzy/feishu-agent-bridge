@@ -93,8 +93,7 @@ export async function handleTaskControlAction(
         title: '任务话题已创建',
         text: [
           `标题: ${action.title}`,
-          `任务 ID: ${created.taskId}`,
-          '进入任务话题后可发送 /task mount <sessionId> [read_only|interactive] 挂载会话。',
+          '点击下方按钮进入任务话题，在话题内发送 /task 可管理后端目标，发送 /help 查看全部命令。',
         ].join('\n'),
         actions: topicUrl ? [{ label: '打开任务话题', value: {}, url: topicUrl }] : [],
       },

@@ -133,6 +133,15 @@ export type TaskChannelAction = (
       action: 'panel';
     }
   | {
+      action: 'help';
+      scope?: 'admin';
+    }
+  | {
+      action: 'swarm';
+      prompt: string;
+      rawText: string;
+    }
+  | {
       action: 'history';
       targetId?: string;
       targetGeneration?: number;

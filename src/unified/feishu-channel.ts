@@ -10,6 +10,15 @@ import { sessionListCard } from './session-list-card.js';
 import { interactionCard, operationCard, providerDisplayLabel, sessionCard, type ChannelCard } from './feishu-cards.js';
 import { buildHealthCard } from './health-card.js';
 import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
+import {
+  buildAdminHelpCard,
+  buildMainChatTopicOnlyGuidanceCard,
+  buildMainHelpCard,
+  buildModelsCard,
+  buildSessionHelpCard,
+  buildSwarmReadOnlyAgyCard,
+  buildSwarmUnsupportedCard,
+} from './help-cards.js';
 
 /** Identity and destination must come from an authenticated, verified transport envelope. */
 export interface TrustedEnvelope { eventId: string; destination: string; identity: Identity; cardMessageId?: string }
@@ -57,7 +66,8 @@ export type ChannelAction = (
  | { action: 'attachment'; name: string; mediaType: string; content: Uint8Array; mode: 'new' | 'queue' | 'steer' }
  | { action: 'models'; cursor?: string }
  | { action: 'legacy_model'; model?: string; effort?: string; invalid?: boolean }
- | { action: 'help' }
+ | { action: 'help'; scope?: 'admin' }
+ | { action: 'swarm'; prompt: string; rawText: string }
  | { action: 'new_help' }
  | { action: 'settings'; model: string | null; preferences: Record<string, string>; revision: number; controlGeneration: number }
  | { action: 'notifications'; enabled: boolean; eventTypes: string[]; revision: number; controlGeneration: number }
@@ -281,7 +291,7 @@ export class FeishuChannel {
   private stampCard(destination:string, card:ChannelCard): ChannelCard {
     const row=this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(destination) as {binding_id:string} | undefined;
     if (!row) return card;
-    return {...card,actions:card.actions.map(action => ['list'].includes(String(action.value.action)) ? action : {...action,value:{...action.value,bindingId:row.binding_id}})};
+    return {...card,actions:card.actions.map(action => ['list','new_help'].includes(String(action.value.action)) ? action : {...action,value:{...action.value,bindingId:row.binding_id}})};
   }
   private async deliver(destination: string, card: ChannelCard, id: string, guard?:()=>Promise<void>): Promise<string | void> {
     await guard?.();
@@ -400,7 +410,7 @@ export class FeishuChannel {
       const result={status:'rejected',reason:'read_only_binding'};
       this.db.exec('BEGIN IMMEDIATE');
       try { this.db.prepare("UPDATE channel_inbox SET state='rejected' WHERE event_id=? AND state='received'").run(eventId); this.db.prepare("UPDATE channel_receipts SET state='rejected',result=? WHERE event_id=?").run(JSON.stringify(result),eventId); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
-      await this.deliver(e.destination,{title:'操作未执行',text:'此话题为只读，不能执行此操作。可在本话题打开会话控制并选择转为可交互。',actions:[{label:'会话控制',value:{action:'panel',sessionId:bound}}]},`${eventId}:readonly-rejected`);
+      await this.deliver(e.destination,{title:'操作未执行',text:'此话题为只读，不能执行此操作。可在本话题打开会话控制并选择转为可交互。',actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},{label:'会话控制',value:{action:'panel',sessionId:bound}}]},`${eventId}:readonly-rejected`);
       return result;
     }
     if (bound && a.action === 'attach') throw new Error('use upgrade for a bound destination');
@@ -467,7 +477,16 @@ export class FeishuChannel {
     };
     if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片和 UTF-8 文本附件。',size:'文本附件为空或超过 1 MiB，未提交。',encoding:'文本附件不是有效 UTF-8 或包含 NUL，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
     if (a.action === 'task_create' || a.action === 'task_mount' || a.action === 'task_panel' || a.action === 'handoff_preview') { throw contractError('unsupported', 'action is unavailable for this destination'); }
-    if (a.action === 'help') { await reply({title:'帮助',text:'会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；Codex 当前唯一运行轮追加输入：/steer 内容；中断当前回复：/stop；后台任务是否终止尚未确认。',actions:[]}); return {status:'guidance'}; }
+    if (a.action === 'help') {
+      if (a.scope === 'admin') { await reply(buildAdminHelpCard()); return {status:'guidance'}; }
+      if (bound && typeof this.service.getSession === 'function') {
+        const boundSession = await this.service.getSession(bound);
+        await reply(buildSessionHelpCard(boundSession.native.provider, this.accessMode(e.destination)));
+        return {status:'guidance'};
+      }
+      await reply(buildMainHelpCard());
+      return {status:'guidance'};
+    }
     if (a.action === 'new_help') {
       const defaultProject = this.channelOptions.defaultCreateProject?.trim() || undefined;
       const text = defaultProject
@@ -597,7 +616,10 @@ export class FeishuChannel {
       }
       throw new Error('operation result mismatch');
     }
-    if (!bound && (a.action === 'models' || a.action === 'legacy_model')) { await reply({title:'模型',text:'请进入已绑定的会话话题后发送 /model。',actions:[]}); return {status:'guidance'}; }
+    if (!bound && ['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','history','swarm'].includes(a.action)) {
+      await reply(buildMainChatTopicOnlyGuidanceCard(a.action === 'swarm'));
+      return {status:'guidance'};
+    }
     if (!bound) throw new Error('destination is not bound');
     const session = await this.service.getSession(bound);
     const current = () => this.context(e, bound, session.revision, session.control.generation);
@@ -673,10 +695,15 @@ export class FeishuChannel {
       if (a.action === 'legacy_model' && a.invalid) { await reply({title:'模型',text:'格式：/model <模型> <思考强度>；发送 /model 查看选项。',actions:[]}); return {status:'guidance'}; }
       if (a.action === 'legacy_model' && a.model && a.effort) { const op=await this.service.updateSessionSettings({context:current(),payload:{model:a.model,preferences:{reasoningEffort:a.effort}}}); await reply(operationCard(op)); return op; }
       const page = await this.service.listModels(bound, {limit:100,...(a.action === 'models' && a.cursor ? {cursor:a.cursor}:{})}); const confirmed=await this.service.getConfirmedSettings?.(bound) ?? null;
-      const status=confirmed ? `已提交的下一轮设置（请求值）：${confirmed.model ?? '默认'}${confirmed.preferences.reasoningEffort ? ' / '+confirmed.preferences.reasoningEffort : ''}；实际模型与强度以原生运行结果及策略为准。` : '尚无已提交的下一轮设置；实际模型与强度以原生运行结果及策略为准。';
-      const actions=page.items.flatMap(m => m.reasoningEfforts?.length ? m.reasoningEfforts.map(effort=>({label:`${m.label} / ${effort}`,value:{action:'settings',model:m.id,preferences:{reasoningEffort:effort},revision:session.revision,controlGeneration:session.control.generation}})) : [{label:m.label,value:{action:'settings',model:m.id,preferences:{},revision:session.revision,controlGeneration:session.control.generation}}]);
-      if (page.nextCursor) actions.push({label:'下一页',value:{action:'models',cursor:page.nextCursor} as any});
-      await reply({title:'模型',text:status+'\n'+page.items.map(m => `${m.label}${m.reasoningEfforts?.length ? '：'+m.reasoningEfforts.join('、') : ''}`).join('\n'),actions}); return page;
+      await reply(buildModelsCard({provider:session.native.provider,items:page.items,nextCursor:page.nextCursor,confirmed,revision:session.revision,controlGeneration:session.control.generation})); return page;
+    }
+    if (a.action === 'swarm') {
+      if (session.native.provider !== 'agy') { await reply(buildSwarmUnsupportedCard()); return {status:'rejected',reason:'unsupported'}; }
+      if (this.accessMode(e.destination) === 'read_only') { await reply(buildSwarmReadOnlyAgyCard()); return {status:'rejected',reason:'read_only_binding'}; }
+      const swarmOp = await this.service.submitInput({context:current(),mode:'new',blocks:[{type:'text',text:a.rawText}]});
+      if (swarmOp.status !== 'queued' && swarmOp.status !== 'failed' && swarmOp.status !== 'unknown') return swarmOp;
+      const card = operationCard(swarmOp); if (swarmOp.status === 'queued') card.actions.push({label:'查看排队',value:{action:'panel'}});
+      await reply(card); return swarmOp;
     }
     if (a.action === 'reconcile') { const op = await this.service.getOperation(a.operationId); if (op.targetId !== bound) throw new Error('operation target mismatch'); const result = await this.service.reconcile(a.operationId); await reply(operationCard(result)); return result; }
     if(a.action==='stop' && this.service.getTurn) {await guard();const turn=await this.service.getTurn(bound,a.turnId);await guard();if(turn && ['completed','failed','interrupted'].includes(turn.status)) {const label:Record<string,string>={completed:'已完成',failed:'已失败',interrupted:'已中断'};let text=`目标轮次${label[turn.status]}，未再次发出中断。`;if(turn.status==='interrupted'){const result=await this.service.inspectTurnResidual?.(bound,a.turnId);await guard();text+=`\n残留核对：${result?.reason ?? '此provider未提供可信残留查询'}${result?.count==null?'':`（${result.count}项）`}${result?.observedAt?`；核对时间 ${result.observedAt}`:''}`;}await reply({title:'中断回复',text,actions:[]});return {status:'already_finished',turnStatus:turn.status};}}

@@ -86,6 +86,9 @@ async function loadOwnerConfig(configPath, validateRuntimeConfig) {
   if (!info.isFile()) {
     throw new Error('config path must be a regular file');
   }
+  if ((info.mode & 0o077) !== 0) {
+    throw new Error('config file must have private permissions (0600)');
+  }
   if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
     throw new Error('config file must be owned by the current user');
   }

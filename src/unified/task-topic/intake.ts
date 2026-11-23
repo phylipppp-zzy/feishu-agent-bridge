@@ -129,7 +129,7 @@ export function resolveTargetForIntake(
   }
 
   if (!binding.active_target_id) {
-    if (a.action === 'panel') {
+    if (a.action === 'panel' || a.action === 'help') {
       return {
         task_id: binding.task_id,
         target_id: '',

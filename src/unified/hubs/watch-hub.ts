@@ -78,6 +78,7 @@ export class WatchHub {
     this.now = options.now ?? (() => Date.now());
 
     this.db = new DatabaseSync(options.dbPath);
+    this.db.exec('PRAGMA busy_timeout = 5000;');
     this.db.exec(`
       PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS watch_hub_roots_v1 (

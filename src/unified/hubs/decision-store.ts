@@ -64,6 +64,7 @@ export class DecisionSyncStore {
     this.now = options.now ?? (() => Date.now());
 
     this.db = new DatabaseSync(options.dbPath);
+    this.db.exec('PRAGMA busy_timeout = 5000;');
     this.db.exec(`
       PRAGMA journal_mode=WAL;
       PRAGMA foreign_keys=ON;

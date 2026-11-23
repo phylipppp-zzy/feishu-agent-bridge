@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -508,6 +508,7 @@ test('scripts/wave2-operator.mjs watch-ingest, decision-create, and decision-lis
   const cfgPath = join(dir, 'config.json');
   const runtimeConfig = makeConfig(dir, projectDir);
   writeFileSync(cfgPath, JSON.stringify({ runtime: runtimeConfig, sdkDb: join(dir, 'sdk.sqlite') }, null, 2));
+  chmodSync(cfgPath, 0o600);
 
   const scriptPath = resolve('scripts/wave2-operator.mjs');
   const runCli = (args: string[]) =>

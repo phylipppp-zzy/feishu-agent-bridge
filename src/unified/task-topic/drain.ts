@@ -16,6 +16,12 @@ import {
 } from '../feishu-cards.js';
 import { decodeQuestionForm } from '../feishu-question-forms.js';
 import type { FeishuPort, TrustedEnvelope } from '../feishu-channel.js';
+import {
+  buildAdminHelpCard,
+  buildModelsCard,
+  buildSwarmUnsupportedCard,
+  buildTaskTopicHelpCard,
+} from '../help-cards.js';
 import { taskPanelCard } from './cards.js';
 import { getBindingRow, getTargetRow } from './schema.js';
 import {
@@ -128,7 +134,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       return { ok: false, status: 'expired', reason: 'task_binding_changed' };
     }
 
-    if (a.action === 'panel' && row.target_id === '') {
+    if ((a.action === 'panel' || a.action === 'help') && row.target_id === '') {
       const allowed = await deps.authorize(e.identity, e.destination, null);
       if (!allowed) return { ok: false, status: 'rejected', reason: 'unauthorized' };
       return { ok: true, binding, target: null };
@@ -238,6 +244,57 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       activeRevision: check.binding.active_revision,
       targets,
     });
+  }
+
+  if (a.action === 'help') {
+    const claim = deps.db
+      .prepare("UPDATE task_inbox_scope_v1 SET state = 'unknown' WHERE event_id = ? AND state = 'received'")
+      .run(eventId);
+    if (!claim.changes) return { status: 'unknown' };
+    const card =
+      a.scope === 'admin'
+        ? buildAdminHelpCard()
+        : buildTaskTopicHelpCard(check.target?.provider ?? null);
+    await deliverTaskCard(deps, e.destination, row.task_id, check.target?.target_id ?? null, card, `${eventId}:help`);
+    return finalize('completed', { status: 'guidance' });
+  }
+
+  if (a.action === 'swarm') {
+    const swarmTarget = check.target!;
+    if (swarmTarget.provider !== 'agy') {
+      const claim = deps.db
+        .prepare("UPDATE task_inbox_scope_v1 SET state = 'unknown' WHERE event_id = ? AND state = 'received'")
+        .run(eventId);
+      if (!claim.changes) return { status: 'unknown' };
+      await deliverTaskCard(
+        deps,
+        e.destination,
+        row.task_id,
+        row.target_id,
+        buildSwarmUnsupportedCard(),
+        `${eventId}:swarm-unsupported`,
+      );
+      return finalize('rejected', { status: 'rejected', reason: 'unsupported' });
+    }
+    if (swarmTarget.access_mode !== 'interactive') {
+      const claim = deps.db
+        .prepare("UPDATE task_inbox_scope_v1 SET state = 'unknown' WHERE event_id = ? AND state = 'received'")
+        .run(eventId);
+      if (!claim.changes) return { status: 'unknown' };
+      await deliverTaskCard(
+        deps,
+        e.destination,
+        row.task_id,
+        row.target_id,
+        {
+          title: `${providerTitlePrefix(swarmTarget.provider)} · 无法启动 /swarm`,
+          text: '此 Antigravity 目标当前为只读模式，无法直接启动 /swarm。请先挂载或切换到可交互的 Antigravity 目标。',
+          actions: [],
+        },
+        `${eventId}:swarm-readonly`,
+      );
+      return finalize('rejected', { status: 'rejected', reason: 'read_only_target', targetId: row.target_id });
+    }
   }
 
   if (a.action === 'resource_rejected') {
@@ -351,6 +408,13 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
               expectedConnectionGeneration: payload.steer_connection_generation!,
             }
           : {}),
+      });
+      result = op;
+    } else if (a.action === 'swarm') {
+      const op = await deps.service.submitInput({
+        context: makeContext(session.revision, session.control.generation),
+        mode: 'new',
+        blocks: [{ type: 'text', text: a.rawText }],
       });
       result = op;
     } else if (a.action === 'answer') {
@@ -528,11 +592,23 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         e.destination,
         row.task_id,
         row.target_id,
-        {
+        buildModelsCard({
+          provider: target.provider,
+          items: page.items,
+          nextCursor: page.nextCursor,
+          revision: session.revision,
+          controlGeneration: session.control.generation,
+          readOnly: target.access_mode !== 'interactive',
           title: `${label} · 模型`,
-          text: page.items.map((m) => m.label).join('\n') || '暂无可选模型。',
-          actions: [],
-        },
+          taskScope: {
+            taskId: row.task_id,
+            rootGeneration: row.root_generation,
+            activeRevision: check.binding.active_revision,
+            targetId: row.target_id,
+            targetGeneration: row.target_generation,
+            sessionId: row.session_id,
+          },
+        }),
         `${eventId}:models`,
       );
       result = page;
