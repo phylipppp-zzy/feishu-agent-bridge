@@ -878,7 +878,11 @@ export class PendingHub {
         actions,
       };
       if (item.interaction.kind !== 'approval') {
-        card.form = questionForm(item.interaction, hubBindingId, false, this.now());
+        card.form = questionForm(item.interaction, hubBindingId, false, this.now(), {
+          entry: entryPoint,
+          category: item.category,
+          sourceSessionId: item.sourceSessionId,
+        });
       }
       return card;
     }
@@ -911,8 +915,7 @@ export class PendingHub {
     };
   }
 
-  async buildSummaryCard(query: PendingQuery = {}, nowMs = this.now()): Promise<ChannelCard> {
-    const page = await this.listPending(query, nowMs);
+  formatSummaryCard(page: PendingPage, query: PendingQuery = {}): ChannelCard {
     const headerLine = [
       `模型问答: ${page.countsByCategory.question} 项`,
       `工具权限: ${page.countsByCategory.approval} 项`,
@@ -949,6 +952,33 @@ export class PendingHub {
       text: `${headerLine}\n${providerLine}\n\n${itemLines.join('\n')}`,
       actions,
     };
+  }
+
+  async buildSummaryCard(query: PendingQuery = {}, nowMs = this.now()): Promise<ChannelCard> {
+    const page = await this.listPending(query, nowMs);
+    return this.formatSummaryCard(page, query);
+  }
+
+  async renderPage(
+    envelope: PendingEnvelope & { cardMessageId?: string },
+    query: PendingQuery = {},
+    nowMs = this.now(),
+  ): Promise<PendingPage> {
+    await this.checkEnvelopeAuth('hub', envelope, 'hub:page', null);
+    const page = await this.listPending(query, nowMs);
+    const card = this.formatSummaryCard(page, query);
+    const deliveryId = `pending-page:${payloadDigest([
+      envelope.eventId,
+      envelope.destination,
+      envelope.cardMessageId ?? null,
+      query,
+    ])}`;
+    if (envelope.cardMessageId) {
+      await this.port.update(envelope.destination, envelope.cardMessageId, card, deliveryId);
+    } else {
+      await this.port.send(envelope.destination, card, deliveryId);
+    }
+    return page;
   }
 
   private async deliverOnce(

@@ -35,9 +35,15 @@ export interface WatchHubRuntimeConfig { enabled:boolean; destination:string; db
 export interface PendingHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
 export interface DecisionSyncRuntimeConfig { enabled:boolean; dbPath?:string; markdownPath?:string; protectedReadOnlyPaths?:string[] }
 export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string;showTitles?:boolean}; taskTopic?:{enabled:boolean}; watchHub?:WatchHubRuntimeConfig; pendingHub?:PendingHubRuntimeConfig; decisionSync?:DecisionSyncRuntimeConfig; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
+export type PendingHubEntry = 'hub' | 'source' | 'pending_hub';
 export type RuntimeTrustedAction =
   | ChannelAction
   | TaskChannelAction
+  | (Extract<ChannelAction, { action: 'answer' | 'answer_form' }> & {
+      entry?: PendingHubEntry;
+      sourceSessionId?: string;
+      category?: 'question' | 'approval';
+    })
   | {
       action: 'confirm_handoff';
       handoffId: string;
@@ -54,7 +60,9 @@ export type RuntimeTrustedAction =
       selectedOptionId?: string | null;
       freeText?: string | null;
       rawUtterance?: string;
-      entry?: 'hub' | 'source';
+      entry?: PendingHubEntry;
+      category?: 'business_decision' | 'execution_auth';
+      sourceSessionId?: string;
       bindingId?: string;
     }
   | {
@@ -278,6 +286,9 @@ export class UnifiedRuntime {
           throw new TaskHandoffError('stale_revision','task binding mismatch');
         }
         const draft=this._taskHandoff.getHandoff(action.handoffId);
+        if(draft && draft.taskId!==action.taskId) {
+          throw new TaskHandoffError('stale_revision','handoff task mismatch');
+        }
         if(draft && draft.activeRevision!==action.activeRevision) {
           throw new TaskHandoffError('stale_revision','active revision mismatch');
         }
@@ -289,19 +300,12 @@ export class UnifiedRuntime {
           envelope.eventId,
         );
       }
-      if(this._taskChannel && this._taskChannel.getBindingByDestination(envelope.destination)) {
-        if(action.action==='legacy_model') {
-          if(!action.model && !action.invalid) return this._taskChannel.intake(envelope,{action:'models'});
-          throw new TaskChannelError('invalid_request','use /models to switch target model');
-        }
-        return this._taskChannel.intake(envelope,action as TaskChannelAction);
-      }
       if(this._pendingHub) {
         const hubRoot=this._pendingHub.getRoot();
         const hubBindingId=createHash('sha256').update('pending-hub:singleton').digest('hex').slice(0,16);
         const inHubTopic=!!hubRoot?.topicDestination && hubRoot.topicDestination!==hubRoot.chatDestination && envelope.destination===hubRoot.topicDestination;
         const meta=action as {entry?:unknown;bindingId?:unknown;sourceSessionId?:unknown};
-        const entry=meta.entry==='source' ? 'source' : meta.entry==='hub' ? 'hub' : undefined;
+        const entry=meta.entry==='source' ? 'source' : (meta.entry==='hub' || meta.entry==='pending_hub') ? 'hub' : undefined;
         if(action.action==='decision_answer') {
           const payload:PendingSubmitPayload={
             kind:'decision',
@@ -339,16 +343,34 @@ export class UnifiedRuntime {
               };
           return entry==='source' ? this._pendingHub.submitFromSource(envelope,payload) : this._pendingHub.submitFromHub(envelope,payload);
         }
-        if(inHubTopic && action.action==='input') {
-          return this._pendingHub.handleHubText(envelope,action.text);
-        }
         if(action.action==='pending_page' && (inHubTopic || envelope.destination===this.config.pendingHub!.destination)) {
-          return this._pendingHub.listPending({
+          return this._pendingHub.renderPage(envelope,{
             ...(action.cursor!==undefined ? {cursor:action.cursor} : {}),
             ...(action.category!==undefined ? {category:action.category} : {}),
             ...(action.provider!==undefined ? {provider:action.provider} : {}),
           });
         }
+      }
+      if(this._taskChannel && this._taskChannel.getBindingByDestination(envelope.destination)) {
+        if(action.action==='legacy_model') {
+          if(!action.model && !action.invalid) return this._taskChannel.intake(envelope,{action:'models'});
+          throw new TaskChannelError('invalid_request','use /models to switch target model');
+        }
+        return this._taskChannel.intake(envelope,action as TaskChannelAction);
+      }
+      if(this._pendingHub) {
+        const hubRoot=this._pendingHub.getRoot();
+        const inHubTopic=!!hubRoot?.topicDestination && hubRoot.topicDestination!==hubRoot.chatDestination && envelope.destination===hubRoot.topicDestination;
+        if(inHubTopic && action.action==='input') {
+          return this._pendingHub.handleHubText(envelope,action.text);
+        }
+      }
+      if(
+        ['confirm_handoff','switch_target','decision_answer','pending_page'].includes(action.action) ||
+        ('entry' in action && action.entry!==undefined) ||
+        ('taskId' in action && action.taskId!==undefined)
+      ) {
+        throw contractError('unsupported','action is unavailable for this destination');
       }
       return this.channel.intake(envelope,action as ChannelAction);
     })();
@@ -357,7 +379,7 @@ export class UnifiedRuntime {
   }
   async tick():Promise<void> {
     if (this.closed || this.closing || this.baselinePreparing) throw new Error('closed or baseline preparation active'); if (this.running) return this.running;
-    this.running = (async()=>{ let failed=false; try { if(this.hasPendingOrActiveWork()) this.lastActivityAt=Date.now(); await this.port.drainInbound?.((e,a,scope)=>this.channel.intake(e,a,scope)); for (const id of this.channel.pendingInbox()) { try { await this.channel.drain(id); } catch { failed=true; } } if(this._taskChannel) { for (const id of this._taskChannel.pendingInbox()) { try { await this._taskChannel.drain(id); } catch { failed=true; } } } await this.core.dispatchPending(); await this.channel.advanceCompleted(); try {await this.options.refresh?.(this);} catch {failed=true;} for(const destination of this.channel.boundDestinations()) { try { const binding=this.channel.bindingsForRestore().find(b=>b.destination===destination); if(binding) { let session:Session|undefined; try { session=this.store.getSession(binding.sessionId); } catch {} if(session && session.status==='read_only' && session.control.input!=='available' && !existsSync(session.project)) continue; } if(this.options.requireReadonlyHydration && binding?.accessMode==='read_only' && !this.channel.readonlyHydrated(destination,binding.sessionId)) continue; await this.channel.sync(destination); } catch(e) { if (!(e instanceof Error && e.message==='destination is not bound')) failed=true; } } if(this._taskChannel) { for(const binding of this._taskChannel.listActiveBindings()) { try { const res=await this._taskChannel.syncTask(binding.taskId); if(res.failedTargets.length>0) failed=true; } catch { failed=true; } } } if(this._watchHub && this._watchHub.listOutbox().some(r=>r.state==='pending')) { try { await this._watchHub.flush(); } catch { failed=true; } } if(this._pendingHub) { try { for(const b of this.channel.bindingsForRestore()) { if(this._pendingHub.getSourceDestination(b.sessionId)!==b.destination) this._pendingHub.bindSourceSession(b.sessionId,b.destination); } if(this._taskChannel) { for(const b of this._taskChannel.listActiveBindings()) { for(const t of this._taskChannel.listTargets(b.taskId)) { if(t.accessMode==='interactive' && this._pendingHub.getSourceDestination(t.sessionId)!==b.destination) this._pendingHub.bindSourceSession(t.sessionId,b.destination); } } } const trackedCards=[...this.channel.listInteractionCards().map(c=>({destination:c.destination,sessionId:c.sessionId,interactionId:c.interactionId,messageId:c.messageId})),...(this._taskChannel?.listInteractionCards().map(c=>({destination:c.destination,sessionId:c.sessionId,interactionId:c.interactionId,messageId:c.messageId})) ?? [])]; for(const card of trackedCards) { try { const interaction=await this.core.getInteraction(card.interactionId); const session=await this.core.getSession(card.sessionId); if(interaction.status==='awaiting_answer' && session.status!=='read_only' && session.control.input==='available') { const existingRef=this._pendingHub.getRef(`interaction:${interaction.interactionId}`); if(!existingRef || (existingRef.card_active===1 && (existingRef.source_card_message_id!==card.messageId || existingRef.revision<interaction.revision))) { this._pendingHub.trackSourceCard({interactionId:interaction.interactionId,category:interaction.kind==='approval'?'approval':'question',provider:session.native.provider,sourceSessionId:card.sessionId,sourceDestination:card.destination,messageId:card.messageId,revision:interaction.revision,connectionGeneration:interaction.connectionGeneration}); } } } catch {} } await this._pendingHub.sync(); } catch { failed=true; } } if(this._decisionSync && this._decisionSync.listDocOutbox().some(r=>r.state==='pending_sync')) { try { this._decisionSync.retryPendingSyncs(); } catch { failed=true; } } if (failed) throw new Error('isolated work failed'); if(this.hasPendingOrActiveWork()) this.lastActivityAt=Date.now(); this.lastError=null; this.core.clearTransientRefreshFailure(); try {this.channel.recordHealth('core','healthy');} catch {} } catch { try {this.channel.recordHealth('core','degraded','调度或同步失败');} catch {} this.lastError='dispatch or synchronization failed; inspect persisted state before retry'; throw new Error(this.lastError); } })();
+    this.running = (async()=>{ let failed=false; try { if(this.hasPendingOrActiveWork()) this.lastActivityAt=Date.now(); await this.port.drainInbound?.((e,a,scope)=> (this._taskChannel && this._taskChannel.getBindingByDestination(e.destination)) ? this._taskChannel.intake(e, a as TaskChannelAction, scope) : this.channel.intake(e,a,scope)); for (const id of this.channel.pendingInbox()) { try { await this.channel.drain(id); } catch { failed=true; } } if(this._taskChannel) { for (const id of this._taskChannel.pendingInbox()) { try { await this._taskChannel.drain(id); } catch { failed=true; } } } await this.core.dispatchPending(); await this.channel.advanceCompleted(); try {await this.options.refresh?.(this);} catch {failed=true;} for(const destination of this.channel.boundDestinations()) { try { const binding=this.channel.bindingsForRestore().find(b=>b.destination===destination); if(binding) { let session:Session|undefined; try { session=this.store.getSession(binding.sessionId); } catch {} if(session && session.status==='read_only' && session.control.input!=='available' && !existsSync(session.project)) continue; } if(this.options.requireReadonlyHydration && binding?.accessMode==='read_only' && !this.channel.readonlyHydrated(destination,binding.sessionId)) continue; await this.channel.sync(destination); } catch(e) { if (!(e instanceof Error && e.message==='destination is not bound')) failed=true; } } if(this._taskChannel) { for(const binding of this._taskChannel.listActiveBindings()) { try { const res=await this._taskChannel.syncTask(binding.taskId); if(res.failedTargets.length>0) failed=true; } catch { failed=true; } } } if(this._watchHub && this._watchHub.listOutbox().some(r=>r.state==='pending')) { try { await this._watchHub.flush(); } catch { failed=true; } } if(this._pendingHub) { try { for(const b of this.channel.bindingsForRestore()) { if(this._pendingHub.getSourceDestination(b.sessionId)!==b.destination) this._pendingHub.bindSourceSession(b.sessionId,b.destination); } if(this._taskChannel) { for(const b of this._taskChannel.listActiveBindings()) { for(const t of this._taskChannel.listTargets(b.taskId)) { if(t.accessMode==='interactive' && this._pendingHub.getSourceDestination(t.sessionId)!==b.destination) this._pendingHub.bindSourceSession(t.sessionId,b.destination); } } } const trackedCards=[...this.channel.listInteractionCards().map(c=>({destination:c.destination,sessionId:c.sessionId,interactionId:c.interactionId,messageId:c.messageId})),...(this._taskChannel?.listInteractionCards().map(c=>({destination:c.destination,sessionId:c.sessionId,interactionId:c.interactionId,messageId:c.messageId})) ?? [])]; for(const card of trackedCards) { try { const interaction=await this.core.getInteraction(card.interactionId); const session=await this.core.getSession(card.sessionId); if(interaction.status==='awaiting_answer' && session.status!=='read_only' && session.control.input==='available') { const existingRef=this._pendingHub.getRef(`interaction:${interaction.interactionId}`); if(!existingRef || (existingRef.card_active===1 && (existingRef.source_card_message_id!==card.messageId || existingRef.revision<interaction.revision))) { this._pendingHub.trackSourceCard({interactionId:interaction.interactionId,category:interaction.kind==='approval'?'approval':'question',provider:session.native.provider,sourceSessionId:card.sessionId,sourceDestination:card.destination,messageId:card.messageId,revision:interaction.revision,connectionGeneration:interaction.connectionGeneration}); } } } catch {} } await this._pendingHub.sync(); } catch { failed=true; } } if(this._decisionSync && this._decisionSync.listDocOutbox().some(r=>r.state==='pending_sync')) { try { this._decisionSync.retryPendingSyncs(); } catch { failed=true; } } if (failed) throw new Error('isolated work failed'); if(this.hasPendingOrActiveWork()) this.lastActivityAt=Date.now(); this.lastError=null; this.core.clearTransientRefreshFailure(); try {this.channel.recordHealth('core','healthy');} catch {} } catch { try {this.channel.recordHealth('core','degraded','调度或同步失败');} catch {} this.lastError='dispatch or synchronization failed; inspect persisted state before retry'; throw new Error(this.lastError); } })();
     try {
       await this.running;
     } finally {
@@ -673,7 +695,8 @@ export async function createLiveRuntime(config:RuntimeConfig, credentials:{appId
     });
     agyAdapter = new AgyAdapter(agyTransport, agyCatalog, config.hostId, config.agy!.serviceId, agyQuota);
   }
-  const port=new FeishuSdkPort(credentials,sdkDb,new Set(config.allowedDestinations),config.ownerOpenId,config.taskTopic?.enabled===true); let runtime:UnifiedRuntime;
+  const taskTopicEnabled = config.taskTopic?.enabled === true;
+  const port=new FeishuSdkPort(credentials,sdkDb,new Set(config.allowedDestinations),config.ownerOpenId,taskTopicEnabled,taskTopicEnabled); let runtime:UnifiedRuntime;
   const bases:PlatformPort[] = agyAdapter ? [claude,codex,agyAdapter] : [claude,codex];
   try {runtime=await createIntegratedRuntime(config,port,bases);} catch(error) {port.close();transport.close();await agyTransport?.close().catch(()=>{});throw error;}
   const overlayConn = (row:Awaited<ReturnType<UnifiedCore['health']>>[number], h:ReturnType<CodexTransport['health']> | ReturnType<AgyAcpTransport['health']>) => ({

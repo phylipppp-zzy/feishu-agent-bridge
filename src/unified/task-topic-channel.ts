@@ -150,6 +150,10 @@ export type TaskChannelAction = (
       mode: 'new' | 'queue' | 'steer';
     }
   | {
+      action: 'resource_rejected';
+      reason: 'size' | 'encoding' | 'unsupported';
+    }
+  | {
       action: 'panel';
     }
   | {
@@ -361,6 +365,8 @@ export function taskInteractionCard(
       interaction,
       interactionFormBindingId(target.taskId, target.targetId, target.targetGeneration),
       readOnly,
+      Date.now(),
+      stamp,
     );
   }
   return card;
@@ -1212,7 +1218,7 @@ export class TaskTopicChannel {
     const preTarget = this.resolveTargetForIntake(preBinding, a, isCard);
 
     if (expectedResourceScope !== undefined) {
-      if (a.action !== 'attachment') {
+      if (a.action !== 'attachment' && a.action !== 'resource_rejected') {
         throw new TaskChannelError('invalid_request', 'resource scope only valid for attachment');
       }
       const currentResourceScope = JSON.stringify({
@@ -1495,6 +1501,26 @@ export class TaskTopicChannel {
         activeRevision: check.binding.active_revision,
         targets,
       });
+    }
+
+    if (a.action === 'resource_rejected') {
+      const claim = this.db
+        .prepare("UPDATE task_inbox_scope_v1 SET state = 'unknown' WHERE event_id = ? AND state = 'received'")
+        .run(eventId);
+      if (!claim.changes) return { status: 'unknown' };
+      const text = {
+        unsupported: '仅支持图片和 UTF-8 文本附件。',
+        size: '文本附件为空或超过 1 MiB，未提交。',
+        encoding: '文本附件不是有效 UTF-8 或包含 NUL，未提交。',
+      }[a.reason];
+      await this.deliverCard(
+        e.destination,
+        row.task_id,
+        row.target_id || null,
+        { title: '附件未提交', text, actions: [] },
+        `${eventId}:resource-rejected`,
+      );
+      return finalize('completed', { status: 'rejected', reason: a.reason });
     }
 
     const target = check.target!;
