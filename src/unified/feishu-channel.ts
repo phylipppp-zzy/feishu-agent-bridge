@@ -13,6 +13,7 @@ import { interactionCard, operationCard, providerDisplayLabel, sessionCard, type
 export interface TrustedEnvelope { eventId: string; destination: string; identity: Identity; cardMessageId?: string }
 export interface FeishuPort {
   isTopicDestination?(destination:string): boolean;
+  chatDestination?(destination:string): string | null;
   createTopic?(destination:string, sessionId:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>): Promise<string>;
   reassignTopic?(destination:string,sessionId:string):void;
   send(destination: string, card: ChannelCard, deliveryId: string, guard?:()=>Promise<void>): Promise<string | void>;
@@ -28,6 +29,11 @@ class BindingManagementDenied extends Error {}
 class BindingExpired extends Error {}
 class ReadAuthorizationRevoked extends Error {}
 class FileCommandError extends Error {}
+function formatHumanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 export type AuthorizeBindingAdmin = (identity: Identity, destination: string, sessionId: string) => Promise<boolean>;
 export type Authorize = (identity: Identity, destination: string, sessionId: string | null) => Promise<boolean>;
 export type ChannelAction = (
@@ -593,7 +599,29 @@ export class FeishuChannel {
       await reply({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]}); return op;
     }
     if (a.action === 'bind') { const s = await this.service.getSession(a.sessionId); const bindGuard=async()=>{if(executionScope!==this.bindingScope(e.destination) || !await this.authorize(e.identity,e.destination,s.sessionId) || executionScope!==this.bindingScope(e.destination)) throw new Error('binding changed or unauthorized');}; await bindGuard(); const destination = this.port.createTopic && !this.port.isTopicDestination?.(e.destination) ? await this.port.createTopic(e.destination,s.sessionId,{title:s.title,text:`${providerDisplayLabel(s.native.provider)} · ${s.project} · ${s.status}`,actions:[]},`${e.eventId}:topic`,bindGuard) : e.destination; if (!await this.authorize(e.identity,destination,s.sessionId)) throw new Error('unauthorized'); const existing=this.db.prepare('SELECT session_id,owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;owner_source:string;owner_subject:string}|undefined; if(existing && (existing.owner_source!==e.identity.source || existing.owner_subject!==e.identity.subject) && !await this.authorizeBindingAdmin?.(e.identity,destination,existing.session_id)) throw new Error('binding management unauthorized'); let autoExistingInteractive=false; this.db.exec('BEGIN IMMEDIATE'); try { const auto=this.db.prepare('SELECT 1 FROM channel_auto_baselines WHERE event_id=? AND session_id=? AND destination IS NULL').get(e.eventId,s.sessionId); const current=this.db.prepare('SELECT session_id,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;access_mode:string}|undefined; if(auto && current && current.session_id!==s.sessionId) throw new Error('automatic binding superseded'); if (auto ? !current : (!existing || existing.session_id!==s.sessionId)) { if(this.port.isTopicDestination?.(destination)) this.port.reassignTopic?.(destination,s.sessionId); this.db.prepare("INSERT INTO channel_bindings(destination,session_id,binding_id,owner_source,owner_subject,revision,access_mode) VALUES (?,?,?,?,?,1,'read_only') ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,binding_id=excluded.binding_id,owner_source=excluded.owner_source,owner_subject=excluded.owner_subject,revision=channel_bindings.revision+1,access_mode='read_only'").run(destination,s.sessionId,randomUUID(),e.identity.source,e.identity.subject); this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(destination); } autoExistingInteractive=!!auto && current?.access_mode==='interactive'; if(autoExistingInteractive) this.db.prepare('DELETE FROM channel_auto_baselines WHERE event_id=?').run(e.eventId); else this.db.prepare('UPDATE channel_auto_baselines SET destination=?,binding_scope=? WHERE event_id=? AND session_id=? AND destination IS NULL').run(destination,this.bindingScope(destination),e.eventId,s.sessionId); this.db.exec('COMMIT'); } catch(error) {this.db.exec('ROLLBACK');throw error;} if(autoExistingInteractive) return {sessionId:s.sessionId,accessMode:'interactive',destination}; await this.deliver(destination,{...sessionCard(s),text:sessionCard(s).text + `\n绑定模式: ${this.accessMode(destination)}`},`${e.eventId}:reply`); if(destination!==e.destination && a.mode!=='interactive') {const url=await this.port.topicLinkForSession?.(e.destination,s.sessionId) ?? null; if(url) await reply({title:'会话已打开',text:'在话题中查看和继续操作。',actions:[{label:'打开话题',value:{},url}]},'open-topic'); else await reply({title:'话题链接暂不可用',text:'会话话题已建立，请稍后重试打开。',actions:[]},'open-topic');} return { sessionId: s.sessionId, accessMode:this.accessMode(destination), destination }; }
-    if (a.action === 'create' || a.action === 'attach') { const ctx = this.context(e, `new:${e.destination}`, 0, 0); this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(ctx.operationId,e.destination,a.action === 'attach' ? a.mode : 'interactive'); this.db.prepare('INSERT OR IGNORE INTO channel_pending_scope VALUES (?,?)').run(ctx.operationId,this.bindingScope(e.destination)); this.recordPendingActor(ctx.operationId,e); const op = a.action === 'create' ? await this.service.createSession({ context: ctx, payload: { provider: a.provider, project: a.project, model: a.model } }) : await this.service.attachSession({ context: ctx, payload: { provider: a.provider, hostId: a.hostId, serviceId: a.serviceId, nativeSessionId: a.nativeSessionId, mode: a.mode } }); this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(op.operationId,e.destination,a.action === 'attach' ? a.mode : 'interactive'); await (a.action === 'create' ? replyOrUpdate : reply)({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]}); return op; }
+    if (a.action === 'create' || a.action === 'attach') {
+      let createTarget = e.destination;
+      if (a.action === 'create' && bound && this.port.isTopicDestination?.(e.destination)) {
+        const parentChat = this.port.chatDestination?.(e.destination) ?? null;
+        if (!parentChat) {
+          await replyOrUpdate({ title: '请在主群新建会话', text: '当前话题已绑定会话，请前往主群发送 /new 或 /create 新建会话。', actions: [] });
+          return { status: 'guidance' };
+        }
+        await guard();
+        if (!await this.authorize(e.identity, parentChat, null)) throw new Error('unauthorized');
+        await guard();
+        createTarget = parentChat;
+      }
+      const pendingEnvelope = createTarget === e.destination ? e : { ...e, destination: createTarget };
+      const ctx = this.context(e, `new:${createTarget}`, 0, 0);
+      this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(ctx.operationId, createTarget, a.action === 'attach' ? a.mode : 'interactive');
+      this.db.prepare('INSERT OR IGNORE INTO channel_pending_scope VALUES (?,?)').run(ctx.operationId, this.bindingScope(createTarget));
+      this.recordPendingActor(ctx.operationId, pendingEnvelope);
+      const op = a.action === 'create' ? await this.service.createSession({ context: ctx, payload: { provider: a.provider, project: a.project, model: a.model } }) : await this.service.attachSession({ context: ctx, payload: { provider: a.provider, hostId: a.hostId, serviceId: a.serviceId, nativeSessionId: a.nativeSessionId, mode: a.mode } });
+      this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(op.operationId, createTarget, a.action === 'attach' ? a.mode : 'interactive');
+      await (a.action === 'create' ? replyOrUpdate : reply)({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]});
+      return op;
+    }
     if (a.action === 'upgrade') {
       if (!bound || this.accessMode(e.destination) !== 'read_only') throw new Error('no read-only binding');
       const session=await this.service.getSession(bound); const n=session.native;
@@ -604,21 +632,34 @@ export class FeishuChannel {
       await reply({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]}); return op;
     }
     if (a.action === 'finish') {
-      const pending = this.db.prepare('SELECT * FROM channel_pending WHERE operation_id=? AND destination=?').get(a.operationId,e.destination) as {session_id:string | null;kind:string;mode:'new'|'queue'|'steer'|'read_only'|'interactive' | null;state:string} | undefined;
+      type PendingRow = {session_id:string | null;kind:string;mode:'new'|'queue'|'steer'|'read_only'|'interactive' | null;state:string};
+      let finishDest = e.destination;
+      let pending = this.db.prepare('SELECT * FROM channel_pending WHERE operation_id=? AND destination=?').get(a.operationId,finishDest) as PendingRow | undefined;
+      if (!pending && this.port.isTopicDestination?.(e.destination)) {
+        const parentChat = this.port.chatDestination?.(e.destination);
+        if (parentChat) {
+          const parentPending = this.db.prepare('SELECT * FROM channel_pending WHERE operation_id=? AND destination=?').get(a.operationId, parentChat) as PendingRow | undefined;
+          if (parentPending?.kind === 'session') {
+            finishDest = parentChat;
+            pending = parentPending;
+          }
+        }
+      }
       if (!pending) throw new Error('pending operation not found');
       if (pending.state === 'completed') return {status:'completed'};
       const pendingScope = this.db.prepare('SELECT scope FROM channel_pending_scope WHERE operation_id=?').get(a.operationId) as {scope:string} | undefined;
-      if (!pendingScope || pendingScope.scope !== this.bindingScope(e.destination)) return {status:'expired',reason:'binding_changed'};
+      if (!pendingScope || pendingScope.scope !== this.bindingScope(finishDest)) return {status:'expired',reason:'binding_changed'};
       const op = await this.service.getOperation(a.operationId); await guard();
       if (op.status !== 'completed' || !op.result) return op;
       if (pending.kind === 'session' && op.result.kind === 'session') {
-        if (!await this.authorize(e.identity,e.destination,op.result.sessionId)) throw new Error('unauthorized');
+        if (!await this.authorize(e.identity,finishDest,op.result.sessionId)) throw new Error('unauthorized');
         const session = await this.service.getSession(op.result.sessionId); await guard();
-        if (pending.mode === 'interactive' && bound && op.result.sessionId !== bound) throw new Error('upgrade session mismatch');
-        const destination = this.port.createTopic && !this.port.isTopicDestination?.(e.destination) ? await this.port.createTopic(e.destination,session.sessionId,{title:session.title,text:`${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}`,actions:[]},`${a.operationId}:topic`) : e.destination;
+        const finishBound = finishDest === e.destination ? bound : this.binding(finishDest);
+        if (pending.mode === 'interactive' && finishBound && op.result.sessionId !== finishBound && !(op.action === 'createSession' && this.port.createTopic && !this.port.isTopicDestination?.(finishDest))) throw new Error('upgrade session mismatch');
+        const destination = this.port.createTopic && !this.port.isTopicDestination?.(finishDest) ? await this.port.createTopic(finishDest,session.sessionId,{title:session.title,text:`${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}`,actions:[]},`${a.operationId}:topic`) : finishDest;
         if (!await this.authorize(e.identity,destination,session.sessionId)) throw new Error('unauthorized'); await guard();
         const existing=this.db.prepare('SELECT session_id,owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;owner_source:string;owner_subject:string}|undefined; if(existing && (existing.owner_source!==e.identity.source || existing.owner_subject!==e.identity.subject) && !await this.authorizeBindingAdmin?.(e.identity,destination,existing.session_id)) throw new Error('binding management unauthorized'); await guard();
-        if (existing?.session_id === session.sessionId && destination !== e.destination && pending.mode === 'interactive' && this.accessMode(destination) === 'read_only') {
+        if (existing?.session_id === session.sessionId && destination !== finishDest && pending.mode === 'interactive' && this.accessMode(destination) === 'read_only') {
           this.db.prepare("UPDATE channel_pending SET state='completed' WHERE operation_id=?").run(a.operationId);
           await this.deliver(destination,{title:'只读话题已存在',text:'此话题仍为只读。请在本话题打开会话控制，选择转为可交互。',actions:[{label:'会话控制',value:{action:'panel',sessionId:session.sessionId}}]},`${a.operationId}:existing-readonly`);
           return {sessionId:session.sessionId,accessMode:'read_only',destination,reason:'upgrade_in_existing_topic'};
@@ -658,7 +699,30 @@ export class FeishuChannel {
       await reply({title:'会话控制',text,actions}); return {running:work.runningTurns.length,queued:work.queuedInputs.length};
     }
     if (a.action === 'legacy_stop') { const work=await this.service.getWorkState(bound); await guard(); if(work.runningTurns.length!==1) {await reply({title:'中断回复',text:work.runningTurns.length===0 ? '当前没有可中断的回复。' : '当前有多个进行中的回复，请打开会话控制选择本轮。',actions:[{label:'会话控制',value:{action:'panel'}}]});return {status:'rejected',reason:work.runningTurns.length===0?'no_running_turn':'ambiguous_running_turn'};} const op=await this.service.interruptTurn({context:current(),payload:{turnId:work.runningTurns[0]!.turnId}});await reply(operationCard(op));return op; }
-    if (a.action === 'project_files') { if(!this.service.listProjectFiles) throw new Error('project browsing unavailable'); const listing=await this.service.listProjectFiles(bound,a.directory,a.showHidden); await reply({title:'项目目录',text:listing.kind==='error' ? listing.message : listing.kind==='file' ? `${listing.entry.name} (${listing.entry.size} B)` : `${listing.path}\n${listing.entries.map(x=>`${x.kind==='dir' ? '[目录]' : '[文件]'} ${x.name}${x.kind==='file' ? ` (${x.size} B)` : ''}`).join('\n')}\n显示 ${listing.entries.length}/${listing.total} 项，隐藏 ${listing.hidden} 项`,actions:[]}); return listing; }
+    if (a.action === 'project_files') {
+      if (!this.service.listProjectFiles) throw new Error('project browsing unavailable');
+      const listing = await this.service.listProjectFiles(bound, a.directory, a.showHidden);
+      let text: string;
+      if (listing.kind === 'error') {
+        text = listing.message;
+      } else if (listing.kind === 'file') {
+        text = `${listing.entry.name} (${formatHumanSize(listing.entry.size)})`;
+      } else {
+        const sorted = [...listing.entries].sort((x, y) =>
+          x.kind === y.kind ? x.name.localeCompare(y.name) : x.kind === 'dir' ? -1 : 1,
+        );
+        const treeLines = sorted.map((x, idx) => {
+          const branch = idx === sorted.length - 1 ? '└──' : '├──';
+          return x.kind === 'dir'
+            ? `${branch} ${x.name}/`
+            : `${branch} ${x.name} (${formatHumanSize(x.size)})`;
+        });
+        const body = treeLines.length ? treeLines.join('\n') : '(空目录)';
+        text = `📁 ${listing.path}\n${body}\n显示 ${listing.entries.length}/${listing.total} 项，隐藏 ${listing.hidden} 项`;
+      }
+      await reply({ title: '项目目录', text, actions: [] });
+      return listing;
+    }
     if (a.action === 'deliver_files') { if(!this.service.selectProjectFiles) throw new Error('file selection unavailable'); const scope=executionScope; await guard(); let files:Awaited<ReturnType<NonNullable<UnifiedService['selectProjectFiles']>>>; try {files=await this.service.selectProjectFiles(bound,a.args);} catch {throw new FileCommandError('文件选择失败：仅支持项目内路径和 *、?、[]、** 模式；凭据、符号链接、超限或不可读文件不会发送。');} if(files.length>20 || files.reduce((n,f)=>n+f.size,0)>20*1024*1024) throw new FileCommandError('文件数量超过 20 个或总大小超过 20 MiB，未发送。'); const contents:Uint8Array[]=[]; for(const f of files) {await guard();contents.push(await this.service.readArtifact(bound,f.artifactId,f.contentVersion));} await guard(); const results=[]; for(let i=0;i<files.length;i++) {const f=files[i]!; const id=`file:v2:${payloadDigest([scope,e.destination,bound,f.artifactId,f.contentVersion])}`; await guard(); if(this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {effects.started=true;await this.port.sendFile(e.destination,f.name,contents[i]!,id,guard);this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);results.push({name:f.name,status:'sent'});} else {const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null;await guard();results.push({name:f.name,status:url?'located':'unknown',url});}} await reply({title:'文件发送结果',text:results.map(r=>`${r.name}: ${r.status}`).join('\n'),actions:results.filter(r=>r.url).map(r=>({label:`定位 ${r.name}`,value:{},url:r.url!}))}); return results; }
     if (a.action === 'export') {
       const scope=executionScope;
@@ -719,21 +783,17 @@ export class FeishuChannel {
       const prevCursor = offset > 0 ? String(Math.max(0, offset - PAGE_SIZE)) : null;
       const nextCursor = offset + PAGE_SIZE < total ? String(offset + PAGE_SIZE) : null;
 
-      const humanSize = (bytes: number): string => {
-        if (bytes < 1024) return `${bytes} B`;
-        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
-        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-      };
       const truncateLabel = (name: string, max: number): string => {
         const chars = [...name];
         return chars.length > max ? `${chars.slice(0, Math.max(1, max - 1)).join('')}…` : name;
       };
 
-      const headerLines = [`默认目录：${session.project || '未知'}`];
+      const projectDir = session.project || '未知';
+      const headerLines = [`默认目录：${projectDir}`];
       const actions: ChannelCard['actions'] = [];
       let text: string;
       if (total === 0) {
-        text = `${headerLines[0]}\n\n暂无可下载文件。`;
+        text = `默认目录：${projectDir}\n\n暂无可下载文件。\n提示：如需浏览项目目录，可发送 /ls 或 /ls <子目录>。`;
       } else {
         if (totalPages > 1) headerLines.push(`共 ${total} 个文件（第 ${currentPage}/${totalPages} 页）`);
         const pageGroups: Array<{ dir: string; entries: Array<{ item: import('./contracts.js').Artifact; num: number; filename: string; pathKey: string }> }> = [];
@@ -764,7 +824,7 @@ export class FeishuChannel {
           for (const [entryIdx, entry] of group.entries.entries()) {
             const branch = entryIdx === group.entries.length - 1 ? '└──' : '├──';
             const hashSuffix = (pathCounts.get(entry.pathKey) ?? 0) > 1 ? ` · ${entry.item.contentVersion.slice(0, 6)}` : '';
-            treeLines.push(`${branch} ${entry.num}. ${entry.filename} (${humanSize(entry.item.size)})${hashSuffix}`);
+            treeLines.push(`${branch} ${entry.num}. ${entry.filename} (${formatHumanSize(entry.item.size)})${hashSuffix}`);
           }
         }
         text = `${headerLines.join('\n')}\n\n${treeLines.join('\n')}`;

@@ -60,6 +60,26 @@ const LIST_SNAPSHOT_TTL_MS = 120_000;
 const MAX_LIST_SNAPSHOTS = 8;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const EFFORT_SUFFIX_RE = /^(.*?)(?:-tiered)?-(low|medium|high|xhigh|max)$/i;
+const GENERIC_AGY_TITLE_RE = /^Antigravity 会话 · [0-9a-f]{8}$/i;
+
+function isGenericAgyTitle(title: string | undefined, sessionId: string): boolean {
+  const trimmed = title?.trim() ?? '';
+  if (!trimmed) return true;
+  if (GENERIC_AGY_TITLE_RE.test(trimmed)) return true;
+  return trimmed === `Antigravity 会话 · ${sessionId.slice(0, 8)}`;
+}
+
+function deriveTitleFromInputBlocks(blocks: readonly PlatformInputBlock[], maxLen = 48): string | null {
+  for (const block of blocks) {
+    if (block.type !== 'text') continue;
+    const collapsed = block.text.replace(/\s+/g, ' ').trim();
+    if (!collapsed) continue;
+    const chars = [...collapsed];
+    if (chars.length <= maxLen) return collapsed;
+    return `${chars.slice(0, maxLen - 1).join('').trimEnd()}…`;
+  }
+  return null;
+}
 
 const available = { status: 'available' as const };
 const unsupported = (reason: string) => ({ status: 'unsupported' as const, reason });
@@ -386,7 +406,8 @@ export class AgyAdapter implements PlatformPort {
 
     const project = summary?.project || liveMeta?.cwd || '';
     const subagentCount = summary?.subagentCount ?? 0;
-    const baseTitle = summary?.title || liveMeta?.title || `Antigravity 会话 · ${id.slice(0, 8)}`;
+    const summaryTitle = summary?.title && !isGenericAgyTitle(summary.title, id) ? summary.title : '';
+    const baseTitle = summaryTitle || liveMeta?.title || summary?.title || `Antigravity 会话 · ${id.slice(0, 8)}`;
     const title = formatSessionTitle(baseTitle, subagentCount);
     const updatedAt = summary?.lastModifiedAt ?? liveMeta?.updatedAt ?? undefined;
     const createdAt = createdAtOverride ?? liveMeta?.createdAt ?? undefined;
@@ -886,9 +907,14 @@ export class AgyAdapter implements PlatformPort {
 
   private captureServerSessionMeta(id: string, cwd: string, res: unknown): void {
     const existing = this.knownSessions.get(id);
+    const catalogTitle = this.catalog.get(id)?.title;
+    const fallbackTitle =
+      catalogTitle && !isGenericAgyTitle(catalogTitle, id)
+        ? catalogTitle
+        : `Antigravity 会话 · ${id.slice(0, 8)}`;
     const meta: LiveSessionMeta = {
       cwd,
-      title: existing?.title ?? `Antigravity 会话 · ${id.slice(0, 8)}`,
+      title: existing?.title ?? fallbackTitle,
       updatedAt: new Date().toISOString(),
       ...(existing?.createdAt ? { createdAt: existing.createdAt } : {}),
       ...(existing?.models ? { models: existing.models } : {}),
@@ -1157,6 +1183,24 @@ export class AgyAdapter implements PlatformPort {
       outputIds: [],
     };
     this.putSessionTurn(id, runningTurn);
+
+    const liveMeta = this.knownSessions.get(id);
+    if (liveMeta) {
+      liveMeta.updatedAt = now;
+      const summary = this.catalog.get(id);
+      const hasRealCatalogTitle = Boolean(summary?.title && !isGenericAgyTitle(summary.title, id));
+      if (!hasRealCatalogTitle && isGenericAgyTitle(liveMeta.title, id)) {
+        const promptTitle = deriveTitleFromInputBlocks(blocks);
+        if (promptTitle) {
+          liveMeta.title = promptTitle;
+          this.emit({
+            type: 'session',
+            ref,
+            session: this.buildSession(id, summary ?? null, liveMeta),
+          });
+        }
+      }
+    }
 
     this.emit({ type: 'message', ref, message: userMsg, connectionGeneration: generation });
     this.emit({ type: 'turn', ref, turn: runningTurn, connectionGeneration: generation });

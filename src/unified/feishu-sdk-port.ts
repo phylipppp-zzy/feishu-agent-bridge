@@ -214,6 +214,7 @@ export class FeishuSdkPort implements FeishuPort {
     } catch(e) {this.migrationAbort();throw e;}
   }
   public isTopicDestination(destination:string):boolean { return !!this.route(destination); }
+  public chatDestination(destination:string):string | null { return this.route(destination)?.chat_id ?? null; }
   public reassignTopic(destination:string,sessionId:string):void { this.allowed(destination); this.routeGeneration++; if (!this.route(destination)) throw new Error('topic required'); this.db.prepare('UPDATE sdk_topic_routes SET session_id=? WHERE destination=?').run(sessionId,destination); }
   private laneReserved(destination:string):boolean { return !!this.db.prepare('SELECT 1 FROM sdk_lane_registry WHERE destination=?').get(destination); }
   public authorizedDestination(destination:string):boolean {
