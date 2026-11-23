@@ -23,6 +23,24 @@ export class ArtifactRegistry {
   getRoots(ref: NativeSessionRef): readonly string[] { return [...(this.roots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])] ?? [])]; }
   setProjectRoot(ref:NativeSessionRef, root:string):void { if(!isAbsolute(root)) throw new Error('absolute project root required'); this.projectRoots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])]=resolve(root); }
   getProjectRoot(ref:NativeSessionRef):string | undefined { return this.projectRoots[JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId])]; }
+  private relativePathFor(sessionId: string, fullPath: string, entryRoot: string): string {
+    const toPosix = (p: string) => p.split(sep).join('/');
+    const projectRoot = this.projectRoots[sessionId];
+    if (projectRoot) {
+      const rel = relative(resolve(projectRoot), resolve(fullPath));
+      if (rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
+        return toPosix(rel);
+      }
+    }
+    const rootResolved = resolve(entryRoot);
+    const rootRel = relative(rootResolved, resolve(fullPath));
+    if (rootRel && rootRel !== '..' && !rootRel.startsWith(`..${sep}`) && !isAbsolute(rootRel)) {
+      const rootName = basename(rootResolved);
+      const relPosix = toPosix(rootRel);
+      return rootName ? `${rootName}/${relPosix}` : relPosix;
+    }
+    return basename(fullPath);
+  }
   private authorized(e: Entry): boolean { return [...(this.roots[e.artifact.sessionId] ?? []),...(this.projectRoots[e.artifact.sessionId] ? [this.projectRoots[e.artifact.sessionId]!] : [])].some(r=>resolve(r)===e.root); }
   async eventTime(eventId: string, observedAt: string): Promise<string> {
     const task = this.tail.catch(()=>undefined).then(async () => {
@@ -40,7 +58,7 @@ export class ArtifactRegistry {
     const loaded = new Map<string, Entry>();
     for (const x of (state as any).entries) {
       const a = x?.artifact;
-      if (!a || typeof a.sessionId !== 'string' || typeof x.path !== 'string' || !isAbsolute(x.path) || typeof x.root !== 'string'  || a.artifactId !== digest(JSON.stringify([a.sessionId,x.path])) || typeof a.name !== 'string' || a.name !== basename(x.path) || typeof a.mediaType !== 'string' || !Number.isSafeInteger(a.size) || a.size < 0 || a.size > this.maxBytes || !/^[a-f0-9]{64}$/.test(a.contentVersion)) throw new Error('invalid artifact registry entry');
+      if (!a || typeof a.sessionId !== 'string' || typeof x.path !== 'string' || !isAbsolute(x.path) || typeof x.root !== 'string'  || a.artifactId !== digest(JSON.stringify([a.sessionId,x.path])) || typeof a.name !== 'string' || a.name !== basename(x.path) || (a.relativePath !== undefined && typeof a.relativePath !== 'string') || typeof a.mediaType !== 'string' || !Number.isSafeInteger(a.size) || a.size < 0 || a.size > this.maxBytes || !/^[a-f0-9]{64}$/.test(a.contentVersion)) throw new Error('invalid artifact registry entry');
       if (loaded.has(a.artifactId)) throw new Error('duplicate artifact registry entry');
       loaded.set(a.artifactId,{artifact:a,path:x.path,root:x.root});
     }
@@ -72,7 +90,7 @@ export class ArtifactRegistry {
     for (const candidate of roots) { try { data = await this.readSafe(observedPath,candidate); root = resolve(candidate); break; } catch { /* try another authorized root */ } }
     if (!data) throw new Error('artifact unavailable or outside allowed roots');
     const path = resolve(observedPath), artifactId = digest(JSON.stringify([sessionId,path]));
-    const artifact: Artifact = {artifactId,sessionId,name:basename(path),mediaType,size:data.length,contentVersion:digest(data)};
+    const artifact: Artifact = {artifactId,sessionId,name:basename(path),mediaType,size:data.length,contentVersion:digest(data),relativePath:this.relativePathFor(sessionId,path,root)};
     const commit = this.tail.catch(()=>undefined).then(async () => {
       const previous = this.entries.get(artifactId); this.entries.set(artifactId,{artifact,path,root});
       try { await this.persist(); } catch (e) { if (previous) this.entries.set(artifactId,previous); else this.entries.delete(artifactId); throw e; }
@@ -82,7 +100,10 @@ export class ArtifactRegistry {
   has(artifactId: string): boolean { return this.entries.has(artifactId); }
   list(sessionId: string, limit: number, cursor?: string): Page<Artifact> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('invalid limit');
-    const items = [...this.entries.values()].filter(e => e.artifact.sessionId === sessionId && this.authorized(e)).map(e=>e.artifact).sort((a,b)=>a.artifactId.localeCompare(b.artifactId));
+    const items = [...this.entries.values()]
+      .filter(e => e.artifact.sessionId === sessionId && this.authorized(e))
+      .map(e => ({...e.artifact, relativePath: this.relativePathFor(e.artifact.sessionId, e.path, e.root)}))
+      .sort((a,b)=>a.artifactId.localeCompare(b.artifactId));
     const fingerprint = digest(JSON.stringify(items)); let offset = 0;
     if (cursor) { let c: any; try { c = JSON.parse(Buffer.from(cursor,'base64url').toString()); } catch { throw new Error('invalid cursor'); } if (c.sessionId !== sessionId || c.fingerprint !== fingerprint || !Number.isSafeInteger(c.offset) || c.offset < 0 || c.offset > items.length) throw new Error('stale or invalid cursor'); offset = c.offset; }
     const end = Math.min(offset+limit,items.length); return {items:items.slice(offset,end).map(x=>({...x})),nextCursor:end < items.length ? Buffer.from(JSON.stringify({sessionId,fingerprint,offset:end})).toString('base64url') : null};

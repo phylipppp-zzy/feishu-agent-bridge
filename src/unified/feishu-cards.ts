@@ -9,8 +9,13 @@ export function providerTitlePrefix(provider: Provider): string {
   return provider === 'codex' ? 'Codex' : provider === 'agy' ? 'Antigravity' : 'Claude';
 }
 
+export interface ChannelCardTable {
+  columns: Array<{ header: string; weight?: number }>;
+  rows: string[][];
+  footer?: string;
+}
 /** Presentation-neutral cards; an injected transport converts these to Feishu SDK payloads. */
-export interface ChannelCard { form?: QuestionForm; title: string; text: string; actions: Array<{ label: string; value: Record<string, unknown>; url?: string }> }
+export interface ChannelCard { form?: QuestionForm; title: string; text: string; table?: ChannelCardTable; actions: Array<{ label: string; value: Record<string, unknown>; url?: string }> }
 export function sessionCard(session: Session): ChannelCard {
   return { title: session.title, text: `${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}\n控制: ${session.control.input}`, actions: [
     { label: '查看历史', value: { action: 'history' } },

@@ -34,7 +34,7 @@ const interaction: Check = x => obj({...ibase,kind:one('question_group'),toolInp
 const error = obj({code:one('unsupported','busy','control_conflict','stale_revision','interaction_expired','unauthorized','temporarily_unavailable','outcome_unknown','idempotency_conflict','invalid_request','snapshot_required'),retryable:bool,suggestedAction:str},{message:str});
 const operationResult: Check = x => obj({kind:one('session'),sessionId:str})(x) || obj({kind:one('artifact'),artifactId:str,contentVersion:str})(x) || obj({kind:one('turn'),turnId:str,status:one('completed','failed','interrupted')})(x);
 const operation = obj({operationId:str,idempotencyKey:str,targetId:str,action:str,payloadDigest:str,status:one('received','queued','accepted','completed','failed','unknown'),revision:uint,error:nullable(error)},{result:operationResult});
-const artifact = obj({artifactId:str,sessionId:str,name:str,mediaType:str,size:uint,contentVersion:str});
+const artifact = obj({artifactId:str,sessionId:str,name:str,mediaType:str,size:uint,contentVersion:str},{relativePath:str});
 const event = obj({schemaVersion:one(1),eventId:str,sessionId:str,objectId:str,objectRevision:uint,sequence:uint,type:str,occurredAt:date,receivedAt:date,operationId:nullable(str),cursor:str,data:json});
 const page = (item: Check) => obj({items:array(item),nextCursor:nullable(str)});
 const snapshot = obj({value:obj({session,messages:array(message),interactions:array(interaction)}),cursor:str});

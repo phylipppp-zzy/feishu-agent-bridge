@@ -70,7 +70,7 @@ async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:s
 export function parseSdkCardCallback(data:Lark.RawCardActionEvent, owner:string, resolve:(chatId:string,messageId:string)=>string): {envelope:TrustedEnvelope;action:ChannelAction} | null {
   const a=parseCardAction(data); if (!a || !a.eventId) return null;
   if (a.openId !== owner) throw new Error('unauthorized');
-  return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId}},action:parseFeishuAction(a.value,a.formValues)};
+  return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseFeishuAction(a.value,a.formValues)};
 }
 /** Old or malformed cards are guidance only; their untrusted values never reach the channel. */
 export async function handleSdkCardCallback(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:ChannelAction)=>Promise<unknown>):Promise<{toast:{type:'info';content:string}} | undefined> {
@@ -79,7 +79,7 @@ export async function handleSdkCardCallback(data:Lark.RawCardActionEvent, owner:
   let action:ChannelAction;
   try { action=parseFeishuAction(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
   let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof TaskPendingRoute ? {toast:{type:'info',content:'任务话题待核查，写入暂不可用。'}} : error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownTestRoute ? {toast:{type:'info',content:'测试话题创建结果待核查，请联系管理员。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
-  const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId}};
+  const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})};
   try {await handle(envelope,action);} catch {return {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};} return undefined;
 }
 export type TestLaneToken={rootId:string;destination:string;appId:string;chatId:string;owner:string;laneId:string;namespace:string;generation:number;provider:'codex'|'claude'};
@@ -395,7 +395,19 @@ export class FeishuSdkPort implements FeishuPort {
     if (!botId) throw new Error('bot identity unavailable');
     const handles: Partial<Lark.EventHandles> & {'card.action.trigger':(data:Lark.RawCardActionEvent)=>Promise<any>} = {
       'im.message.receive_v1': async data => { try {if(await this.guideTaskPending(data,botId))return;await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),async (e,a)=>{if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId))return this.guideTaskPending(data,botId);return this.dispatchLane(e,a,handle);},async (e,id,key,type,metadata)=>{if(await this.guideTaskPending(data,botId))return;const task=this.taskToken(e.destination);if(task){if(e.identity.source!=='feishu'||e.identity.subject!==this.owner)throw Error('task topic unauthorized');this.taskStore.holdResource(task,e,e.eventId,id,key,type,metadata);await this.handleTask(e,task);return;}const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);const scope=await handler.capture(e,token);if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);this.queueTestResource(e,id,key,type,scope,token,metadata);}else{const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId)){await this.guideTaskPending(data,botId);return;}this.queueResource(e,id,key,type,scope,metadata);}},(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread));}catch(error){if(error instanceof UnknownTopic && await this.guideTaskPending(data,botId,true))return;if(error instanceof UnknownTopic && await this.guideTestUnavailable(data,botId))return;throw error;} },
-      'card.action.trigger': async data => handleSdkCardCallback(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle)),
+      'card.action.trigger': async data => {
+        const work = handleSdkCardCallback(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<{toast:{type:'info';content:string}}>(resolve => {
+          timer = setTimeout(() => resolve({toast:{type:'info',content:'正在处理…'}}), 1500);
+        });
+        try {
+          return await Promise.race([work, timeout]);
+        } finally {
+          if (timer) clearTimeout(timer);
+          void work.catch(() => {});
+        }
+      },
     };
     if (this.closing) throw new Error('SDK port closing');
     await this.ws.start({eventDispatcher:new Lark.EventDispatcher({}).register(handles)});

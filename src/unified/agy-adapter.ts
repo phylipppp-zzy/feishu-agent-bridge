@@ -1821,6 +1821,7 @@ export class AgyAdapter implements PlatformPort {
         mediaType: entry.mediaType,
         size: entry.size,
         contentVersion: entry.contentVersion,
+        relativePath: `会话产物/${entry.relativePath}`,
       }));
     } catch (error) {
       throw contractError(

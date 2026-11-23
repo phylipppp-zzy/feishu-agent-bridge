@@ -6,10 +6,60 @@ import type { ChannelCard } from './feishu-cards.js';
  * Pass JSON.stringify(result) as the SDK message content with msg_type=interactive. */
 export function toFeishuCard(card: ChannelCard): object {
   if (card.form) return renderQuestionForm(card.form);
-  return { config: { wide_screen_mode: true }, header: { title: { tag:'plain_text', content:card.title.trim() || '未命名会话' } }, elements: [
-    { tag:'div', text:{ tag:'plain_text', content:card.text } },
-    ...(card.actions.length ? [{tag:'action',actions:card.actions.map(a => ({tag:'button',text:{tag:'plain_text',content:a.label},type:'default',...(a.url ? {url:a.url} : {value:a.value})}))}] : []),
-  ] };
+  const elements: unknown[] = [];
+  if (card.table) {
+    const renderColumns = (cells: string[], bold: boolean) =>
+      card.table!.columns.map((col, idx) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: col.weight ?? 1,
+        vertical_align: 'top',
+        elements: [
+          {
+            tag: 'div',
+            text: {
+              tag: 'lark_md',
+              content: bold ? `**${cells[idx] ?? col.header}**` : (cells[idx] ?? ''),
+            },
+          },
+        ],
+      }));
+    elements.push(
+      {
+        tag: 'column_set',
+        flex_mode: 'none',
+        background_style: 'grey',
+        columns: renderColumns(card.table.columns.map(c => c.header), true),
+      },
+      { tag: 'hr' },
+      ...card.table.rows.map(row => ({
+        tag: 'column_set',
+        flex_mode: 'none',
+        columns: renderColumns(row, false),
+      })),
+    );
+    if (card.table.footer) {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: card.table.footer } });
+    }
+  } else {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: card.text } });
+  }
+  if (card.actions.length) {
+    elements.push({
+      tag: 'action',
+      actions: card.actions.map(a => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: a.label },
+        type: 'default',
+        ...(a.url ? { url: a.url } : { value: a.value }),
+      })),
+    });
+  }
+  return {
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: card.title.trim() || '未命名会话' } },
+    elements,
+  };
 }
 const object = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
 const str = (x: unknown): x is string => typeof x === 'string' && x.length > 0;
@@ -34,7 +84,7 @@ function parseAction(value: unknown): ChannelAction {
     case 'archive': if (typeof value.archived === 'boolean' && counter(value.revision) && counter(value.controlGeneration)) return {action:'archive',archived:value.archived,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'bind': if (str(value.sessionId) && (value.mode === undefined || value.mode === 'read_only' || value.mode === 'interactive')) return {action:'bind',sessionId:value.sessionId,...(value.mode ? {mode:value.mode} : {})}; break;
     case 'create': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.project) && (value.model === null || str(value.model))) return {action:'create',provider:value.provider,project:value.project,model:value.model}; break;
-    case 'artifacts': if (value.sessionId === undefined || str(value.sessionId)) return value.sessionId === undefined ? {action:'artifacts'} : {action:'artifacts',sessionId:value.sessionId as string}; break;
+    case 'artifacts': if ((value.sessionId === undefined || str(value.sessionId)) && (value.cursor === undefined || str(value.cursor))) return {action:'artifacts',...(str(value.sessionId) ? {sessionId:value.sessionId} : {}),...(str(value.cursor) ? {cursor:value.cursor} : {})}; break;
     case 'file': if (str(value.artifactId) && str(value.contentVersion)) return {action:'file',artifactId:value.artifactId,contentVersion:value.contentVersion}; break;
     case 'reconcile': case 'finish': if (str(value.operationId)) return {action:value.action,operationId:value.operationId}; break;
     case 'answer': {

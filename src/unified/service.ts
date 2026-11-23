@@ -8,6 +8,36 @@ import { StoreError, UnifiedStore } from './store.js';
 /** Authentication is supplied by the channel; an identity string alone is never trusted. */
 export type Authorize = (identity: WriteContext['identity'], session: Session, action: string) => boolean;
 const sessionIdFor = (native: Session['native']): string => `session_${payloadDigest(native)}`;
+const GENERIC_SESSION_TITLE_RE = /(?:Claude|Codex|Antigravity) 会话 · [0-9a-f]{8}$/;
+const isGenericFallbackTitle = (title: string): boolean => GENERIC_SESSION_TITLE_RE.test(title.trim());
+const isMissingNativeSessionError = (error: unknown): boolean => {
+  const obj = error && typeof error === 'object' ? (error as { code?: unknown; message?: unknown; detail?: { code?: unknown; message?: unknown } }) : null;
+  const code = obj?.code ?? obj?.detail?.code;
+  if (code === 'ENOENT') return true;
+  const msg = typeof obj?.message === 'string' ? obj.message : typeof obj?.detail?.message === 'string' ? obj.detail.message : String(error ?? '');
+  return /^(?:agy )?session not found$/i.test(msg.trim()) || /thread not found|no rollout found/i.test(msg);
+};
+function mergeDiscoveredReadonlyMetadata(current: Session, discovered: Session): Session {
+  if (current.status !== 'read_only' || current.control.input === 'available') return current;
+  const candTitle = discovered.title?.trim() ?? '';
+  const currTitle = current.title?.trim() ?? '';
+  const candTime = discovered.updatedAt ? Date.parse(discovered.updatedAt) : NaN;
+  const currTime = current.updatedAt ? Date.parse(current.updatedAt) : NaN;
+  const isNewer = Number.isFinite(candTime) && (!Number.isFinite(currTime) || candTime > currTime);
+  const shouldUpdateTitle =
+    !!candTitle &&
+    candTitle !== currTitle &&
+    !isGenericFallbackTitle(candTitle) &&
+    (isGenericFallbackTitle(currTitle) || !currTitle || isNewer);
+  const nextTitle = shouldUpdateTitle ? candTitle : current.title;
+  const nextUpdatedAt = isNewer ? discovered.updatedAt : current.updatedAt;
+  if (nextTitle === current.title && nextUpdatedAt === current.updatedAt) return current;
+  return {
+    ...current,
+    title: nextTitle,
+    ...(nextUpdatedAt ? { updatedAt: nextUpdatedAt } : {}),
+  };
+}
 const fail = (code: Parameters<typeof contractError>[0], message?: string): never => { throw new StoreError(contractError(code, message)); };
 function page<T>(items: T[], q: ListQuery) {
   const start = q.cursor === undefined ? 0 : Number(q.cursor);
@@ -62,10 +92,67 @@ export class UnifiedCore implements UnifiedService {
   }
   presentSession:(session:Session)=>Session=session=>session;
   private present(session: Session): Session { session=this.presentSession(session); if(this.unavailableProviders.has(session.native.provider)) {const capabilities=Object.fromEntries(Object.entries(session.capabilities).map(([key,value])=>[key,key==='view'?value:{status:'temporarily_unavailable',reason:'provider unavailable'}])) as Session['capabilities'];return {...session,status:'unreachable',capabilities,control:{...session.control,input:'unavailable',reason:'provider unavailable'}};} const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
+  clearTransientRefreshFailure(): void {
+    if (this.observationFailure === 'read-only refresh failed') this.observationFailure = null;
+  }
   async listSessions(q: ListQuery) {
     const stored=this.store.listSessions(); const known=new Set(stored.map(s=>payloadDigest(s.native)));
-    const all=stored.filter(s=>!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))).map(s=>this.present(s));
-    const unavailableProviders:Provider[]=[]; if(this.canDiscover) for(const port of this.providers.values()) {try {let cursor:string|null=null;const seen=new Set<string>();do {const found=await boundedProviderList(port,cursor);for(const item of found.items) {if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');const key=payloadDigest(item.native);if(known.has(key)||!this.canDiscover(item))continue;known.add(key);const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});}cursor=found.nextCursor;if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}}while(cursor!==null);this.setProviderAvailable(port.provider,true);} catch {unavailableProviders.push(port.provider);this.setProviderAvailable(port.provider,false);}}
+    const rawByKey=new Map<string,Session>(); const rawAll:Session[]=[];
+    for(const s of stored) {
+      if(!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))) {
+        rawByKey.set(payloadDigest(s.native),s);
+        rawAll.push(s);
+      }
+    }
+    const discoveredByKey=new Map<string,Session>();
+    const unavailableProviders:Provider[]=[];
+    const requestedProvider=q.provider && q.provider!=='all' ? q.provider : undefined;
+    if(this.canDiscover) {
+      const targetPorts=[...this.providers.values()].filter(port=>!requestedProvider || port.provider===requestedProvider);
+      const results=await Promise.all(targetPorts.map(async port=>{
+        const discovered:Session[]=[];
+        try {
+          let cursor:string|null=null;const seen=new Set<string>();
+          do {
+            const found=await boundedProviderList(port,cursor);
+            for(const item of found.items) {
+              if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');
+              if(this.canDiscover!(item)) discovered.push(item);
+            }
+            cursor=found.nextCursor;
+            if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}
+          } while(cursor!==null);
+          this.setProviderAvailable(port.provider,true);
+          return {provider:port.provider,discovered,unavailable:false};
+        } catch {
+          this.setProviderAvailable(port.provider,false);
+          return {provider:port.provider,discovered,unavailable:true};
+        }
+      }));
+      for(const res of results) {
+        if(res.unavailable) unavailableProviders.push(res.provider);
+        for(const item of res.discovered) {
+          const key=payloadDigest(item.native);
+          discoveredByKey.set(key,item);
+          if(!known.has(key)) {
+            known.add(key);
+            const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];
+            rawAll.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});
+          } else {
+            const existing=rawByKey.get(key);
+            if(existing) {
+              const merged=mergeDiscoveredReadonlyMetadata(existing,item);
+              if(merged!==existing) {
+                const idx=rawAll.indexOf(existing);
+                if(idx>=0) rawAll[idx]=merged;
+                rawByKey.set(key,merged);
+              }
+            }
+          }
+        }
+      }
+    }
+    const all=rawAll.map(s=>this.present(s));
     const timeOf = (s: Session): number => (s.updatedAt ? Date.parse(s.updatedAt) : NaN);
     all.sort((a, b) => {
       const ta = timeOf(a), tb = timeOf(b);
@@ -74,8 +161,31 @@ export class UnifiedCore implements UnifiedService {
       if (fa && fb && tb !== ta) return tb - ta;
       return payloadDigest(a.native).localeCompare(payloadDigest(b.native));
     });
-    const search=q.search?.toLowerCase();const selected=page(all.filter(s=>(!q.provider||s.native.provider===q.provider)&&(!search||`${s.native.provider} ${s.native.provider==='agy'?'antigravity ':''}${s.title} ${s.project}`.toLowerCase().includes(search))),q);const items:Session[]=[];
-    for(const candidate of selected.items) {let current=this.store.findSession(candidate.native);if(!current) {try {this.store.insertSession(candidate);current=candidate;} catch(error) {current=this.store.findSession(candidate.native);if(!current)throw error;}} if(this.store.isDetached(current.sessionId) || (this.canDiscover && !this.canDiscover(current))) continue;items.push(this.present(current));}
+    const search=q.search?.toLowerCase();const selected=page(all.filter(s=>(!requestedProvider||s.native.provider===requestedProvider)&&(!search||`${s.native.provider} ${s.native.provider==='agy'?'antigravity ':''}${s.title} ${s.project}`.toLowerCase().includes(search))),q);const items:Session[]=[];
+    for(const candidate of selected.items) {
+      let current=this.store.findSession(candidate.native);
+      if(!current) {
+        try {this.store.insertSession(candidate);current=candidate;} catch(error) {current=this.store.findSession(candidate.native);if(!current)throw error;}
+      } else if(current.status==='read_only' && current.control.input!=='available') {
+        const discovered=discoveredByKey.get(payloadDigest(candidate.native));
+        if(discovered) {
+          const merged=mergeDiscoveredReadonlyMetadata(current,discovered);
+          if(merged!==current) {
+            try {
+              const updated={...merged,revision:current.revision+1};
+              this.store.updateSession(updated,current.revision,current.control.generation);
+              current=updated;
+            } catch(error) {
+              const code=error instanceof StoreError ? error.detail.code : undefined;
+              if(code!=='stale_revision' && code!=='control_conflict') throw error;
+              current=this.store.findSession(candidate.native) ?? current;
+            }
+          }
+        }
+      }
+      if(this.store.isDetached(current.sessionId) || (this.canDiscover && !this.canDiscover(current))) continue;
+      items.push(this.present(current));
+    }
     return {items,nextCursor:selected.nextCursor,...(unavailableProviders.length?{unavailableProviders}:{})};
   }
   async getSession(id: string) { return this.present(this.store.getSession(id)); }
@@ -91,17 +201,23 @@ export class UnifiedCore implements UnifiedService {
   /** Initial history baseline is read-only even when another binding has interactive control. */
   async hydrateSessionHistory(id:string):Promise<void> { return this.refreshHistory(id,true); }
   private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot):Promise<void> {
+    let current:Session|undefined;
     try {
-      const current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
+      current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
       const observed=supplied ?? await this.port(current).read(current.native); if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project) return fail('invalid_request','provider returned wrong native session or project');
       if (observed.connectionGeneration !== undefined && observed.connectionGeneration < this.store.connectionGeneration(id)) return fail('control_conflict','stale connection generation');
-      if ((observed.turns ?? []).some(t=>t.sessionId!==current.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
+      if ((observed.turns ?? []).some(t=>t.sessionId!==current!.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
       // Only refresh presentation metadata on the still-readonly, same native session.
       const latest=this.store.getSession(id); if(latest.status==='read_only' && latest.control.input!=='available' && payloadDigest(latest.native)===payloadDigest(current.native) && latest.project===current.project) {const title=observed.session.title?.trim() || latest.title; const candidateTime=observed.session.updatedAt; const updatedAt=candidateTime && Number.isFinite(Date.parse(candidateTime)) && (!latest.updatedAt || !Number.isFinite(Date.parse(latest.updatedAt)) || Date.parse(candidateTime)>Date.parse(latest.updatedAt)) ? candidateTime : latest.updatedAt; if(title!==latest.title || updatedAt!==latest.updatedAt) {try {this.store.updateSession({...latest,title,...(updatedAt ? {updatedAt}:{}),revision:latest.revision+1},latest.revision,latest.control.generation);} catch(error) {const code=error instanceof StoreError ? error.detail.code : undefined;if(code!=='stale_revision' && code!=='control_conflict')throw error;}}}
 
       for (const native of observed.turns ?? []) this.store.putTurn({...native,sessionId:id});
       for (const native of observed.messages) { const snapshot=this.store.snapshot(id); const old=snapshot.value.messages.find(m=>m.messageId===native.messageId); const value={...native,sessionId:id,sequence:old?.sequence ?? Math.max(0,...snapshot.value.messages.map(m=>m.sequence))+1,revision:old?.revision ?? native.revision}; if(old && payloadDigest(value)===payloadDigest(old)) continue; if(old?.final && !value.final) continue; this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null); }
-    } catch (error) { this.observationFailure='read-only refresh failed'; throw error; }
+      if(this.observationFailure==='read-only refresh failed') this.observationFailure=null;
+    } catch (error) {
+      const suppress=!!current && current.status==='read_only' && current.control.input!=='available' && (isMissingNativeSessionError(error) || this.unavailableProviders.has(current.native.provider));
+      if(!suppress) this.observationFailure='read-only refresh failed';
+      throw error;
+    }
   }
   async initialCursor(id:string) {return this.store.initialCursor(id);}
   async getSnapshot(id: string) { const snapshot=this.store.snapshot(id); return {...snapshot,value:{...snapshot.value,session:this.present(snapshot.value.session)}}; }

@@ -10,7 +10,7 @@ import { sessionListCard } from './session-list-card.js';
 import { interactionCard, operationCard, providerDisplayLabel, sessionCard, type ChannelCard } from './feishu-cards.js';
 
 /** Identity and destination must come from an authenticated, verified transport envelope. */
-export interface TrustedEnvelope { eventId: string; destination: string; identity: Identity }
+export interface TrustedEnvelope { eventId: string; destination: string; identity: Identity; cardMessageId?: string }
 export interface FeishuPort {
   isTopicDestination?(destination:string): boolean;
   createTopic?(destination:string, sessionId:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>): Promise<string>;
@@ -47,7 +47,7 @@ export type ChannelAction = (
  | { action: 'stop'; turnId: string; revision: number; controlGeneration: number }
  | { action: 'legacy_stop' }
  | { action: 'control'; owner: string; strategy: 'wait' | 'interrupt'; revision: number; controlGeneration: number; release?: boolean }
- | { action: 'artifacts'; sessionId?: string }
+ | { action: 'artifacts'; sessionId?: string; cursor?: string }
  | { action: 'file'; artifactId: string; contentVersion: string }
  | { action: 'resource_rejected'; reason:'unsupported'|'size'|'encoding' }
  | { action: 'attachment'; name: string; mediaType: string; content: Uint8Array; mode: 'new' | 'queue' | 'steer' }
@@ -418,10 +418,45 @@ export class FeishuChannel {
     catch (error) {this.db.exec('ROLLBACK');throw error;}
     return result;
   }
+  private async listAllArtifacts(sessionId: string): Promise<import('./contracts.js').Artifact[]> {
+    const items: import('./contracts.js').Artifact[] = [];
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const page = await this.service.listArtifacts(sessionId, { limit: 1000, ...(cursor ? { cursor } : {}) });
+      items.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+      if (cursor) {
+        if (seen.has(cursor) || seen.size >= 1000) throw new Error('invalid artifact pagination');
+        seen.add(cursor);
+      }
+    } while (cursor);
+    return items;
+  }
   async handle(e: TrustedEnvelope, a: ChannelAction): Promise<unknown> { await this.intake(e,a); return this.drain(e.eventId); }
   private async execute(e: TrustedEnvelope, a: ChannelAction, bound: string | null, executionScope:string, effects:{started:boolean}): Promise<unknown> {
     const guard = async () => { if(executionScope!==this.bindingScope(e.destination)) throw new BindingExpired('binding changed'); const allowed=await this.authorize(e.identity,e.destination,bound); if(executionScope!==this.bindingScope(e.destination)) throw new BindingExpired('binding changed'); if(!allowed) throw new ReadAuthorizationRevoked('unauthorized'); };
     const reply = async (card: ChannelCard, suffix = 'reply', extraGuard?:()=>Promise<void>) => { const current=extraGuard ? async()=>{await guard();await extraGuard();await guard();} : guard; await current(); effects.started=true; return this.deliver(e.destination, card, `${e.eventId}:${suffix}`,current); };
+    const replyOrUpdate = async (card: ChannelCard, suffix = 'reply', extraGuard?:()=>Promise<void>) => {
+      const current=extraGuard ? async()=>{await guard();await extraGuard();await guard();} : guard;
+      await current();
+      effects.started=true;
+      if (e.cardMessageId) {
+        const updateId=`${e.eventId}:${suffix}:update`;
+        const inserted=this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(updateId);
+        if(!inserted.changes) return;
+        try {
+          await this.port.update(e.destination,e.cardMessageId,this.stampCard(e.destination,card),updateId,current);
+          await current();
+          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(updateId);
+          return;
+        } catch (error) {
+          if (error instanceof BindingExpired || error instanceof ReadAuthorizationRevoked) throw error;
+          this.db.prepare('DELETE FROM channel_deliveries WHERE delivery_id=?').run(updateId);
+        }
+      }
+      return this.deliver(e.destination, card, `${e.eventId}:${suffix}`, current);
+    };
     if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片和 UTF-8 文本附件。',size:'文本附件为空或超过 1 MiB，未提交。',encoding:'文本附件不是有效 UTF-8 或包含 NUL，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
     if (a.action === 'help') { await reply({title:'帮助',text:'会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；Codex 当前唯一运行轮追加输入：/steer 内容；中断当前回复：/stop；后台任务是否终止尚未确认。',actions:[]}); return {status:'guidance'}; }
     if (a.action === 'new_help') {
@@ -456,7 +491,7 @@ export class FeishuChannel {
       }
       const providerFilters=a.provider !== undefined || page.items.some(s => s.native.provider === 'agy') || hasAgyProvider;
       const card=sessionListCard(visible,{topicUrls,nextCursor:page.nextCursor,...(providerFilters ? {providerFilters:true} : {}),...(a.search ? {search:a.search} : {}),...(a.provider !== undefined ? {provider:a.provider} : {})}); if(page.unavailableProviders?.length) card.text+=`\n暂不可用：${page.unavailableProviders.join('、')}；列表可能不完整。`;
-      await reply(card,'reply',listGuard);return {nextCursor:page.nextCursor};
+      await replyOrUpdate(card,'reply',listGuard);return {nextCursor:page.nextCursor};
     }
     if (a.action === 'health') {
       const health = await this.service.health();
@@ -493,6 +528,8 @@ export class FeishuChannel {
       const attention: string[] = [];
       const normal: string[] = [];
       const unverified: string[] = [];
+      const attentionRows: string[][] = [];
+      const normalRows: string[][] = [];
       for (const h of health) {
         const label = labelOf(h.component);
         if (h.status === 'healthy') {
@@ -500,10 +537,13 @@ export class FeishuChannel {
           const observed = formatTime(h.lastObservedAt);
           const timeText = success ? `（最近成功 ${success}）` : observed ? `（最近观测 ${observed}）` : '';
           normal.push(`- ${label}：正常${timeText}`);
+          const detailText = success ? `最近成功 ${success}` : observed ? `最近观测 ${observed}` : '—';
+          normalRows.push([label, `✅ ${states.healthy}`, detailText]);
         } else if (h.status === 'unverified') {
           unverified.push(label);
         } else {
           const state = states[h.status] ?? h.status;
+          const icon = h.status === 'unreachable' ? '❌' : '⚠️';
           const reason = translateReason(h.reason ?? h.lastFailureReason);
           const details: string[] = [];
           const success = formatTime(h.lastSuccessAt);
@@ -513,13 +553,32 @@ export class FeishuChannel {
           if (typeof h.unknown === 'number' && h.unknown > 0) details.push(`待核对 ${h.unknown}`);
           if (typeof h.backlog === 'number' && h.backlog > 0) details.push(`积压 ${h.backlog}`);
           attention.push(`- ${label}：${state}${reason ? `（${reason}）` : ''}${details.length ? `；${details.join('；')}` : ''}`);
+          const rowDetails = [...(reason ? [reason] : []), ...details];
+          attentionRows.push([label, `${icon} ${state}`, rowDetails.length ? rowDetails.join('；') : '—']);
         }
       }
       const sections: string[] = [];
       if (attention.length) sections.push(`【需关注】\n${attention.join('\n')}`);
       if (normal.length) sections.push(`【正常】\n${normal.join('\n')}`);
       if (unverified.length) sections.push(`【尚未触发】\n${unverified.join('、')}`);
-      await reply({title:'健康状态',text:sections.length ? sections.join('\n\n') : '暂无健康状态记录。',actions:[]});
+      const rows = [...attentionRows, ...normalRows];
+      const table = rows.length || unverified.length
+        ? {
+            columns: [
+              { header: '组件', weight: 2 },
+              { header: '状态', weight: 1 },
+              { header: '最近动态 / 说明', weight: 3 },
+            ],
+            rows,
+            ...(unverified.length ? { footer: `⚪ 尚未触发：${unverified.join('、')}` } : {}),
+          }
+        : undefined;
+      await reply({
+        title:'健康状态',
+        text:sections.length ? sections.join('\n\n') : '暂无健康状态记录。',
+        ...(table ? { table } : {}),
+        actions:[],
+      });
       return health;
     }
     if (a.action === 'bind' && a.mode === 'interactive') {
@@ -534,7 +593,7 @@ export class FeishuChannel {
       await reply({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]}); return op;
     }
     if (a.action === 'bind') { const s = await this.service.getSession(a.sessionId); const bindGuard=async()=>{if(executionScope!==this.bindingScope(e.destination) || !await this.authorize(e.identity,e.destination,s.sessionId) || executionScope!==this.bindingScope(e.destination)) throw new Error('binding changed or unauthorized');}; await bindGuard(); const destination = this.port.createTopic && !this.port.isTopicDestination?.(e.destination) ? await this.port.createTopic(e.destination,s.sessionId,{title:s.title,text:`${providerDisplayLabel(s.native.provider)} · ${s.project} · ${s.status}`,actions:[]},`${e.eventId}:topic`,bindGuard) : e.destination; if (!await this.authorize(e.identity,destination,s.sessionId)) throw new Error('unauthorized'); const existing=this.db.prepare('SELECT session_id,owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;owner_source:string;owner_subject:string}|undefined; if(existing && (existing.owner_source!==e.identity.source || existing.owner_subject!==e.identity.subject) && !await this.authorizeBindingAdmin?.(e.identity,destination,existing.session_id)) throw new Error('binding management unauthorized'); let autoExistingInteractive=false; this.db.exec('BEGIN IMMEDIATE'); try { const auto=this.db.prepare('SELECT 1 FROM channel_auto_baselines WHERE event_id=? AND session_id=? AND destination IS NULL').get(e.eventId,s.sessionId); const current=this.db.prepare('SELECT session_id,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;access_mode:string}|undefined; if(auto && current && current.session_id!==s.sessionId) throw new Error('automatic binding superseded'); if (auto ? !current : (!existing || existing.session_id!==s.sessionId)) { if(this.port.isTopicDestination?.(destination)) this.port.reassignTopic?.(destination,s.sessionId); this.db.prepare("INSERT INTO channel_bindings(destination,session_id,binding_id,owner_source,owner_subject,revision,access_mode) VALUES (?,?,?,?,?,1,'read_only') ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,binding_id=excluded.binding_id,owner_source=excluded.owner_source,owner_subject=excluded.owner_subject,revision=channel_bindings.revision+1,access_mode='read_only'").run(destination,s.sessionId,randomUUID(),e.identity.source,e.identity.subject); this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(destination); } autoExistingInteractive=!!auto && current?.access_mode==='interactive'; if(autoExistingInteractive) this.db.prepare('DELETE FROM channel_auto_baselines WHERE event_id=?').run(e.eventId); else this.db.prepare('UPDATE channel_auto_baselines SET destination=?,binding_scope=? WHERE event_id=? AND session_id=? AND destination IS NULL').run(destination,this.bindingScope(destination),e.eventId,s.sessionId); this.db.exec('COMMIT'); } catch(error) {this.db.exec('ROLLBACK');throw error;} if(autoExistingInteractive) return {sessionId:s.sessionId,accessMode:'interactive',destination}; await this.deliver(destination,{...sessionCard(s),text:sessionCard(s).text + `\n绑定模式: ${this.accessMode(destination)}`},`${e.eventId}:reply`); if(destination!==e.destination && a.mode!=='interactive') {const url=await this.port.topicLinkForSession?.(e.destination,s.sessionId) ?? null; if(url) await reply({title:'会话已打开',text:'在话题中查看和继续操作。',actions:[{label:'打开话题',value:{},url}]},'open-topic'); else await reply({title:'话题链接暂不可用',text:'会话话题已建立，请稍后重试打开。',actions:[]},'open-topic');} return { sessionId: s.sessionId, accessMode:this.accessMode(destination), destination }; }
-    if (a.action === 'create' || a.action === 'attach') { const ctx = this.context(e, `new:${e.destination}`, 0, 0); this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(ctx.operationId,e.destination,a.action === 'attach' ? a.mode : 'interactive'); this.db.prepare('INSERT OR IGNORE INTO channel_pending_scope VALUES (?,?)').run(ctx.operationId,this.bindingScope(e.destination)); this.recordPendingActor(ctx.operationId,e); const op = a.action === 'create' ? await this.service.createSession({ context: ctx, payload: { provider: a.provider, project: a.project, model: a.model } }) : await this.service.attachSession({ context: ctx, payload: { provider: a.provider, hostId: a.hostId, serviceId: a.serviceId, nativeSessionId: a.nativeSessionId, mode: a.mode } }); this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(op.operationId,e.destination,a.action === 'attach' ? a.mode : 'interactive'); await reply({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]}); return op; }
+    if (a.action === 'create' || a.action === 'attach') { const ctx = this.context(e, `new:${e.destination}`, 0, 0); this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(ctx.operationId,e.destination,a.action === 'attach' ? a.mode : 'interactive'); this.db.prepare('INSERT OR IGNORE INTO channel_pending_scope VALUES (?,?)').run(ctx.operationId,this.bindingScope(e.destination)); this.recordPendingActor(ctx.operationId,e); const op = a.action === 'create' ? await this.service.createSession({ context: ctx, payload: { provider: a.provider, project: a.project, model: a.model } }) : await this.service.attachSession({ context: ctx, payload: { provider: a.provider, hostId: a.hostId, serviceId: a.serviceId, nativeSessionId: a.nativeSessionId, mode: a.mode } }); this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,NULL,'session',?,'pending')").run(op.operationId,e.destination,a.action === 'attach' ? a.mode : 'interactive'); await (a.action === 'create' ? replyOrUpdate : reply)({...operationCard(op),text:operationCard(op).text+(op.status === 'unknown' ? '' : '；完成后将自动继续'),actions:[{label:'查看处理进度',value:{action:'finish',operationId:op.operationId}}]}); return op; }
     if (a.action === 'upgrade') {
       if (!bound || this.accessMode(e.destination) !== 'read_only') throw new Error('no read-only binding');
       const session=await this.service.getSession(bound); const n=session.native;
@@ -613,11 +672,110 @@ export class FeishuChannel {
       const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null; await guard(); await reply(url ? {title:'历史已导出',text:'可打开原消息查看文件。',actions:[{label:'定位原文件消息',value:{},url}]} : {title:'导出状态未知',text:'尚无法定位原消息；不会重复上传。',actions:[]}); return {deliveryId:id,status:url ? 'located' : 'unknown'};
     }
     if (a.action === 'history') { const hydrate=(this.service as UnifiedService & {hydrateSessionHistory?:(id:string)=>Promise<void>}).hydrateSessionHistory; if(this.requireReadonlyHydration && this.accessMode(e.destination)==='read_only' && !this.readonlyHydrated(e.destination,bound) && hydrate) {await guard();await hydrate.call(this.service,bound);await guard();await this.baselineReadonlyHistory(e.destination,bound);await guard();} const page = await this.service.readHistory(bound,{limit:20,...(a.cursor ? {cursor:a.cursor}:{})}); await reply(await this.longTextCard(e.destination,bound,'会话历史',page.items.map(m => `${m.role}: ${m.blocks.map(b => b.type === 'text' ? b.text : `[文件 ${b.artifactId}]`).join(' ')}`).join('\n'),page.nextCursor ? [{label:'下一页',value:{action:'history',cursor:page.nextCursor}}] : [],guard,()=>{effects.started=true;})); return page; }
-    if (a.action === 'artifacts') { if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch'); const page = await this.service.listArtifacts(bound, {limit: 100}); const counts = new Map<string, number>(); for (const f of page.items) counts.set(f.name, (counts.get(f.name) ?? 0) + 1); await reply({ title: '文件', text: page.items.map(f => `${f.name} (${f.contentVersion})`).join('\n'), actions: page.items.map(f => ({label: (counts.get(f.name) ?? 0) > 1 ? `${f.name} (${f.contentVersion.slice(0, 8)})` : f.name, value: {action:'file', artifactId:f.artifactId, contentVersion:f.contentVersion}})) }); return page; }
+    if (a.action === 'artifacts') {
+      if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
+      const rawItems = await this.listAllArtifacts(bound);
+      const deduped: import('./contracts.js').Artifact[] = [];
+      const seenVersions = new Set<string>();
+      for (const item of rawItems) {
+        const pathKey = item.relativePath || item.name;
+        const dedupKey = `${pathKey}\0${item.contentVersion}`;
+        if (seenVersions.has(dedupKey)) continue;
+        seenVersions.add(dedupKey);
+        deduped.push(item);
+      }
+      const normalizeRel = (item: import('./contracts.js').Artifact): string =>
+        (item.relativePath || item.name).replace(/\\/g, '/').replace(/^\.\//, '');
+      const splitRel = (item: import('./contracts.js').Artifact): { dir: string; filename: string; pathKey: string } => {
+        const rel = normalizeRel(item);
+        const slash = rel.lastIndexOf('/');
+        return {
+          dir: slash >= 0 ? rel.slice(0, slash) || '.' : '.',
+          filename: slash >= 0 ? rel.slice(slash + 1) || item.name : rel,
+          pathKey: item.relativePath || item.name,
+        };
+      };
+      const pathCounts = new Map<string, number>();
+      const byDir = new Map<string, import('./contracts.js').Artifact[]>();
+      for (const item of deduped) {
+        const { dir, pathKey } = splitRel(item);
+        pathCounts.set(pathKey, (pathCounts.get(pathKey) ?? 0) + 1);
+        const list = byDir.get(dir) ?? [];
+        list.push(item);
+        byDir.set(dir, list);
+      }
+      const sortedDirs = [...byDir.keys()].sort((x, y) => (x === '.' ? -1 : y === '.' ? 1 : x.localeCompare(y)));
+      const ordered = sortedDirs.flatMap((dir) => byDir.get(dir)!);
+
+      const PAGE_SIZE = 8;
+      const total = ordered.length;
+      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      const parsedCursor = a.cursor !== undefined ? Number(a.cursor) : 0;
+      const rawOffset = Number.isSafeInteger(parsedCursor) && parsedCursor >= 0 ? parsedCursor : 0;
+      const maxOffset = total === 0 ? 0 : Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE;
+      const offset = Math.min(rawOffset, maxOffset);
+      const pageItems = ordered.slice(offset, offset + PAGE_SIZE);
+      const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
+      const prevCursor = offset > 0 ? String(Math.max(0, offset - PAGE_SIZE)) : null;
+      const nextCursor = offset + PAGE_SIZE < total ? String(offset + PAGE_SIZE) : null;
+
+      const humanSize = (bytes: number): string => {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      };
+      const truncateLabel = (name: string, max: number): string => {
+        const chars = [...name];
+        return chars.length > max ? `${chars.slice(0, Math.max(1, max - 1)).join('')}…` : name;
+      };
+
+      const headerLines = [`默认目录：${session.project || '未知'}`];
+      const actions: ChannelCard['actions'] = [];
+      let text: string;
+      if (total === 0) {
+        text = `${headerLines[0]}\n\n暂无可下载文件。`;
+      } else {
+        if (totalPages > 1) headerLines.push(`共 ${total} 个文件（第 ${currentPage}/${totalPages} 页）`);
+        const pageGroups: Array<{ dir: string; entries: Array<{ item: import('./contracts.js').Artifact; num: number; filename: string; pathKey: string }> }> = [];
+        for (const [idx, item] of pageItems.entries()) {
+          const { dir, filename, pathKey } = splitRel(item);
+          const num = idx + 1;
+          let group = pageGroups.find((g) => g.dir === dir);
+          if (!group) {
+            group = { dir, entries: [] };
+            pageGroups.push(group);
+          }
+          group.entries.push({ item, num, filename, pathKey });
+          const needsHash = (pathCounts.get(pathKey) ?? 0) > 1;
+          const label = needsHash
+            ? `${num}. ${truncateLabel(filename, 14)} (${item.contentVersion.slice(0, 6)})`
+            : `${num}. ${truncateLabel(filename, 20)}`;
+          actions.push({ label, value: { action: 'file', artifactId: item.artifactId, contentVersion: item.contentVersion } });
+        }
+        if (prevCursor !== null) {
+          actions.push({ label: '上一页', value: { action: 'artifacts', ...(a.sessionId ? { sessionId: a.sessionId } : {}), cursor: prevCursor } });
+        }
+        if (nextCursor !== null) {
+          actions.push({ label: '下一页', value: { action: 'artifacts', ...(a.sessionId ? { sessionId: a.sessionId } : {}), cursor: nextCursor } });
+        }
+        const treeLines: string[] = [];
+        for (const group of pageGroups) {
+          treeLines.push(`📁 ${group.dir === '.' ? './' : `${group.dir}/`}`);
+          for (const [entryIdx, entry] of group.entries.entries()) {
+            const branch = entryIdx === group.entries.length - 1 ? '└──' : '├──';
+            const hashSuffix = (pathCounts.get(entry.pathKey) ?? 0) > 1 ? ` · ${entry.item.contentVersion.slice(0, 6)}` : '';
+            treeLines.push(`${branch} ${entry.num}. ${entry.filename} (${humanSize(entry.item.size)})${hashSuffix}`);
+          }
+        }
+        text = `${headerLines.join('\n')}\n\n${treeLines.join('\n')}`;
+      }
+      await replyOrUpdate({ title: '文件', text, actions });
+      return { items: pageItems, nextCursor };
+    }
     if (a.action === 'file') {
       const scope=executionScope;
-      const files = await this.service.listArtifacts(bound, {limit: 100});
-      const file = files.items.find(f => f.artifactId === a.artifactId && f.contentVersion === a.contentVersion);
+      const files = await this.listAllArtifacts(bound);
+      const file = files.find(f => f.artifactId === a.artifactId && f.contentVersion === a.contentVersion);
       if (!file) throw new Error('artifact not found');
       const id = `file:v2:${payloadDigest([scope,e.destination,bound,file.artifactId,file.contentVersion])}`;
       const current=guard;

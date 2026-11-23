@@ -102,14 +102,14 @@ test('TestLaneRuntime operator.sock file-v2 exposes distinct artifact buttons an
   const codexRoot=createdCodex.result.rootId as string;
   await lane.tick();
 
-  // Single-version codex lane keeps plain 'fixture.txt' button label without breaking existing behavior.
+  // Single-version codex lane renders numbered '1. fixture.txt', '2. fixture.png' button labels.
   const receiveMsg=(id:string,text:string,rootId:string)=>({sender:{sender_type:'user',sender_id:{open_id:'owner'}},message:{message_id:id,chat_id:'chat',chat_type:'p2p',message_type:'text',content:JSON.stringify({text}),root_id:rootId}});
   await handles.get('im.message.receive_v1')(receiveMsg('codex-files','/files',codexRoot));
   await lane.tick();
   const codexFilesCard=replies.find(r=>r.root===codexRoot&&r.msgType==='interactive'&&JSON.parse(r.content).header?.title?.content==='文件')!;
   assert.ok(codexFilesCard);
   const codexLabels=JSON.parse(codexFilesCard.content).elements[1].actions.map((a:any)=>a.text.content);
-  assert.deepEqual(codexLabels,['fixture.txt','fixture.png']);
+  assert.deepEqual(codexLabels,['1. fixture.txt','2. fixture.png']);
 
   // Trigger file-v2 via scripts/test-lane-operator.mjs over operator.sock.
   const {stdout}=await execFileAsync(process.execPath,[operatorScript,laneDir,'trigger','claude','file-v2','trigger-file-v2']);
@@ -117,14 +117,14 @@ test('TestLaneRuntime operator.sock file-v2 exposes distinct artifact buttons an
   await lane.tick();
   assert.ok(replies.some(r=>r.root===claudeRoot&&r.content.includes('fixture.txt（第二版本）')));
 
-  // Request /files in claude test topic: dual-version fixture.txt buttons get short version suffix, single-version fixture.png stays plain.
+  // Request /files in claude test topic: dual-version fixture.txt buttons get short 6-char version suffix, single-version fixture.png stays clean.
   await handles.get('im.message.receive_v1')(receiveMsg('claude-files','/files',claudeRoot));
   await lane.tick();
   assert.equal(prod,0);
   const claudeFilesCard=replies.find(r=>r.root===claudeRoot&&r.msgType==='interactive'&&JSON.parse(r.content).header?.title?.content==='文件')!;
   assert.ok(claudeFilesCard);
   const buttons=JSON.parse(claudeFilesCard.content).elements[1].actions as Array<{text:{content:string};value:Record<string,unknown>}>;
-  assert.deepEqual(buttons.map(b=>b.text.content),[`fixture.txt (${v1Hash.slice(0,8)})`,'fixture.png',`fixture.txt (${v2Hash.slice(0,8)})`]);
+  assert.deepEqual(buttons.map(b=>b.text.content),[`1. fixture.txt (${v1Hash.slice(0,6)})`,'2. fixture.png',`3. fixture.txt (${v2Hash.slice(0,6)})`]);
   assert.equal(new Set(buttons.map(b=>b.text.content)).size,3);
 
   const btnV1=buttons[0]!,btnV2=buttons[2]!;
@@ -162,7 +162,7 @@ test('TestLaneRuntime operator.sock file-v2 exposes distinct artifact buttons an
   const dest=bound.destination as string;
   await channel.handle(env('chan-artifacts',dest),{action:'artifacts'});
   const channelButtons=sentCards.at(-1).elements[1].actions as Array<{text:{content:string};value:Record<string,unknown>}>;
-  assert.deepEqual(channelButtons.map(b=>b.text.content),[`fixture.txt (${v1Hash.slice(0,8)})`,'fixture.png',`fixture.txt (${v2Hash.slice(0,8)})`]);
+  assert.deepEqual(channelButtons.map(b=>b.text.content),[`1. fixture.txt (${v1Hash.slice(0,6)})`,'2. fixture.png',`3. fixture.txt (${v2Hash.slice(0,6)})`]);
 
   await channel.handle(env('chan-dl-v1',dest),parseFeishuAction(channelButtons[0]!.value));
   assert.equal(uploads,3);
