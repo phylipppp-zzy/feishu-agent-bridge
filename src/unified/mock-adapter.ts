@@ -27,6 +27,7 @@ export function createMockAdapter(provider: Provider): UnifiedService & { provid
   }
   const methods = {
     provider,
+    hasProvider(p: Provider) { return p === provider; },
     async listSessions(_query: ListQuery) { return { items: [session], nextCursor: null }; },
     async attachSession(request: WriteRequest<{ provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' }>) { return receipt(request.context, 'attachSession', request.payload); },
     async createSession(request: WriteRequest<{ provider: Provider; project: string; model: string | null }>) { return receipt(request.context, 'createSession', request.payload); },

@@ -1067,18 +1067,26 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
     try {
       await agyTransport.connect();
       core = new UnifiedCore(store, [claude, codex, agy], () => true, () => true, () => false, () => true);
-      channel = new FeishuChannel(core, port, async () => true, join(root, 'channel.sqlite'));
+      channel = new FeishuChannel(core, port, async () => true, join(root, 'channel.sqlite'), undefined, false, { defaultCreateProject: projectDir });
       const ownerId = { source: 'feishu', subject: 'ou_owner' };
       const sendCmd = async (eventId: string, destination: string, action: ChannelAction) => {
         await channel!.handle({ eventId, destination, identity: ownerId }, action);
       };
 
-      // 1. /new guidance mentions codex / claude / agy & includes Antigravity filter button
+      // 1. /new guidance mentions codex / claude / agy & offers direct create buttons (never misleading list filter buttons)
       await sendCmd('ev-new', 'chat-main', { action: 'new_help' });
       const newCard = sentCards.at(-1)!.card;
       assert.match(newCard.text, /agy/);
       assert.match(newCard.text, /Antigravity/);
-      assert.ok(newCard.actions.some((a) => a.value.search === 'agy'));
+      assert.equal(newCard.actions.some((a) => a.value.action === 'list'), false);
+      assert.deepEqual(
+        newCard.actions.map((a) => ({ label: a.label, value: a.value })),
+        [
+          { label: '新建 Antigravity', value: { action: 'create', provider: 'agy', project: projectDir, model: null } },
+          { label: '新建 Codex', value: { action: 'create', provider: 'codex', project: projectDir, model: null } },
+          { label: '新建 Claude', value: { action: 'create', provider: 'claude', project: projectDir, model: null } },
+        ],
+      );
 
       // 2. /sessions lists all 3 backends cleanly, and filtering by agy/antigravity isolates agy sessions
       await sendCmd('ev-list-all', 'chat-main', { action: 'list' });

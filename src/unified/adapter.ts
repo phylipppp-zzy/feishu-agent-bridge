@@ -6,6 +6,7 @@ export interface ListQuery { cursor?: string; limit: number; search?: string; pr
 export interface WriteRequest<T> { context: WriteContext; payload: T }
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
+  hasProvider?(provider: Provider): boolean;
   listSessions(query: ListQuery): Promise<Page<Session>>;
   unknownCreateProvider?(identity:{source:string;subject:string},destination:string,operationId:string):Promise<Provider|null>;
   inspectUnknownCreateCandidates?(identity:{source:string;subject:string},destination:string,operationId:string,query:{cursor?:string;nativeId?:string}):Promise<{items:CandidateMetadata[];nextCursor:string|null;partial:boolean}>;

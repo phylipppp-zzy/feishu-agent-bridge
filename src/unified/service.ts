@@ -29,6 +29,7 @@ export class UnifiedCore implements UnifiedService {
   validateSteerScope?: (scope:NonNullable<SubmitInput['channelScope']>,sessionId:string)=>boolean;
   onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
+  hasProvider(provider: Provider): boolean { return this.providers.has(provider); }
   constructor(readonly store: UnifiedStore, providers: PlatformPort[], private readonly authorize: Authorize, private readonly authorizeBootstrap: (identity: WriteContext['identity'], provider: Provider) => boolean = () => false, private readonly mayDetach: (session: Session) => boolean = () => false, private readonly canDiscover?: (session: Session) => boolean, private readonly historyReader?: HistoryReader,private readonly canInspectCandidate?:(native:Session['native'],project:string)=>boolean) {
     for (const port of providers) {
       if (this.providers.has(port.provider)) throw new Error('duplicate provider');
@@ -65,7 +66,15 @@ export class UnifiedCore implements UnifiedService {
     const stored=this.store.listSessions(); const known=new Set(stored.map(s=>payloadDigest(s.native)));
     const all=stored.filter(s=>!this.store.isDetached(s.sessionId) && (!this.canDiscover || this.canDiscover(s))).map(s=>this.present(s));
     const unavailableProviders:Provider[]=[]; if(this.canDiscover) for(const port of this.providers.values()) {try {let cursor:string|null=null;const seen=new Set<string>();do {const found=await boundedProviderList(port,cursor);for(const item of found.items) {if(item.native.provider!==port.provider) return fail('invalid_request','provider discovery mismatch');const key=payloadDigest(item.native);if(known.has(key)||!this.canDiscover(item))continue;known.add(key);const capabilities=Object.fromEntries(Object.entries(item.capabilities).map(([name,value])=>[name,name==='view' ? value : {status:'unsupported',reason:'discovered session is read-only until attached'}])) as Session['capabilities'];all.push({...item,sessionId:sessionIdFor(item.native),status:'read_only',capabilities,control:{...item.control,owner:null,input:'unavailable',reason:'discovered session is not attached'}});}cursor=found.nextCursor;if(cursor!==null){if(seen.has(cursor)||seen.size>=1000)return fail('temporarily_unavailable','invalid provider pagination');seen.add(cursor);}}while(cursor!==null);this.setProviderAvailable(port.provider,true);} catch {unavailableProviders.push(port.provider);this.setProviderAvailable(port.provider,false);}}
-    all.sort((a,b)=>payloadDigest(a.native).localeCompare(payloadDigest(b.native)));const search=q.search?.toLowerCase();const selected=page(all.filter(s=>(!q.provider||s.native.provider===q.provider)&&(!search||`${s.native.provider} ${s.native.provider==='agy'?'antigravity ':''}${s.title} ${s.project}`.toLowerCase().includes(search))),q);const items:Session[]=[];
+    const timeOf = (s: Session): number => (s.updatedAt ? Date.parse(s.updatedAt) : NaN);
+    all.sort((a, b) => {
+      const ta = timeOf(a), tb = timeOf(b);
+      const fa = Number.isFinite(ta), fb = Number.isFinite(tb);
+      if (fa !== fb) return fa ? -1 : 1;
+      if (fa && fb && tb !== ta) return tb - ta;
+      return payloadDigest(a.native).localeCompare(payloadDigest(b.native));
+    });
+    const search=q.search?.toLowerCase();const selected=page(all.filter(s=>(!q.provider||s.native.provider===q.provider)&&(!search||`${s.native.provider} ${s.native.provider==='agy'?'antigravity ':''}${s.title} ${s.project}`.toLowerCase().includes(search))),q);const items:Session[]=[];
     for(const candidate of selected.items) {let current=this.store.findSession(candidate.native);if(!current) {try {this.store.insertSession(candidate);current=candidate;} catch(error) {current=this.store.findSession(candidate.native);if(!current)throw error;}} if(this.store.isDetached(current.sessionId) || (this.canDiscover && !this.canDiscover(current))) continue;items.push(this.present(current));}
     return {items,nextCursor:selected.nextCursor,...(unavailableProviders.length?{unavailableProviders}:{})};
   }

@@ -14,7 +14,8 @@ export function sessionListCard(items: readonly Session[], options: {topicUrls?:
     const title = compact(session.title, 42) || '未命名会话';
     const project = compact(session.project.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '', 24) || '项目未知';
     const timestamp = session.updatedAt ? Date.parse(session.updatedAt) : NaN;
-    const time = Number.isFinite(timestamp) ? ` · 最近活动 ${new Date(timestamp).toISOString().slice(0,16).replace('T',' ')} UTC` : '';
+    const beijing = Number.isFinite(timestamp) ? new Date(timestamp + 8 * 3600 * 1000) : null;
+    const time = beijing && Number.isFinite(beijing.getTime()) ? ` · 最近活动 ${beijing.toISOString().slice(0,16).replace('T',' ')} 北京` : '';
     const available = session.capabilities?.view?.status === 'available';
     lines.push(`${index + 1}. ${title}\n${providerDisplayLabel(session.native.provider)} · ${project}${time}${available ? '' : ' · 暂不可查看'}`);
     if (available) {

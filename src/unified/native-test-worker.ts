@@ -12,6 +12,7 @@ export class NativeTestWorker {
     if(!sessionId)throw contractError('invalid_request');this.sessionId=sessionId;this.ledger=new NativeTestLedger(path,scope);const self=this;
     this.service=new Proxy({} as UnifiedService,{get(_target,key){
       if(key==='then'||typeof key==='symbol')return undefined;
+      if(key==='hasProvider')return (p:Provider)=>p===self.provider;
       if(key==='getSession')return (id:string)=>self.session(id);
       if(key==='getSnapshot')return (id:string)=>self.snapshot(id);
       if(key==='getInteraction')return (id:string)=>self.interaction(id);

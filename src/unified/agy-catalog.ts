@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { constants, existsSync, lstatSync, realpathSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -100,6 +100,7 @@ const MAX_ARTIFACT_SCAN_ENTRIES = 10_000;
 const DEFAULT_MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_TITLE_LENGTH = 80;
+const TITLE_TRANSCRIPT_READ_BYTES = 16 * 1024;
 
 export type AgySessionStatus = 'idle' | 'running' | 'canceling' | 'busy' | 'unspecified';
 
@@ -481,13 +482,11 @@ function truncateText(text: string, maxLen: number): string {
   return `${chars.slice(0, maxLen - 1).join('').trimEnd()}…`;
 }
 
-/** Derive a display title: non-empty `title`, else cleaned `preview` first line, else `Antigravity 会话 · <shortId>`. */
-export function deriveAgySessionTitle(
-  conversationId: string,
+function derivePresentAgyTitle(
   title: unknown,
   preview: unknown,
   maxLength = DEFAULT_MAX_TITLE_LENGTH,
-): string {
+): string | null {
   if (typeof title === 'string') {
     const cleanTitle = stripHostInjectionBlocks(title)
       .replace(ALL_CONTROL_CHARS_RE, ' ')
@@ -503,6 +502,144 @@ export function deriveAgySessionTitle(
       .find(Boolean);
     if (firstLine) return truncateText(firstLine, maxLength);
   }
+  return null;
+}
+
+function cleanUserRequestLine(rawContent: string, maxLength: number): string | null {
+  const cleaned = extractAgyUserInput(rawContent).replace(/<truncated\s+\d+\s+bytes>\s*$/gi, '').trim();
+  if (!cleaned) return null;
+  const firstLine = cleaned
+    .split(/\r?\n/)
+    .map((line) => line.replace(ALL_CONTROL_CHARS_RE, ' ').replace(/\s+/g, ' ').trim())
+    .find(Boolean);
+  return firstLine ? truncateText(firstLine, maxLength) : null;
+}
+
+function decodePartialJsonStringField(line: string, fieldName: string): string | null {
+  const match = new RegExp(`"${fieldName}"\\s*:\\s*"`).exec(line);
+  if (!match) return null;
+  let out = '';
+  let i = match.index + match[0].length;
+  while (i < line.length) {
+    const ch = line[i]!;
+    if (ch === '"') break;
+    if (ch === '\\') {
+      if (i + 1 >= line.length) break;
+      const esc = line[i + 1]!;
+      if (esc === 'n') { out += '\n'; i += 2; continue; }
+      if (esc === 'r') { out += '\r'; i += 2; continue; }
+      if (esc === 't') { out += '\t'; i += 2; continue; }
+      if (esc === 'b') { out += '\b'; i += 2; continue; }
+      if (esc === 'f') { out += '\f'; i += 2; continue; }
+      if (esc === 'u') {
+        const hex = line.slice(i + 2, i + 6);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          out += String.fromCharCode(Number.parseInt(hex, 16));
+          i += 6;
+          continue;
+        }
+        break;
+      }
+      out += esc;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out || null;
+}
+
+function readTranscriptTitleFromBrain(
+  conversationId: string,
+  canonicalBrainDir: string | null,
+  maxLength: number,
+): string | null {
+  if (!canonicalBrainDir) return null;
+  try {
+    const sessionDir = join(canonicalBrainDir, conversationId);
+    const sessionStat = lstatSync(sessionDir);
+    if (sessionStat.isSymbolicLink() || !sessionStat.isDirectory()) return null;
+    const canonicalSessionDir = realpathSync(sessionDir);
+    if (!isInside(canonicalSessionDir, canonicalBrainDir)) return null;
+
+    let current = canonicalSessionDir;
+    for (const seg of ['.system_generated', 'logs']) {
+      current = join(current, seg);
+      const segStat = lstatSync(current);
+      if (segStat.isSymbolicLink() || !segStat.isDirectory()) return null;
+    }
+    const transcriptPath = join(current, 'transcript.jsonl');
+    const fileStat = lstatSync(transcriptPath);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null;
+    const canonicalPath = realpathSync(transcriptPath);
+    if (!isInside(canonicalPath, canonicalSessionDir)) return null;
+
+    let fd: number | undefined;
+    let bytesRead = 0;
+    let truncatedAtCap = false;
+    let rawText = '';
+    try {
+      fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const st = fstatSync(fd);
+      if (!st.isFile()) return null;
+      const toRead = Math.min(st.size, TITLE_TRANSCRIPT_READ_BYTES);
+      if (toRead <= 0) return null;
+      const buf = Buffer.allocUnsafe(toRead);
+      while (bytesRead < toRead) {
+        const n = readSync(fd, buf, bytesRead, toRead - bytesRead, bytesRead);
+        if (n <= 0) break;
+        bytesRead += n;
+      }
+      truncatedAtCap = st.size > bytesRead;
+      rawText = buf.subarray(0, bytesRead).toString('utf8');
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch {}
+      }
+    }
+
+    const rawLines = rawText.split(/\r?\n/);
+    const completeLines = truncatedAtCap ? rawLines.slice(0, -1) : rawLines;
+    for (const line of completeLines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (!isPlainRecord(parsed) || parsed.type !== 'USER_INPUT' || typeof parsed.content !== 'string') continue;
+      const extracted = cleanUserRequestLine(parsed.content, maxLength);
+      if (extracted) return extracted;
+    }
+
+    if (truncatedAtCap) {
+      const trailing = rawLines.at(-1) ?? '';
+      if (/"type"\s*:\s*"USER_INPUT"/.test(trailing)) {
+        const partialContent = decodePartialJsonStringField(trailing, 'content');
+        if (partialContent) {
+          const extracted = cleanUserRequestLine(partialContent, maxLength);
+          if (extracted) return extracted;
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Derive a display title: non-empty `title`, else cleaned `preview` first line, else `Antigravity 会话 · <shortId>`. */
+export function deriveAgySessionTitle(
+  conversationId: string,
+  title: unknown,
+  preview: unknown,
+  maxLength = DEFAULT_MAX_TITLE_LENGTH,
+): string {
+  const present = derivePresentAgyTitle(title, preview, maxLength);
+  if (present) return present;
   const shortId = (typeof conversationId === 'string' && conversationId.slice(0, 8)) || 'unknown';
   return `Antigravity 会话 · ${shortId}`;
 }
@@ -526,12 +663,20 @@ function mapCascadeStatus(raw: string): AgySessionStatus {
 export function readAgySummaries(
   options: {
     dbPath?: string;
+    brainDir?: string;
     allowedProjectRoots?: readonly string[];
     includeOutsideRoots?: boolean;
     maxTitleLength?: number;
   } = {},
 ): AgyDiscoveredSession[] {
   const dbPath = resolve(expandHomePath(options.dbPath ?? DEFAULT_AGY_SUMMARIES_DB_PATH));
+  const brainDir = resolve(expandHomePath(options.brainDir ?? DEFAULT_AGY_BRAIN_DIR));
+  let canonicalBrainDir: string | null = null;
+  try {
+    if (existsSync(brainDir)) canonicalBrainDir = realpathSync(brainDir);
+  } catch {
+    canonicalBrainDir = null;
+  }
   if (!existsSync(dbPath)) return [];
   const st = lstatSync(dbPath);
   if (st.isSymbolicLink() || !st.isFile()) {
@@ -627,9 +772,13 @@ export function readAgySummaries(
     const rawTitle = typeof row.title === 'string' ? row.title : '';
     const preview = typeof row.preview === 'string' ? row.preview : '';
     const rawStatus = typeof row.status === 'string' ? row.status : '';
+    const derivedTitle =
+      derivePresentAgyTitle(rawTitle, preview, maxTitleLength) ??
+      readTranscriptTitleFromBrain(row.conversation_id, canonicalBrainDir, maxTitleLength) ??
+      deriveAgySessionTitle(row.conversation_id, '', '', maxTitleLength);
     sessions.push({
       conversationId: row.conversation_id,
-      title: deriveAgySessionTitle(row.conversation_id, rawTitle, preview, maxTitleLength),
+      title: derivedTitle,
       rawTitle,
       preview,
       project: projectInfo.project,
@@ -1390,6 +1539,7 @@ export class AgyCatalog {
   refresh(): AgyDiscoveredSession[] {
     const summaryOpts: Parameters<typeof readAgySummaries>[0] = {};
     if (this.options.dbPath !== undefined) summaryOpts.dbPath = this.options.dbPath;
+    if (this.options.brainDir !== undefined) summaryOpts.brainDir = this.options.brainDir;
     if (this.options.allowedProjectRoots !== undefined) {
       summaryOpts.allowedProjectRoots = this.options.allowedProjectRoots;
     }

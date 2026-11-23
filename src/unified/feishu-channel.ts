@@ -74,7 +74,7 @@ export class FeishuChannel {
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
-  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false) {
+  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string } = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL);`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
@@ -423,7 +423,22 @@ export class FeishuChannel {
     const guard = async () => { if(executionScope!==this.bindingScope(e.destination)) throw new BindingExpired('binding changed'); const allowed=await this.authorize(e.identity,e.destination,bound); if(executionScope!==this.bindingScope(e.destination)) throw new BindingExpired('binding changed'); if(!allowed) throw new ReadAuthorizationRevoked('unauthorized'); };
     const reply = async (card: ChannelCard, suffix = 'reply', extraGuard?:()=>Promise<void>) => { const current=extraGuard ? async()=>{await guard();await extraGuard();await guard();} : guard; await current(); effects.started=true; return this.deliver(e.destination, card, `${e.eventId}:${suffix}`,current); };
     if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片和 UTF-8 文本附件。',size:'文本附件为空或超过 1 MiB，未提交。',encoding:'文本附件不是有效 UTF-8 或包含 NUL，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
-    if (a.action === 'help' || a.action === 'new_help') { const text = a.action === 'help' ? '会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；Codex 当前唯一运行轮追加输入：/steer 内容；中断当前回复：/stop；后台任务是否终止尚未确认。' : '请先选择后端（codex / claude / agy · Antigravity）和可信项目目录，再发送 /create <codex|claude|agy> <项目目录> [模型]。创建完成后在新话题发送任务；目录须符合服务端允许范围。'; const actions = a.action === 'new_help' ? [{label:'全部会话',value:{action:'list'}},{label:'筛选 Codex',value:{action:'list',provider:'codex',search:'codex'}},{label:'筛选 Claude',value:{action:'list',provider:'claude',search:'claude'}},{label:'筛选 Antigravity',value:{action:'list',provider:'agy',search:'agy'}}] : []; await reply({title:a.action === 'help' ? '帮助' : '新建会话',text,actions}); return {status:'guidance'}; }
+    if (a.action === 'help') { await reply({title:'帮助',text:'会话列表：/sessions；选择模型：在会话话题发送 /model；新建：/new；会话控制：/panel；历史：/history；Codex 当前唯一运行轮追加输入：/steer 内容；中断当前回复：/stop；后台任务是否终止尚未确认。',actions:[]}); return {status:'guidance'}; }
+    if (a.action === 'new_help') {
+      const defaultProject = this.channelOptions.defaultCreateProject?.trim() || undefined;
+      const text = defaultProject
+        ? `点击下方按钮可在默认目录（${defaultProject}）新建会话（支持 codex / claude / agy · Antigravity）；如需指定其他目录或模型，请发送 /create <codex|claude|agy> <项目目录> [模型]。创建完成后在新话题发送任务；目录须符合服务端允许范围。`
+        : '请先选择后端（codex / claude / agy · Antigravity）和可信项目目录，再发送 /create <codex|claude|agy> <项目目录> [模型]。创建完成后在新话题发送任务；目录须符合服务端允许范围。';
+      const actions: ChannelCard['actions'] = defaultProject
+        ? [
+            {label:'新建 Antigravity',value:{action:'create',provider:'agy',project:defaultProject,model:null}},
+            {label:'新建 Codex',value:{action:'create',provider:'codex',project:defaultProject,model:null}},
+            {label:'新建 Claude',value:{action:'create',provider:'claude',project:defaultProject,model:null}},
+          ]
+        : [];
+      await reply({title:'新建会话',text,actions});
+      return {status:'guidance'};
+    }
     if (a.action === 'pending') { const pending=this.pendingOperations(e.destination),actions:ChannelCard['actions']=[];for(const p of pending){actions.push({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}});if(p.kind==='session'&&this.service.inspectUnknownCreateCandidates&&this.service.unknownCreateProvider){try{if(await this.service.unknownCreateProvider(e.identity,e.destination,p.operationId)==='codex')actions.push({label:'查看 Codex 候选',value:{action:'inspect_unknown',operationId:p.operationId}})}catch{}}}await reply({title:'待完成操作',text:pending.length ? `查询完成结果后继续。操作 ID：${pending.map(p=>p.operationId).join('、')}` : '没有待完成操作',actions});return pending; }
     if(a.action==='inspect_unknown'){const row=this.db.prepare("SELECT p.destination,p.kind,p.state,s.scope,a.envelope FROM channel_pending p JOIN channel_pending_scope s ON s.operation_id=p.operation_id JOIN channel_pending_actors a ON a.operation_id=p.operation_id WHERE p.operation_id=?").get(a.operationId) as {destination:string;kind:string;state:string;scope:string;envelope:string}|undefined;const actor=row?JSON.parse(row.envelope) as TrustedEnvelope:null;if(!row||row.destination!==e.destination||row.kind!=='session'||row.state!=='pending'||row.scope!==executionScope||!actor||actor.identity.source!==e.identity.source||actor.identity.subject!==e.identity.subject||!this.service.inspectUnknownCreateCandidates)throw new Error('candidate inspection unavailable');await guard();const result=await this.service.inspectUnknownCreateCandidates(e.identity,e.destination,a.operationId,{...(a.cursor?{cursor:a.cursor}:{}),...(a.nativeId?{nativeId:a.nativeId}:{})});await guard();const lines=result.items.map(x=>`Codex ${JSON.stringify(x.native.hostId)}/${JSON.stringify(x.native.serviceId)} · ${x.native.nativeSessionId} · ${JSON.stringify(x.project)} · 观测状态 ${x.status}`);await reply({title:'Codex 候选元数据',text:`原创建结果仍未知；以下候选不代表该次创建成功，历史未验证。${result.partial?' 部分候选未能读取。':''}\n${lines.length?lines.join('\n'):'当前页没有可展示的候选。'}`,actions:result.nextCursor?[{label:'下一页',value:{action:'inspect_unknown',operationId:a.operationId,cursor:result.nextCursor}}]:[]});return result;}
     if (a.action === 'list') {
@@ -433,11 +448,80 @@ export class FeishuChannel {
       const topicUrls=new Map<string,string>();const links=await Promise.all(sessions.map(async session=>{await guard();const url=await this.port.topicLinkForSession?.(e.destination,session.sessionId);await guard();return {sessionId:session.sessionId,url};}));for(const link of links) if(link.url) topicUrls.set(link.sessionId,link.url);
       const visible:Array<(typeof page.items)[number]>=[];for(const session of sessions) {await guard();if(await this.authorize(e.identity,e.destination,session.sessionId)) visible.push(session);await guard();}
       const listGuard=async()=>{for(const session of visible) {await guard();if(!await this.authorize(e.identity,e.destination,session.sessionId)) throw new ReadAuthorizationRevoked('unauthorized');}await guard();};
-      const providerFilters=a.provider !== undefined || page.items.some(s => s.native.provider === 'agy');
+      let hasAgyProvider = false;
+      if (typeof this.service.hasProvider === 'function') {
+        const has = this.service.hasProvider('agy') as unknown;
+        if (typeof has === 'boolean') hasAgyProvider = has;
+        else if (has && typeof (has as Promise<unknown>).catch === 'function') void (has as Promise<unknown>).catch(() => {});
+      }
+      const providerFilters=a.provider !== undefined || page.items.some(s => s.native.provider === 'agy') || hasAgyProvider;
       const card=sessionListCard(visible,{topicUrls,nextCursor:page.nextCursor,...(providerFilters ? {providerFilters:true} : {}),...(a.search ? {search:a.search} : {}),...(a.provider !== undefined ? {provider:a.provider} : {})}); if(page.unavailableProviders?.length) card.text+=`\n暂不可用：${page.unavailableProviders.join('、')}；列表可能不完整。`;
       await reply(card,'reply',listGuard);return {nextCursor:page.nextCursor};
     }
-    if (a.action === 'health') { const health = await this.service.health(); const labels:Record<string,string>={core:'核心',runtime:'本机调度概况',feishu_delivery:'飞书投递',feishu_callback:'飞书回调与入站',feishu_resources:'飞书资源',codex_connection:'Codex连接',codex_run:'Codex运行',claude_connection:'Claude SDK事件流',claude_run:'Claude运行',claude_quota:'Claude额度',agy_connection:'Antigravity连接',agy_run:'Antigravity运行',agy_quota:'Antigravity额度',interaction_return:'问题回传'}; const states:Record<string,string>={healthy:'已观测可用',degraded:'异常或待核对',unreachable:'不可连接',unverified:'未验证'}; await reply({title:'健康状态',text:health.map(h=>`${labels[h.component] ?? h.component}：${states[h.status] ?? h.status}${h.reason ? `（${h.reason}）`:''}；最近观测 ${h.lastObservedAt ?? '无'}；最近成功 ${h.lastSuccessAt ?? '无'}；最近失败 ${h.lastFailureAt ?? '无'}${h.lastFailureReason ? `（${h.lastFailureReason}）`:''}；积压 ${h.backlog ?? '不适用'}；未知 ${h.unknown ?? '不适用'}`).join('\n'),actions:[]}); return health; }
+    if (a.action === 'health') {
+      const health = await this.service.health();
+      const labels:Record<string,string>={core:'核心',runtime:'本机调度概况',feishu_delivery:'飞书投递',feishu_callback:'飞书回调与入站',feishu_resources:'飞书资源',codex_connection:'Codex连接',codex_run:'Codex运行',claude_connection:'Claude SDK事件流',claude_run:'Claude运行',claude_quota:'Claude额度',agy_connection:'Antigravity连接',agy_run:'Antigravity运行',agy_quota:'Antigravity额度',interaction_return:'问题回传'};
+      const states:Record<string,string>={healthy:'正常',degraded:'异常或待核对',unreachable:'不可连接',unverified:'尚未触发'};
+      const reasonMap:Record<string,string>={
+        'dispatch or synchronization failed; inspect persisted state before retry':'存在同步或调度异常，请检查本机状态',
+        'connection closed':'连接曾断开',
+        'not connected':'尚未连接',
+        'transport error':'连接传输异常',
+        'response timed out':'响应超时',
+        'send failed':'消息发送失败',
+        'app-server rejected request':'服务端拒绝请求',
+        'invalid app-server message':'服务端消息格式无效',
+        'reconnect and explicitly attach quarantined sessions':'存在隔离会话，请重新连接并手动恢复',
+        'one or more sessions could not be restored; inspect before retry':'部分会话恢复失败，请检查后再试',
+        'binding recovery failed; inspect before retry':'绑定恢复失败，请检查后再试',
+        'normalized observation could not be persisted; replay required':'观测记录落盘失败，需要重放',
+        'read-only refresh failed':'只读会话刷新失败',
+        'restart recovery failed; inspect session before retry':'重启恢复失败，请检查会话后再试',
+        'restart recovery failed; subscription released; reconciliation required':'重启恢复失败，订阅已释放，需人工核对',
+        'restart recovery failed; subscription release outcome unknown':'重启恢复失败，订阅释放结果未知',
+      };
+      const formatTime = (iso: string | null | undefined): string | null => {
+        if (!iso) return null;
+        const ms = Date.parse(iso);
+        if (!Number.isFinite(ms)) return null;
+        const bj = new Date(ms + 8 * 3600 * 1000);
+        if (!Number.isFinite(bj.getTime())) return null;
+        return bj.toISOString().slice(5, 16).replace('T', ' ');
+      };
+      const translateReason = (reason: string | null | undefined): string | null => reason ? (reasonMap[reason] ?? reason) : null;
+      const labelOf = (component: string): string => labels[component] ?? component;
+      const attention: string[] = [];
+      const normal: string[] = [];
+      const unverified: string[] = [];
+      for (const h of health) {
+        const label = labelOf(h.component);
+        if (h.status === 'healthy') {
+          const success = formatTime(h.lastSuccessAt);
+          const observed = formatTime(h.lastObservedAt);
+          const timeText = success ? `（最近成功 ${success}）` : observed ? `（最近观测 ${observed}）` : '';
+          normal.push(`- ${label}：正常${timeText}`);
+        } else if (h.status === 'unverified') {
+          unverified.push(label);
+        } else {
+          const state = states[h.status] ?? h.status;
+          const reason = translateReason(h.reason ?? h.lastFailureReason);
+          const details: string[] = [];
+          const success = formatTime(h.lastSuccessAt);
+          const failure = formatTime(h.lastFailureAt);
+          if (success) details.push(`最近成功 ${success}`);
+          if (failure) details.push(`最近失败 ${failure}`);
+          if (typeof h.unknown === 'number' && h.unknown > 0) details.push(`待核对 ${h.unknown}`);
+          if (typeof h.backlog === 'number' && h.backlog > 0) details.push(`积压 ${h.backlog}`);
+          attention.push(`- ${label}：${state}${reason ? `（${reason}）` : ''}${details.length ? `；${details.join('；')}` : ''}`);
+        }
+      }
+      const sections: string[] = [];
+      if (attention.length) sections.push(`【需关注】\n${attention.join('\n')}`);
+      if (normal.length) sections.push(`【正常】\n${normal.join('\n')}`);
+      if (unverified.length) sections.push(`【尚未触发】\n${unverified.join('、')}`);
+      await reply({title:'健康状态',text:sections.length ? sections.join('\n\n') : '暂无健康状态记录。',actions:[]});
+      return health;
+    }
     if (a.action === 'bind' && a.mode === 'interactive') {
       if (bound && bound !== a.sessionId) {await reply({title:'无法接入',text:'此话题已绑定其他会话，请先在目标话题操作。',actions:[]});return {status:'rejected',reason:'session_mismatch'};}
       if (bound && this.accessMode(e.destination) === 'interactive') {await reply({title:'已接入',text:'此话题已绑定为可交互，可查看会话控制确认当前状态。',actions:[]});return {status:'completed',sessionId:bound,accessMode:'interactive'};}

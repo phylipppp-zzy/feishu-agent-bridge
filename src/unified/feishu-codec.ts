@@ -33,6 +33,7 @@ function parseAction(value: unknown): ChannelAction {
     case 'notifications': if (typeof value.enabled === 'boolean' && Array.isArray(value.eventTypes) && value.eventTypes.every(str) && counter(value.revision) && counter(value.controlGeneration)) return {action:'notifications',enabled:value.enabled,eventTypes:value.eventTypes,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'archive': if (typeof value.archived === 'boolean' && counter(value.revision) && counter(value.controlGeneration)) return {action:'archive',archived:value.archived,revision:value.revision,controlGeneration:value.controlGeneration}; break;
     case 'bind': if (str(value.sessionId) && (value.mode === undefined || value.mode === 'read_only' || value.mode === 'interactive')) return {action:'bind',sessionId:value.sessionId,...(value.mode ? {mode:value.mode} : {})}; break;
+    case 'create': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.project) && (value.model === null || str(value.model))) return {action:'create',provider:value.provider,project:value.project,model:value.model}; break;
     case 'artifacts': if (value.sessionId === undefined || str(value.sessionId)) return value.sessionId === undefined ? {action:'artifacts'} : {action:'artifacts',sessionId:value.sessionId as string}; break;
     case 'file': if (str(value.artifactId) && str(value.contentVersion)) return {action:'file',artifactId:value.artifactId,contentVersion:value.contentVersion}; break;
     case 'reconcile': case 'finish': if (str(value.operationId)) return {action:value.action,operationId:value.operationId}; break;
@@ -52,7 +53,7 @@ export function parseFeishuAction(value: unknown, formValues?: unknown): Channel
   if (object(value) && value.action === 'answer_form') { if (!str(value.bindingId) || !str(value.interactionId) || !counter(value.revision) || !counter(value.connectionGeneration) || !object(formValues) || JSON.stringify(formValues).length > 100_000) throw new Error('invalid question form callback'); return {action:'answer_form',bindingId:value.bindingId,interactionId:value.interactionId,revision:value.revision,connectionGeneration:value.connectionGeneration,fields:formValues}; }
   const action = parseAction(value);
   if (!object(value)) throw new Error('invalid card action');
-  if (!['bind','list','finish','inspect_unknown'].includes(action.action) && !str(value.bindingId)) throw new Error('missing binding identity');
+  if (!['bind','list','finish','inspect_unknown','create'].includes(action.action) && !str(value.bindingId)) throw new Error('missing binding identity');
   return {...action,...(str(value.bindingId) ? {bindingId:value.bindingId}:{})};
 }
 /** Commands work identically for either provider; text without a slash is an input. */
@@ -63,7 +64,7 @@ export function parseFeishuText(text: string): ChannelAction {
   switch (command) {
     case '/help': return {action:'help'};
     case '/new': return {action:'new_help'};
-    case '/sessions': return {action:'list'};
+    case '/sessions': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/candidates': if(parts.length===1||parts.length===2)return {action:'inspect_unknown',operationId:parts[0]!,...(parts[1]?{nativeId:parts[1]}:{})};break;
     case '/model': return parts.length === 0 ? {action:'legacy_model'} : parts.length === 2 ? {action:'legacy_model',model:parts[0]!,effort:parts[1]!} : {action:'legacy_model',invalid:true};
     case '/list': return rest ? {action:'list',search:rest} : {action:'list'};
@@ -90,6 +91,7 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/deliver': if (rest) return {action:'deliver_files',args:input.slice(command!.length).trim()}; break;
     case '/export': if (!rest) return {action:'export'}; break;
     case '/history': return {action:'history',...(rest ? {cursor:rest}:{})};
+    case '/file':
     case '/files': return {action:'artifacts'};
     case '/models': return {action:'models'};
     case '/pending': return {action:'pending'};
