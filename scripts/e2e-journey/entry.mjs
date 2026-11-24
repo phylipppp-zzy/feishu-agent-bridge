@@ -62,7 +62,8 @@ async function mainChat(ctx) {
       await ctx.settle();
       trace.check('显示进入话题的引导与两个导航入口', () => {
         const message = lastCard(ctx, null);
-        assert.match(message.card.title, /请在会话话题中/);
+        assert.equal(message.card.title, '请选择会话');
+        assert.match(message.card.bodyText, /请先选择已有会话或新建会话再发送任务/);
         assert.deepEqual(labels(message), ['会话列表', '新建会话']);
       });
     });
@@ -211,6 +212,13 @@ async function firstPrompt(ctx) {
         assert.deepEqual(providers.agy.inputs.map(input => input.text), [prompt]);
         assert.equal(providers.agy.inputs[0].ref.nativeSessionId, topics.agy.ref.nativeSessionId);
         assert.equal(ctx.turn(topics.agy)?.status, 'running');
+      });
+      trace.check('话题根卡与接入卡均显示首句标题，接入卡没有闪现空闲状态', () => {
+        const root = ctx.wire.messages.get(topics.agy.rootId);
+        const binding = ctx.writes(topics.agy).find(({card}) => /已接入/.test(card.bodyText));
+        assert.equal(root.card.title, `[AGY · gui-rl] ${prompt}`);
+        assert.equal(binding?.card.title, prompt);
+        assert.doesNotMatch(binding.card.bodyText, /空闲/);
       });
       await ctx.finish(topics.agy, '已检查长回复边界，并整理实验看板。');
     });

@@ -34,24 +34,26 @@ export function buildSessionPanel(session: Session, notice: Panel, work: Awaited
   const available = session.control.input === 'available';
   const running = work.runningTurns;
   const queued = work.queuedInputs;
-  const actions = [...notice.actions];
-  if (!available) actions.push({label:'重新接入',value:{action:'upgrade'}});
-  if (work.canArchive) actions.push(
-    {label:'归档',value:{action:'archive',archived:true,...base}},
-    {label:'恢复归档',value:{action:'archive',archived:false,...base}},
-  );
-  if (session.capabilities?.handoff?.status === 'available') actions.push(
-    {label:'切换到飞书',value:{action:'control',owner:'feishu',strategy:'wait',...base}},
-    {label:'释放控制',value:{action:'control',owner:'feishu',strategy:'wait',release:true,...base}},
-  );
+  const actions: ChannelCard['actions'] = [];
   if (available && session.capabilities?.interrupt?.status === 'available') {
-    running.forEach((turn,index) => actions.push({label:running.length === 1 ? '中断当前回复' : `中断本轮回复 ${index+1}`,value:{action:'stop',turnId:turn.turnId,...base}}));
+    running.forEach((turn,index) => actions.push({label:running.length === 1 ? '中断当前回复' : `中断本轮回复 ${index+1}`,type:'primary',value:{action:'stop',turnId:turn.turnId,...base}}));
   }
   if (available && session.capabilities?.queue?.status === 'available') {
     queued.forEach((item,index) => actions.push({label:`取消排队输入 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}}));
   }
-  const status = available ? sessionStatusLabel(session.status) : '连接不可用';
+  actions.push(...notice.actions);
+  if (!available) actions.push({label:'重新接入',value:{action:'upgrade'}});
+  const archived = session.archived === true || String(session.status) === 'archived';
+  if (work.canArchive) actions.push({
+    label:archived ? '恢复归档' : '归档',value:{action:'archive',archived:!archived,...base},
+  });
+  if (session.capabilities?.handoff?.status === 'available') {
+    const ownsControl = session.control.owner === 'feishu';
+    actions.push({label:ownsControl ? '释放控制' : '切换到飞书',
+      value:{action:'control',owner:'feishu',strategy:'wait',...(ownsControl ? {release:true} : {}),...base}});
+  }
+  const status = archived ? '已归档' : available ? sessionStatusLabel(session.status) : '连接不可用';
   const text = [`状态：${status}`, notice.text, ...(queued.length ? [`排队中：${queued.length} 条`] : [])].join('\n');
-  const template = available ? sessionStatusTemplate(session.status) : 'orange';
+  const template = archived ? 'grey' : available ? sessionStatusTemplate(session.status) : 'orange';
   return {title:'会话控制',text,actions,...(template ? {template} : {})};
 }

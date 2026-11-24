@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { DEFAULT_AGY_MODELS } from '../../src/unified/agy/adapter-types.ts';
 import { payloadDigest } from '../../src/unified/contracts.ts';
 import { deriveTitleFromInputBlocks } from '../../src/unified/session-title.ts';
+import { isTerminalTurn } from '../../src/unified/tool-progress.ts';
 
 const capabilities = Object.fromEntries(
   ['view', 'send', 'queue', 'steer', 'answer', 'approve', 'interrupt', 'handoff', 'files', 'config']
@@ -104,13 +105,35 @@ export class JourneyProvider {
     return () => this.listeners.delete(listener);
   }
 
+  updateRunStatus(state, settledTurn, clearWaiting = false) {
+    const { session, interactions, turns } = state;
+    if (session.control.input !== 'available') return;
+    const pending = [...interactions.values()].filter(interaction =>
+      interaction.status === 'awaiting_answer' || interaction.status === 'answer_pending_delivery');
+    let status = session.status;
+    if (pending.length) status = pending.some(interaction => interaction.kind === 'approval') ? 'waiting_approval' : 'waiting_question';
+    else if ([...turns.values()].some(item => item.status === 'running' || item.status === 'queued')) status = 'running';
+    else if (settledTurn && isTerminalTurn(settledTurn.status)) {
+      status = settledTurn.status === 'completed' ? 'idle' : settledTurn.status;
+    } else if (clearWaiting) status = 'idle';
+    if (status !== session.status) state.session = { ...session, status, revision: session.revision + 1 };
+  }
+
   emit(observation) {
     const copy = structuredClone(observation);
     const state = this.state(copy.ref);
     if (copy.type === 'session') state.session = copy.session;
     if (copy.type === 'message') state.messages.set(copy.message.messageId, copy.message);
-    if (copy.type === 'turn') state.turns.set(copy.turn.turnId, copy.turn);
-    if (copy.type === 'interaction') state.interactions.set(copy.interaction.interactionId, copy.interaction);
+    if (copy.type === 'turn' && !isTerminalTurn(state.turns.get(copy.turn.turnId)?.status)) {
+      state.turns.set(copy.turn.turnId, copy.turn);
+      this.updateRunStatus(state, copy.turn);
+    }
+    if (copy.type === 'interaction' && copy.interaction.revision > (state.interactions.get(copy.interaction.interactionId)?.revision ?? -1)) {
+      state.interactions.set(copy.interaction.interactionId, copy.interaction);
+      const wasWaiting = state.session.status === 'waiting_approval' || state.session.status === 'waiting_question';
+      const latest = wasWaiting && state.turns.has(copy.interaction.turnId) ? [...state.turns.values()].at(-1) : undefined;
+      this.updateRunStatus(state, latest, wasWaiting);
+    }
     for (const listener of this.listeners) listener(copy);
     return copy;
   }

@@ -4,8 +4,21 @@ import type { UnifiedService } from './adapter.js';
 import type { Artifact, Session } from './contracts.js';
 import type { Authorize, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { providerTitlePrefix, type ChannelCard } from './feishu-cards.js';
+import { buildModelsCard } from './help-cards.js';
 import { sessionListCard } from './session-list-card.js';
 import { ReadAuthorizationRevoked } from './topic-title-sync.js';
+
+export async function sessionModelPage(service: UnifiedService, session: Session, cursor?: string, readOnly?: boolean) {
+  const id = session.sessionId;
+  const [page, confirmed] = await Promise.all([
+    service.listModels(id, {limit:100, ...(cursor ? {cursor} : {})}),
+    service.getConfirmedSettings?.(id),
+  ]);
+  const card = buildModelsCard({provider:session.native.provider, items:page.items, nextCursor:page.nextCursor,
+    confirmed:confirmed ?? null, revision:session.revision, controlGeneration:session.control.generation,
+    ...(readOnly ? {readOnly} : {})});
+  return {card, page};
+}
 
 export async function showSessionList(
   service: UnifiedService,

@@ -3,7 +3,7 @@ import type { UnifiedStore } from './store.js';
 import type { FeishuChannel } from './feishu-channel.js';
 import type { TaskTopicChannel } from './task-topic-channel.js';
 import type { PendingHub } from './pending-hub.js';
-import type { ResolveInteraction } from './contracts.js';
+import type { ResolveInteraction, SubmitInput } from './contracts.js';
 
 export type InboxTarget =
   | { kind: 'channel'; destination: string }
@@ -80,6 +80,10 @@ export class RuntimeInteractive {
           else throw error;
         } finally {
           if (answer) this.notifyInteraction(answer.context.targetId, answer.interactionId);
+          if (out.kind === 'archiveSession' || out.kind === 'updateSessionSettings' ||
+              out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'steer') {
+            this.notifyImmediateProgress(out.context.targetId);
+          }
         }
       }
       const child = await this.channel.advanceOperation(operationId);

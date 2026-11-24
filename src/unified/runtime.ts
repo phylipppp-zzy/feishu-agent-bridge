@@ -27,10 +27,10 @@ import { AgyAcpTransport } from './agy-transport.js';
 import { providerTitlePrefix } from './feishu-cards.js';
 import { DecisionSyncStore } from './decision-sync.js';
 import { PendingHub, type PendingQuery } from './pending-hub.js';
-import { TaskHandoffError, TaskHandoffService } from './task-handoff.js';
+import { TaskHandoffService } from './task-handoff.js';
 import { TaskTopicChannel, TaskChannelError, type TaskAuthorize, type TaskChannelAction } from './task-topic-channel.js';
 import type { TaskTopicToken } from './task-topic-store.js';
-import { handleTaskControlAction, isTaskControlAction } from './task-topic/control-plane.js';
+import { handleTaskControlAction, handleTaskHandoffConfirmation, isTaskControlAction } from './task-topic/control-plane.js';
 import { WatchHub } from './watch-hub.js';
 import { RuntimeInteractive } from './runtime-interactive.js';
 import { runBackgroundWork } from './runtime-background.js';
@@ -135,7 +135,7 @@ export class UnifiedRuntime {
   get decisionSync():DecisionSyncStore|undefined { return this._decisionSync; }
   get taskChannel():TaskTopicChannel|undefined { return this._taskChannel; }
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
-  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
+  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
   constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
     const channelPath=resolve(config.channelDb); const canonical=existsSync(channelPath) ? realpathSync(channelPath) : join(realpathSync(dirname(channelPath)),basename(channelPath));
@@ -392,24 +392,7 @@ export class UnifiedRuntime {
         );
       }
       if(this._taskHandoff && action.action==='confirm_handoff') {
-        const binding=this._taskChannel?.getBindingByDestination(envelope.destination);
-        if(this._taskChannel && (!binding || binding.taskId!==action.taskId)) {
-          throw new TaskHandoffError('stale_revision','task binding mismatch');
-        }
-        const draft=this._taskHandoff.getHandoff(action.handoffId);
-        if(draft && draft.taskId!==action.taskId) {
-          throw new TaskHandoffError('stale_revision','handoff task mismatch');
-        }
-        if(draft && draft.activeRevision!==action.activeRevision) {
-          throw new TaskHandoffError('stale_revision','active revision mismatch');
-        }
-        return this._taskHandoff.confirmHandoff(
-          action.handoffId,
-          action.previewDigest,
-          action.targetGeneration,
-          envelope.identity,
-          envelope.eventId,
-        );
+        return handleTaskHandoffConfirmation(this._taskHandoff,this._taskChannel,this.sendPort,envelope,action);
       }
       const pending = handlePendingAction({
         hub: this._pendingHub, mainDestination: this.config.pendingHub?.destination, core: this.core, port: this.port,

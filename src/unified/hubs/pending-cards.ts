@@ -1,4 +1,4 @@
-import type { Interaction, Session } from '../contracts.js';
+import type { Interaction, Operation, Session } from '../contracts.js';
 import { formatApprovalAction } from '../card-formatters.js';
 import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import {
@@ -8,7 +8,7 @@ import {
   type ChannelCard,
 } from '../feishu-cards.js';
 import { questionForm } from '../feishu-question-forms.js';
-import type { DecisionRecord } from './decision-types.js';
+import type { DecisionAnswerRecord, DecisionRecord } from './decision-types.js';
 import {
   PENDING_CATEGORY_LABELS,
   fail,
@@ -36,6 +36,29 @@ export function buildWithdrawnCard(category: PendingCategory, reason: string): C
     template: 'grey',
     ...(category === 'question' ? { schema: '2.0' as const } : {}),
     text: `${reason}。本卡片操作已撤下，不可重复提交。`,
+    actions: [],
+  };
+}
+
+export function buildPendingInteractionStatusCard(
+  interaction: Interaction,
+  status: string,
+  operation?: Operation | null,
+): ChannelCard {
+  const base = interactionCard(interaction, false, operation);
+  if (interaction.kind === 'approval') return base;
+  if (interaction.status === 'resolved' || operation?.status === 'completed') return { ...base, schema: '2.0' };
+  return { title: `模型问答 · ${status}`, text: status, schema: '2.0', actions: [] };
+}
+
+export function buildAnsweredDecisionCard(decision: DecisionRecord, answer?: DecisionAnswerRecord): ChannelCard {
+  const selected = answer?.selectedLabel ?? answer?.freeText;
+  const extra = answer?.selectedLabel && answer.freeText ? `补充：${answer.freeText}` : '';
+  return {
+    title: `${PENDING_CATEGORY_LABELS[decision.kind]} · 已确认`,
+    template: 'green',
+    format: 'plain',
+    text: [decision.title, decision.prompt, selected && `已选择：${selected}`, extra].filter(Boolean).join('\n'),
     actions: [],
   };
 }

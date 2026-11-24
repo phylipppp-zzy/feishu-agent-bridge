@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
+import { verifyStatusAfterFailure } from './status.mjs';
 
 function cardWith(ctx, topic, title) {
   const message = ctx.writes(topic).findLast(({ card }) => card?.title === title);
@@ -33,6 +34,7 @@ async function waitForCard(ctx, topic, predicate) {
 }
 
 const interruptedCard = card => card.title === 'Codex · 已中断' && card.template === 'grey';
+const failedInputReceipt = card => card.title === '操作回执' && card.bodyText.includes('发送输入：失败');
 
 async function busyTurn(ctx) {
   const { trace, runtime, topics: { codex }, providers: { codex: provider } } = ctx;
@@ -81,16 +83,14 @@ async function busyTurn(ctx) {
       const count = provider.inputs.length;
       await ctx.send(codex, '/queue 跑完顺便更新一下 README');
       await ctx.settle();
-      const receipt = cardWith(ctx, codex, '操作回执');
+      const receipt = cardWith(ctx, codex, '已加入排队');
       trace.check('显示查看排队按钮，输入尚未到达后端', () => {
-        assert.match(receipt.card.bodyText, /发送输入/);
+        assert.equal(receipt.card.template, 'blue');
+        assert.equal(receipt.card.bodyText, '跑完顺便更新一下 README');
         assert.ok(receipt.card.buttons.some(({ label }) => label === '查看排队'));
         assert.equal(runtime.store.queuedInputs(codex.sessionId).length, 1);
         assert.equal(provider.inputs.length, count);
       });
-      if (!receipt.card.bodyText.includes('已排队')) {
-        trace.observe('用户执行 /queue 后，回执用语仍是「已接收，等待处理」。', receipt.card.bodyText);
-      }
     });
 
     await trace.step('4.2 在原始轮次运行时发送「/status」', async () => {
@@ -103,17 +103,24 @@ async function busyTurn(ctx) {
         assert.match(panel.card.bodyText, /排队中：1 条/);
         assert.match(cancelButton.label, /取消排队/);
         assert.match(action(panel, 'stop').label, /中断/);
+        assert.equal(action(panel, 'stop').type, 'primary');
+        assert.ok(panel.card.buttons.indexOf(cancelButton) < panel.card.buttons.findIndex(({value}) => value?.action === 'notice_settings'));
         assert.equal(action(panel, 'stop').value.turnId, busy.turnId);
       });
     });
 
     await trace.step('4.2 点击「取消排队输入 1」', async () => {
       const before = provider.inputs.length;
-      await ctx.click(panel, cancelButton.label);
+      const callback = await ctx.click(panel, cancelButton.label);
       await ctx.settle();
-      trace.check('排队记录消失，取消的输入没有提交给后端', () => {
+      trace.check('取消弹出确认，排队记录消失且没有输入失败回执', () => {
+        assert.deepEqual(callback.result, { toast: { type: 'success', content: '已确认' } });
         assert.equal(runtime.store.queuedInputs(codex.sessionId).length, 0);
         assert.equal(provider.inputs.length, before);
+        assert.ok(!ctx.writes(codex).some(({ card }) => failedInputReceipt(card)));
+        const writes = ctx.writes(codex);
+        assert.deepEqual(writes.map(({id,method}) => ({id,method})), [{id:panel.id,method:'im.message.patch'}]);
+        assert.ok(!writes[0].card.buttons.some(({ value }) => value?.action === 'cancel'));
       });
     });
 
@@ -131,12 +138,16 @@ async function busyTurn(ctx) {
       const count = provider.inputs.length;
       await ctx.send(codex, '/steer 优先只检查核心模块，跳过归档目录');
       await ctx.settle();
-      trace.check('精准转向原始运行轮次', () => {
+      trace.check('精准转向原始运行轮次，话题收到一次确认', () => {
         assert.equal(provider.inputs.length, count + 1);
         const input = provider.inputs[count];
         assert.equal(input.mode, 'steer');
         assert.equal(input.turnId, busy.turnId);
         assert.equal(input.text, '优先只检查核心模块，跳过归档目录');
+        const confirmations = ctx.writes(codex).filter(({ card }) => card.title === '已发送引导');
+        assert.equal(confirmations.length, 1);
+        assert.equal(confirmations[0].card.template, 'blue');
+        assert.equal(confirmations[0].card.bodyText, '已向当前运行中的轮次追加引导：优先只检查核心模块，跳过归档目录');
       });
     });
 
@@ -150,18 +161,23 @@ async function busyTurn(ctx) {
         assert.equal(provider.interrupts[count].turnId, busy.turnId);
         assertTurn(ctx, codex, busy.turnId, 'interrupted');
         assert.ok(interrupted);
-        assert.ok(ctx.writes(codex).some(({ card }) =>
-          card.title === '会话更新' && card.bodyText.includes('残留核对')));
+        assert.ok(!ctx.writes(codex).some(({ card }) => failedInputReceipt(card)));
+        const notice = ctx.writes(codex).find(({ card }) => card.title === '会话更新' && card.bodyText.includes('未发现残留进程'));
+        assert.match(notice?.card.bodyText ?? '', /^本轮已确认中断（未发现残留进程）。\n核对时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2} 北京$/);
       });
     });
 
     await trace.step('4.4 发送「重新开始：只输出简短结论」', async () => {
       const turn = await ctx.start(codex, '重新开始：只输出简短结论');
+      trace.check('新轮次启动后会话恢复运行中', () => {
+        assert.equal(runtime.store.getSession(codex.sessionId).status, 'running');
+      });
       await ctx.finish(codex, '核心模块运行正常。');
       const result = await waitForCard(ctx, codex, card => card.bodyText.includes('核心模块运行正常。'));
       trace.check('中断后的新输入独立完成', () => {
         assert.notEqual(turn.turnId, busy.turnId);
         assertTurn(ctx, codex, turn.turnId, 'completed');
+        assert.equal(runtime.store.getSession(codex.sessionId).status, 'idle');
         assert.ok(result);
       });
     });
@@ -188,6 +204,7 @@ async function busyTurn(ctx) {
         assert.equal(provider.interrupts[before].turnId, buttonTurn.turnId);
         assertTurn(ctx, codex, buttonTurn.turnId, 'interrupted');
         assert.ok(interrupted);
+        assert.ok(!ctx.writes(codex).some(({ card }) => failedInputReceipt(card)));
       });
     });
 
@@ -198,9 +215,10 @@ async function busyTurn(ctx) {
       trace.check('按钮只中断对应轮次一次，重复点击显示中断及残留核对结果', () => {
         assert.equal(provider.interrupts.length, before + 1);
         assert.ok(ctx.writes(codex).some(({ card }) =>
-          card.title === '中断回复' && /目标轮次已中断[\s\S]*残留核对/.test(card.bodyText)));
+          card.title === '中断回复' && /已确认中断（未发现残留进程）。[\s\S]*未再次发出中断/.test(card.bodyText)));
       });
     });
+    await verifyStatusAfterFailure(ctx, codex);
   });
 }
 
@@ -246,13 +264,11 @@ async function models(ctx) {
         assert.equal(setting?.model, choice.value.model);
         assert.deepEqual(setting.preferences, choice.value.preferences);
       });
-      trace.check('点击后还能读取原模型卡', () => assert.ok(updatedCard));
-      const changed = updatedCard.content !== originalCard.content;
-      trace.observe(changed ? '原模型卡已更新。' : '原模型卡未更新，点击后只显示回调提示。', {
-        originalTitle: originalCard.card.title,
-        originalBody: originalCard.card.bodyText,
-        currentBody: updatedCard.card.bodyText,
-        currentButtons: updatedCard.card.buttons.map(({ label }) => label),
+      trace.check('只更新原模型卡，并以主按钮标记当前预设', () => {
+        const writes = ctx.writes(topic).filter(({card}) => card.title === '模型');
+        assert.deepEqual(writes.map(({id,method}) => ({id,method})), [{id:originalCard.id,method:'im.message.patch'}]);
+        assert.ok(updatedCard.card.bodyText.includes(choice.value.model));
+        assert.deepEqual(updatedCard.card.buttons.filter(({type}) => type === 'primary').map(({label}) => label), [`✓ ${choice.label}`]);
       });
     });
     await trace.step(`5.1 在 ${name} 话题重新发送「/model」查看已保存的设置`, async () => {
@@ -262,6 +278,7 @@ async function models(ctx) {
       trace.check('重新打开模型卡可见已提交选项', () => {
         assert.ok(reopened.card.bodyText.includes(choice.value.model));
         assert.ok(reopened.card.bodyText.includes(choice.value.preferences.reasoningEffort));
+        assert.deepEqual(reopened.card.buttons.filter(({type}) => type === 'primary').map(({label}) => label), [`✓ ${choice.label}`]);
       });
     });
   }
@@ -293,10 +310,9 @@ async function projectFiles(ctx) {
       const bytes = await readFile(join(bridge, path));
       await ctx.send(codex, `/deliver ${path}`);
       await ctx.settle();
-      const delivery = cardWith(ctx, codex, '文件发送结果');
-      trace.check('SDK 上传和话题内文件消息对应原始字节', () => {
+      trace.check('SDK 上传和话题内文件消息对应原始字节，成功时没有多余结果卡', () => {
         assertUpload(ctx, codex, before, filename, bytes);
-        assert.ok(delivery.card.bodyText.includes(`${filename}: sent`));
+        assert.ok(!ctx.writes(codex).some(({card}) => card.title === '文件发送结果'));
       });
     });
   }
@@ -401,7 +417,9 @@ async function historyAndNotices(ctx) {
     await ctx.click(history, '下一页');
     await ctx.settle();
     const next = cardWith(ctx, codex, '会话历史');
-    trace.check('分页实际返回不同的历史内容', () => {
+    trace.check('翻页原地更新同一张卡，返回不同的历史内容', () => {
+      assert.equal(next.id, history.id);
+      assert.equal(next.method, 'im.message.patch');
       assert.notEqual(next.card.bodyText, history.card.bodyText);
       assert.match(next.card.bodyText, /JOURNEY-HISTORY-/);
     });
@@ -435,13 +453,19 @@ async function historyAndNotices(ctx) {
   });
 
   await trace.step('5.5 点击「关闭等待提醒」，随后重开状态面板确认', async () => {
-    await ctx.click(panel, '关闭等待提醒');
+    const callback = await ctx.click(panel, '关闭等待提醒');
     await ctx.settle();
-    const notice = cardWith(ctx, codex, '通知设置');
+    const notice = cardWith(ctx, codex, '会话控制');
+    trace.check('开关更新当前控制面板，并保留会话操作', () => {
+      assert.equal(notice.id, panel.id);
+      assert.equal(notice.method, 'im.message.patch');
+      assert.ok(!ctx.writes(codex).some(({card}) => card.title === '通知设置'));
+    });
     await ctx.send(codex, '/status');
     await ctx.settle();
     const updated = cardWith(ctx, codex, '会话控制');
-    trace.check('通知卡和新面板均显示等待提醒已关闭，其他选项仍开启', () => {
+    trace.check('原面板和新面板均显示等待提醒已关闭，其他选项仍开启', () => {
+      assert.deepEqual(callback.result, { toast: { type: 'success', content: '已确认' } });
       for (const message of [notice, updated]) {
         assert.match(message.card.bodyText, /通知：开启（完成：开 · 等待：关 · 失败：开）/);
         assert.equal(action(message, 'notice_settings', 'waiting').label, '开启等待提醒');
@@ -453,8 +477,12 @@ async function historyAndNotices(ctx) {
     const current = ctx.cards(codex).findLast(({ card }) => card?.title === '会话控制');
     await ctx.click(current, '开启等待提醒');
     await ctx.settle();
-    const notice = cardWith(ctx, codex, '通知设置');
-    trace.check('等待提醒可以恢复', () => assert.match(notice.card.bodyText, /等待：开/));
+    const notice = cardWith(ctx, codex, '会话控制');
+    trace.check('等待提醒可以恢复', () => {
+      assert.equal(notice.id, current.id);
+      assert.equal(notice.method, 'im.message.patch');
+      assert.match(notice.card.bodyText, /等待：开/);
+    });
   });
 }
 
@@ -507,7 +535,9 @@ async function attachments(ctx) {
     await trace.step('6.3 在 Codex 话题上传不支持的「paper.pdf」', async () => {
       const count = provider.inputs.length;
       const prior = new Set(sdk.resourceIssues().map(issue => issue.eventId));
-      await ctx.attach(codex, { name: 'paper.pdf', type: 'file', mediaType: 'application/pdf', bytes: pdf });
+      const { replay } = await ctx.attach(codex, { name: 'paper.pdf', type: 'file', mediaType: 'application/pdf', bytes: pdf });
+      await ctx.tick();
+      await replay();
       await ctx.tick();
       const newIssues = sdk.resourceIssues().filter(issue => !prior.has(issue.eventId));
       trace.check('不支持的附件进入 SDK 拒绝记录且未到达后端', () => {
@@ -516,17 +546,21 @@ async function attachments(ctx) {
         ]);
         assert.equal(provider.inputs.length, count);
       });
-      const rejected = cardWith(ctx, codex, '附件未提交');
-      trace.check('带文件名和 MIME 的 PDF 收到可见格式提示', () =>
-        assert.match(rejected.card.bodyText, /仅支持图片和 UTF-8 文本附件/));
+      trace.check('带文件名和 MIME 的 PDF 在事件重放后仍只收到一次格式提示', () => {
+        const notices = ctx.writes(codex).filter(({ card }) => card.title === '附件未提交');
+        assert.equal(notices.length, 1);
+        assert.equal(notices[0].card.bodyText, '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。');
+      });
       trace.observe('SDK 资源问题记录包含本次格式拒绝。', newIssues);
     });
 
-    await trace.step('6.3 模拟飞书缺少文件名与 MIME 的 PDF 事件', async () => {
+    await trace.step('6.4 模拟飞书缺少文件名与 MIME 的 PDF 事件并重放', async () => {
       const count = provider.inputs.length;
-      const before = ctx.wire.calls.length;
-      await ctx.attach(codex, { type: 'file', bytes: pdf });
-      await ctx.settle();
+      const before = ctx.wire.calls.filter(call => call.method === 'im.messageResource.get').length;
+      const { replay } = await ctx.attach(codex, { type: 'file', bytes: pdf });
+      await ctx.tick();
+      await replay();
+      await ctx.tick();
       const db = new DatabaseSync(ctx.sdkDbPath, { readOnly: true });
       let rejected;
       try {
@@ -534,14 +568,25 @@ async function attachments(ctx) {
       } finally {
         db.close();
       }
-      trace.check('旧资源接收路径写入失败台账，未派发给后端，话题内无消息', () => {
+      trace.check('拒绝记录写入台账，话题仅收到一次格式提示', () => {
         assert.equal(rejected?.state, 'rejected');
         assert.equal(rejected?.attempts, 1);
         assert.equal(rejected?.reason, 'unsupported resource type');
         assert.equal(provider.inputs.length, count);
-        assert.ok(ctx.wire.calls.slice(before).every(call => call.method === 'im.messageResource.get'));
+        assert.equal(ctx.wire.calls.filter(call => call.method === 'im.messageResource.get').length, before + 1);
+        const notices = ctx.writes(codex).filter(({ card }) => card.title === '附件未提交');
+        assert.equal(notices.length, 1);
+        assert.equal(notices[0].card.bodyText, '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。');
       });
-      trace.observe('没有文件名和 MIME 时，飞书话题静默。拒绝原因只记在 sdk_resource_failures。', rejected);
+    });
+    await trace.step('6.5 在有资源拒绝记录时查看 /health', async () => {
+      await ctx.send(null, '/health');
+      await ctx.settle();
+      const health = cardWith(ctx, null, '健康状态');
+      trace.check('异常健康卡使用橙色，并提供待核对操作入口', () => {
+        assert.equal(health.card.template, 'orange');
+        assert.equal(action(health, 'pending').label, '查看待核对操作');
+      });
     });
   });
 }

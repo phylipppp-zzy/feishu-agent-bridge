@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from '../adapter.js';
 import { payloadDigest } from '../contracts.js';
 import type { TrustedEnvelope } from '../feishu-channel.js';
+import { isResolvedApproval } from '../feishu-interaction-cards.js';
 import {
   getBindingRow,
   getBindingRowByDestination,
@@ -195,6 +196,11 @@ export async function intakeTaskEvent(
 
   if (!await deps.authorize(e.identity, e.destination, preTarget.session_id || null)) {
     throw new TaskChannelError('unauthorized', 'target authorization denied');
+  }
+
+  if (e.cardMessageId && preTarget.session_id && a.action === 'answer' && a.answer.kind === 'approval' &&
+      await isResolvedApproval(deps.service,preTarget.session_id,a.interactionId)) {
+    throw new TaskChannelError('stale_revision', 'approval already resolved');
   }
 
   let steerTurnId: string | null = null;

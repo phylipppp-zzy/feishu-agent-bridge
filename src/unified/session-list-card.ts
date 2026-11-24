@@ -27,12 +27,14 @@ export function sessionListCard(items: readonly Session[], options: {topicUrls?:
     : {};
   if (options.nextCursor) actions.push({label:'下一页',value:{action:'list',cursor:options.nextCursor,...searchValue(options.provider),...(options.provider !== undefined ? {provider:options.provider} : {})}});
   if (options.providerFilters) {
-    actions.push(
-      { label: '全部', value: { action: 'list', provider: 'all', ...searchValue('all') } },
-      { label: 'Codex', value: { action: 'list', provider: 'codex', ...searchValue('codex') } },
-      { label: 'Claude', value: { action: 'list', provider: 'claude', ...searchValue('claude') } },
-      { label: 'Antigravity', value: { action: 'list', provider: 'agy', ...searchValue('agy') } },
-    );
+    for (const provider of ['all', 'codex', 'claude', 'agy'] as const) {
+      const label = provider === 'all' ? '全部' : providerDisplayLabel(provider);
+      const selected = provider === (options.provider ?? 'all');
+      actions.push({
+        ...(selected ? { label: `✓ ${label}`, type: 'primary' } : { label }),
+        value: { action: 'list', provider, ...searchValue(provider) },
+      });
+    }
   }
   return {title:'会话列表',text:lines.length ? lines.join('\n\n') : '没有可显示的会话。',actions};
 }

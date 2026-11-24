@@ -28,7 +28,8 @@ export interface ChannelCard {
   table?: ChannelCardTable;
   actions: Array<{ label: string; value: Record<string, unknown>; url?: string; type?: 'primary' | 'default' }>;
 }
-export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only' | 'interactive' = 'unbound'): ChannelCard {
+export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only' | 'interactive' = 'unbound',
+  statusLabel = sessionStatusLabel(session.status)): ChannelCard {
   const connected = session.control.input === 'available' && session.status !== 'read_only' && session.status !== 'unreachable';
   const controls: ChannelCard['actions'] = accessMode === 'unbound'
     ? [{label:'接入并续聊',value:{action:'bind',sessionId:session.sessionId,mode:'interactive'}}]
@@ -39,7 +40,7 @@ export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only
     : accessMode === 'read_only' ? '\n只读接入，可直接查看历史与文件。' : '';
   const template = accessMode === 'interactive' ? connected ? 'green' : 'orange'
     : accessMode === 'read_only' ? 'grey' : sessionStatusTemplate(session.status);
-  return { title:session.title, ...(template ? { template } : {}), text:`${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${sessionStatusLabel(session.status)}${access}`, actions:[
+  return { title:session.title, ...(template ? { template } : {}), text:`${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${statusLabel}${access}`, actions:[
     { label:'查看历史', value:{action:'history'} },
     ...(accessMode === 'interactive' && connected ? [{ label:'切换模型', value:{action:'models'} }] : []),
     ...controls,
@@ -74,7 +75,11 @@ export function interactionCard(i: Interaction, readOnly = false, operation?: Op
   const readonlyNote = '此话题为只读。请在原终端答复。';
   let actions: ChannelCard['actions'] = [];
   if (!readOnly && awaiting) {
-    if (i.kind === 'approval') actions = (i.allowedDecisions ?? ['allow', 'deny']).map(decision => ({ label: decision === 'allow' ? '允许本次' : '拒绝', value: { ...base, answer: { kind: 'approval', decision, scope: i.scope }, toolInputDigest: i.toolInputDigest } }));
+    if (i.kind === 'approval') actions = (i.allowedDecisions ?? ['allow', 'deny']).map(decision => ({
+      label: decision === 'allow' ? '允许本次' : '拒绝',
+      type: decision === 'allow' ? 'primary' : 'default',
+      value: { ...base, answer: { kind: 'approval', decision, scope: i.scope }, toolInputDigest: i.toolInputDigest },
+    }));
     else if (i.kind === 'question' && !i.multiple) actions = i.choices.map(choice => ({ label: choice, value: { ...base, answer: { kind: 'question', values: [choice] }, toolInputDigest: null } }));
   }
   if (i.kind === 'approval') {
@@ -94,9 +99,20 @@ export function interactionCard(i: Interaction, readOnly = false, operation?: Op
     const originalNote = awaiting && i.allowedDecisions?.length === 0 ? '请在原端处理此审批。' : '';
     return { title, template, format: 'markdown', text: [view.text, status, readOnly ? readonlyNote : originalNote].filter(Boolean).join('\n\n'), actions };
   }
-  const text = i.kind === 'question' ? i.prompt : i.questions.map(q => q.prompt).join('\n');
-  const note = readOnly ? readonlyNote : awaiting ? '可通过答复入口提交文字或多选。' : '';
-  return { title: '问题', text: [text, status, note].filter(Boolean).join('\n'), actions };
+  const resolved = i.status === 'resolved' || operation?.status === 'completed';
+  const answer = i.nativeResult?.status === 'accepted' ? i.nativeResult.answer : null;
+  const withAnswer = (prompt: string, values?: string[]) =>
+    values?.length ? `${prompt}\n已答复：${values.join('、')}` : prompt;
+  const text = i.kind === 'question'
+    ? withAnswer(i.prompt, answer?.kind === 'question' ? answer.values : undefined)
+    : i.questions.map(q => withAnswer(q.prompt, answer?.kind === 'question_group' ? answer.answers[q.id] : undefined)).join('\n');
+  const note = resolved ? '' : readOnly ? readonlyNote : awaiting ? '可通过答复入口提交文字或多选。' : '';
+  return {
+    title: resolved ? '问题 · 已答复' : '问题',
+    ...(resolved ? { template: 'green', format: 'plain' } : {}),
+    text: [text, status, note].filter(Boolean).join('\n'),
+    actions,
+  };
 }
 export function operationCard(op: Operation): ChannelCard {
   const actions:Record<string,string>={submitInput:'发送输入',stageInputArtifact:'提交附件',interruptTurn:'中断当前回复',cancelQueuedInput:'取消排队输入',resolveInteraction:'提交答复',attachSession:'接入会话',createSession:'创建会话',requestControl:'切换控制',releaseControl:'释放控制',updateSessionSettings:'更新设置',archiveSession:'更新归档'};

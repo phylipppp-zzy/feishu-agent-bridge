@@ -148,8 +148,9 @@ function journeyContext(context) {
     wire.registerResource(id, key, bytes);
     const info = { name, type, mediaType, byteLength: bytes.length,
       sha256: createHash('sha256').update(bytes).digest('hex') };
-    return dispatch('im.message.receive_v1', userMessage(target, id, type, content),
+    const replay = () => dispatch('im.message.receive_v1', userMessage(target, id, type, content),
       `message-${id}`, { messageId: id, destination: target.destination, attachment: info });
+    return { ...await replay(), replay };
   }
 
   async function click(message, labelOrPredicate, form) {

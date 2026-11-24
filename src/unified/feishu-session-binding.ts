@@ -7,6 +7,7 @@ import { operationCard, sessionCard, type ChannelCard } from './feishu-cards.js'
 import type { Authorize, AuthorizeBindingAdmin, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { needsOperationNotice, operationFromReceipt, pendingSessionAuthorization } from './feishu-operation-notices.js';
 import type { NewSessionDraft, NewSessionDrafts } from './new-session-drafts.js';
+import { deriveTitleFromInputBlocks, isGenericSessionTitle } from './session-title.js';
 import { BindingExpired, ReadAuthorizationRevoked, recordNewTopicRootTitle, topicRootCard } from './topic-title-sync.js';
 
 type AccessMode = 'read_only' | 'interactive';
@@ -438,7 +439,9 @@ export class FeishuSessionBinding {
       return {status:'rejected',reason:'interactive_attach_unavailable'};
     }
 
-    const destination = await this.topic(source,session,`${op.operationId}:topic`,guard);
+    const promptTitle = draft?.initial_prompt && deriveTitleFromInputBlocks([{type:'text',text:draft.initial_prompt}]);
+    const displaySession = promptTitle && isGenericSessionTitle(session.title) ? {...session,title:promptTitle} : session;
+    const destination = await this.topic(source,displaySession,`${op.operationId}:topic`,guard);
     if (!await this.authorize(original.identity,destination,sessionId)) throw new ReadAuthorizationRevoked('unauthorized');
     const targetScope = this.channel.scope(destination);
     const existing = this.ownerRow(destination);
@@ -477,7 +480,8 @@ export class FeishuSessionBinding {
       }
       finalScope = this.channel.scope(destination);
       this.completePending(op.operationId);
-      const card = sessionCard(session,this.channel.accessMode(destination));
+      const card = sessionCard(displaySession,this.channel.accessMode(destination),
+        promptTitle && session.status === 'idle' ? '准备提交首条任务' : undefined);
       this.rememberDelivery(op.operationId,destination,session,finalScope,original,card);
       if (draft) {
         this.drafts.settle(op.operationId,'completed');
@@ -500,7 +504,7 @@ export class FeishuSessionBinding {
     }
 
     if (!existing && destination !== source) {
-      await recordNewTopicRootTitle(this.db,this.port,destination,finalScope,session,`${op.operationId}:topic`);
+      await recordNewTopicRootTitle(this.db,this.port,destination,finalScope,displaySession,`${op.operationId}:topic`);
     }
     if (deliverNow) {
       const child = await this.advanceFirstPrompt(op.operationId);

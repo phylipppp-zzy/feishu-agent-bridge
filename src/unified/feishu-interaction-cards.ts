@@ -6,6 +6,11 @@ import { interactionCard, interactionStatusText, type ChannelCard } from './feis
 import { questionForm } from './feishu-question-forms.js';
 import type { FeishuPort } from './feishu-channel.js';
 
+export async function isResolvedApproval(service: UnifiedService, sessionId: string, interactionId: string): Promise<boolean> {
+  const interaction = await service.getInteraction(interactionId).catch(() => null);
+  return interaction?.kind === 'approval' && interaction.sessionId === sessionId && interaction.status === 'resolved';
+}
+
 type Guard = () => Promise<void>;
 type ChannelAccess = {
   checkBinding(destination: string, sessionId: string, scope: string): Promise<void>;
@@ -52,13 +57,15 @@ export class FeishuInteractionCards {
     const readOnly = this.channel.accessMode(destination) === 'read_only';
     const view = interactionCard(interaction,readOnly,op);
     if (interaction.kind !== 'approval') {
-      const binding = this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(destination) as {binding_id:string};
-      const statusText = interactionStatusText(interaction,op);
       view.schema = '2.0';
-      view.text = readOnly ? '请回原会话答复。' : '';
       view.actions = [];
-      view.form = questionForm(interaction,binding.binding_id,readOnly || !!statusText);
-      if (statusText) view.form.statusText = statusText;
+      if (interaction.status !== 'resolved' && op?.status !== 'completed') {
+        const binding = this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(destination) as {binding_id:string};
+        const statusText = interactionStatusText(interaction,op);
+        view.text = readOnly ? '请回原会话答复。' : '';
+        view.form = questionForm(interaction,binding.binding_id,readOnly || !!statusText);
+        if (statusText) view.form.statusText = statusText;
+      }
     }
     const signature=createHash('sha256').update(JSON.stringify(view)).digest('hex');
     const prior=this.db.prepare('SELECT signature FROM channel_interaction_view WHERE destination=? AND session_id=? AND interaction_id=?').get(destination,sessionId,interaction.interactionId) as {signature:string}|undefined;

@@ -306,8 +306,8 @@ test('E2E: /task create -> /task mount -> /task panel -> /handoff -> confirm_han
     // Latest reply in task topic is updated taskPanelCard showing both targets & switch button
     const panelReply = JSON.parse(sdk.replies.at(-1)!.content);
     assert.equal(panelReply.header.title.content, '任务目标面板');
-    assert.ok(panelReply.elements[0].content.includes(mountClaude.targetId.replaceAll('-', '\\-')));
-    assert.ok(panelReply.elements[0].content.includes(mountAgy.targetId.replaceAll('-', '\\-')));
+    assert.ok(panelReply.elements[0].content.includes(mountClaude.targetId));
+    assert.ok(panelReply.elements[0].content.includes(mountAgy.targetId));
     assert.doesNotMatch(panelReply.elements[0].content, /rev=|activeRev=|gen=/);
 
     // 4. /task (no args) inside task topic shows task panel on tick

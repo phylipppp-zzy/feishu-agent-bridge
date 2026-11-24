@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import type { ChannelCard } from './feishu-cards.js';
-import type { RunStatus } from './contracts.js';
+import type { RunStatus, TurnResidual } from './contracts.js';
 import { escapeCardMarkdown, stripCardMentions } from './feishu-card-wire.js';
 
 type DisplayStatus = RunStatus | 'completed';
@@ -47,6 +47,19 @@ export function compactProjectName(project: string): string {
 export function compactCardField(value: string, limit: number): string {
   const characters = [...value.replace(/\s+/gu, ' ').trim()];
   return characters.length > limit ? characters.slice(0, limit - 1).join('') + '…' : characters.join('');
+}
+
+export function formatInterruptedTurn(residual?: TurnResidual): string {
+  const complete = residual?.status === 'none' && residual.complete && residual.count === 0;
+  const count = residual?.count == null ? '' : `（${residual.count}项）`;
+  const text = complete
+    ? '本轮已确认中断（未发现残留进程）。'
+    : `本轮已确认中断。\n残留核对：${residual?.reason ?? '此 provider 未提供可信残留查询'}${count}`;
+  const observedAt = Date.parse(residual?.observedAt ?? '');
+  const beijing = new Date(observedAt + 8 * 60 * 60 * 1000);
+  return Number.isFinite(beijing.getTime())
+    ? `${text}\n核对时间 ${beijing.toISOString().slice(0, 16).replace('T', ' ')} 北京`
+    : text;
 }
 
 const record = (value: unknown): Record<string, unknown> | undefined =>

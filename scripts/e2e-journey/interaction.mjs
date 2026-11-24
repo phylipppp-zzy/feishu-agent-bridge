@@ -290,6 +290,7 @@ async function approvals(ctx) {
         assert.match(firstSource.card.bodyText, /```(?:bash)?\ngit push --force origin main\n```/);
         assert.match(firstSource.card.bodyText, /生效范围.*仅本次操作/);
         assert.doesNotMatch(firstSource.card.bodyText, /\\["n]|awaiting_answer|\{"command":/);
+        assert.equal(firstSource.card.buttons.find(button => button.label === '允许本次')?.type, 'primary');
       });
       if (!firstSource.card.bodyText.includes('```bash\n')) {
         trace.observe('命令已放进代码块，当前代码围栏未标注 bash。');
@@ -324,12 +325,14 @@ async function approvals(ctx) {
 
     await trace.step('8.3 重放同一张原审批卡的旧允许按钮', async () => {
       const before = providers.codex.responses.length;
+      const cursor = wire.calls.length;
       const { result } = await ctx.click(firstSource, '允许本次');
       await ctx.tick();
-      trace.check('旧按钮不能再向后端发出审批答复', () => assert.equal(providers.codex.responses.length, before));
-      if (result?.toast?.content !== '该项已处理完成，无需重复操作。') {
-        trace.observe('原话题旧按钮未返回已处理 toast。实际卡片反馈见本步骤的出站消息。', result ?? null);
-      }
+      trace.check('源话题旧按钮只返回已处理的 toast，未发出新卡或审批答复', () => {
+        assert.deepEqual(result, { toast: { type: 'info', content: '该项已处理完成，无需重复操作。' } });
+        assert.equal(providers.codex.responses.length, before);
+        assert.ok(!wire.calls.slice(cursor).some(call => call.message?.card?.title === '操作未执行'));
+      });
     });
 
     let second, secondSource, secondHub;
@@ -430,17 +433,25 @@ async function questions(ctx) {
         const fields = { [fixture.field]: fixture.selected };
         await ctx.click(source, '提交答复', fields);
         await ctx.tick();
-        trace.check('原端收到无损的结构化答案，源卡在同一消息内收起表单', () => {
+        trace.check('原端收到完整答案，源卡和汇总卡保留问题及答复并收起表单', () => {
           const response = providers.codex.responses.at(-1);
           assert.equal(providers.codex.responses.length, before + 1);
           assert.equal(response?.interactionId, question.interactionId);
           assert.deepEqual(response.answer, { kind: 'question', values: fixture.values });
           const current = wire.messages.get(source.id);
           assert.ok(current.patchCount > source.patchCount);
-          assert.equal(current.card.schema, '2.0');
-          assert.deepEqual(current.card.forms, []);
-          assert.match(current.card.bodyText, /原端已确认答复/);
-          assert.equal(runtime.pendingHub.getRef(`interaction:${question.interactionId}`)?.card_active, 0);
+          const ref = runtime.pendingHub.getRef(`interaction:${question.interactionId}`);
+          assert.equal(ref?.card_active, 0);
+          const hub = wire.messages.get(ref.hub_card_message_id);
+          for (const { card } of [current, hub]) {
+            assert.equal(card.schema, '2.0');
+            assert.equal(card.title, '问题 · 已答复');
+            assert.equal(card.template, 'green');
+            assert.deepEqual(card.forms, []);
+            assert.ok(card.bodyText.includes(fixture.prompt));
+            assert.ok(card.bodyText.includes(`已答复：${fixture.values.join('、')}`));
+            assert.match(card.bodyText, /原端已确认答复/);
+          }
         });
       }, { fields: { [fixture.field]: fixture.selected } });
     }

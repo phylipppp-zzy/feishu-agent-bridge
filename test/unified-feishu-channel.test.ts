@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js';
 import type { UnifiedService } from '../src/unified/adapter.js';
 import type { Interaction, Session, WriteContext } from '../src/unified/contracts.js';
-import { interactionCard } from '../src/unified/feishu-cards.js';
+import { interactionCard, type ChannelCard } from '../src/unified/feishu-cards.js';
 
 // Establish an interactive fixture through the channel's authorized attach/finish path.
 async function interactiveBinding(channel:FeishuChannel, service:UnifiedService, env:{eventId:string;destination:string;identity:{source:string;subject:string}}, sessionId:string) {
@@ -21,7 +21,7 @@ async function interactiveBinding(channel:FeishuChannel, service:UnifiedService,
 }
 
 for (const provider of ['claude', 'codex'] as const) test(`${provider}: same entry, trusted identity, duplicate input and old answer`, async () => {
- const dir = mkdtempSync(join(tmpdir(),'channel-')); let submissions = 0; let resolutions = 0; const cards: unknown[] = [];
+ const dir = mkdtempSync(join(tmpdir(),'channel-')); let submissions = 0; let resolutions = 0; const cards: ChannelCard[] = [];
  const session = {sessionId:'s',native:{provider,hostId:'h',serviceId:'svc',nativeSessionId:'native'},project:'p',title:'session',status:'idle',revision:2,control:{input:'available',generation:3}} as unknown as Session;
  const operation = (context: {operationId:string; idempotencyKey:string;targetId:string}) => ({...context,action:'input',payloadDigest:'d',status:'received',revision:0,error:null});
  const service = {
@@ -31,7 +31,7 @@ for (const provider of ['claude', 'codex'] as const) test(`${provider}: same ent
    getInteraction: async () => ({sessionId:'s',status:'resolved'}),
    resolveInteraction: async () => { resolutions++; throw new Error('interaction_expired'); },
  } as unknown as UnifiedService;
- const port: FeishuPort = {send:async (_d,c) => {cards.push(c); return 'message';},update:async () => {},sendFile:async () => {}};
+ const port: FeishuPort = {isTopicDestination:destination=>destination==='topic',send:async (_d,c) => {cards.push(c); return 'message';},update:async () => {},sendFile:async () => {}};
  const auth = async (i: {subject:string}) => i.subject === 'trusted';
  const channel = new FeishuChannel(service,port,auth,join(dir,'channel.sqlite'));
  const env = (eventId: string) => ({eventId,destination:'topic',identity:{source:'verified',subject:'trusted'}});
@@ -44,8 +44,11 @@ for (const provider of ['claude', 'codex'] as const) test(`${provider}: same ent
   await assert.rejects(channel.handle({...env('bad'),identity:{source:'verified',subject:'other'}},action),/unauthorized/);
   await assert.rejects(channel.handle(env('answer'),{action:'answer',interactionId:'i',revision:1,connectionGeneration:1,answer:{kind:'question',values:['x']},toolInputDigest:null}),/interaction_expired/);
   assert.deepEqual(await channel.handle(env('answer'),{action:'answer',interactionId:'i',revision:1,connectionGeneration:1,answer:{kind:'question',values:['x']},toolInputDigest:null}),{status:'unknown'}); assert.equal(resolutions,1);
-  await channel.handle(env('unbind'),{action:'unbind'}); await assert.rejects(channel.handle(env('after'),action),/not bound/);
-  assert.ok(cards.length >= 2);
+  assert.deepEqual(await channel.handle(env('unbind'),{action:'unbind'}),{unbound:true});
+  assert.equal(cards.at(-1)?.title,'已解除绑定');
+  assert.deepEqual(await channel.handle(env('after'),action),{status:'guidance'});
+  assert.equal(cards.at(-1)?.title,'当前话题未绑定会话');
+  assert.equal(submissions,1);
  } finally {channel.close();rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -139,7 +142,13 @@ for (const provider of ['claude','codex'] as const) test(`${provider}: generated
   assert.doesNotMatch(panel.text,/当前不支持|旧版/);
   const json=toFeishuCard(panel) as {elements:Array<{actions?:Array<{value:unknown}>}>};
   for (const [i,button] of json.elements[1]!.actions!.entries()) await channel.handle(env(`a${i}`),parseFeishuAction(button.value));
-  assert.deepEqual(calls.slice(0,6),['archive','archive','control','release','stop','cancel']);
+  assert.deepEqual(calls,['stop','cancel','archive','control']);
+  session.control.owner='feishu';
+  session.archived=true;
+  await channel.handle(env('owned-panel'),{action:'panel'});
+  const ownedPanel=cards.at(-1)!;
+  assert.deepEqual(ownedPanel.actions.filter(button=>button.value.action==='control' || button.value.action==='archive').map(button=>button.label),
+    ['恢复归档','释放控制']);
   await channel.handle(env('models'),{action:'models'}); const model=toFeishuCard(cards.at(-1)!) as {elements:Array<{actions?:Array<{value:unknown}>}>}; await channel.handle(env('model-choice'),parseFeishuAction(model.elements[1]!.actions![0]!.value));
   await assert.rejects(channel.handle(env('attach'),parseFeishuText(`/attach ${provider} host service native interactive`)),/use upgrade/); assert.ok(calls.includes('settings'));
   await assert.rejects(channel.handle(env('other','other'),{action:'unbind'}),/binding management unauthorized/);

@@ -79,6 +79,11 @@ export function taskInteractionCard(
   } else {
     card.schema = '2.0';
     card.actions = [];
+    if (interaction.status === 'resolved' || operation?.status === 'completed') {
+      card.title = baseCard.title;
+      card.text = `来源: ${providerDisplayLabel(target.native.provider)} (${target.targetId})\n\n${baseCard.text}`;
+      return card;
+    }
     if (readOnly) card.text += '\n此话题为只读。请在原终端答复。';
     const statusText = interactionStatusText(interaction, operation);
     card.form = questionForm(

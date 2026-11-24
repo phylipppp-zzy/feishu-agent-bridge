@@ -27,6 +27,7 @@ export interface UnifiedService {
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
   getTurn?(sessionId:string,turnId:string):Promise<Turn|null>;
   hasStopRequest?(sessionId:string,turnId:string):Promise<boolean>;
+  wasQueuedInputCancelled?(sessionId:string,inputId:string):Promise<boolean>;
   getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
   submitInput(request: SubmitInput): Promise<Operation>;
   resumeFirstPrompt?(operationId:string,authorized:boolean):Promise<Operation|null>;

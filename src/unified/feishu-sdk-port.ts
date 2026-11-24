@@ -13,9 +13,13 @@ import type { Provider } from './contracts.js';
 import { imageMediaType } from '../image-media.js';
 import {TaskTopicStore,type TaskTopicToken} from './task-topic-store.js';
 import {attachmentDisplayName,decodeTextAttachment,MAX_TEXT_ATTACHMENT_BYTES} from './text-attachment.js';
+import { BindingExpired } from './topic-title-sync.js';
 import type { Readable } from 'node:stream';
 
 class ResourceRejected extends Error {}
+class UnsupportedInboundFile extends ResourceRejected {
+  constructor() { super('unsupported resource type'); }
+}
 export class FeishuApiRejected extends Error {
   readonly deliveryKind = 'api_rejected';
   constructor(readonly platformCode: number) { super('Feishu API rejected request'); }
@@ -79,6 +83,7 @@ class UnknownTestRoute extends Error {}
 class ClosedKnownTestCreation extends Error { readonly deliveryKind='known_closed'; }
 class PendingKnownTestCreation extends Error { readonly deliveryKind='known_pending'; }
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
+const IMAGE_SIGNATURE_BYTES = 12; // The longest signature checked by imageMediaType is WebP.
 type ResourceMetadata={name?:string;mime?:string};
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
@@ -117,8 +122,20 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
 }
 async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:string,resourceType:'image'|'file',download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>,handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>,scope?:string,metadata?:ResourceMetadata):Promise<void> {
   const rawName=metadata?.name, mime=metadata?.mime?.toLowerCase();const textHint=resourceType==='file' && (typeof rawName==='string'&&/\.txt$/i.test(rawName)||mime==='text/plain');const stream=await download(messageId,key,resourceType); const chunks:Buffer[]=[]; let length=0;
-  try { for await (const part of stream) { const chunk=Buffer.isBuffer(part) ? part : Buffer.from(part); length+=chunk.length; if(length>(textHint?MAX_TEXT_ATTACHMENT_BYTES:MAX_INBOUND_BYTES)) throw new ResourceRejected(textHint?'size':'inbound resource exceeds limit'); chunks.push(chunk); } } finally { if (!stream.destroyed) stream.destroy(); }
-  const content=Buffer.concat(chunks); const mediaType=imageMediaType(content);if(resourceType==='file'&&!textHint&&((rawName&&!/\.(png|jpe?g|gif|webp)$/i.test(rawName))||(mime&&!['image/png','image/jpeg','image/gif','image/webp'].includes(mime))||(mime&&mediaType&&mime!==mediaType)))throw new ResourceRejected('unsupported');if(textHint){if(mediaType || (mime&&mime!=='text/plain') || (rawName&&!/\.txt$/i.test(rawName)))throw new ResourceRejected('unsupported');try{decodeTextAttachment(content)}catch(error){throw new ResourceRejected(content.length===0||content.length>MAX_TEXT_ATTACHMENT_BYTES?'size':'encoding')}await handle(envelope,{action:'attachment',name:attachmentDisplayName(rawName??'attachment.txt'),mediaType:'text/plain',content,mode:'new'},scope);return;} if (!mediaType) throw new ResourceRejected('unsupported resource type');
+  try {
+    for await (const part of stream) {
+      const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
+      if (resourceType === 'file' && !rawName && !mime && length < IMAGE_SIGNATURE_BYTES && length + chunk.length >= IMAGE_SIGNATURE_BYTES) {
+        const signature = Buffer.concat([...chunks, chunk.subarray(0, IMAGE_SIGNATURE_BYTES - length)], IMAGE_SIGNATURE_BYTES);
+        if (!imageMediaType(signature)) throw new UnsupportedInboundFile();
+      }
+      length += chunk.length;
+      if (length > (textHint ? MAX_TEXT_ATTACHMENT_BYTES : MAX_INBOUND_BYTES)) throw new ResourceRejected(textHint ? 'size' : 'inbound resource exceeds limit');
+      chunks.push(chunk);
+    }
+  } finally { if (!stream.destroyed) stream.destroy(); }
+  const content=Buffer.concat(chunks); const mediaType=imageMediaType(content);if(resourceType==='file'&&!textHint&&((rawName&&!/\.(png|jpe?g|gif|webp)$/i.test(rawName))||(mime&&!['image/png','image/jpeg','image/gif','image/webp'].includes(mime))||(mime&&mediaType&&mime!==mediaType)))throw new ResourceRejected('unsupported');if(textHint){if(mediaType || (mime&&mime!=='text/plain') || (rawName&&!/\.txt$/i.test(rawName)))throw new ResourceRejected('unsupported');try{decodeTextAttachment(content)}catch(error){throw new ResourceRejected(content.length===0||content.length>MAX_TEXT_ATTACHMENT_BYTES?'size':'encoding')}await handle(envelope,{action:'attachment',name:attachmentDisplayName(rawName??'attachment.txt'),mediaType:'text/plain',content,mode:'new'},scope);return;}
+  if (!mediaType) throw resourceType === 'file' ? new UnsupportedInboundFile() : new ResourceRejected('unsupported resource type');
   const ext={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp'}[mediaType];
   await handle(envelope,{action:'attachment',name:rawName?attachmentDisplayName(rawName):`image.${ext}`,mediaType,content,mode:'new'},scope);
 }
@@ -129,7 +146,7 @@ export function parseSdkCardCallback<T extends RuntimeTrustedAction = ChannelAct
   if (a.openId !== owner) throw new Error('unauthorized');
   return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseFeishuAction<T>(a.value,a.formValues)};
 }
-const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target']);
+const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target', 'cancel', 'archive', 'notice_settings']);
 function isAlreadyHandledCardError(error: unknown): boolean {
   const obj = typeof error === 'object' && error !== null ? (error as { code?: unknown; detail?: unknown }) : null;
   const code = obj && 'code' in obj ? String(obj.code ?? '') : '';
@@ -513,15 +530,42 @@ export class FeishuSdkPort implements FeishuPort {
   /** GET may safely repeat; per-item failures are persisted and never block later work. */
   async drainInbound(handle:(envelope:TrustedEnvelope,action:ChannelAction,scope?:string)=>Promise<unknown>):Promise<void> {
     await this.drainTextInbound(handle);
-    const rows=this.db.prepare("SELECT r.* FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE NOT EXISTS (SELECT 1 FROM sdk_lane_resource_tokens l WHERE l.event_id=r.event_id) AND (f.event_id IS NULL OR (f.state='retry' AND f.next_attempt<=?)) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file'}>;
+    const rows=this.db.prepare("SELECT r.*, f.state, f.attempts FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE NOT EXISTS (SELECT 1 FROM sdk_lane_resource_tokens l WHERE l.event_id=r.event_id) AND (f.event_id IS NULL OR (f.state IN ('retry','reject_pending') AND f.next_attempt<=?)) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file';state:string|null;attempts:number|null}>;
     for(const row of rows) {
+      let rejectionPending = row.state === 'reject_pending';
       try {
-        const e=JSON.parse(row.envelope) as TrustedEnvelope; this.allowedTaskOrProduction(e.destination); if(e.identity.source!=='feishu' || e.identity.subject!==this.owner) throw new ResourceRejected('authorization changed');
+        const e=JSON.parse(row.envelope) as TrustedEnvelope;
+        const check=()=>{this.allowedTaskOrProduction(e.destination); if(e.identity.source!=='feishu' || e.identity.subject!==this.owner) throw new ResourceRejected('authorization changed');};
+        check();
         const saved=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(row.event_id) as {scope:string}|undefined; if (!saved) throw new ResourceRejected('resource missing binding scope');
-        await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>{this.allowedTaskOrProduction(e.destination);return (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream();},async (envelope,action,scope)=>{this.allowedTaskOrProduction(envelope.destination);return handle(envelope,action,scope);},saved.scope);
+        const dispatch=async (envelope:TrustedEnvelope,action:ChannelAction)=>{check();return handle(envelope,action,saved.scope);};
+        if (!rejectionPending) {
+          try {
+            await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>{check();return (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream();},dispatch,saved.scope);
+          } catch (error) {
+            if (!(error instanceof UnsupportedInboundFile) || !this.isTopicDestination(e.destination)) throw error;
+            // A retry can deliver the rejection without fetching the bad resource again.
+            this.db.prepare("INSERT OR REPLACE INTO sdk_resource_failures VALUES (?, 'reject_pending', ?, ?, 0)").run(row.event_id,(row.attempts ?? 0)+1,error.message);
+            rejectionPending = true;
+          }
+        }
+        if (rejectionPending) {
+          await dispatch({...e,eventId:`${e.eventId}:rejected`},{action:'resource_rejected',reason:'unsupported'});
+          this.db.prepare("UPDATE sdk_resource_failures SET state='rejected' WHERE event_id=? AND state='reject_pending'").run(row.event_id);
+          continue;
+        }
         this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('DELETE FROM sdk_inbound_resources WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_failures WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_scopes WHERE event_id=?').run(row.event_id); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
         try {this.onResourceHealth('healthy',null);} catch {}
       } catch(error) {
+        if (rejectionPending && error instanceof BindingExpired) {
+          this.db.prepare("UPDATE sdk_resource_failures SET state='rejected' WHERE event_id=? AND state='reject_pending'").run(row.event_id);
+          continue;
+        }
+        if (rejectionPending && !(error instanceof ResourceRejected)) {
+          this.db.prepare("UPDATE sdk_resource_failures SET next_attempt=? WHERE event_id=? AND state='reject_pending'").run(Date.now()+1000,row.event_id);
+          try {this.onResourceHealth('degraded','附件拒绝提示待核对');} catch {}
+          continue;
+        }
         const previous=this.db.prepare('SELECT attempts FROM sdk_resource_failures WHERE event_id=?').get(row.event_id) as {attempts:number}|undefined;
         const attempts=(previous?.attempts ?? 0)+1; const permanent=error instanceof ResourceRejected;
         const state=permanent?'rejected':attempts>=3?'needs_review':'retry';

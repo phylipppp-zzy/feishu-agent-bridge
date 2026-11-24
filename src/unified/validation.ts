@@ -23,7 +23,7 @@ const native = obj({provider:one('claude','codex','agy'),hostId:str,serviceId:st
 const capability: Check = x => obj({status:one('available')})(x) || obj({status:one('unsupported','temporarily_unavailable'),reason:str})(x);
 const capabilities = obj(Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config'].map(k => [k,capability])));
 const control = obj({serviceId:str,owner:nullable(str),input:one('available','unavailable','unknown'),generation:uint,operationId:nullable(str),reason:nullable(str)});
-const session = obj({sessionId:str,native,project:str,title:str,status:one('idle','running','waiting_question','waiting_approval','interrupted','failed','unreachable','read_only'),revision:uint,capabilities,control});
+const session = obj({sessionId:str,native,project:str,title:str,status:one('idle','running','waiting_question','waiting_approval','interrupted','failed','unreachable','read_only'),revision:uint,capabilities,control},{archived:bool});
 const block: Check = x => obj({type:one('text'),text:str})(x) || obj({type:one('artifact'),artifactId:str,contentVersion:str})(x);
 const message = obj({messageId:str,sessionId:str,turnId:str,role:one('user','assistant','tool'),blocks:array(block),sequence:uint,revision:uint,final:bool,source:str});
 const question = obj({id:str,prompt:str,choices:array(str),multiple:nullable(bool),allowFreeText:bool});

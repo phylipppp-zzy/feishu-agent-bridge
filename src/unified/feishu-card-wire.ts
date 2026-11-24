@@ -12,11 +12,14 @@ export function stripCardMentions(text: string): string {
   return text.replace(/<at\b[^>]*>[\s\S]*?<\/at\s*>|<\/?at\b[^>]*>/giu, '');
 }
 
-/** Escape a literal field before interpolating it into a Markdown card. */
+/** Escape a literal field before interpolating it into a Markdown card.
+ * Underscores inside identifiers and hyphens outside block syntax are literal. */
 export function escapeCardMarkdown(text: string): string {
   return stripCardMentions(text)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/[\\`*_{}\[\]()#+.!|~$-]/g, '\\$&');
+    .replace(/[\\`*{}\[\]()#+.!|~$]/g, '\\$&')
+    .replace(/(?<![\p{L}\p{N}_])_+|_+(?![\p{L}\p{N}_])/gu, run => run.replace(/_/g, '\\_'))
+    .replace(/(^[ \t]*)-(?=[ \t]|-+\s*$|$)/gm, '$1\\-');
 }
 
 function header(card: ChannelCard) {

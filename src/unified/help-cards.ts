@@ -152,12 +152,14 @@ export function buildTaskTopicHelpCard(activeProvider?: Provider | null): Channe
   };
 }
 
-export function buildMainChatTopicOnlyGuidanceCard(isSwarm = false): ChannelCard {
-  const text = isSwarm
+export function buildMainChatTopicOnlyGuidanceCard(action?: 'swarm' | 'input'): ChannelCard {
+  const text = action === 'input'
+    ? '请先选择已有会话或新建会话再发送任务。'
+    : action === 'swarm'
     ? '该命令需要在具体会话话题中使用（仅 Antigravity 交互会话支持 /swarm）。请先发送 /sessions 打开已有会话，或发送 /new 新建会话。'
     : '该命令需要在具体会话话题中使用。请先发送 /sessions 打开已有会话，或发送 /new 新建会话。';
   return {
-    title: '请在会话话题中使用',
+    title: action === 'input' ? '请选择会话' : '请在会话话题中使用',
     text,
     actions: [
       { label: '会话列表', value: { action: 'list' } },
@@ -327,6 +329,17 @@ export function buildModelsCard(options: {
             },
           });
         }
+      }
+    }
+  }
+
+  if (options.confirmed) {
+    const { model, preferences } = options.confirmed;
+    for (const action of actions) {
+      const preset = action.value.preferences as Record<string, string>;
+      if (action.value.model === model && preset.reasoningEffort === preferences.reasoningEffort) {
+        action.label = `✓ ${action.label}`;
+        action.type = 'primary';
       }
     }
   }

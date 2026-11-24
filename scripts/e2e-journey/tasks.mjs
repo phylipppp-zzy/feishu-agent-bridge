@@ -111,6 +111,12 @@ export async function tasks(ctx) {
         assert.ok(preview.card.buttons.some(hasAction('confirm_handoff')));
         assert.equal(providers.agy.inputs.length, before);
       });
+      trace.check('Codex 中断后完成了后续轮次，交接预览显示当前会话空闲', () => {
+        const turns = runtime.store.listTurns(codex.sessionId);
+        assert.ok(turns.some((turn) => turn.status === 'interrupted'));
+        assert.equal(turns.at(-1)?.status, 'completed');
+        assert.match(preview.card.bodyText, /原会话状态: idle/);
+      });
     });
 
     await trace.step('点击交接预览中的「确认交接到 Antigravity」', async () => {
@@ -130,7 +136,20 @@ export async function tasks(ctx) {
         assert.equal(taskChannel.getBinding(binding.taskId).activeTargetId, codexTarget.targetId);
       });
       const shown = wire.messages.get(preview.id);
-      trace.observe('确认交接后，原预览卡上仍可见的按钮', shown.card.buttons.map((button) => button.label));
+      trace.check('原交接预览卡更新为绿色已确认状态，保留原文并移除确认按钮', () => {
+        assert.equal(shown.patchCount, preview.patchCount + 1);
+        assert.equal(shown.card.title, '✅ 已确认交接');
+        assert.equal(shown.card.template, 'green');
+        assert.equal(shown.card.bodyText, preview.card.bodyText);
+        assert.ok(!shown.card.buttons.some(confirmAction));
+        assert.equal(ctx.cards(topic).filter((message) => message.card.title === '✅ 已确认交接').length, 1);
+      });
+      const replay = await ctx.click(preview, confirmAction);
+      trace.check('旧预览的确认回调重放时不会再次提交交接', () => {
+        assert.deepEqual(replay.result?.toast, { type: 'info', content: '该项已处理完成，无需重复操作。' });
+        assert.equal(providers.agy.inputs.length, before + 1);
+        assert.equal(wire.messages.get(preview.id).patchCount, shown.patchCount);
+      });
       await ctx.finish(agy, '已收到交接摘要，Antigravity 可以接续验证。');
     });
 
@@ -222,7 +241,14 @@ export async function tasks(ctx) {
         assert.equal(answers[0].selectedOptionId, 'c');
         assert.equal(answers[0].selectedLabel, '先验证 Codex');
         assert.equal(runtime.pendingHub.getRef(`decision:${decisionId}`)?.card_active, 0);
-        assert.ok(!wire.messages.get(decisionCard.id).card.buttons.some(hasAction('decision_answer')));
+        const updated = wire.messages.get(decisionCard.id);
+        assert.ok(updated.patchCount > decisionCard.patchCount);
+        assert.equal(updated.card.title, '业务决定 · 已确认');
+        assert.equal(updated.card.template, 'green');
+        assert.ok(updated.card.bodyText.includes(decisionTitle));
+        assert.ok(updated.card.bodyText.includes('先验证 Codex 还是 Antigravity 的实验产物？'));
+        assert.ok(updated.card.bodyText.includes('已选择：先验证 Codex'));
+        assert.ok(!updated.card.buttons.some(hasAction('decision_answer')));
       });
     });
   });

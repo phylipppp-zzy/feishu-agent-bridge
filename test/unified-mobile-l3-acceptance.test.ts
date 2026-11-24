@@ -170,7 +170,7 @@ test('listSessions orders by updatedAt descending with missing/invalid last, and
     const channel = new FeishuChannel(core, port, async () => true, join(dir, 'channel.sqlite'));
     await channel.handle({ eventId: 'list-1', destination: 'chat', identity: { source: 'feishu', subject: 'owner' } }, { action: 'list' });
     const listCard = cards.at(-1);
-    assert.ok(listCard.actions.some((a: any) => a.label === '全部'));
+    assert.ok(listCard.actions.some((a: any) => a.label === '✓ 全部' && a.type === 'primary'));
     assert.ok(listCard.actions.some((a: any) => a.label === 'Antigravity'));
 
     // Also verify createMockAdapter proxy does not reject or mistakenly report agy filter buttons

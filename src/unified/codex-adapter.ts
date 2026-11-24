@@ -347,9 +347,11 @@ export class CodexAdapter implements PlatformPort {
     const generation = this.transport.generation;
     guard.assertCurrent(); const response = await this.transport.request(mode === 'new' ? 'turn/start' : 'turn/steer', mode === 'new' ? { threadId: id, input, ...(this.settings.get(id) ?? {}) } : { threadId: id, expectedTurnId: turnId, input });
     const r = response as Obj; const returned=typeof r?.turn?.id === 'string' ? r.turn.id : typeof r?.turnId === 'string' ? r.turnId : null; if(mode==='steer' && returned!==turnId) throw contractError('outcome_unknown','steer acknowledgement did not identify the captured turn');
-    if (mode === 'new' && returned && r.turn?.status === 'inProgress' && info?.status === previousStatus
+    if (mode === 'new' && info && returned && r.turn?.status === 'inProgress' && info.status === previousStatus
       && this.active.has(id) && this.transport.generation === generation && this.knownSessions.get(id) === info) {
       this.trackApprovalTurn(id, returned, generation);
+      info.status = {type: 'active'};
+      this.emit({type:'turn',ref,turn:this.turn(id,r.turn),connectionGeneration:generation});
     }
     if (mode === 'new' && info && this.awaitingFirstInput.delete(info) && this.active.has(id) && this.knownSessions.get(id) === info) {
       const title = this.session(info).title.trim() ? null : deriveTitleFromInputBlocks(blocks);

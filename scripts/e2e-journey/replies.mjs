@@ -3,6 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { ToolProgressTracker } from '../../src/unified/tool-progress.ts';
 
 function completionCard(ctx, topic, pattern = /已完成/) {
   const message = ctx.writes(topic).findLast(({ card }) => pattern.test(card.title));
@@ -58,16 +59,19 @@ async function longReplies(ctx) {
   const { trace, topics: { codex, claude }, providers, wire } = ctx;
   await trace.stage(10, '多段聚合、长文完整渲染、文件直发、120 秒锁屏提醒与限流容错', async () => {
     await trace.step('10.1 请求分三次报告实验进展，期间穿插两次工具步骤', async () => {
-      await ctx.start(codex, '请分阶段汇报实验进展');
+      const turn = await ctx.start(codex, '请分阶段汇报实验进展');
       const parts = ['先核对数据来源。', '再分析失败样本。', '最后补充回归结论。'];
+      const toolSummaries = ['Read · /workspace/feishu-agent-bridge/gui-rl/task_result', 'Read · <文件> & _字面文本_'];
+      const tracker = new ToolProgressTracker();
+      const generation = ctx.runtime.store.connectionGeneration(codex.sessionId);
       for (const [index, text] of parts.entries()) {
-        ctx.emitText(codex, text, { messageId: `journey-aggregation-${index}`, final: true });
         if (index < parts.length - 1) {
-          providers.codex.event(codex.ref, 'tool.updated', {
-            turnId: ctx.turn(codex).turnId, callId: `aggregation-tool-${index}`,
-            tool: 'Read', phase: 'succeeded', summary: `Read · 实验记录 ${index + 1}`,
-          });
+          const observation = tracker.observe(codex.ref, generation, turn.turnId, `aggregation-tool-${index}`,
+            'succeeded', { tool: 'Read', summary: toolSummaries[index] });
+          assert.ok(observation);
+          providers.codex.emit(observation);
         }
+        ctx.emitText(codex, text, { messageId: `journey-aggregation-${index}`, final: true });
         await ctx.settle();
       }
       await ctx.finish(codex);
@@ -76,6 +80,11 @@ async function longReplies(ctx) {
         const { card } = completionCard(ctx, codex);
         assert.equal(card.template, 'green');
         assert.equal(card.raw.body.elements[0].content, parts.join('\n\n'));
+      });
+      trace.check('执行记录保留路径标识符并转义 Markdown 格式字符', () => {
+        const { card } = completionCard(ctx, codex);
+        assert.equal(card.collapsiblePanels[0].bodyText,
+          '✓ Read · /workspace/feishu-agent-bridge/gui-rl/task_result\n✓ Read · &lt;文件&gt; &amp; \\_字面文本\\_');
       });
     });
 
@@ -266,6 +275,8 @@ async function isolatedSessions(ctx) {
         assert.ok(searchCard.card.bodyText.includes(desktopTitle));
         assert.ok(searchCard.card.bodyText.includes(otherTitle));
         assert.equal(searchCard.card.buttons.filter(button => button.value?.action === 'bind').length, 2);
+        assert.equal(searchCard.card.buttons.find(button => button.value?.provider === 'all')?.label, '✓ 全部');
+        assert.equal(searchCard.card.buttons.find(button => button.value?.provider === 'all')?.type, 'primary');
       });
     });
     await trace.step('11.2 在搜索结果点击「Codex」筛选', async () => {
@@ -277,6 +288,7 @@ async function isolatedSessions(ctx) {
         assert.ok(filteredCard.card.bodyText.includes(desktopTitle));
         assert.ok(!filteredCard.card.bodyText.includes(otherTitle));
         assert.equal(filteredCard.card.buttons.filter(button => button.value?.action === 'bind').length, 1);
+        assert.deepEqual(filteredCard.card.buttons.filter(button => button.type === 'primary').map(button => button.label), ['✓ Codex']);
       });
     });
     await trace.step('11.3 点击 Codex 搜索结果的「接入」进入只读话题', async () => {
@@ -336,14 +348,20 @@ async function isolatedSessions(ctx) {
         const quota = completionCard(ctx, desktopTopic, /^额度提示$/);
         assert.equal(failed.card.template, 'red');
         assert.match(quota.card.bodyText, /额度接近限制，当前仍可继续/);
+        assert.ok(!ctx.writes(desktopTopic).some(({ card }) =>
+          card.title === '操作回执' && card.bodyText.includes('发送输入：失败')));
       });
     });
     await trace.step('11.4 失败后在同一话题发送新消息', async () => {
       await ctx.start(desktopTopic, '请只给出一行可行的结论');
+      trace.check('新轮次启动后会话恢复运行中', () => {
+        assert.equal(runtime.store.getSession(desktopTopic.sessionId).status, 'running');
+      });
       await ctx.finish(desktopTopic, '请求已恢复，可以继续。');
       await waitForPatchWindow(ctx, desktopTopic);
       trace.check('同一会话可继续执行，回复正常完成', () => {
         assert.equal(completionCard(ctx, desktopTopic).card.bodyText, '请求已恢复，可以继续。');
+        assert.equal(runtime.store.getSession(desktopTopic.sessionId).status, 'idle');
       });
     });
 
@@ -352,45 +370,60 @@ async function isolatedSessions(ctx) {
       await ctx.send(desktopTopic, '/status');
       await ctx.tick();
       archivePanel = completionCard(ctx, desktopTopic, /^会话控制$/);
-      trace.check('面板包含归档和恢复归档按钮', () => {
-        assert.ok(archivePanel.card.buttons.some(button => button.label === '归档'));
-        assert.ok(archivePanel.card.buttons.some(button => button.label === '恢复归档'));
+      trace.check('未归档的面板只提供归档按钮，并且只显示一种控制交接操作', () => {
+        assert.deepEqual(archivePanel.card.buttons.filter(button => button.value?.action === 'archive').map(button => button.label), ['归档']);
+        assert.deepEqual(archivePanel.card.buttons.filter(button => button.value?.action === 'control').map(button => button.label), ['切换到飞书']);
       });
     });
     await trace.step('11.5 点击「归档」', async () => {
       const before = providers.codex.archives.length;
-      await ctx.click(archivePanel, '归档');
+      const callback = await ctx.click(archivePanel, '归档');
       await ctx.tick();
-      trace.check('归档请求进入该桌面会话的供应商适配层一次', () => {
+      trace.check('归档请求派发一次，用户收到确认且原面板就地更新', () => {
+        assert.deepEqual(callback.result, { toast: { type: 'success', content: '已确认' } });
         assert.equal(providers.codex.archives.length, before + 1);
         assert.deepEqual(providers.codex.archives.at(-1), { ref: desktopTopic.ref, archived: true });
+        const updated = completionCard(ctx, desktopTopic, /^会话控制$/);
+        assert.equal(updated.id, archivePanel.id);
+        assert.match(updated.card.bodyText, /会话已归档/);
+        assert.deepEqual(updated.card.buttons.filter(button => button.value?.action === 'archive').map(button => button.label), ['恢复归档']);
+        assert.equal(runtime.store.getSession(desktopTopic.sessionId).archived, true);
+      });
+    });
+    await trace.step('11.5 在同一张面板点击「恢复归档」', async () => {
+      const callback = await ctx.click(wire.messages.get(archivePanel.id), '恢复归档');
+      await ctx.tick();
+      trace.check('原面板恢复归档入口并确认更新', () => {
+        assert.deepEqual(callback.result, { toast: { type: 'success', content: '已确认' } });
+        const updated = completionCard(ctx, desktopTopic, /^会话控制$/);
+        assert.equal(updated.id, archivePanel.id);
+        assert.deepEqual(updated.card.buttons.filter(button => button.value?.action === 'archive').map(button => button.label), ['归档']);
+        assert.equal(runtime.store.getSession(desktopTopic.sessionId).archived, false);
       });
     });
     await trace.step('11.5 在一次性话题发送 /unbind', async () => {
       await ctx.send(desktopTopic, '/unbind');
       await ctx.tick();
-      trace.check('绑定确实移除，当前界面没有给用户确认消息', () => {
+      trace.check('绑定移除且话题收到解除绑定确认', () => {
         assert.ok(!runtime.channel.bindingsForRestore().some(binding => binding.destination === desktopTopic.destination));
-        assert.equal(visibleWrites(ctx, desktopTopic).length, 0);
+        const confirmed = completionCard(ctx, desktopTopic, /^已解除绑定$/);
+        assert.equal(confirmed.card.template, 'grey');
+        assert.match(confirmed.card.bodyText, /\/sessions.*\/new/);
       });
-      trace.observe('解绑在后台完成，用户没有收到确认卡或文本。');
     });
     await trace.step('11.5 解绑后继续向旧话题发送一条普通消息', async () => {
       const before = providers.codex.inputs.length;
       const beforeUnknown = runtime.channel.unknownInbox();
       await ctx.send(desktopTopic, '解绑后还能继续吗？');
-      await trace.check('当前实现将旧话题输入视作后台派发异常', () => {
-        return assert.rejects(() => ctx.tick(), /dispatch or synchronization failed/);
-      });
+      await ctx.send(desktopTopic, '/steer 继续刚才的内容');
       await ctx.tick();
-      trace.check('消息未交给后端，旧话题无提示，并在后台留下待核对入站记录', () => {
+      trace.check('普通消息和 /steer 各收到一条重绑指引，后台没有待核对入站记录', () => {
         assert.equal(providers.codex.inputs.length, before);
-        assert.equal(visibleWrites(ctx, desktopTopic).length, 0);
-        const newUnknown = runtime.channel.unknownInbox().filter(id => !beforeUnknown.includes(id));
-        assert.equal(newUnknown.length, 1);
-        assert.match(newUnknown[0], /^message:om_user_/);
+        const guidance = ctx.writes(desktopTopic).filter(({ card }) => card.title === '当前话题未绑定会话');
+        assert.equal(guidance.length, 2);
+        for (const { card } of guidance) assert.match(card.bodyText, /\/sessions.*\/new/);
+        assert.deepEqual(runtime.channel.unknownInbox(), beforeUnknown);
       });
-      trace.observe('仍能往旧话题发消息。后台留下未确认的入站记录，飞书端保持静默。');
     });
   });
 }

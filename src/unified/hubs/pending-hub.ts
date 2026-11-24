@@ -7,12 +7,14 @@ import {
   type Operation,
   type Provider,
 } from '../contracts.js';
-import { interactionCard, interactionStatusText, type ChannelCard } from '../feishu-cards.js';
+import { interactionStatusText, type ChannelCard } from '../feishu-cards.js';
 import { StoreError } from '../store.js';
 import type { DecisionSyncStore } from './decision-store.js';
 import {
+  buildAnsweredDecisionCard,
   buildDecisionPendingItem,
   buildInteractionPendingItem,
+  buildPendingInteractionStatusCard,
   buildPendingRootCard,
   buildWithdrawnCard,
   formatPendingSummaryCard,
@@ -662,12 +664,7 @@ export class PendingHub {
     const operation = await this.service.getResponseOperation?.(interactionId);
     const status = interactionStatusText(interaction, operation);
     if (status) {
-      const card: ChannelCard = interaction.kind === 'approval' ? interactionCard(interaction, false, operation) : {
-        title: `模型问答 · ${status}`,
-        text: status,
-        schema: '2.0',
-        actions: [],
-      };
+      const card = buildPendingInteractionStatusCard(interaction, status, operation);
       return this.updateRefCards(ref, status, interaction.revision, card);
     }
 
@@ -705,8 +702,12 @@ export class PendingHub {
     const decision = this.findDecision(decisionId);
     if (!decision) return this.updateRefCards(ref, '该决定已不可用', ref.revision);
     if (isActionableDecision(decision, nowMs)) return { sourceUpdated: false, hubUpdated: false };
-    const reason = decision.status === 'answered' ? '决定已登记'
-      : decision.status === 'cancelled' ? '决定已取消' : '决定已过期';
+    if (decision.status === 'answered') {
+      const answer = this.decisionStore?.getAnswers(decisionId)
+        .find(a => a.decisionVersion === decision.version && a.decisionDigest === decision.digest);
+      return this.updateRefCards(ref, '决定已确认', decision.version, buildAnsweredDecisionCard(decision, answer));
+    }
+    const reason = decision.status === 'cancelled' ? '决定已取消' : '决定已过期';
     return this.updateRefCards(ref, reason, decision.version);
   }
 

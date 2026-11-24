@@ -206,6 +206,7 @@ export class UnifiedCore implements UnifiedService {
   }
   async getSession(id: string) { return this.present(this.store.getSession(id)); }
   async hasStopRequest(sessionId:string,turnId:string) {this.store.getSession(sessionId);return this.store.hasStopRequest(sessionId,turnId);}
+  async wasQueuedInputCancelled(sessionId:string,inputId:string) {return this.store.wasQueuedInputCancelled(sessionId,inputId);}
   async getTurn(sessionId:string,turnId:string) {this.store.getSession(sessionId);return this.store.listTurns(sessionId).find(t=>t.turnId===turnId) ?? null;}
   async getWorkState(id:string) { const session=this.store.getSession(id); return {runningTurns:this.store.listTurns(id).filter(t=>t.status==='running'),queuedInputs:this.store.queuedInputs(id),canArchive:typeof this.port(session).archive === 'function'}; }
   async capabilities(id: string) { return this.present(this.store.getSession(id)).capabilities; }
@@ -544,7 +545,7 @@ export class UnifiedCore implements UnifiedService {
       if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project || payloadDigest(now.native)!==payloadDigest(current.native) || now.project!==current.project || now.revision!==current.revision || this.store.connectionGeneration(link.sessionId)!==generation || this.store.isDetached(link.sessionId) || this.store.recoveryQuarantined(link.sessionId) || !this.authorize(context.identity,now,'reconcile') || (this.canDiscover && !this.canDiscover(now))) return fail('unauthorized','reconcile metadata or authorization changed');
       if (observed.connectionGeneration !== undefined && (observed.connectionGeneration < generation || (current.control.input === 'available' && observed.connectionGeneration !== generation))) return fail('control_conflict','reconcile connection changed');
       if ((observed.turns ?? []).some(t=>t.sessionId!==current.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
-      for (const turn of observed.turns ?? []) if (turn.turnId===link.turnId) this.store.putTurn({...turn,sessionId:link.sessionId});
+      for (const turn of observed.turns ?? []) if (turn.turnId===link.turnId) this.store.reconcileTurn({...turn,sessionId:link.sessionId});
       return this.store.getOperation(id);
     });
   }
@@ -598,7 +599,18 @@ export class UnifiedCore implements UnifiedService {
     }
     if (observation.type === 'session') {
       const next = {...observation.session, sessionId:mapped.sessionId, native:mapped.native};
-      await this.serial(next.sessionId, async () => { const owner = randomUUID(); const generation = this.store.acquireDispatchLease(next.sessionId,owner,Date.now(),30000); if (generation === null) return fail('busy','control observation needs replay'); try { if(this.store.recoveryQuarantined(next.sessionId)) return; const current = this.store.getSession(next.sessionId); if (next.control.generation < current.control.generation) return fail('control_conflict'); const normalized = {...next, revision:current.revision}; if (JSON.stringify(normalized) !== JSON.stringify(current)) this.store.updateSession({...normalized,revision:current.revision+1},current.revision,current.control.generation); } finally { this.store.releaseDispatchLease(next.sessionId,owner,generation); } });
+      await this.serial(next.sessionId, async () => {
+        const owner = randomUUID(), generation = this.store.acquireDispatchLease(next.sessionId,owner,Date.now(),30000);
+        if (generation === null) return fail('busy','control observation needs replay');
+        try {
+          if (this.store.recoveryQuarantined(next.sessionId)) return;
+          const current = this.store.getSession(next.sessionId);
+          if (next.control.generation < current.control.generation) return fail('control_conflict');
+          const normalized = {...next, revision:current.revision};
+          if (normalized.archived === undefined && current.archived !== undefined) normalized.archived = current.archived;
+          if (JSON.stringify(normalized) !== JSON.stringify(current)) this.store.updateSession({...normalized,revision:current.revision+1},current.revision,current.control.generation);
+        } finally { this.store.releaseDispatchLease(next.sessionId,owner,generation); }
+      });
     }
     if (observation.type === 'turn') await this.serial(mapped.sessionId, async () => {
       if (this.closed || this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId) ||

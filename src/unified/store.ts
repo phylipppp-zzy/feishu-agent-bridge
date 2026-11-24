@@ -162,9 +162,7 @@ export class UnifiedStore {
       const current=this.getSession(existing.sessionId);
       if (session.control.generation <= current.control.generation) return fail('control_conflict','control generation must advance');
       const updated={...session,sessionId:existing.sessionId,revision:current.revision+1};
-      this.invalidateDeliveries(existing.sessionId,false);
-      this.run('UPDATE sessions SET value=?,revision=?,control_generation=? WHERE id=?',JSON.stringify(updated),updated.revision,updated.control.generation,existing.sessionId);
-      this.eventFor(existing.sessionId,existing.sessionId,updated.revision,'session.updated',null,updated);
+      this.updateSessionInTransaction(updated,current);
     }
     if (observed) {
       if (existing?.native.provider === 'agy') {
@@ -214,6 +212,11 @@ export class UnifiedStore {
     if (op.action === 'submitInput' && nativeReference) this.run('INSERT INTO operation_turns(operation_id,session_id,turn_id) VALUES(?,?,?)',id,op.targetId,nativeReference);
     const next: Operation = {...op,status:'accepted',revision:op.revision+1,error:null}; this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id); this.eventFor(op.targetId,id,next.revision,'operation.accepted',id,next);
     if (op.action === 'submitInput' && nativeReference) {const row=this.row('SELECT value FROM turns WHERE id=? AND session_id=?',nativeReference,op.targetId); if(row) this.settleTurn(parse<Turn>(row.value));}
+    if (out.kind === 'archiveSession') {
+      const current = this.session(op.targetId), { archived } = out.payload as { archived: boolean };
+      if (current.archived !== archived) this.updateSessionInTransaction({...current, archived, revision:current.revision+1},current);
+      this.run("UPDATE outbox SET state='done' WHERE operation_id=?",id);
+    }
     return this.getOperation(id);
   }); }
   /** A locally written reply has no remaining send work. Keep its payload for native evidence. */
@@ -261,30 +264,46 @@ export class UnifiedStore {
 
   operationTurn(id:string): {sessionId:string;turnId:string} | null { const row=this.row('SELECT session_id,turn_id FROM operation_turns WHERE operation_id=?',id); return row ? {sessionId:String(row.session_id),turnId:String(row.turn_id)} : null; }
   /** Apply live turn evidence and its session status atomically; stale terminals never clear newer work. */
-  observeTurn(turn: Turn, observedAt = Date.now()): boolean { return this.transaction(() => {
+  observeTurn(turn: Turn, observedAt = Date.now()): boolean {
+    return this.transaction(() => this.applyCurrentTurnInTransaction(turn, observedAt));
+  }
+  reconcileTurn(turn: Turn): void {
+    this.transaction(() => this.applyCurrentTurnInTransaction(turn));
+  }
+  private applyCurrentTurnInTransaction(turn: Turn, observedAt?: number): boolean {
     const current=this.session(turn.sessionId), previous=this.listTurns(turn.sessionId).find(t=>t.turnId===turn.turnId);
     const changed = this.putTurnInTransaction(turn, observedAt);
-    if (this.isDetached(turn.sessionId) || this.recoveryQuarantined(turn.sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return changed;
+    if (!this.canObserveRunStatus(current)) return changed;
     const interactions=this.snapshotInteractions(turn.sessionId).filter(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery');
     const active=this.listTurns(turn.sessionId).some(t=>t.status==='running'||t.status==='queued');
     let status=current.status;
     if (interactions.length) status=interactions.some(i=>i.kind==='approval') ? 'waiting_approval' : 'waiting_question';
-    else if (turn.status==='running' && (!previous || previous.status==='queued' || previous.status==='running')) status='running';
-    else if (!active && (previous?.status==='running' && isTerminalTurn(turn.status) ||
-        changed && previous?.status===turn.status && isTerminalTurn(turn.status))) {
+    else if (active) status='running';
+    else if (isTerminalTurn(turn.status) && (previous?.status==='running' || previous?.status==='queued' ||
+        changed && previous?.status===turn.status && current.status==='running' ||
+        !previous && this.row('SELECT turn_id FROM operation_turns WHERE session_id=? ORDER BY rowid DESC LIMIT 1',turn.sessionId)?.turn_id===turn.turnId)) {
       status=turn.status==='completed' ? 'idle' : turn.status as 'failed'|'interrupted';
     }
-    if(status!==current.status) { const next={...current,status,revision:current.revision+1}; this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,turn.sessionId); this.eventFor(turn.sessionId,turn.sessionId,next.revision,'session.updated',null,next); }
+    if (status!==current.status) this.updateSessionInTransaction({...current,status,revision:current.revision+1},current);
     return changed;
-  }); }
+  }
   observeInteractionStatus(sessionId:string, turnId:string): void { this.transaction(() => {
-    const current=this.session(sessionId); if(this.isDetached(sessionId) || this.recoveryQuarantined(sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return;
-    const interactions=this.snapshotInteractions(sessionId).filter(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery'); const turns=this.listTurns(sessionId), turn=turns.find(t=>t.turnId===turnId); let status=current.status;
+    const current=this.session(sessionId); if (!this.canObserveRunStatus(current)) return;
+    const interactions=this.snapshotInteractions(sessionId).filter(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery');
+    const turns=this.listTurns(sessionId); let status=current.status;
     if(interactions.length) status=interactions.some(i=>i.kind==='approval') ? 'waiting_approval' : 'waiting_question';
-    else if(turn?.status==='running') status='running';
-    else if(turn && ['completed','failed','interrupted'].includes(turn.status) && !turns.some(t=>t.status==='running'||t.status==='queued')) status=turn.status==='completed' ? 'idle' : turn.status as 'failed'|'interrupted';
-    if(status!==current.status) {const next={...current,status,revision:current.revision+1};this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,sessionId);this.eventFor(sessionId,sessionId,next.revision,'session.updated',null,next);}
+    else if (turns.some(t=>t.status==='running'||t.status==='queued')) status='running';
+    else if (['waiting_question','waiting_approval'].includes(current.status)) {
+      const latest = turns.some(turn=>turn.turnId===turnId) ? turns.at(-1) : undefined;
+      status = latest?.status === 'failed' || latest?.status === 'interrupted' ? latest.status : 'idle';
+    }
+    if (status!==current.status) this.updateSessionInTransaction({...current,status,revision:current.revision+1},current);
   }); }
+  private canObserveRunStatus(session: Session): boolean {
+    return session.control.input === 'available' &&
+      ['idle','running','waiting_question','waiting_approval','failed','interrupted'].includes(session.status) &&
+      !this.isDetached(session.sessionId) && !this.recoveryQuarantined(session.sessionId);
+  }
   listTurns(sessionId: string): Turn[] { this.session(sessionId); return (this.db.prepare('SELECT value FROM turns WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string,unknown>[]).map(r => parse<Turn>(r.value)); }
   queuedInputs(sessionId:string): Array<{inputId:string}> { this.session(sessionId); return this.pendingOutbox(sessionId,'submitInput').filter(id=>(this.getOutbox(id).payload as {mode?:string}).mode==='queue').map(inputId=>({inputId})); }
   cancelQueuedInput(context: WriteContext, inputId: string): Operation { return this.transaction(() => {
@@ -320,6 +339,11 @@ export class UnifiedStore {
     return {pending:Number(row.pending),unknown:Number(row.unknown)};
   }
   hasStopRequest(sessionId:string,turnId:string):boolean {return !!this.db.prepare("SELECT 1 FROM outbox WHERE kind='interruptTurn' AND state IN ('in_flight','unknown','done') AND json_extract(context,'$.targetId')=? AND json_extract(payload,'$.turnId')=? LIMIT 1").get(sessionId,turnId);}
+  wasQueuedInputCancelled(sessionId:string,inputId:string):boolean {
+    return !!this.row(`SELECT 1 FROM outbox JOIN operations ON operations.id=outbox.operation_id
+      WHERE kind='cancelQueuedInput' AND state='done' AND json_extract(value,'$.status')='completed'
+      AND json_extract(context,'$.targetId')=? AND json_extract(payload,'$.inputId')=? LIMIT 1`,sessionId,inputId);
+  }
   hasPendingOutbox(id: string): boolean {
     return !!this.row("SELECT 1 FROM outbox WHERE operation_id=? AND state='pending' AND operation_id NOT IN (SELECT operation_id FROM first_prompt_suspensions) UNION ALL SELECT 1 FROM steer_outbox_v1 WHERE operation_id=? AND state='pending' LIMIT 1",id,id);
   }
@@ -368,10 +392,14 @@ export class UnifiedStore {
     if (old.revision !== expectedRevision) return fail('stale_revision');
     if (old.control.generation !== expectedControlGeneration) return fail('control_conflict');
     if (session.revision !== old.revision + 1 || session.control.generation < old.control.generation) return fail('invalid_request', 'invalid new session revision or generation');
+    this.updateSessionInTransaction(session,old);
+  }); }
+  private updateSessionInTransaction(session: Session, old: Session): void {
+    if (session.archived === undefined && old.archived !== undefined) session = {...session, archived:old.archived};
     if (session.control.generation !== old.control.generation) this.invalidateDeliveries(session.sessionId, false);
     this.run('UPDATE sessions SET value=?,revision=?,control_generation=? WHERE id=?', JSON.stringify(session), session.revision, session.control.generation, session.sessionId);
     this.eventFor(session.sessionId, session.sessionId, session.revision, 'session.updated', null, session);
-  }); }
+  }
   findMessage(sessionId: string, messageId: string): Message | null {
     const row = this.row('SELECT value FROM messages WHERE id=? AND session_id=?', messageId, sessionId);
     return row ? parse<Message>(row.value) : null;

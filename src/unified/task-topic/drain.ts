@@ -313,7 +313,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       .run(eventId);
     if (!claim.changes) return { status: 'unknown' };
     const text = {
-      unsupported: '仅支持图片和 UTF-8 文本附件。',
+      unsupported: '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。',
       size: '文本附件为空或超过 1 MiB，未提交。',
       encoding: '文本附件不是有效 UTF-8 或包含 NUL，未提交。',
     }[a.reason];
