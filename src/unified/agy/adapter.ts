@@ -32,7 +32,6 @@ import {
   DEFAULT_AGY_MODELS,
   DEFAULT_PROMPT_TIMEOUT_MS,
   findEffortConfigId,
-  formatSessionTitle,
   isGenericAgyTitle,
   isRecord,
   isString,
@@ -58,6 +57,7 @@ import {
   readAutoActivityForSession,
   readSessionArtifact,
   readSessionSnapshot,
+  resolveSessionTitle,
 } from './adapter-discovery.js';
 import {
   expireAllPendingRequests,
@@ -86,6 +86,7 @@ export class AgyAdapter implements PlatformPort {
   private readonly listSnapshots = new Map<string, ListSnapshot>();
   private readonly recentDiscovery = new Map<string, RecentDiscoveryState>();
   private readonly existingSnapshots = new Map<string, ExistingSnapshotState>();
+  private readonly acpTitles = new Map<string, string>();
 
   private sequence = 0;
   private closed = false;
@@ -120,6 +121,7 @@ export class AgyAdapter implements PlatformPort {
       listSnapshots: this.listSnapshots,
       recentDiscovery: this.recentDiscovery,
       existingSnapshots: this.existingSnapshots,
+      acpTitles: this.acpTitles,
       isClosed: () => this.closed,
       nextSequence: () => ++this.sequence,
       ref: id => this.ref(id),
@@ -279,9 +281,7 @@ export class AgyAdapter implements PlatformPort {
 
     const project = summary?.project || liveMeta?.cwd || '';
     const subagentCount = summary?.subagentCount ?? 0;
-    const summaryTitle = summary?.title && !isGenericAgyTitle(summary.title, id) ? summary.title : '';
-    const baseTitle = (liveMeta?.nativeTitle && liveMeta.title) || summaryTitle || liveMeta?.title || summary?.title || `Antigravity 会话 · ${id.slice(0, 8)}`;
-    const title = formatSessionTitle(baseTitle, subagentCount);
+    const title = resolveSessionTitle(id, summary, liveMeta ?? this.knownSessions.get(id), this.acpTitles.get(id));
     const updatedAt = summary?.lastModifiedAt ?? liveMeta?.updatedAt ?? undefined;
     const createdAt = createdAtOverride ?? liveMeta?.createdAt ?? undefined;
 

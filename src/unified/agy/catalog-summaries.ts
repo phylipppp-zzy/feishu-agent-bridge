@@ -94,6 +94,10 @@ function truncateText(text: string, maxLen: number): string {
   return `${chars.slice(0, maxLen - 1).join('').trimEnd()}…`;
 }
 
+export function isPlaceholderAgyTitle(title: string): boolean {
+  return /^\[(?:USER|ASSISTANT)\]$/i.test(title.trim());
+}
+
 function derivePresentAgyTitle(
   title: unknown,
   preview: unknown,
@@ -104,7 +108,7 @@ function derivePresentAgyTitle(
       .replace(ALL_CONTROL_CHARS_RE, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    if (cleanTitle) return truncateText(cleanTitle, maxLength);
+    if (cleanTitle && !isPlaceholderAgyTitle(cleanTitle)) return truncateText(cleanTitle, maxLength);
   }
   if (typeof preview === 'string') {
     const cleanedPreview = extractAgyUserInput(preview);
@@ -112,7 +116,7 @@ function derivePresentAgyTitle(
       .split(/\r?\n/)
       .map((line) => line.replace(ALL_CONTROL_CHARS_RE, ' ').replace(/\s+/g, ' ').trim())
       .find(Boolean);
-    if (firstLine) return truncateText(firstLine, maxLength);
+    if (firstLine && !isPlaceholderAgyTitle(firstLine)) return truncateText(firstLine, maxLength);
   }
   return null;
 }
@@ -124,7 +128,7 @@ function cleanUserRequestLine(rawContent: string, maxLength: number): string | n
     .split(/\r?\n/)
     .map((line) => line.replace(ALL_CONTROL_CHARS_RE, ' ').replace(/\s+/g, ' ').trim())
     .find(Boolean);
-  return firstLine ? truncateText(firstLine, maxLength) : null;
+  return firstLine && !isPlaceholderAgyTitle(firstLine) ? truncateText(firstLine, maxLength) : null;
 }
 
 function decodePartialJsonStringField(line: string, fieldName: string): string | null {

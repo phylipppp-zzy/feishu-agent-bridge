@@ -139,7 +139,12 @@ async function writeTranscript(
   }
 }
 
-async function writeFakeAgyBinary(binPath: string, rpcLogPath: string, dropFlagPath: string): Promise<void> {
+async function writeFakeAgyBinary(
+  binPath: string,
+  rpcLogPath: string,
+  dropFlagPath: string,
+  listedSessions?: Array<{ sessionId: string; cwd: string; title: string }>,
+): Promise<void> {
   const script = `#!/usr/bin/env node
 import { appendFileSync, createReadStream, existsSync, unlinkSync, writeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -147,6 +152,7 @@ import { createInterface } from 'node:readline';
 const args = process.argv.slice(2);
 const rpcLogPath = ${JSON.stringify(rpcLogPath)};
 const dropFlagPath = ${JSON.stringify(dropFlagPath)};
+const listedSessions = ${JSON.stringify(listedSessions)};
 const log = (entry) => appendFileSync(rpcLogPath, JSON.stringify(entry) + '\\n');
 
 if (args.includes('/usage')) {
@@ -217,6 +223,17 @@ rl.on('line', async (line) => {
       agentCapabilities: { loadSession: true },
       agentInfo: { name: 'fake-agy', version: '1.5.14-test' },
     });
+    return;
+  }
+
+  if (method === 'session/list') {
+    if (listedSessions === undefined) {
+      writeMsg({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
+    } else if (params.cursor === 'second') {
+      reply({ sessions: listedSessions.slice(1), nextCursor: null });
+    } else {
+      reply({ sessions: listedSessions.slice(0, 1), nextCursor: 'second' });
+    }
     return;
   }
 
@@ -751,6 +768,56 @@ test('Agy permission requires known tool identities and complete, scoped inputs'
     assert.equal((await classifyAgyPermission(execute, project, { allowedRoots: [] })).kind, 'allow_once');
     assert.equal((await classifyAgyPermission(execute, project, { enabled: false })).kind, 'ask');
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AgyAdapter list and read prefer paginated ACP titles and share the title cache', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-adapter-titles-'));
+  const dbPath = join(root, 'conversation_summaries.db');
+  const binPath = join(root, 'fake-agy.mjs');
+  const rpcLogPath = join(root, 'rpc-log.jsonl');
+  const transport = new AgyAcpTransport({ agyBin: binPath });
+  const catalog = new AgyCatalog({ dbPath, brainDir: root, allowedProjectRoots: [root] });
+  const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc');
+  const sessionId = 'conv-real-title';
+  const placeholderId = 'conv-placeholder';
+  const workspaceUris = JSON.stringify([pathToFileURL(root).href]);
+  try {
+    createSummariesDb(dbPath, [
+      { conversation_id: sessionId, preview: 'Raw first prompt', workspace_uris: workspaceUris },
+      { conversation_id: placeholderId, preview: 'Local fallback', workspace_uris: workspaceUris },
+    ]);
+    await writeFakeAgyBinary(binPath, rpcLogPath, join(root, 'drop.flag'), [
+      { sessionId: placeholderId, cwd: root, title: ' [USER] ' },
+      { sessionId, cwd: root, title: ' \u0000Real Client Title\u0007 ' },
+    ]);
+    const offline = await adapter.list(null, 20);
+    const localSession = offline.items.find(item => item.native.nativeSessionId === sessionId);
+    assert.equal(localSession?.title, 'Raw first prompt');
+    await transport.connect();
+
+    const [listed, read] = await Promise.all([adapter.list(null, 20), adapter.read(localSession.native)]);
+    assert.equal(listed.items.find(item => item.native.nativeSessionId === sessionId)?.title, 'Real Client Title');
+    assert.equal(read.session.title, 'Real Client Title');
+    assert.equal(listed.items.find(item => item.native.nativeSessionId === placeholderId)?.title, 'Local fallback');
+    assert.equal((await adapter.read(localSession.native)).session.title, 'Real Client Title');
+
+    const calls = (await readFile(rpcLogPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls.filter(call => call.method === 'session/list').map(call => call.params), [
+      {}, { cursor: 'second' },
+    ]);
+
+    const afterExpiry = Date.now() + 15_001;
+    t.mock.method(Date, 'now', () => afterExpiry);
+    const failedRefresh = t.mock.method(transport, 'request', async () => {
+      throw new Error('session/list unavailable');
+    });
+    assert.equal((await adapter.read(localSession.native)).session.title, 'Real Client Title');
+    assert.equal(failedRefresh.mock.callCount(), 1);
+    assert.equal(transport.health().status, 'healthy');
+  } finally {
+    await adapter.close();
     await rm(root, { recursive: true, force: true });
   }
 });

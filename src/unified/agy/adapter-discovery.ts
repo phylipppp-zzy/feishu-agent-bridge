@@ -11,6 +11,8 @@ import type {
 } from '../contracts.js';
 import { contractError } from '../errors.js';
 import {
+  formatSessionTitle,
+  isGenericAgyTitle,
   isRecord,
   isString,
   LIST_SNAPSHOT_TTL_MS,
@@ -18,10 +20,64 @@ import {
   normalizeTranscriptMessage,
   readCaps,
   type AdapterContext,
+  type LiveSessionMeta,
 } from './adapter-types.js';
+import { isPlaceholderAgyTitle } from './catalog-summaries.js';
+import { ALL_CONTROL_CHARS_RE } from './catalog-types.js';
 import { agyPromptText, reconcileAgyReply } from './transcript-reconciliation.js';
 
+const ACP_TITLES_TTL_MS = 15_000;
+
+async function fetchAcpSessionTitles(ctx: AdapterContext): Promise<void> {
+  const generation = ctx.transport.connectionGeneration;
+  const titles = new Map<string, string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 5; page++) {
+    const result = await ctx.transport.request('session/list', cursor ? { cursor } : {}, 3000);
+    if (ctx.isClosed() || !ctx.transport.connected || ctx.transport.connectionGeneration !== generation) return;
+    if (!isRecord(result) || !Array.isArray(result.sessions)) return;
+    for (const session of result.sessions) {
+      if (!isRecord(session) || !isString(session.sessionId) || !session.sessionId.trim() || !isString(session.title)) continue;
+      const title = session.title.replace(ALL_CONTROL_CHARS_RE, '').trim();
+      if (!isGenericAgyTitle(title, session.sessionId)) titles.set(session.sessionId, title);
+    }
+    if (!isString(result.nextCursor)) break;
+    cursor = result.nextCursor;
+  }
+  ctx.acpTitles.clear();
+  for (const [id, title] of titles) ctx.acpTitles.set(id, title);
+}
+
+async function refreshAcpSessionTitles(ctx: AdapterContext): Promise<void> {
+  if (!ctx.transport.connected || ctx.isClosed()) return;
+  if (ctx.acpTitlesRefresh) return ctx.acpTitlesRefresh;
+  if (ctx.acpTitlesExpiresAt !== undefined && Date.now() < ctx.acpTitlesExpiresAt) return;
+
+  ctx.acpTitlesRefresh = fetchAcpSessionTitles(ctx).catch(() => {
+    // session/list is optional. Keep cached titles and let discovery use its catalog fallback.
+  }).finally(() => {
+    ctx.acpTitlesExpiresAt = Date.now() + ACP_TITLES_TTL_MS;
+    delete ctx.acpTitlesRefresh;
+  });
+  return ctx.acpTitlesRefresh;
+}
+
+export function resolveSessionTitle(
+  id: string,
+  summary: AgyDiscoveredSession | null,
+  liveMeta: LiveSessionMeta | undefined,
+  acpTitle: string | undefined,
+): string {
+  const liveTitle = liveMeta?.title && !isPlaceholderAgyTitle(liveMeta.title) ? liveMeta.title : '';
+  const summaryTitle = summary?.title && !isPlaceholderAgyTitle(summary.title) ? summary.title : '';
+  const baseTitle = (liveMeta?.nativeTitle && liveTitle) || acpTitle ||
+    (!isGenericAgyTitle(summaryTitle, id) && summaryTitle) || liveTitle || summaryTitle ||
+    `Antigravity 会话 · ${id.slice(0, 8)}`;
+  return formatSessionTitle(baseTitle, summary?.subagentCount ?? 0);
+}
+
 async function mergeAllSessions(ctx: AdapterContext): Promise<Array<Session & { subagentCount?: number }>> {
+  await refreshAcpSessionTitles(ctx);
   const catalogSessions = await ctx.catalog.refreshAsync();
   const merged = new Map<string, Session & { subagentCount?: number }>();
 
@@ -121,6 +177,7 @@ export async function discoverExistingSessions(
     throw contractError('invalid_request', 'invalid limit');
   }
   ctx.pruneSnapshots();
+  await refreshAcpSessionTitles(ctx);
 
   let snapshotKey: string;
   let ids: string[];
@@ -217,6 +274,7 @@ export async function discoverNewerSessions(
     throw contractError('invalid_request', 'invalid discoverNewer query');
   }
   ctx.pruneSnapshots();
+  await refreshAcpSessionTitles(ctx);
 
   const key = cursor ?? randomUUID();
   let state = ctx.recentDiscovery.get(key);
@@ -294,6 +352,7 @@ export async function discoverRunningSessions(
     throw contractError('snapshot_required', 'invalid cursor');
   }
 
+  await refreshAcpSessionTitles(ctx);
   const summaries = await ctx.catalog.refreshAsync();
   const items: Session[] = [];
   for (const s of summaries) {
@@ -499,6 +558,7 @@ export async function readSessionSnapshot(
     throw contractError('invalid_request', 'agy session not found');
   }
 
+  await refreshAcpSessionTitles(ctx);
   let transcriptMessages: Message[] = [];
   let createdAt: string | undefined;
   try {

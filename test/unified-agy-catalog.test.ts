@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
   AgyCatalog,
+  deriveAgySessionTitle,
   discoverAgyArtifacts,
   extractAgyUserInput,
   isExcludedAgyArtifactPath,
@@ -15,6 +16,12 @@ import {
   readAgySummaries,
   readAgyTranscript,
 } from '../src/unified/agy-catalog.js';
+
+test('deriveAgySessionTitle skips role placeholders', () => {
+  const id = '33333333-3333-4333-8333-333333333333';
+  assert.equal(deriveAgySessionTitle(id, '', '[USER]'), 'Antigravity 会话 · 33333333');
+  assert.equal(deriveAgySessionTitle(id, ' [assistant] ', 'First prompt'), 'First prompt');
+});
 
 function createSummaryDb(dbPath: string, rows: Array<Record<string, unknown>>): void {
   const db = new DatabaseSync(dbPath);

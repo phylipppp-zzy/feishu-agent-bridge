@@ -25,6 +25,7 @@ import type {
 import { contractError } from '../errors.js';
 import { textAttachmentBlock } from '../text-attachment.js';
 import { imageMediaType } from '../../image-media.js';
+import { isPlaceholderAgyTitle } from './catalog-summaries.js';
 
 export const AGY_REASONING_EFFORTS: readonly AgyEffortLevel[] = [
   'low',
@@ -161,6 +162,9 @@ export interface AdapterContext {
   readonly listSnapshots: Map<string, ListSnapshot>;
   readonly recentDiscovery: Map<string, RecentDiscoveryState>;
   readonly existingSnapshots: Map<string, ExistingSnapshotState>;
+  readonly acpTitles: Map<string, string>;
+  acpTitlesExpiresAt?: number;
+  acpTitlesRefresh?: Promise<void>;
   isClosed(): boolean;
   nextSequence(): number;
   ref(id: string): NativeSessionRef;
@@ -187,7 +191,8 @@ export const ack = (nativeReference: string | null = null): PlatformAcknowledgem
 });
 
 export function isGenericAgyTitle(title: string | undefined, sessionId: string): boolean {
-  return isGenericSessionTitle(title) || title?.trim() === `Antigravity 会话 · ${sessionId.slice(0, 8)}`;
+  return isGenericSessionTitle(title) ||
+    (title !== undefined && (isPlaceholderAgyTitle(title) || title.trim() === `Antigravity 会话 · ${sessionId.slice(0, 8)}`));
 }
 
 /** Strip trailing effort suffix (e.g. `-xhigh`, `-tiered-xhigh`) before passing model ID to CLI/ACP. */
