@@ -165,4 +165,108 @@ if (process.env.STORE_WORKER === '1') {
       store.compactEvents('s',event.cursor); assert.deepEqual(store.appendEvent(input),event); assert.equal(store.subscribeEvents('s',snap.cursor,10).status,'snapshot_required'); assert.equal(store.subscribeEvents('s',store.snapshot('s').cursor,10).status,'events');
     } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
   });
+
+  test('bounded tool projection and live timing survive cursor compaction and restart', async () => {
+    const { ToolProgressTracker } = await import('../src/unified/tool-progress.js');
+    const { turnProgressCard } = await import('../src/unified/turn-progress-card.js');
+    const dir = mkdtempSync(join(tmpdir(), 'tool-projection-'));
+    const path = join(dir, 'db');
+    let store = new UnifiedStore(path);
+    const ref = { provider: 'claude' as const, hostId: 'h', serviceId: 'v', nativeSessionId: 'native' };
+    const startedAt = '2026-01-01T00:00:00.000Z';
+    const end = Date.parse(startedAt) + 120_001;
+    try {
+      store.insertSession({ sessionId: 's', native: ref, project: dir, title: 'tools', status: 'idle', revision: 0,
+        capabilities: {} as Session['capabilities'],
+        control: { serviceId: 'v', owner: 'owner', input: 'available', generation: 0, operationId: null, reason: null } });
+      store.setConnectionGeneration('s', 0, 1);
+      const turn = { sessionId: 's', turnId: 't', inputId: null, model: null, outputIds: [], endedAt: null, startedAt,
+        status: 'running' as const };
+      store.putTurn(turn);
+      const historicalStart = store.eventWatermark('s');
+      assert.equal(store.snapshot('s').value.turnProgress!.timing[0]!.liveStartSequence, null);
+      assert.equal(store.observeTurn(turn, Date.parse(startedAt) + 20), true);
+      const started = store.snapshot('s').value.turnProgress!.timing[0]!;
+      assert.ok(started.liveStartSequence! > historicalStart);
+      const runningCursor = store.eventWatermark('s');
+      assert.equal(store.observeTurn(turn, Date.parse(startedAt) + 30), false);
+      assert.equal(store.eventWatermark('s'), runningCursor);
+      const tracker = new ToolProgressTracker();
+      const append = (id: string, phase: 'pending' | 'running' | 'succeeded' | 'failed',
+        generation = 1, emitter = tracker) => {
+        const o = emitter.observe(ref, generation, 't', id, phase, { tool: 'Bash', summary: `Bash · ${id}` });
+        assert.equal(o?.type, 'event');
+        if (o?.type !== 'event') throw Error('expected tool event');
+        const { schemaVersion, sequence, cursor, ...event } = o.event;
+        return store.appendObservedEvent({ ...event, sessionId: 's' }, generation);
+      };
+      assert.equal(append('stale', 'running', 0), false);
+      assert.equal(append('long', 'running'), true);
+      assert.equal(append('queued', 'pending'), true);
+      for (let n = 0; n < 260; n++) {
+        assert.equal(append(String(n), 'running'), true);
+        assert.equal(append(String(n), n === 0 || n === 259 ? 'failed' : 'succeeded'), true);
+      }
+      const projection = store.snapshot('s').value.turnProgress!;
+      assert.equal(projection.tools.length, 256);
+      assert.ok(projection.tools.some(tool => tool.callId === 'long' && tool.phase === 'running'));
+      assert.ok(!projection.tools.some(tool => tool.callId === '0' || tool.callId === 'queued'));
+      assert.deepEqual(projection.toolCounts, [{ turnId: 't', totalTools: 262, failedTools: 2 }]);
+      const cardState = { provider: 'claude', schema: '2.0', message: undefined,
+        tools: projection.tools, toolCounts: projection.toolCounts![0], duration: null, files: [] } as const;
+      const card = turnProgressCard({ ...cardState, status: 'running' });
+      assert.equal(card.executionLog!.count, 262);
+      assert.equal(card.executionLog!.failedCount, 2);
+      assert.equal(card.executionLog!.runningNote, '⏳ 正在执行：Bash · long');
+      assert.equal(card.executionLog!.lines[0], '已省略较早的 247 项');
+      assert.equal(turnProgressCard({ ...cardState, status: 'completed' }).text, '完成 262 项工具操作');
+      assert.equal(append('0', 'failed', 1, new ToolProgressTracker()), false);
+      assert.equal(append('0', 'succeeded', 1, new ToolProgressTracker()), false);
+      assert.equal(append('queued', 'running'), true);
+      const completed = { ...turn, endedAt: new Date(end).toISOString(), status: 'completed' as const };
+      store.putTurn(completed);
+      const historicalEnd = store.eventWatermark('s');
+      const pendingTiming = store.snapshot('s').value.turnProgress!.timing[0]!;
+      assert.equal(pendingTiming.liveStartSequence, started.liveStartSequence);
+      assert.equal(pendingTiming.liveEndSequence, null);
+      assert.equal(store.observeTurn(completed, end + 10), true);
+      assert.equal(store.getSession('s').status, 'idle');
+      const completedCursor = store.eventWatermark('s');
+      assert.equal(store.observeTurn(completed, end + 20), false);
+      assert.equal(store.eventWatermark('s'), completedCursor);
+      const checkpoint = store.snapshot('s');
+      store.compactEvents('s', checkpoint.cursor);
+      store.close();
+      store = new UnifiedStore(path);
+      const recovered = store.snapshot('s');
+      assert.deepEqual(recovered, checkpoint);
+      assert.equal(recovered.value.turns[0]?.startedAt, startedAt);
+      const { timing, tools, toolCounts } = recovered.value.turnProgress!;
+      assert.equal(timing[0]!.endedMs! - timing[0]!.startedMs!, 120_001);
+      assert.equal(timing[0]!.liveStartSequence, started.liveStartSequence);
+      assert.ok(timing[0]!.liveEndSequence! > historicalEnd);
+      assert.deepEqual(toolCounts, [{ turnId: 't', totalTools: 262, failedTools: 2 }]);
+      assert.equal(tools.length, 256);
+      assert.deepEqual(tools.filter(tool => tool.phase === 'running').map(tool => tool.callId), ['long', 'queued']);
+      assert.equal(tools.at(-1)?.phase, 'failed');
+      assert.ok(tools.every(tool => tool.connectionGeneration === 1 && tool.sequence > 0));
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('live completion cannot reuse a start from an earlier connection generation', () => {
+    const {dir,store} = setup();
+    try {
+      const turn = { sessionId: 's', turnId: 't', inputId: null, model: null, outputIds: [], endedAt: null,
+        startedAt: '2026-01-01T00:00:00.000Z' };
+      const start = Date.parse(turn.startedAt);
+      assert.equal(store.observeTurn({...turn, status:'running'}, start), true);
+      store.setConnectionGeneration('s', 1, 2);
+      const completed = {...turn, status:'completed' as const};
+      store.putTurn(completed);
+      assert.equal(store.observeTurn(completed, start + 120_001), false);
+      const timing = store.snapshot('s').value.turnProgress!.timing[0]!;
+      assert.equal(timing.liveStartSequence, null);
+      assert.equal(timing.liveEndSequence, null);
+    } finally { store.close(); rmSync(dir, {recursive:true, force:true}); }
+  });
 }

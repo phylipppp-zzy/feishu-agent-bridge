@@ -303,6 +303,18 @@ rl.on('line', async (line) => {
       { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
     ];
 
+    if (text.startsWith('tool-progress:')) {
+      const terminal = text.split(':')[1];
+      const input = { TargetFile: 'outputs/eval_summary.md', Content: 'do not display this content' };
+      emitTool('tool-progress', 'pending', { sessionUpdate: 'tool_call', name: 'edit_file', rawInput: input });
+      emitTool('tool-progress', 'in_progress');
+      emitTool('tool-progress', 'in_progress');
+      emitTool('tool-progress', terminal, { rawOutput: 'do not display output' });
+      emitTool('tool-progress', 'in_progress');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
     if (text.includes('flow-allow') || text.includes('flow-deny')) {
       emitChunk('Working...');
       emitTool('tc-perm-1', 'pending', {
@@ -897,6 +909,18 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       await adapter.input(liveRef, 'new', [{ type: 'text', text: flow }], makeGuard(gen1));
       await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
       assert.equal(observed.slice(start).filter(o => o.type === 'interaction').length, 0, flow);
+    }
+
+    for (const [native, phase] of [['completed', 'succeeded'], ['failed', 'failed'], ['cancelled', 'cancelled']]) {
+      const start = observed.length;
+      const operation = await adapter.input(liveRef, 'new', [{ type: 'text', text: `tool-progress:${native}` }], makeGuard(gen1));
+      await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      const updates = observed.slice(start).flatMap(o => o.type === 'event' && o.event.type === 'tool.updated' ? [o] : []);
+      assert.deepEqual(updates.map(o => o.event.data), ['pending', 'running', phase].map(phase => ({
+        turnId: operation.nativeReference, callId: 'tool-progress', phase, tool: 'edit_file', summary: 'edit_file · outputs/eval_summary.md',
+      })));
+      assert.ok(updates.every(o => o.connectionGeneration === gen1));
+      assert.equal(observed.slice(start).some(o => o.type === 'message' && o.message.role === 'assistant'), false);
     }
 
     const bypassStart = observed.length;

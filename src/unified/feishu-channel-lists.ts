@@ -1,3 +1,5 @@
+import type { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import type { UnifiedService } from './adapter.js';
 import type { Artifact, Session } from './contracts.js';
 import type { Authorize, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
@@ -69,4 +71,29 @@ export async function listAllArtifacts(service: UnifiedService, sessionId: strin
     }
   } while (cursor);
   return items;
+}
+
+export async function historyTextCard(db: DatabaseSync, port: FeishuPort, key: [string, string, string],
+  text: string, actions: ChannelCard['actions'], guard: () => Promise<void>, onSend: () => void): Promise<ChannelCard> {
+  const [destination, sessionId, scope] = key;
+  const title = '会话历史';
+  await guard();
+  if ([...text].length <= 3000) return { title, text, actions };
+  const digest = createHash('sha256').update(text, 'utf8').digest('hex');
+  const id = `long:${createHash('sha256').update(JSON.stringify([destination, sessionId, scope, digest])).digest('hex')}`;
+  await guard();
+  if (db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {
+    try {
+      onSend();
+      await port.sendFile(destination, `完整内容-${digest.slice(0, 12)}.txt`, Buffer.from(text, 'utf8'), id, guard);
+      db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);
+    } catch { /* The upload may have succeeded. */ }
+  }
+  await guard();
+  const row = db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(id) as { state: string };
+  const sent = row.state === 'sent';
+  const url = sent ? await port.fileMessageLink?.(destination, sessionId, id) : null;
+  await guard();
+  return { title, text: `${[...text].slice(0, 1000).join('')}\n\n${sent ? '全文已作为文件发送。' : '全文文件投递结果未知，请核对后再操作。'}`,
+    actions: [...actions, ...(url ? [{ label: '打开全文', url, value: { action: 'open_file' } }] : [])] };
 }

@@ -237,6 +237,8 @@ export class UnifiedCore implements UnifiedService {
     }
   }
   async initialCursor(id:string) {return this.store.initialCursor(id);}
+  eventWatermark(id: string): number { return this.store.eventWatermark(id); }
+  async getMessage(sessionId: string, messageId: string): Promise<Message | null> { return this.store.findMessage(sessionId, messageId); }
   async getSnapshot(id: string) { const snapshot=this.store.snapshot(id); return {...snapshot,value:{...snapshot.value,session:this.present(snapshot.value.session)}}; }
   async subscribeEvents(id: string, cursor: string, limit: number) { return this.store.subscribeEvents(id, cursor, limit); }
   async getControlState(id: string) { return this.store.getSession(id).control; }
@@ -383,6 +385,14 @@ export class UnifiedCore implements UnifiedService {
   async archiveSession(request: {context:WriteContext; payload:{archived:boolean}}): Promise<Operation> { const s = this.check(request.context,'archiveSession'); if (!this.port(s).archive) return fail('unsupported'); return this.store.registerOperation(request.context,'archiveSession',request.payload); }
   async listProjectFiles(sessionId:string,directory:string,showHidden:boolean) { const s=this.store.getSession(sessionId), p=this.port(s); if(!p.listProjectFiles) return fail('unsupported'); return p.listProjectFiles(s.native,directory,showHidden); }
   async selectProjectFiles(sessionId:string,args:string) { const s=this.store.getSession(sessionId), p=this.port(s); if(!p.selectProjectFiles) return fail('unsupported'); return (await p.selectProjectFiles(s.native,args)).map(a=>({...a,sessionId})); }
+  async findRegisteredReplyFiles(id: string, blocks: readonly import('./contracts.js').ContentBlock[]) {
+    try {
+      const session = this.store.getSession(id);
+      if (this.unavailableProviders.has(session.native.provider)) return [];
+      const files = this.port(session).findRegisteredReplyFiles?.(session.native, blocks) ?? [];
+      return files.map(file => ({ ...file, sessionId: id }));
+    } catch { return []; }
+  }
   async listArtifacts(sessionId: string, query: ListQuery) { const s = this.store.getSession(sessionId); return page([...this.store.stagedArtifacts(sessionId),...(await this.port(s).listArtifacts(s.native)).map(a=>({...a,sessionId}))],query); }
   async readArtifact(sessionId: string, artifactId: string, contentVersion: string) { const s = this.store.getSession(sessionId); return this.store.stagedArtifact(sessionId,artifactId,contentVersion) ?? await this.port(s).readArtifact(s.native,artifactId,contentVersion); }
   async getConfirmedSettings(sessionId: string) { return this.store.confirmedSettings(sessionId); }
@@ -541,6 +551,7 @@ export class UnifiedCore implements UnifiedService {
   /** Apply only normalized observations. Existing native/session mappings must already be established. */
   async observe(observation: PlatformObservation): Promise<void> {
     if(this.closed)return;
+    const observedAt = Date.now();
     const mapped = this.store.findSession(observation.ref); if (!mapped || this.store.isDetached(mapped.sessionId)) return fail('invalid_request', 'observation native session is not attached');
     if(this.store.recoveryQuarantined(mapped.sessionId)) return;
     if (observation.type !== 'connection') {
@@ -558,9 +569,9 @@ export class UnifiedCore implements UnifiedService {
       return;
     }
     if (observation.type === 'message') {
-      const m: Message = {...observation.message, sessionId:mapped.sessionId}; const generation=observation.connectionGeneration; if(generation!==undefined && generation!==this.store.connectionGeneration(mapped.sessionId)) return; const snapshot = this.store.snapshot(m.sessionId); const prior = snapshot.value.messages.find(x => x.messageId === m.messageId);
+      const m: Message = {...observation.message, sessionId:mapped.sessionId}; const generation=observation.connectionGeneration; if(generation!==undefined && generation!==this.store.connectionGeneration(mapped.sessionId)) return; const prior = this.store.findMessage(m.sessionId, m.messageId);
       const key=JSON.stringify([mapped.sessionId,generation,m.messageId]); const seen=this.messageObservations.get(key); if((seen!==undefined && m.revision<=seen) || (generation===undefined && prior && m.revision<=prior.revision) || (prior?.final && !m.final)) return; this.messageObservations.set(key,m.revision); if(prior && payloadDigest({...m,sequence:prior.sequence,revision:prior.revision})===payloadDigest(prior)) return;
-      this.store.putMessage(prior ? {...m,sequence:prior.sequence,revision:prior.revision+1} : {...m,sequence:Math.max(0,...snapshot.value.messages.map(x=>x.sequence))+1}, prior?.revision ?? null); this.onAcceptedObservation?.(observation); return;
+      this.store.putMessage(prior ? {...m,sequence:prior.sequence,revision:prior.revision+1} : {...m,sequence:this.store.nextMessageSequence(m.sessionId)}, prior?.revision ?? null); this.onAcceptedObservation?.(observation); return;
     }
     if (observation.type === 'interaction') {
       const i: Interaction = {...observation.interaction,sessionId:mapped.sessionId};
@@ -583,12 +594,16 @@ export class UnifiedCore implements UnifiedService {
     }
     if (observation.type === 'event') {
       if(observation.connectionGeneration!==undefined && observation.connectionGeneration!==this.store.connectionGeneration(mapped.sessionId))return;
-      const { schemaVersion: _v, sequence: _s, cursor: _c, ...event } = observation.event; const data = event.type === 'artifact.available' && event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? {...event.data,sessionId:mapped.sessionId} : event.data; const before=this.store.snapshot(mapped.sessionId).cursor; this.store.appendEvent({...event,sessionId:mapped.sessionId,data}); if(this.store.snapshot(mapped.sessionId).cursor!==before) this.onAcceptedObservation?.(observation); return;
+      const { schemaVersion: _v, sequence: _s, cursor: _c, ...event } = observation.event; const data = event.type === 'artifact.available' && event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? {...event.data,sessionId:mapped.sessionId} : event.data; if(this.store.appendObservedEvent({...event,sessionId:mapped.sessionId,data}, observation.connectionGeneration)) this.onAcceptedObservation?.(observation); return;
     }
     if (observation.type === 'session') {
       const next = {...observation.session, sessionId:mapped.sessionId, native:mapped.native};
       await this.serial(next.sessionId, async () => { const owner = randomUUID(); const generation = this.store.acquireDispatchLease(next.sessionId,owner,Date.now(),30000); if (generation === null) return fail('busy','control observation needs replay'); try { if(this.store.recoveryQuarantined(next.sessionId)) return; const current = this.store.getSession(next.sessionId); if (next.control.generation < current.control.generation) return fail('control_conflict'); const normalized = {...next, revision:current.revision}; if (JSON.stringify(normalized) !== JSON.stringify(current)) this.store.updateSession({...normalized,revision:current.revision+1},current.revision,current.control.generation); } finally { this.store.releaseDispatchLease(next.sessionId,owner,generation); } });
     }
-    if (observation.type === 'turn') await this.serial(mapped.sessionId,async () => { if (this.closed || this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId) || (observation.connectionGeneration!==undefined && observation.connectionGeneration!==this.store.connectionGeneration(mapped.sessionId))) return; const before=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); this.store.observeTurn({...observation.turn,sessionId:mapped.sessionId}); const persisted=this.store.listTurns(mapped.sessionId).find(t=>t.turnId===observation.turn.turnId); if(persisted?.status===observation.turn.status && (!before || payloadDigest(before)!==payloadDigest(persisted))) this.onAcceptedObservation?.(observation); });
+    if (observation.type === 'turn') await this.serial(mapped.sessionId, async () => {
+      if (this.closed || this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId) ||
+        observation.connectionGeneration !== undefined && observation.connectionGeneration !== this.store.connectionGeneration(mapped.sessionId)) return;
+      if (this.store.observeTurn({ ...observation.turn, sessionId: mapped.sessionId }, observedAt)) this.onAcceptedObservation?.(observation);
+    });
   }
 }

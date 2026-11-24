@@ -41,6 +41,7 @@ type ChannelAccess = {
   checkBinding(destination: string, sessionId: string, scope: string): Promise<void>;
   deliver(destination: string, card: ChannelCard, id: string, guard?: Guard): Promise<string | void>;
   stamp(destination: string, card: ChannelCard): ChannelCard;
+  bindingChanged?(destination: string): void;
   handle(envelope: TrustedEnvelope, action: ChannelAction): Promise<unknown>;
 };
 
@@ -138,6 +139,7 @@ export class FeishuSessionBinding {
         access_mode=excluded.access_mode
     `).run(destination,sessionId,randomUUID(),e.identity.source,e.identity.subject,mode);
     this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(destination);
+    this.channel.bindingChanged?.(destination);
   }
 
   async bindReadOnly(e: TrustedEnvelope, sessionId: string, scope: string, reply: Reply): Promise<unknown> {
@@ -468,8 +470,11 @@ export class FeishuSessionBinding {
         if (this.port.isTopicDestination?.(destination)) this.port.reassignTopic?.(destination,sessionId);
         this.setBinding(destination,sessionId,original,mode);
       }
-      else if (existing.access_mode !== mode) this.db.prepare('UPDATE channel_bindings SET access_mode=?,binding_id=?,revision=revision+1 WHERE destination=?')
-        .run(mode,randomUUID(),destination);
+      else if (existing.access_mode !== mode) {
+        this.db.prepare('UPDATE channel_bindings SET access_mode=?,binding_id=?,revision=revision+1 WHERE destination=?')
+          .run(mode,randomUUID(),destination);
+        this.channel.bindingChanged?.(destination);
+      }
       finalScope = this.channel.scope(destination);
       this.completePending(op.operationId);
       const card = sessionCard(session,this.channel.accessMode(destination));

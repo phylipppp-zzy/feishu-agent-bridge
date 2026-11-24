@@ -10,14 +10,18 @@ export type InboxTarget =
   | { kind: 'task'; taskId: string };
 
 interface Work {
+  run: () => Promise<void>;
   done: Promise<void>;
   dirty: boolean;
 }
+
+const STREAM_PROGRESS_INTERVAL_MS = 350;
 
 /** The inbox commit is the ACK boundary. This scheduler only consumes durable work. */
 export class RuntimeInteractive {
   private readonly active = new Map<string, Work>();
   private readonly syncs = new Map<string, Promise<void>>();
+  private readonly progressWindows = new Map<string, { timer: NodeJS.Timeout; pending: boolean }>();
   private closed = false;
   private failed = false;
 
@@ -108,21 +112,54 @@ export class RuntimeInteractive {
     if (retryPending) {
       for (const id of this.store.pendingOutbox(sessionId)) this.notifyOperation(id);
     }
-    for (const destination of this.channel.destinationsForSession(sessionId)) {
-      this.start(`target:channel:${destination}`, async () => {
-        const current = this.syncs.get(`channel:${destination}`);
-        if (current) await current;
-        if (this.requireReadonlyHydration && this.channel.accessMode(destination) === 'read_only'
-          && !this.channel.readonlyHydrated(destination, sessionId)) return;
-        await this.syncChannel(destination);
-      });
-    }
+    this.notifyImmediateProgress(sessionId);
     for (const taskId of this.taskChannel?.tasksForSession(sessionId) ?? []) {
       this.start(`target:task:${taskId}`, async () => {
         await this.syncs.get(`task:${taskId}`);
         await this.syncTask(taskId);
       });
     }
+  }
+
+  notifyProgress(sessionId: string): void {
+    if (this.closed) return;
+    const window = this.progressWindows.get(sessionId);
+    if (window) window.pending = true;
+    else this.wakeStreamingProgress(sessionId);
+  }
+
+  private wakeStreamingProgress(sessionId: string): void {
+    const timer = setTimeout(() => {
+      const pending = this.progressWindows.get(sessionId)?.pending;
+      this.progressWindows.delete(sessionId);
+      if (pending) this.wakeStreamingProgress(sessionId);
+    }, STREAM_PROGRESS_INTERVAL_MS);
+    timer.unref();
+    this.progressWindows.set(sessionId, { timer, pending: false });
+    this.wakeProgress(sessionId);
+  }
+
+  notifyImmediateProgress(sessionId: string): void {
+    clearTimeout(this.progressWindows.get(sessionId)?.timer);
+    this.progressWindows.delete(sessionId);
+    this.wakeProgress(sessionId);
+  }
+
+  private wakeProgress(sessionId: string): void {
+    for (const destination of this.channel.destinationsForSession(sessionId)) {
+      this.notifyChannelProgress(destination, sessionId);
+    }
+  }
+
+  notifyChannelProgress(destination: string, sessionId?: string): void {
+    this.start(`target:channel:${destination}`, async () => {
+      // Join the current write, then consume observations seen during that write.
+      await this.syncs.get(`channel:${destination}`);
+      if (sessionId && !this.channel.destinationsForSession(sessionId).includes(destination)) return;
+      if (sessionId && this.requireReadonlyHydration && this.channel.accessMode(destination) === 'read_only' &&
+        !this.channel.readonlyHydrated(destination, sessionId)) return;
+      await this.syncChannel(destination);
+    });
   }
 
   syncChannel(destination: string): Promise<void> {
@@ -159,16 +196,17 @@ export class RuntimeInteractive {
     if (this.closed) return;
     const existing = this.active.get(key);
     if (existing) {
+      existing.run = run;
       existing.dirty = true;
       return;
     }
     // Yield beyond the callback's persisted ACK before consuming the event.
-    const work: Work = { dirty: true, done: Promise.resolve() };
+    const work: Work = { run, dirty: true, done: Promise.resolve() };
     work.done = new Promise<void>(resolve => setImmediate(resolve)).then(async () => {
       try {
         while (work.dirty) {
           work.dirty = false;
-          await run();
+          await work.run();
         }
       } catch {
         this.reportFailure();
@@ -180,7 +218,15 @@ export class RuntimeInteractive {
   }
 
   async flushInteractive(): Promise<void> {
-    while (this.active.size) await Promise.all([...this.active.values()].map(work => work.done));
+    for (;;) {
+      for (const [sessionId, window] of this.progressWindows) {
+        if (!window.pending) continue;
+        clearTimeout(window.timer);
+        this.wakeStreamingProgress(sessionId);
+      }
+      if (!this.active.size) break;
+      await Promise.all([...this.active.values()].map(work => work.done));
+    }
     if (this.failed) {
       this.failed = false;
       throw new Error('interactive work failed');
@@ -192,6 +238,8 @@ export class RuntimeInteractive {
       await this.flushInteractive();
     } finally {
       this.closed = true;
+      for (const { timer } of this.progressWindows.values()) clearTimeout(timer);
+      this.progressWindows.clear();
     }
   }
 }

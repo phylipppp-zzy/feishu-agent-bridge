@@ -327,3 +327,32 @@ for (const completedBeforeAck of [false, true]) {
     }
   });
 }
+
+for (const exitCode of [0, 1]) test(`Codex tool lifecycle and native turn times, exit=${exitCode}`, async () => {
+  const { sockets, transport, adapter, events } = setup();
+  try {
+    await transport.connect();
+    await adapter.resume(ref);
+    const emit = (method: string, data: object) => sockets[0]!.message({ method, params: { threadId: 't', ...data } });
+    const startedAt = 1_780_000_000;
+    emit('turn/started', { turn: { id: 'tool-turn', status: 'inProgress', startedAt } });
+    const item = { id: 'tool-item', type: 'commandExecution', command: 'npm test --secret=hidden',
+      aggregatedOutput: 'stdout and stderr' };
+    emit('item/started', { turnId: 'tool-turn', item });
+    emit('item/started', { turnId: 'tool-turn', item });
+    emit('item/completed', { turnId: 'tool-turn', item: { ...item, exitCode } });
+    emit('item/started', { turnId: 'tool-turn', item });
+    const endedAtMs = startedAt * 1000 + 120_001;
+    emit('turn/completed', { turn: { id: 'tool-turn', status: 'completed', endedAtMs, startedAtMs: -1 } });
+    const tools = events.flatMap(o => o.type === 'event' && o.event.type === 'tool.updated' ? [o] : []);
+    assert.deepEqual(tools.map(o => o.event.data), [
+      { turnId: 'tool-turn', callId: 'tool-item', phase: 'running', tool: 'Bash', summary: 'Bash · npm test' },
+      { turnId: 'tool-turn', callId: 'tool-item', phase: exitCode ? 'failed' : 'succeeded', tool: 'Bash', summary: 'Bash · npm test' },
+    ]);
+    assert.ok(tools.every(o => o.connectionGeneration === transport.generation));
+    const turns = events.flatMap(o => o.type === 'turn' ? [o.turn] : []);
+    assert.equal(turns[0]?.startedAt, new Date(startedAt * 1000).toISOString());
+    assert.equal(turns[1]?.endedAt, new Date(endedAtMs).toISOString());
+    assert.equal(turns[1]?.startedAt, null);
+  } finally { transport.close(); }
+});

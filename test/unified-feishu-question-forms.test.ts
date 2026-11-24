@@ -60,13 +60,21 @@ test('card wire keeps form framing, uses versioned actions, and preserves natura
  const plain:ChannelCard={title:'纯文本',text:'**字面**',format:'plain',actions:[]};
  assert.deepEqual(encodeCard(plain).elements,[{tag:'div',text:{tag:'plain_text',content:'**字面**'}}]);
  assert.equal(escapeCardMarkdown('<AT id=all>所有人</at>[文件](地址)*'),'\\[文件\\]\\(地址\\)\\*');
- const executionLog = {count:2,lines:['read <at id=all>不应显示</at>file'],failedCount:1,runningNote:'读取中'};
+ const executionLog = {count:2,lines:['read <at id=all>不应显示</at>file'],failedCount:1,runningNote:'⏳ 正在执行：[读取中]'};
  const logCard = {title:'回复',text:markdown,actions:[],executionLog};
  const v1 = encodeCard(logCard);
  const v2 = encodeCard(logCard,'2.0');
  assert.match(JSON.stringify(v1),/执行记录（2 项，失败 1 项）/);
- assert.match(JSON.stringify(v2),/"tag":"collapsible_panel"/);
- assert.match(JSON.stringify(v2),/read file/);
+ const {elements: logElements} = v2.body as {elements: Array<Record<string,unknown>>};
+ assert.deepEqual(logElements.slice(1),[
+  {tag:'markdown',content:'⏳ 正在执行：\\[读取中\\]'},
+  {tag:'collapsible_panel',element_id:'execution_log',expanded:false,
+   header:{title:{tag:'markdown',content:'执行记录（2 项，失败 1 项）'}},
+   elements:[{tag:'markdown',content:'read file'}]},
+ ]);
+ const onlyNote = encodeCard({...logCard,executionLog:{count:1,lines:[],runningNote:executionLog.runningNote}},'2.0');
+ const {elements: onlyNoteElements} = onlyNote.body as {elements: unknown[]};
+ assert.deepEqual(onlyNoteElements[1],logElements[1]);
  assert.doesNotMatch(JSON.stringify(v2),/不应显示|<at/);
 });
 

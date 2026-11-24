@@ -1,3 +1,5 @@
+import { timestampMs, TurnProgressStore, turnProgressSchema } from './turn-progress-store.js';
+import { isTerminalTurn, readToolProgress } from './tool-progress.js';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { answerDigest, canTransitionOperation, payloadDigest, SCHEMA_VERSION, validateResolution, validateWriteContext, type Event, type EventSubscription, type Artifact, type Turn, type Interaction, type Message, type NativeResult, type Operation, type OperationStatus, type ResolveInteraction, type ResponseEvidence, type Session, type SessionSnapshot, type Snapshot, type WriteContext } from './contracts.js';
@@ -19,6 +21,7 @@ function readCursor(value: string, sessionId: string): number {
 /** Isolated store; callers authenticate identities and mediate all native effects. */
 export class UnifiedStore {
   private db: DatabaseSync;
+  private readonly turnProgress: TurnProgressStore;
   private migrationLocked=false;
   constructor(path: string) {
     this.db = new DatabaseSync(path);
@@ -41,6 +44,7 @@ export class UnifiedStore {
       CREATE TABLE IF NOT EXISTS staged_artifacts(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL, content BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS dispatch_leases(session_id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires INTEGER NOT NULL, generation INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS turns(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS turns_by_session ON turns(session_id);
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session_id);
       CREATE TABLE IF NOT EXISTS interactions(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
@@ -56,7 +60,9 @@ export class UnifiedStore {
       CREATE TABLE IF NOT EXISTS notification_preferences(session_id TEXT PRIMARY KEY REFERENCES sessions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS event_keys(event_id TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL, value TEXT NOT NULL, UNIQUE(session_id, seq));
+      ${turnProgressSchema}
       PRAGMA application_id=1431193926; PRAGMA user_version=2; COMMIT;`);
+    this.turnProgress = new TurnProgressStore(this.db);
   }
   close(): void { this.db.close(); }
   private transaction<T>(f: () => T): T { const nested=this.migrationLocked; this.db.exec(nested?'SAVEPOINT migration_op':'BEGIN IMMEDIATE'); try { const v=f(); this.db.exec(nested?'RELEASE migration_op':'COMMIT'); return v; } catch(e) { this.db.exec(nested?'ROLLBACK TO migration_op; RELEASE migration_op':'ROLLBACK'); throw e; } }
@@ -222,24 +228,50 @@ export class UnifiedStore {
     this.eventFor(op.targetId, op.operationId, next.revision, `operation.${status}`, op.operationId, next);
     return next;
   }
-  private putTurnInTransaction(turn: Turn): void { this.session(turn.sessionId); const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId); if (old) {const prior=parse<Turn>(old.value); if(prior.sessionId !== turn.sessionId) return fail('invalid_request'); if(JSON.stringify(prior) === JSON.stringify(turn)) { this.settleTurn(prior); return; } if (['completed','failed','interrupted'].includes(prior.status)) { this.settleTurn(prior); return; } } this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',turn.turnId,turn.sessionId,JSON.stringify(turn)); this.eventFor(turn.sessionId,turn.turnId,0,'turn.updated',null,turn); this.settleTurn(turn); }
+  private putTurnInTransaction(turn: Turn, observedAt?: number): boolean {
+    this.session(turn.sessionId);
+    const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId);
+    const prior = old ? parse<Turn>(old.value) : undefined;
+    if (prior && prior.sessionId !== turn.sessionId) return fail('invalid_request');
+    const next = { ...turn, startedAt: timestampMs(turn.startedAt) !== null ? turn.startedAt : prior?.startedAt ?? null };
+    const generation = this.connectionGeneration(turn.sessionId);
+    if (prior && (isTerminalTurn(prior.status) || payloadDigest(prior) === payloadDigest(next))) {
+      // A history write can win the race with the matching live observation.
+      // Give new live evidence its own cursor even when the turn JSON is unchanged.
+      const recorded = observedAt !== undefined && turn.status === prior.status &&
+        this.turnProgress.recordTurn(turn, generation, this.eventWatermark(turn.sessionId) + 1, observedAt, true);
+      if (recorded) this.eventFor(prior.sessionId,prior.turnId,0,'turn.updated',null,prior);
+      this.settleTurn(prior);
+      return recorded;
+    }
+    this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',
+      next.turnId,next.sessionId,JSON.stringify(next));
+    const event = this.eventFor(next.sessionId,next.turnId,0,'turn.updated',null,next);
+    this.turnProgress.recordTurn(turn,generation,event.sequence,observedAt);
+    this.settleTurn(next);
+    return true;
+  }
   putTurn(turn: Turn): void { this.transaction(() => this.putTurnInTransaction(turn)); }
   /** Record already-proven old terminal turns as baseline without emitting historical events. */
   baselineReadonlyTurns(sessionId:string,turns:Turn[]):void { this.transaction(()=>{const current=this.session(sessionId);if(current.status!=='read_only'||current.control.input==='available')return fail('busy');for(const turn of turns){if(turn.sessionId!==sessionId||!['completed','failed','interrupted'].includes(turn.status))return fail('invalid_request');const row=this.row('SELECT value FROM turns WHERE id=?',turn.turnId);if(row){const prior=parse<Turn>(row.value);if(prior.sessionId!==sessionId)return fail('invalid_request');if(['completed','failed','interrupted'].includes(prior.status))continue;this.run('UPDATE turns SET value=? WHERE id=?',JSON.stringify(turn),turn.turnId);}else this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?)',turn.turnId,sessionId,JSON.stringify(turn));}}); }
 
   operationTurn(id:string): {sessionId:string;turnId:string} | null { const row=this.row('SELECT session_id,turn_id FROM operation_turns WHERE operation_id=?',id); return row ? {sessionId:String(row.session_id),turnId:String(row.turn_id)} : null; }
   /** Apply live turn evidence and its session status atomically; stale terminals never clear newer work. */
-  observeTurn(turn: Turn): void { this.transaction(() => {
+  observeTurn(turn: Turn, observedAt = Date.now()): boolean { return this.transaction(() => {
     const current=this.session(turn.sessionId), previous=this.listTurns(turn.sessionId).find(t=>t.turnId===turn.turnId);
-    this.putTurnInTransaction(turn);
-    if (this.isDetached(turn.sessionId) || this.recoveryQuarantined(turn.sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return;
+    const changed = this.putTurnInTransaction(turn, observedAt);
+    if (this.isDetached(turn.sessionId) || this.recoveryQuarantined(turn.sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return changed;
     const interactions=this.snapshotInteractions(turn.sessionId).filter(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery');
     const active=this.listTurns(turn.sessionId).some(t=>t.status==='running'||t.status==='queued');
     let status=current.status;
     if (interactions.length) status=interactions.some(i=>i.kind==='approval') ? 'waiting_approval' : 'waiting_question';
     else if (turn.status==='running' && (!previous || previous.status==='queued' || previous.status==='running')) status='running';
-    else if (previous?.status==='running' && ['completed','failed','interrupted'].includes(turn.status) && !active) status=turn.status==='completed' ? 'idle' : turn.status as 'failed'|'interrupted';
+    else if (!active && (previous?.status==='running' && isTerminalTurn(turn.status) ||
+        changed && previous?.status===turn.status && isTerminalTurn(turn.status))) {
+      status=turn.status==='completed' ? 'idle' : turn.status as 'failed'|'interrupted';
+    }
     if(status!==current.status) { const next={...current,status,revision:current.revision+1}; this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,turn.sessionId); this.eventFor(turn.sessionId,turn.sessionId,next.revision,'session.updated',null,next); }
+    return changed;
   }); }
   observeInteractionStatus(sessionId:string, turnId:string): void { this.transaction(() => {
     const current=this.session(sessionId); if(this.isDetached(sessionId) || this.recoveryQuarantined(sessionId) || current.control.input!=='available' || !['idle','running','waiting_question','waiting_approval'].includes(current.status)) return;
@@ -336,6 +368,14 @@ export class UnifiedStore {
     this.run('UPDATE sessions SET value=?,revision=?,control_generation=? WHERE id=?', JSON.stringify(session), session.revision, session.control.generation, session.sessionId);
     this.eventFor(session.sessionId, session.sessionId, session.revision, 'session.updated', null, session);
   }); }
+  findMessage(sessionId: string, messageId: string): Message | null {
+    const row = this.row('SELECT value FROM messages WHERE id=? AND session_id=?', messageId, sessionId);
+    return row ? parse<Message>(row.value) : null;
+  }
+  nextMessageSequence(sessionId: string): number {
+    const row = this.row("SELECT MAX(json_extract(value,'$.sequence')) AS sequence FROM messages WHERE session_id=?", sessionId);
+    return Math.max(0, Number(row?.sequence ?? 0)) + 1;
+  }
   putMessage(value: Message, expectedRevision: number | null): void { this.transaction(() => this.putMessageInTransaction(value,expectedRevision)); }
   private putMessageInTransaction(value: Message, expectedRevision: number | null): void {
     this.session(value.sessionId); const row = this.row('SELECT value FROM messages WHERE id=?', value.messageId);
@@ -617,11 +657,26 @@ export class UnifiedStore {
     const next: Operation = { ...op, status, revision: op.revision + 1, error }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id);
     this.run(`UPDATE ${this.outboxTable(id)} SET state=? WHERE operation_id=?`, status === 'accepted' ? 'in_flight' : 'done', id); this.run('DELETE FROM first_prompt_suspensions WHERE operation_id=?',id); this.eventFor(op.targetId, id, next.revision, `operation.${status}`, id, next); return next;
   }); }
-  private eventFor(sessionId: string, objectId: string, revision: number, type: string, operationId: string | null, data: unknown): void {
+  private eventFor(sessionId: string, objectId: string, revision: number, type: string, operationId: string | null, data: unknown): Event {
     const now = new Date().toISOString();
-    this.appendEventInTransaction({ eventId: randomUUID(), sessionId, objectId, objectRevision: revision, type, occurredAt: now, receivedAt: now, operationId, data });
+    return this.appendEventInTransaction({ eventId: randomUUID(), sessionId, objectId, objectRevision: revision, type, occurredAt: now, receivedAt: now, operationId, data });
   }
   appendEvent(input: Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>): Event { return this.transaction(() => this.appendEventInTransaction(input)); }
+  appendObservedEvent(input: Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>, generation?: number): boolean {
+    return this.transaction(() => {
+      const prior = this.row('SELECT 1 FROM event_keys WHERE event_id=?', input.eventId);
+      if (input.type !== 'tool.updated' || prior) {
+        this.appendEventInTransaction(input);
+        return !prior;
+      }
+      const data = readToolProgress(input.data);
+      if (!data || generation === undefined || generation !== this.connectionGeneration(input.sessionId) ||
+        !this.turnProgress.acceptsTool(input.sessionId, generation, data)) return false;
+      const event = this.appendEventInTransaction({ ...input, data });
+      this.turnProgress.recordTool(event, generation);
+      return true;
+    });
+  }
   private appendEventInTransaction(input: Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>): Event {
     const prior = this.row('SELECT value FROM event_keys WHERE event_id=?', input.eventId);
     if (prior) { const event = parse<Event>(prior.value); const { schemaVersion: _v, sequence: _s, cursor: _c, ...original } = event; if (payloadDigest(original) !== payloadDigest(input)) return fail('idempotency_conflict'); return event; }
@@ -630,13 +685,18 @@ export class UnifiedStore {
     this.run('INSERT INTO event_keys(event_id,value) VALUES(?,?)', input.eventId, JSON.stringify(event));
     this.run('INSERT INTO events(event_id,session_id,seq,value) VALUES(?,?,?,?)', input.eventId, input.sessionId, sequence, JSON.stringify(event)); this.run('UPDATE sessions SET event_seq=? WHERE id=?', sequence, input.sessionId); return event;
   }
+  eventWatermark(sessionId: string): number {
+    const row = this.row('SELECT event_seq FROM sessions WHERE id=?', sessionId);
+    if (!row) return fail('invalid_request', 'unknown session');
+    return Number(row.event_seq);
+  }
   initialCursor(sessionId:string):string {this.session(sessionId);return cursor(sessionId,0);}
-  snapshot(sessionId: string): Snapshot<{ session: Session; messages: Message[]; interactions: Interaction[] }> { return this.transaction(() => {
+  snapshot(sessionId: string): Snapshot<SessionSnapshot & { turns: Turn[] }> { return this.transaction(() => {
     const session = this.session(sessionId);
     const messages = (this.db.prepare('SELECT value FROM messages WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string, unknown>[]).map(r => parse<Message>(r.value));
     const interactions = (this.db.prepare('SELECT value FROM interactions WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string, unknown>[]).map(r => parse<Interaction>(r.value));
     const row = this.row('SELECT event_seq FROM sessions WHERE id=?', sessionId)!;
-    return { value: { session, messages, interactions }, cursor: cursor(sessionId, Number(row.event_seq)) };
+    return { value: { session, messages, interactions, turns: this.listTurns(sessionId), turnProgress: this.turnProgress.snapshot(sessionId) }, cursor: cursor(sessionId, Number(row.event_seq)) };
   }); }
   subscribeEvents(sessionId: string, from: string, limit: number): EventSubscription {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) return fail('invalid_request', 'invalid limit');

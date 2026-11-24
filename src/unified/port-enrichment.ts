@@ -32,7 +32,7 @@ export class EnrichedPort implements PlatformPort {
     };
     this.unsubscribe = base.onObservation(o => {
       for (const f of this.listeners) f(o);
-      if (o.type === 'message' && o.message.role === 'assistant') {
+      if (o.type === 'message' && o.message.role === 'assistant' && o.message.final) {
         this.work = this.work.then(()=>this.observeFiles(o)).catch(e=>{ this.onError(e); });
       }
     });
@@ -54,9 +54,9 @@ export class EnrichedPort implements PlatformPort {
       for (const root of roots) for (const link of await localFileLinks(normalized, project, root)) paths.add(link.path);
       for (const path of paths) {
         let artifact: Artifact; try { artifact = await this.registry.register(nativeRefKey(o.ref),path); } catch (e) { this.onError(e); continue; }
-        const eventId = hash(JSON.stringify([nativeRefKey(o.ref),o.message.messageId,artifact.artifactId,artifact.contentVersion]));
+        const eventId = hash(JSON.stringify([nativeRefKey(o.ref),o.message.turnId,o.message.messageId,artifact.artifactId,artifact.contentVersion]));
         const time = await this.registry.eventTime(eventId, observedAt);
-        const observation: PlatformObservation = {type:'event',ref:o.ref,event:{schemaVersion:1,eventId,sessionId:o.message.sessionId,objectId:artifact.artifactId,objectRevision:1,sequence:o.message.sequence,type:'artifact.available',occurredAt:time,receivedAt:time,operationId:null,cursor:eventId,data:{artifactId:artifact.artifactId,contentVersion:artifact.contentVersion,name:artifact.name,mediaType:artifact.mediaType,size:artifact.size}}};
+        const observation: PlatformObservation = {type:'event',ref:o.ref,event:{schemaVersion:1,eventId,sessionId:o.message.sessionId,objectId:artifact.artifactId,objectRevision:1,sequence:o.message.sequence,type:'artifact.available',occurredAt:time,receivedAt:time,operationId:null,cursor:eventId,data:{turnId:o.message.turnId,messageId:o.message.messageId,artifactId:artifact.artifactId,contentVersion:artifact.contentVersion,name:artifact.name,mediaType:artifact.mediaType,size:artifact.size}}};
         for (const f of this.listeners) f(observation);
       }
     }
@@ -109,6 +109,9 @@ export class EnrichedPort implements PlatformPort {
   async listProjectFiles(ref:NativeSessionRef,directory:string,showHidden:boolean) { await this.read(ref); const root=this.registry.getProjectRoot(ref); if(!root) throw contractError('unsupported'); return listSafeProjectDirectory(directory,root,showHidden); }
   async selectProjectFiles(ref:NativeSessionRef,args:string):Promise<Artifact[]> { await this.read(ref); const root=this.registry.getProjectRoot(ref); if(!root) throw contractError('unsupported'); const selection=await selectSafeProjectFiles(root,args); const result:Artifact[]=[]; for(const file of selection) {const artifact=await this.registry.register(nativeRefKey(ref),file.path,'application/octet-stream',true); if(artifact.contentVersion!==file.digest) throw contractError('invalid_request','selected file changed'); result.push(artifact);} return result; }
 
+  findRegisteredReplyFiles(ref: NativeSessionRef, blocks: readonly import('./contracts.js').ContentBlock[]): Artifact[] {
+    return this.registry.findRegisteredReplyFiles(ref, blocks);
+  }
   async listArtifacts(ref:NativeSessionRef):Promise<Artifact[]> {
     const local = this.registry.list(nativeRefKey(ref),1000); let cursor=local.nextCursor; const result=[...local.items]; while(cursor) { const p=this.registry.list(nativeRefKey(ref),1000,cursor); result.push(...p.items); cursor=p.nextCursor; }
     if (await this.isExternal(ref)) return result;

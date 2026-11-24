@@ -94,6 +94,7 @@ test('Agy permission rechecks changed inputs and retains deny across display upd
         active: new Set(['session']), knownSessions: new Map([['session', { cwd }]]),
         activeTurns: new Map([['session', turn]]), requests: new Map(),
         isClosed: () => false, ref: () => ({ provider: 'agy', hostId: 'h', serviceId: 'agy', nativeSessionId: 'session' }),
+        emit: () => {},
         emitInteraction: (card: Interaction) => { cards.push(card); },
       } as unknown as AdapterContext;
       const toolCall = {

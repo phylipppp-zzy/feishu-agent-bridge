@@ -386,3 +386,194 @@ test('read-only rejection is durable and does not starve later authorized work',
   await r.close();r=new UnifiedRuntime(config,port,[native]);await r.handleTrusted(e('bad'),bad);await r.handleTrusted(e('after-restart'),{action:'history'});await r.tick();assert.deepEqual(r.channel.pendingInbox(),[]);assert.equal(writes,0);assert.equal(sent.filter(x=>x.title==='操作未执行').length,1);assert.equal(sent.filter(x=>x.title==='会话历史').length,3);
  }finally{await r.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+for (const provider of ['claude', 'codex', 'agy'] as const) {
+  test(`${provider} tool-only progress wakes only its topic, then preserves the completed card and schema`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+    const { ToolProgressTracker } = await import('../src/unified/tool-progress.js');
+    const { encodeCard } = await import('../src/unified/feishu-card-wire.js');
+    const dir = mkdtempSync(join(tmpdir(), 'runtime-tool-progress-'));
+    const sent: Array<{ destination: string; id: string; card: ChannelCard }> = [];
+    const patches: Array<{ destination: string; id: string; card: ChannelCard }> = [];
+    const pushed: string[] = [];
+    let dispatches = 0;
+    let uploads = 0;
+    const port = {
+      async send(destination: string, card: ChannelCard) {
+        const id = `m${sent.length + 1}`;
+        sent.push({ destination, id, card });
+        return id;
+      },
+      async update(destination: string, id: string, card: ChannelCard) { patches.push({ destination, id, card }); },
+      async sendText(_destination: string, text: string) { pushed.push(text); },
+      async sendFile() { uploads++; },
+    };
+    const native: any = { provider, onObservation: () => () => {}, input: async () => { dispatches++; } };
+    const runtime = new UnifiedRuntime({ ...runtimeFixtureConfig(dir), allowedDestinations: ['chat', 'other'] }, port, [native]);
+    const ref = { provider, hostId: 'h', serviceId: 'v', nativeSessionId: 'native' };
+    const session: Session = { sessionId: 's', native: ref, project: dir, title: 'progress', status: 'idle', revision: 0,
+      capabilities: caps, control: { serviceId: 'v', owner: 'owner', input: 'available', generation: 1, operationId: null, reason: null } };
+    const bind = (destination: string, sessionId: string) => runtime.channel.handle({
+      eventId: `bind-${destination}`, destination, identity: { source: 'feishu', subject: 'owner' },
+    }, { action: 'bind', sessionId });
+    try {
+      runtime.store.insertSession(session);
+      runtime.store.insertSession({ ...session, sessionId: 'other', native: { ...ref, nativeSessionId: 'other-native' } });
+      await bind('chat', 's');
+      await bind('other', 'other');
+      await runtime.channel.sync('chat');
+      await runtime.channel.sync('other');
+      await runtime.core.observe({ type: 'connection', ref, connectionGeneration: 1 });
+      await runtime.flushInteractive();
+      sent.length = 0;
+      const turns = { turnId: 't', sessionId: 'native', inputId: null, model: null, outputIds: [],
+        startedAt: new Date().toISOString(), endedAt: null };
+      await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1, turn: { ...turns, status: 'running' } });
+      await runtime.flushInteractive();
+      assert.equal(sent.length, 0);
+      const subscriptions: string[] = [];
+      const subscribe = runtime.core.subscribeEvents.bind(runtime.core);
+      runtime.core.subscribeEvents = async (id, ...args) => { subscriptions.push(id); return subscribe(id, ...args); };
+      const tracker = new ToolProgressTracker();
+      const tool = (callId: string, phase: 'running' | 'succeeded' | 'failed') => tracker.observe(ref, 1, 't', callId, phase,
+        { tool: 'Bash', summary: 'Bash · pytest' })!;
+      await runtime.core.observe(tool('1', 'running'));
+      await runtime.flushInteractive();
+      const first = sent[0]!;
+      assert.equal(first.destination, 'chat');
+      assert.equal(first.card.template, 'blue');
+      assert.equal(first.card.text, '正在处理…');
+      assert.equal(first.card.schema, '2.0');
+      assert.match(first.card.executionLog!.runningNote!, /Bash · pytest/);
+      const wire = encodeCard(first.card) as { schema: string; body: { elements: Array<Record<string, unknown>> } };
+      assert.equal(wire.schema, '2.0');
+      const panel = wire.body.elements.find(element => element.tag === 'collapsible_panel');
+      assert.equal(panel?.expanded, false);
+      assert.match(JSON.stringify(panel), /执行记录（1 项）/);
+      assert.deepEqual((await runtime.core.getSnapshot('s')).value.messages, []);
+      assert.deepEqual(subscriptions, ['s']);
+      await runtime.core.observe(tool('2', 'running'));
+      await runtime.core.observe(tool('1', 'succeeded'));
+      await runtime.flushInteractive();
+      assert.equal(patches.length, 0);
+      t.mock.timers.tick(1499);
+      await runtime.flushInteractive();
+      assert.equal(patches.length, 0);
+      t.mock.timers.tick(1);
+      await runtime.flushInteractive();
+      assert.equal(patches.length, 1);
+      assert.deepEqual(patches[0]!.card.executionLog!.lines, ['✓ Bash · pytest', '⏳ Bash · pytest']);
+      t.mock.timers.tick(13_500);
+      await runtime.flushInteractive();
+      assert.match(patches.at(-1)!.card.title, /用时 15秒/);
+      await runtime.core.observe(tool('2', 'failed'));
+      await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1,
+        turn: { ...turns, status: 'completed', startedAt: null, endedAt: new Date().toISOString() } });
+      await runtime.flushInteractive();
+      t.mock.timers.tick(1500);
+      await runtime.flushInteractive();
+      assert.equal(patches.at(-1)!.card.template, 'green');
+      assert.equal(patches.at(-1)!.card.executionLog!.failedCount, 1);
+      assert.ok(patches.every(patch => patch.destination === 'chat' && patch.id === first.id && patch.card.schema === '2.0'));
+      assert.equal(sent.length, 1);
+      assert.equal(dispatches + uploads + pushed.length, 0);
+      const after = patches.length;
+      const reads = subscriptions.length;
+      t.mock.timers.tick(30_000);
+      await runtime.flushInteractive();
+      assert.equal(patches.length, after);
+      assert.equal(subscriptions.length, reads, 'completion removes the heartbeat');
+      await runtime.close();
+      t.mock.timers.tick(30_000);
+      assert.equal(subscriptions.length, reads);
+    } finally {
+      await runtime.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('runtime coalesces assistant deltas per session and drains the tail without delaying final observations', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-delta-wake-'));
+  const port = { async send() { return 'm'; }, async update() {}, async sendFile() {} };
+  const native: any = { provider: 'codex', onObservation: () => () => {} };
+  const runtime = new UnifiedRuntime({ ...runtimeFixtureConfig(dir), allowedDestinations: ['chat', 'other'] }, port, [native]);
+  const ref = { provider: 'codex' as const, hostId: 'h', serviceId: 'v', nativeSessionId: 'n' };
+  const otherRef = { ...ref, nativeSessionId: 'other-native' };
+  const session: Session = { sessionId: 's', native: ref, project: dir, title: 'stream', status: 'idle', revision: 0,
+    capabilities: caps, control: { serviceId: 'v', owner: 'owner', input: 'available', generation: 1, operationId: null, reason: null } };
+  const updates: string[] = [];
+  const otherUpdates: string[] = [];
+  const nextImmediate = () => new Promise<void>(resolve => setImmediate(resolve));
+  const turn = { turnId: 't', sessionId: 'n', inputId: null, model: null, outputIds: [], startedAt: null, endedAt: null };
+  const message = (revision: number, final = false, messageId = 'reply', target = ref) => runtime.core.observe({
+    type: 'message', ref: target, connectionGeneration: 1, message: { messageId, sessionId: target.nativeSessionId, turnId: 't',
+      role: 'assistant', blocks: [{ type: 'text', text: String(revision) }], sequence: 1, revision, final, source: 'codex' } });
+  try {
+    runtime.store.insertSession(session);
+    runtime.store.insertSession({ ...session, sessionId: 'other', native: otherRef });
+    for (const [destination, sessionId] of [['chat', session.sessionId], ['other', 'other']] as const) {
+      await runtime.channel.handle({ eventId: `bind-${destination}`, destination, identity: { source: 'feishu', subject: 'owner' } },
+        { action: 'bind', sessionId });
+    }
+    await runtime.core.observe({ type: 'connection', ref, connectionGeneration: 1 });
+    await runtime.core.observe({ type: 'connection', ref: otherRef, connectionGeneration: 1 });
+    await runtime.flushInteractive();
+    runtime.channel.sync = async destination => {
+      const snapshot = (await runtime.core.getSnapshot(destination === 'chat' ? 's' : 'other')).value;
+      const message = snapshot.messages.at(-1);
+      const block = message?.blocks[0];
+      const status = snapshot.turns?.[0]?.status;
+      const received = destination === 'chat' ? updates : otherUpdates;
+      received.push(`${block?.type === 'text' ? block.text : ''}${message?.final ? ' final' : ''}${status ? ` ${status}` : ''}`);
+    };
+    await message(1);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1']);
+    for (let revision = 2; revision <= 10; revision++) {
+      await message(revision);
+      await nextImmediate();
+    }
+    await message(1, false, 'other-reply', otherRef);
+    await nextImmediate();
+    assert.deepEqual(otherUpdates, ['1']);
+    t.mock.timers.tick(349);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1']);
+    t.mock.timers.tick(1);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1', '10']);
+
+    await message(11);
+    await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1,
+      turn: { ...turn, status: 'completed', endedAt: new Date().toISOString() } });
+    await nextImmediate();
+    assert.deepEqual(updates, ['1', '10', '11 completed']);
+    await message(12);
+    await nextImmediate();
+    await message(13);
+    await message(14, true);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1', '10', '11 completed', '12 completed', '14 final completed']);
+    t.mock.timers.tick(350);
+    await nextImmediate();
+    assert.equal(updates.length, 5, 'urgent wakes consume queued deltas');
+
+    await message(15, false, 'next-reply');
+    await nextImmediate();
+    await message(16, false, 'next-reply');
+    await runtime.flushInteractive();
+    assert.equal(updates.at(-1), '16 completed');
+    await message(17, false, 'next-reply');
+    await runtime.close();
+    assert.equal(updates.at(-1), '17 completed');
+    const afterClose = updates.length;
+    t.mock.timers.tick(350);
+    await nextImmediate();
+    assert.equal(updates.length, afterClose);
+  } finally {
+    await runtime.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -58,10 +58,10 @@ function cardElements(card: ChannelCard, omitEmpty = false): unknown[] {
 function executionElements(log: ChannelCard['executionLog'], schema: CardSchema): unknown[] {
   if (!log || (!log.count && !log.lines.length && !log.runningNote)) return [];
   const title = `执行记录（${log.count} 项${log.failedCount ? `，失败 ${log.failedCount} 项` : ''}）`;
-  const selected = schema === '1.0' ? log.lines.slice(-15) : log.lines;
-  const lines = [...(log.runningNote ? [log.runningNote] : []), ...selected].map(escapeCardMarkdown);
-  if (schema === '1.0') return [markdown([`**${title}**`, ...lines].join('\n'))];
-  return [{
+  const lines = log.lines.map(escapeCardMarkdown);
+  const status = log.runningNote ? [markdown(escapeCardMarkdown(log.runningNote))] : [];
+  if (schema === '1.0') return [...status, markdown([`**${title}**`, ...lines].join('\n'))];
+  return [...status, {
     tag: 'collapsible_panel',
     element_id: 'execution_log',
     expanded: false,

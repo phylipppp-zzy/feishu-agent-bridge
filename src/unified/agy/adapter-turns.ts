@@ -1,3 +1,4 @@
+import { agyToolProgress, ToolProgressTracker } from '../tool-progress.js';
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement } from '../adapter.js';
 import type { AgyAcpNotification, AgyServerRequest } from '../agy-transport.js';
@@ -226,6 +227,8 @@ function compactToolCall(turn: ActiveTurnState, toolCallId: string, call: Obj): 
   turn.fullToolCalls.delete(toolCallId);
 }
 
+const toolProgress = new WeakMap<ActiveTurnState, ToolProgressTracker>();
+
 function releaseToolCall(ctx: AdapterContext, sessionId: string, turn: ActiveTurnState, toolCallId: string): void {
   if (!turn.fullToolCalls.has(toolCallId)) return;
   for (const req of ctx.requests.values()) {
@@ -304,6 +307,13 @@ export function handleAcpNotification(
       if ((update.status === 'in_progress' || update.status === 'completed') &&
           previous?.status !== 'in_progress' && previous?.status !== 'completed') {
         observeToolExecution(ctx, sessionId, turnState, toolCallId);
+      }
+      const progress = agyToolProgress(call, ctx.knownSessions.get(sessionId)?.cwd, kind === 'tool_call');
+      if (progress) {
+        let tracker = toolProgress.get(turnState);
+        if (!tracker) { tracker = new ToolProgressTracker(); toolProgress.set(turnState, tracker); }
+        const observation = tracker.observe(ref, turnState.generation, turnState.turnId, toolCallId, progress.phase, progress.detail);
+        if (observation) ctx.emit(observation);
       }
       if (terminal) releaseToolCall(ctx, sessionId, turnState, toolCallId);
       if (turnState.fullToolCalls.size > maxFullToolCalls) {

@@ -1,3 +1,4 @@
+import { summarizeTool, ToolProgressTracker } from './tool-progress.js';
 import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
@@ -204,10 +205,26 @@ export class ClaudeAdapter implements PlatformPort {
   }
   private async consume(live: Live): Promise<void> {
     const ref = this.ref(live.id);
+    const tools = new ToolProgressTracker();
+    let toolTurn: string | null = null;
     let streamFailure: {kind:string; exitCode:number|null} | null = null;
     try { for await (const raw of live.query) {
       const m = raw as any;
       if(!this.closed && this.lives.get(live.id)===live)live.residual.observe(m);
+      if (live.turn && !this.closed && this.lives.get(live.id) === live && !m.parent_tool_use_id && !m.parent_agent_id) {
+        if (toolTurn !== live.turn) { tools.clear(); toolTurn = live.turn; }
+        const blocks = m.type === 'stream_event' && m.event?.type === 'content_block_start'
+          ? [m.event.content_block]
+          : (m.type === 'assistant' || m.type === 'user') && Array.isArray(m.message?.content) ? m.message.content : [];
+        for (const block of blocks) {
+          const update = block?.type === 'tool_use' && typeof block.id === 'string'
+            ? tools.observe(ref, live.generation, live.turn, block.id, 'running', summarizeTool(block.name, block.input, live.cwd))
+            : block?.type === 'tool_result' && typeof block.tool_use_id === 'string'
+              ? tools.observe(ref, live.generation, live.turn, block.tool_use_id, block.is_error === true ? 'failed' : 'succeeded')
+              : undefined;
+          if (update) this.emit(update);
+        }
+      }
       let providerEvent: { type: string; data: Record<string, unknown> } | null = null;
       if (m.type === 'system' && m.subtype === 'api_retry') {
         const status = safeNumber(m.error_status);

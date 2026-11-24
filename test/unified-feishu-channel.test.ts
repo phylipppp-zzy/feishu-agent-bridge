@@ -104,13 +104,13 @@ test('sync rechecks authorization, resumes cursor after reopen, and removes answ
  } finally {channel.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('notification pause persists cursor and resumes event delivery after reopen', async () => {
+test('notification pause consumes events quietly across reopen', async () => {
  const dir=mkdtempSync(join(tmpdir(),'channel-pause-')); const db=join(dir,'db'); let eventReads=0; let sends=0;
  const session={sessionId:'s',native:{provider:'claude'},title:'t',project:'p',status:'idle',revision:1,control:{input:'available',generation:1}} as unknown as Session;
  const service={getSession:async()=>session,getSnapshot:async()=>({cursor:'c1',value:{session,interactions:[],messages:[]}}),subscribeEvents:async()=>{eventReads++;return {status:'events',cursor:'c2',events:[{eventId:'e',objectId:'o',type:'done'}]};},setNotificationSubscription:async({context}: {context:WriteContext})=>({...context,action:'notify',payloadDigest:'d',status:'completed',revision:1,error:null})} as unknown as UnifiedService;
  const port:FeishuPort={send:async()=>{sends++;return 'id';},update:async()=>{},sendFile:async()=>{}};
  const env=(eventId:string)=>({eventId,destination:'topic',identity:{source:'v',subject:'owner'}}); let channel=new FeishuChannel(service,port,async()=>true,db);
- try {await channel.handle(env('bind'),{action:'bind',sessionId:'s'});await channel.sync('topic'); await channel.handle(env('pause'),{action:'notifications',enabled:false,eventTypes:['done'],revision:1,controlGeneration:1}); channel.close(); channel=new FeishuChannel(service,port,async()=>true,db); await channel.sync('topic'); assert.equal(eventReads,0); await channel.handle(env('resume'),{action:'notifications',enabled:true,eventTypes:['done'],revision:1,controlGeneration:1}); const before=sends; await channel.sync('topic'); assert.equal(eventReads,1); assert.equal(sends,before);} finally {channel.close();rmSync(dir,{recursive:true,force:true});}
+ try {await channel.handle(env('bind'),{action:'bind',sessionId:'s'});await channel.sync('topic'); await channel.handle(env('pause'),{action:'notifications',enabled:false,eventTypes:['done'],revision:1,controlGeneration:1}); channel.close(); channel=new FeishuChannel(service,port,async()=>true,db); await channel.sync('topic'); assert.equal(eventReads,1); await channel.handle(env('resume'),{action:'notifications',enabled:true,eventTypes:['done'],revision:1,controlGeneration:1}); const before=sends; await channel.sync('topic'); assert.equal(eventReads,2); assert.equal(sends,before);} finally {channel.close();rmSync(dir,{recursive:true,force:true});}
 });
 
 test('expired cursor recovers new finals without exporting initial history', async () => {
@@ -128,7 +128,7 @@ for (const provider of ['claude','codex'] as const) test(`${provider}: generated
  const dir=mkdtempSync(join(tmpdir(),'channel-controls-')); const cards:import('../src/unified/feishu-cards.js').ChannelCard[]=[]; const calls:string[]=[];
  const session={sessionId:'s',native:{provider},title:'t',project:'p',status:'idle',revision:1,capabilities:{interrupt:{status:'available'},queue:{status:'available'},handoff:{status:'available'}},control:{input:'available',generation:1}} as unknown as Session;
  const makeOp=(name:string)=>(request:{context:WriteContext})=>{calls.push(name);return Promise.resolve({...request.context,action:name,status:'completed',revision:1,error:null,payloadDigest:'d'});};
- const service={getSession:async()=>session,getWorkState:async()=>({runningTurns:[{turnId:'turn'}],queuedInputs:[{inputId:'queue'}],canArchive:true}),interruptTurn:makeOp('stop'),cancelQueuedInput:makeOp('cancel'),requestControl:makeOp('control'),releaseControl:makeOp('release'),archiveSession:makeOp('archive'),updateSessionSettings:makeOp('settings'),attachSession:makeOp('attach'),listModels:async()=>({items:[{id:'m',label:'Model'}],nextCursor:null})} as unknown as UnifiedService;
+ const service={getSession:async()=>session,eventWatermark:()=>0,getWorkState:async()=>({runningTurns:[{turnId:'turn'}],queuedInputs:[{inputId:'queue'}],canArchive:true}),interruptTurn:makeOp('stop'),cancelQueuedInput:makeOp('cancel'),requestControl:makeOp('control'),releaseControl:makeOp('release'),archiveSession:makeOp('archive'),updateSessionSettings:makeOp('settings'),attachSession:makeOp('attach'),listModels:async()=>({items:[{id:'m',label:'Model'}],nextCursor:null})} as unknown as UnifiedService;
  const port:FeishuPort={send:async(_d,c)=>{cards.push(c);return 'id';},update:async()=>{},sendFile:async()=>{}};
  const channel=new FeishuChannel(service,port,async()=>true,join(dir,'db')); const env=(eventId:string,subject='owner')=>({eventId,destination:'d',identity:{source:'v',subject}});
  try {

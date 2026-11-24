@@ -1,3 +1,4 @@
+import { codexToolProgress, nativeTimestamp, ToolProgressTracker } from './tool-progress.js';
 import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
@@ -60,6 +61,7 @@ export class CodexAdapter implements PlatformPort {
   private readonly residualTurns=new Map<string,{generation:number;items:Set<string>;version:number;overflow:boolean}>();
   private readonly residualQueries=new Map<string,Promise<TurnResidual>>();
   private sequence = 0;
+  private readonly toolProgress = new ToolProgressTracker();
   private settings = new Map<string, {model:string|null; effort?:string}>();
   constructor(readonly transport: CodexTransport, readonly hostId: string, readonly serviceId: string,
     private readonly options: CodexAdapterOptions = {}) {
@@ -67,6 +69,7 @@ export class CodexAdapter implements PlatformPort {
     transport.onMessage = (message, generation) => this.receive(message as Obj, generation);
     transport.onDisconnect = generation => {
       this.approvalTurns.clear();
+      this.toolProgress.clear();
       this.evaluatingApprovals.clear();
       this.answeredRequests.clear();
       this.nativeIndex.clear();
@@ -109,7 +112,7 @@ export class CodexAdapter implements PlatformPort {
   }
   private turn(thread: string, native: Obj): Turn {
     if (!native || !isString(native.id) || !['inProgress','completed','failed','interrupted'].includes(native.status)) return invalidNative();
-    return {turnId:native.id,sessionId:thread,status:native.status === 'inProgress' ? 'running' : native.status,inputId:null,startedAt:null,endedAt:null,model:null,outputIds:[]};
+    return {turnId:native.id,sessionId:thread,status:native.status === 'inProgress' ? 'running' : native.status,inputId:null,startedAt:nativeTimestamp(native.startedAtMs,'ms') ?? nativeTimestamp(native.startedAt ?? native.started_at),endedAt:nativeTimestamp(native.endedAtMs ?? native.completedAtMs,'ms') ?? nativeTimestamp(native.endedAt ?? native.completedAt ?? native.ended_at),model:null,outputIds:[]};
   }
   private trackApprovalTurn(thread: string, id: string, generation: number): void {
     const turn = this.approvalTurns.get(thread);
@@ -218,6 +221,13 @@ export class CodexAdapter implements PlatformPort {
     }
     if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
     if(m.method==='turn/started' && isString(p.turn?.id) && this.active.has(thread)) {this.trackApprovalTurn(thread,p.turn.id,generation);const key=`${thread}\0${p.turn.id}`;if(this.residualTurns.get(key)?.generation!==generation){if(this.residualTurns.size>=1024) this.residualTurns.delete(this.residualTurns.keys().next().value!);this.residualTurns.set(key,{generation,items:new Set(),version:0,overflow:false});}}
+    if ((m.method === 'item/started' || m.method === 'item/completed') && this.active.has(thread) && isString(p.turnId) && p.item) {
+      const tool = codexToolProgress(p.item, m.method === 'item/completed', info?.cwd);
+      if (tool) {
+        const update = this.toolProgress.observe(this.ref(thread), generation, p.turnId, tool.callId, tool.phase, tool.detail);
+        if (update) this.emit(update);
+      }
+    }
     if (m.method === 'item/started' && p.item?.type === 'fileChange' && isString(p.item.id)) {
       const turn = this.approvalTurns.get(thread);
       if (turn && turn.id === p.turnId && turn.generation === generation && turn.changes.size < 1_024) {
@@ -232,7 +242,7 @@ export class CodexAdapter implements PlatformPort {
         const threadStates = {running: 'active', failed: 'systemError', interrupted: 'interrupted', completed: 'idle', queued: 'idle'};
         info.status = {type: threadStates[turn.status]};
       }
-      this.emit({ type: 'turn', turn, ref: this.ref(thread) } as PlatformObservation); return;
+      this.emit({ type: 'turn', turn, ref: this.ref(thread), connectionGeneration: generation }); return;
     }
     if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread), connectionGeneration:generation } as PlatformObservation); }
   }

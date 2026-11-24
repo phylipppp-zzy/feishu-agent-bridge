@@ -1,3 +1,4 @@
+import type { TurnProgressSnapshot } from './turn-progress-store.js';
 import { createHash } from 'node:crypto';
 import { contractError, type ContractError } from './errors.js';
 
@@ -41,7 +42,7 @@ export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; 
 export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
 export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[]; partialFailure?:boolean }
 /** All collections and the cursor are read at one consistent event watermark. Interaction status includes delivery state. */
-export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; connectionGeneration?: number }
+export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; turnProgress?: TurnProgressSnapshot; connectionGeneration?: number }
 export interface Snapshot<T> { value: T; cursor: string }
 export type EventSubscription = { status: 'events'; events: Event[]; cursor: string } | { status: 'snapshot_required'; error: ContractError };
 

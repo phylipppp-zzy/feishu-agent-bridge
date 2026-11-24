@@ -19,6 +19,8 @@ export interface UnifiedService {
   readHistory(sessionId: string, query: ListQuery): Promise<Page<Message>>;
   listProjectFiles?(sessionId:string, directory:string, showHidden:boolean):Promise<DirectoryListing>;
   selectProjectFiles?(sessionId:string, args:string):Promise<Artifact[]>;
+  eventWatermark?(sessionId: string): number;
+  getMessage?(sessionId: string, messageId: string): Promise<Message | null>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
   initialCursor?(sessionId:string):Promise<string>;
   restoreInteractive?(sessionId:string,identity:WriteContext['identity'],stillAuthorized:()=>Promise<boolean>):Promise<void>;
@@ -39,6 +41,7 @@ export interface UnifiedService {
   getControlState(sessionId: string): Promise<ControlState>;
   requestControl(request: WriteRequest<{ owner: string; strategy: 'wait' | 'interrupt' }>): Promise<Operation>;
   releaseControl(request: WriteRequest<{ owner: string }>): Promise<Operation>;
+  findRegisteredReplyFiles?(sessionId: string, blocks: readonly import('./contracts.js').ContentBlock[]): Promise<Artifact[]>;
   listArtifacts(sessionId: string, query: ListQuery): Promise<Page<Artifact>>;
   readArtifact(sessionId: string, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   stageInputArtifact(request: WriteRequest<{ name: string; mediaType: string; size: number; contentDigest: string; content: Uint8Array }>): Promise<Operation>;
@@ -98,6 +101,7 @@ export interface PlatformPort {
   onObservation(listener: (observation: PlatformObservation) => void): () => void;
   listProjectFiles?(ref:NativeSessionRef, directory:string, showHidden:boolean):Promise<DirectoryListing>;
   selectProjectFiles?(ref:NativeSessionRef, args:string):Promise<Artifact[]>;
+  findRegisteredReplyFiles?(ref: NativeSessionRef, blocks: readonly import('./contracts.js').ContentBlock[]): Artifact[];
   listArtifacts(ref: NativeSessionRef): Promise<Artifact[]>;
   readArtifact(ref: NativeSessionRef, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   listModels(ref: NativeSessionRef): Promise<ModelOption[]>;

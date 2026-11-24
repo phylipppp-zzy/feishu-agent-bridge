@@ -46,3 +46,39 @@ test('two main panel create completions bind distinct roots',async()=>{
  const channel=new FeishuChannel(service,port,async(i,d)=>i.subject==='owner'&&port.authorizedDestination(d),join(dir,'channel')); const env=(eventId:string)=>({eventId,destination:'chat',identity:{source:'feishu',subject:'owner'}});
  try { const destinations:string[]=[]; for(const id of ['first','second']) {const op=await channel.handle(env(id),{action:'create',provider:'codex',project:'p',model:null}) as {operationId:string}; const result=await channel.handle(env(`${id}-finish`),{action:'finish',operationId:op.operationId}) as {destination:string}; destinations.push(result.destination); await channel.handle({...env(`${id}-input`),destination:result.destination},{action:'input',text:'hello',mode:'new'}); } assert.deepEqual(inputs,['session1','session2']); assert.notEqual(destinations[0],destinations[1]); assert.equal(channel.boundDestinations().length,2); } finally {channel.close();port.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('SDK completion text is a single idempotent reply to the topic root', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'topic-text-'));
+  const db = join(dir, 'sdk');
+  const open = () => new FeishuSdkPort({ appId: 'x', appSecret: 'x' }, db, new Set(['chat']), 'owner');
+  let port = open();
+  const calls: any[] = [];
+  const install = () => {
+    (port as any).client.im.message.create = async () => ({ data: { message_id: 'root' } });
+    (port as any).client.im.message.reply = async (request: unknown) => {
+      calls.push(request);
+      return { data: { message_id: 'completion' } };
+    };
+  };
+  install();
+  try {
+    const topic = await port.createTopic('chat', 's', { title: 'session', text: '', actions: [] }, 'root-id');
+    const text = '✅ 本轮已完成（用时 2分00秒）· 完成 2 项工具操作';
+    const delivery = 'turn-push:result';
+    await assert.rejects(port.sendText(topic, text, delivery, async () => { throw Error('binding changed'); }), /binding changed/);
+    assert.equal(calls.length, 0);
+    assert.equal(await port.sendText(topic, text, delivery), 'completion');
+    port.close();
+    port = open();
+    install();
+    assert.equal(await port.lookupDelivery(delivery), 'sent');
+    assert.equal(await port.sendText(topic, text, delivery), 'completion');
+    assert.deepEqual(calls, [{ path: { message_id: 'root' }, data: {
+      msg_type: 'text', reply_in_thread: true, content: JSON.stringify({ text }), uuid: calls[0].data.uuid,
+    } }]);
+    assert.match(calls[0]!.data.uuid, /^[a-f0-9]{40}$/);
+  } finally {
+    port.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

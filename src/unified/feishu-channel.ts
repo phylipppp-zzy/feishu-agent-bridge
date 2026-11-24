@@ -1,12 +1,13 @@
+import { eventSequence, TurnCardDelivery } from './turn-card-delivery.js';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { relative, isAbsolute, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
-import type { Answer, Identity, Operation, Provider, WriteContext, Session } from './contracts.js';
+import type { Answer, Identity, Operation, Provider, WriteContext, Session, Message } from './contracts.js';
 import { payloadDigest } from './contracts.js';
 import { contractError } from './errors.js';
 import { decodeQuestionForm } from './feishu-question-forms.js';
-import { listAllArtifacts, showSessionList } from './feishu-channel-lists.js';
+import { historyTextCard, listAllArtifacts, showSessionList } from './feishu-channel-lists.js';
 import { buildSessionPanel, noticePanel } from './feishu-session-panel.js';
 import { NewSessionDrafts } from './new-session-drafts.js';
 import { NewSessionFlow, type NewSessionAction } from './new-session-flow.js';
@@ -39,6 +40,7 @@ export interface FeishuPort {
   createTopic?(destination:string, sessionId:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>): Promise<string>;
   reassignTopic?(destination:string,sessionId:string):void;
   send(destination: string, card: ChannelCard, deliveryId: string, guard?:()=>Promise<void>): Promise<string | void>;
+  sendText?(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string | void>;
   update(destination: string, messageId: string, card: ChannelCard, deliveryId: string, guard?:()=>Promise<void>): Promise<void>;
   sendFile(destination: string, name: string, content: Uint8Array, deliveryId: string, guard?: () => Promise<void>): Promise<void>;
   /** Query by transport idempotency key; unknown is never retried automatically. */
@@ -70,6 +72,7 @@ export type ChannelAction = (
  | { action: 'legacy_stop' }
  | { action: 'control'; owner: string; strategy: 'wait' | 'interrupt'; revision: number; controlGeneration: number; release?: boolean }
  | { action: 'artifacts'; sessionId?: string; cursor?: string }
+ | { action: 'full_reply'; messageId: string }
  | { action: 'file'; artifactId: string; contentVersion: string }
  | { action: 'resource_rejected'; reason:'unsupported'|'size'|'encoding' }
  | { action: 'attachment'; name: string; mediaType: string; content: Uint8Array; mode: 'new' | 'queue' | 'steer' }
@@ -102,11 +105,14 @@ export class FeishuChannel {
   private readonly sessionBinding: FeishuSessionBinding;
   private readonly newSession: NewSessionFlow;
   private readonly interactionCards: FeishuInteractionCards;
+  protected readonly turnCards: TurnCardDelivery;
+  private readonly topicSyncs = new Map<string, Promise<void>>();
   private migrationLocked=false;
+  private closed = false;
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
-  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; onInteractionChanged?: (sessionId:string,interactionId:string) => void } = {}) {
+  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void } = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL);`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
@@ -117,10 +123,8 @@ export class FeishuChannel {
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_pending_actors (operation_id TEXT PRIMARY KEY, envelope TEXT NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_operation_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, operation_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY(destination,session_id,binding_scope,operation_id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_operation_states (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, operation_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,operation_id))');
-    this.db.exec('CREATE TABLE IF NOT EXISTS channel_completion_pending (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, turn_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,turn_id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_markers (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, category TEXT NOT NULL, object_key TEXT NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,category,object_key))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_notice_settings (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, paused INTEGER NOT NULL, completed INTEGER NOT NULL, waiting INTEGER NOT NULL, failed INTEGER NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope))');
-    this.db.exec('CREATE TABLE IF NOT EXISTS channel_stream_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, message_id TEXT NOT NULL, card_id TEXT, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, final INTEGER NOT NULL, current_message TEXT NOT NULL, latest_sequence INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,message_id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_private_titles (native_key TEXT PRIMARY KEY)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_uncertain (destination TEXT NOT NULL, native_key TEXT NOT NULL, PRIMARY KEY(destination,native_key))');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_auto_watermarks (destination TEXT PRIMARY KEY, enabled INTEGER NOT NULL, watermark INTEGER NOT NULL)');
@@ -134,6 +138,16 @@ export class FeishuChannel {
     if (!columns.some(c => c.name === 'access_mode')) this.db.exec("ALTER TABLE channel_bindings ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'read_only'");
     for(const table of ['channel_interaction_cards','channel_cursors']) {const fields=this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>;if(!fields.some(c=>c.name==='binding_scope')) this.db.exec(`ALTER TABLE ${table} ADD COLUMN binding_scope TEXT NOT NULL DEFAULT ''`);}
     this.db.exec('CREATE INDEX IF NOT EXISTS channel_bindings_session ON channel_bindings(session_id,destination)');
+    this.turnCards = new TurnCardDelivery(this.db, service, port, {
+      guard: key => this.checkBinding(...key),
+      stamp: (destination, card) => this.stampCard(destination, card),
+      wake: destination => {
+        if (channelOptions.onProgressWake) channelOptions.onProgressWake(destination);
+        else void Promise.resolve(this.topicSyncs.get(destination)).catch(() => {}).then(() => {
+          if (!this.closed) return this.sync(destination);
+        }).catch(() => {});
+      },
+    });
     this.inbox = new FeishuInbox(this.db);
     const drafts = new NewSessionDrafts(this.db);
     this.sessionBinding = new FeishuSessionBinding(this.db,service,port,authorize,authorizeBindingAdmin,{
@@ -145,6 +159,7 @@ export class FeishuChannel {
       deliver: (...args) => this.deliver(...args),
       stamp: (...args) => this.stampCard(...args),
       handle: (...args) => this.handle(...args),
+      bindingChanged: destination => this.turnCards.discardOtherScopes(destination, this.bindingScope(destination)),
     },drafts);
     this.newSession = new NewSessionFlow(drafts,service,port,authorize,this.sessionBinding,channelOptions);
     this.interactionCards = new FeishuInteractionCards(this.db,service,port,{
@@ -167,7 +182,7 @@ export class FeishuChannel {
     } catch(error){this.healthFaults.add(component);throw error;}
   }
   healthFact(component:string):{status:'healthy'|'degraded'|'unverified';reason:string|null;lastObservedAt:string|null;lastSuccessAt:string|null;lastFailureAt:string|null;lastFailureReason:string|null} {const r=this.db.prepare('SELECT status,reason,observed_at,success_at,failure_at,failure_reason FROM channel_health_facts WHERE component=?').get(component) as {status:'healthy'|'degraded'|'unverified';reason:string|null;observed_at:string;success_at:string|null;failure_at:string|null;failure_reason:string|null}|undefined;const fault=this.healthFaults.has(component)||this.diagnosticFaults.has(component);return r?{status:fault?'degraded':this.observedHealth.has(component)?r.status:'unverified',reason:fault?'健康诊断记录失败':this.observedHealth.has(component)?r.reason:'当前进程尚未重新观测',lastObservedAt:r.observed_at,lastSuccessAt:r.success_at,lastFailureAt:r.failure_at,lastFailureReason:r.failure_reason}:{status:fault?'degraded':'unverified',reason:fault?'健康诊断记录失败':'尚无可验证观测',lastObservedAt:null,lastSuccessAt:null,lastFailureAt:null,lastFailureReason:null};}
-  close(): void { this.db.close(); }
+  close(): void { this.closed = true; this.turnCards.close(); this.db.close(); }
   beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
   endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
   inspectMigrationBinding(id:string,destination:string):'removable'|'retained'|'absent' { if(!this.migrationLocked) throw new Error('migration lock required'); this.db.exec('SAVEPOINT migration_inspect'); try {const result=this.rollbackMigrationBinding(id); if(result==='retained' && !this.db.prepare('SELECT 1 FROM channel_bindings WHERE destination=?').get(destination)) throw new Error('migration binding missing despite receipt; manual review'); this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); return result==='removed'?'removable':result==='absent' && this.db.prepare('SELECT 1 FROM channel_bindings WHERE destination=?').get(destination)?'retained':result;} catch(e) {this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); throw e;} }
@@ -248,10 +263,11 @@ export class FeishuChannel {
     return state;
   }
   private async checkBinding(destination: string, sessionId: string, scope?:string): Promise<void> {
+    if (this.closed) throw new BindingExpired('channel closed');
     if(scope!==undefined && scope!==this.bindingScope(destination)) throw new BindingExpired('binding changed');
     const b = this.db.prepare('SELECT session_id,owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;owner_source:string;owner_subject:string} | undefined;
     if (!b || b.session_id !== sessionId || !await this.authorize({source:b.owner_source,subject:b.owner_subject},destination,sessionId)) throw new ReadAuthorizationRevoked('binding unauthorized or changed');
-    if (this.binding(destination) !== sessionId || (scope!==undefined && scope!==this.bindingScope(destination))) throw new BindingExpired('binding changed');
+    if (this.closed || this.binding(destination) !== sessionId || (scope!==undefined && scope!==this.bindingScope(destination))) throw new BindingExpired('binding changed');
   }
   private bindingScope(destination: string): string { const row = this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination); return JSON.stringify(row ?? null); }
   private actionScope(action: ChannelAction, destination: string): string { return ['list','health','pending','pending_open','create','attach'].includes(action.action) ? 'global' : this.bindingScope(destination); }
@@ -305,7 +321,7 @@ export class FeishuChannel {
   async baselineReadonlyHistory(destination:string,sessionId:string,prepared?:{cursor:string;messages:Array<{messageId:string;revision:number}>}):Promise<void> {
     const scope=this.bindingScope(destination); await this.checkBinding(destination,sessionId,scope); if(this.accessMode(destination)!=='read_only') throw new Error('binding changed'); if(this.readonlyHydrated(destination,sessionId)) return;
     const snapshot=prepared ?? await this.service.getSnapshot(sessionId).then(s=>({cursor:s.cursor,messages:s.value.messages})); await this.checkBinding(destination,sessionId,scope); if(!snapshot || this.accessMode(destination)!=='read_only') throw new Error('binding changed');
-    this.db.exec('BEGIN IMMEDIATE'); try {if(scope!==this.bindingScope(destination)) throw new Error('binding changed'); const put=this.db.prepare('INSERT INTO channel_known_messages(destination,session_id,message_id,revision) VALUES (?,?,?,?) ON CONFLICT(destination,session_id,message_id) DO UPDATE SET revision=MAX(revision,excluded.revision)'); for(const m of snapshot.messages) put.run(destination,sessionId,m.messageId,m.revision); this.db.prepare('INSERT INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?) ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,cursor=excluded.cursor,binding_scope=excluded.binding_scope WHERE channel_cursors.session_id<>excluded.session_id OR channel_cursors.binding_scope<>excluded.binding_scope').run(destination,sessionId,snapshot.cursor,scope); this.db.prepare('INSERT OR IGNORE INTO channel_history_baselines VALUES (?,?,?)').run(destination,sessionId,scope);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
+    this.db.exec('BEGIN IMMEDIATE'); try {if(scope!==this.bindingScope(destination)) throw new Error('binding changed'); const put=this.db.prepare('INSERT INTO channel_known_messages(destination,session_id,message_id,revision) VALUES (?,?,?,?) ON CONFLICT(destination,session_id,message_id) DO UPDATE SET revision=MAX(revision,excluded.revision)'); for(const m of snapshot.messages) put.run(destination,sessionId,m.messageId,m.revision); this.turnCards.baseline([destination,sessionId,scope],snapshot.cursor); this.db.prepare('INSERT INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?) ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,cursor=excluded.cursor,binding_scope=excluded.binding_scope WHERE channel_cursors.session_id<>excluded.session_id OR channel_cursors.binding_scope<>excluded.binding_scope').run(destination,sessionId,snapshot.cursor,scope); this.db.prepare('INSERT OR IGNORE INTO channel_history_baselines VALUES (?,?,?)').run(destination,sessionId,scope);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
   private binding(destination: string): string | null { return (this.db.prepare('SELECT session_id FROM channel_bindings WHERE destination=?').get(destination) as {session_id: string} | undefined)?.session_id ?? null; }
   private isCurrentOwnedScope(scope:{destination:string;bindingScope:string;ownerSource:string;ownerSubject:string},sessionId:string):boolean {const owner=this.db.prepare('SELECT owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(scope.destination) as {owner_source:string;owner_subject:string}|undefined;return owner?.owner_source===scope.ownerSource && owner.owner_subject===scope.ownerSubject && this.binding(scope.destination)===sessionId && this.bindingScope(scope.destination)===scope.bindingScope;}
@@ -458,7 +474,7 @@ export class FeishuChannel {
     try { result=await this.execute(e,a,bound,executionScope,effects); }
     catch (error) {
       if(a.action==='list' && !effects.started && executionScope===this.bindingScope(e.destination) && await this.authorize(e.identity,e.destination,bound) && executionScope===this.bindingScope(e.destination)) {const result={status:'rejected',reason:'temporarily_unavailable'}; const current=async()=>{if(executionScope!==this.bindingScope(e.destination) || !await this.authorize(e.identity,e.destination,bound) || executionScope!==this.bindingScope(e.destination)) throw new Error('binding changed or unauthorized');}; await this.deliver(e.destination,{title:'会话列表暂不可用',text:'读取会话列表失败，请稍后重试。',actions:[]},`${eventId}:list-unavailable`,current);this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare("UPDATE channel_receipts SET state='completed',result=? WHERE event_id=?").run(JSON.stringify(result),eventId);this.db.prepare("UPDATE channel_inbox SET state='completed' WHERE event_id=?").run(eventId);this.db.exec('COMMIT');}catch(e){this.db.exec('ROLLBACK');throw e;}return result;}
-      const readOnly=['help','new_help','pending','pending_open','list','health','panel','history','artifacts','project_files','deliver_files','export','file','models'].includes(a.action) || (a.action==='legacy_model' && !a.model);
+      const readOnly=['help','new_help','pending','pending_open','list','health','panel','history','artifacts','project_files','deliver_files','export','file','full_reply','models'].includes(a.action) || (a.action==='legacy_model' && !a.model);
       if (readOnly && !effects.started && (error instanceof BindingExpired || error instanceof ReadAuthorizationRevoked)) { const result={status:error instanceof BindingExpired ? 'expired' : 'rejected',reason:error instanceof BindingExpired ? 'binding_changed' : 'unauthorized'}; this.db.exec('BEGIN IMMEDIATE'); try {this.db.prepare('UPDATE channel_inbox SET state=? WHERE event_id=?').run(result.status,eventId);this.db.prepare('UPDATE channel_receipts SET state=?,result=? WHERE event_id=?').run(result.status,JSON.stringify(result),eventId);this.db.exec('COMMIT');} catch(e) {this.db.exec('ROLLBACK');throw e;} return result; }
       if(error instanceof FileCommandError) { const allowed=executionScope===this.bindingScope(e.destination) && await this.authorize(e.identity,e.destination,bound); const stale=executionScope!==this.bindingScope(e.destination); if(stale || !allowed) {if(effects.started) throw error; const result={status:stale?'expired':'rejected',reason:stale?'binding_changed':'unauthorized'}; this.db.exec('BEGIN IMMEDIATE'); try {this.db.prepare('UPDATE channel_inbox SET state=? WHERE event_id=?').run(result.status,eventId); this.db.prepare('UPDATE channel_receipts SET state=?,result=? WHERE event_id=?').run(result.status,JSON.stringify(result),eventId); this.db.exec('COMMIT');} catch(e) {this.db.exec('ROLLBACK');throw e;} return result;} result={status:'rejected',reason:error.message}; await this.deliver(e.destination,{title:'文件操作未完成',text:error.message,actions:[]},`${eventId}:file-rejected`); this.db.prepare("UPDATE channel_receipts SET state='completed',result=? WHERE event_id=?").run(JSON.stringify(result),eventId); this.db.prepare("UPDATE channel_inbox SET state='completed' WHERE event_id=?").run(eventId); return result; }
       const detail=error && typeof error==='object' && 'detail' in error ? (error as {detail?:{code?:string}}).detail : undefined;
@@ -552,7 +568,7 @@ export class FeishuChannel {
       return this.sessionBinding.beginInteractiveAttach(e,bound,executionScope,guard,reply);
     }
     if (a.action === 'finish') return this.sessionBinding.finish(e,a.operationId,bound,guard,reply);
-    if (!bound && ['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','history','swarm'].includes(a.action)) {
+    if (!bound && ['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','full_reply','history','swarm'].includes(a.action)) {
       await reply(buildMainChatTopicOnlyGuidanceCard(a.action === 'swarm'));
       return {status:'guidance'};
     }
@@ -566,7 +582,7 @@ export class FeishuChannel {
     if (!bound) throw new Error('destination is not bound');
     const session = await this.service.getSession(bound);
     const current = () => this.context(e, bound, session.revision, session.control.generation);
-    if (a.action === 'unbind') { this.db.prepare('DELETE FROM channel_bindings WHERE destination=?').run(e.destination); this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(e.destination); return { unbound: true }; }
+    if (a.action === 'unbind') { this.db.prepare('DELETE FROM channel_bindings WHERE destination=?').run(e.destination); this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(e.destination); this.turnCards.discardOtherScopes(e.destination, this.bindingScope(e.destination)); return { unbound: true }; }
     if (a.action === 'panel') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
       const mode=this.accessMode(e.destination);
@@ -593,7 +609,7 @@ export class FeishuChannel {
       if(this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) { effects.started=true; await this.port.sendFile(e.destination,'会话历史.md',content,id,guard); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); return {deliveryId:id}; }
       const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null; await guard(); await reply(url ? {title:'历史已导出',text:'可打开原消息查看文件。',actions:[{label:'定位原文件消息',value:{},url}]} : {title:'导出状态未知',text:'尚无法定位原消息；不会重复上传。',actions:[]}); return {deliveryId:id,status:url ? 'located' : 'unknown'};
     }
-    if (a.action === 'history') { const hydrate=(this.service as UnifiedService & {hydrateSessionHistory?:(id:string)=>Promise<boolean>}).hydrateSessionHistory; if(this.requireReadonlyHydration && this.accessMode(e.destination)==='read_only' && !this.readonlyHydrated(e.destination,bound) && hydrate) {await guard(); if(await hydrate.call(this.service,bound)) {await guard();await this.baselineReadonlyHistory(e.destination,bound);} await guard();} const page = await this.service.readHistory(bound,{limit:20,...(a.cursor ? {cursor:a.cursor}:{})}); await reply(await this.longTextCard(e.destination,bound,'会话历史',page.items.map(m => `${m.role}: ${m.blocks.map(b => b.type === 'text' ? b.text : `[文件 ${escapeCardMarkdown(b.artifactId)}]`).join(' ')}`).join('\n'),page.nextCursor ? [{label:'下一页',value:{action:'history',cursor:page.nextCursor}}] : [],guard,()=>{effects.started=true;})); return page; }
+    if (a.action === 'history') { const hydrate=(this.service as UnifiedService & {hydrateSessionHistory?:(id:string)=>Promise<boolean>}).hydrateSessionHistory; if(this.requireReadonlyHydration && this.accessMode(e.destination)==='read_only' && !this.readonlyHydrated(e.destination,bound) && hydrate) {await guard(); if(await hydrate.call(this.service,bound)) {await guard();await this.baselineReadonlyHistory(e.destination,bound);} await guard();} const page = await this.service.readHistory(bound,{limit:20,...(a.cursor ? {cursor:a.cursor}:{})}); await reply(await historyTextCard(this.db,this.port,[e.destination,bound,executionScope],page.items.map(m => `${m.role}: ${m.blocks.map(b => b.type === 'text' ? b.text : `[文件 ${escapeCardMarkdown(b.artifactId)}]`).join(' ')}`).join('\n'),page.nextCursor ? [{label:'下一页',value:{action:'history',cursor:page.nextCursor}}] : [],guard,()=>{effects.started=true;})); return page; }
     if (a.action === 'artifacts') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
       const rawItems = await listAllArtifacts(this.service,bound);
@@ -604,6 +620,12 @@ export class FeishuChannel {
       });
       await replyOrUpdate(card);
       return { items: pageItems, nextCursor };
+    }
+    if (a.action === 'full_reply') {
+      const message = this.service.getMessage ? await this.service.getMessage(bound, a.messageId)
+        : (await this.service.getSnapshot(bound)).value.messages.find(m => m.messageId === a.messageId);
+      if (message?.sessionId !== bound || message.role !== 'assistant') throw new FileCommandError('此会话中没有该回复。');
+      return this.turnCards.sendFullReply([e.destination,bound,executionScope], message, guard, reply, () => { effects.started = true; });
     }
     if (a.action === 'file') {
       const scope=executionScope;
@@ -623,8 +645,20 @@ export class FeishuChannel {
       await reply(url ? {title:'文件已发送',text:'可打开原消息查看文件。',actions:[{label:'定位原文件消息',value:{},url}]} : {title:'文件发送状态未知',text:'尚无法定位原消息，请稍后查看；不会重复上传。',actions:[]});
       return {deliveryId:id,status:url ? 'located' : 'unknown',...(url ? {url} : {})};
     }
-    if(a.action==='notice_settings') {await guard(); const old=this.noticeSettings(e.destination,bound,executionScope); if(old.revision!==a.settingsRevision) throw {detail:contractError('stale_revision','stale notification settings')}; const next={...old,...(a.field==='legacy'?{}:{[a.field]:a.value}),revision:old.revision+1}; this.db.exec('BEGIN IMMEDIATE'); try {if(a.field==='legacy') this.db.prepare("UPDATE channel_preferences SET event_types='[]' WHERE destination=? AND session_id=?").run(e.destination,bound); if(a.field==='paused' && !a.value) {this.db.prepare('UPDATE channel_preferences SET enabled=1 WHERE destination=? AND session_id=?').run(e.destination,bound);this.db.prepare("DELETE FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='waiting'").run(e.destination,bound,executionScope);} this.db.prepare('INSERT OR REPLACE INTO channel_notice_settings VALUES (?,?,?,?,?,?,?,?)').run(e.destination,bound,executionScope,Number(next.paused),Number(next.completed),Number(next.waiting),Number(next.failed),next.revision);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;} const panel=this.noticePanel(e.destination,bound,executionScope,session);await reply({title:'通知设置',...panel});return next; }
-    if (a.action === 'notifications') { if (session.revision !== a.revision || session.control.generation !== a.controlGeneration) throw new Error('stale revision'); this.db.prepare('INSERT OR REPLACE INTO channel_preferences VALUES (?,?,?,?)').run(e.destination,bound,a.enabled ? 1 : 0,JSON.stringify(a.eventTypes)); const result={status:'completed',enabled:a.enabled,eventTypes:a.eventTypes}; await reply({title:'通知设置',text:a.enabled ? '通知已开启' : '通知已暂停',actions:[]}); return result; }
+    if(a.action==='notice_settings') {await guard(); const old=this.noticeSettings(e.destination,bound,executionScope); const priorPush=this.allowTurnPush(e.destination,bound,executionScope); if(old.revision!==a.settingsRevision) throw {detail:contractError('stale_revision','stale notification settings')}; const next={...old,...(a.field==='legacy'?{}:{[a.field]:a.value}),revision:old.revision+1}; const policyCursor = await this.noticePolicyCursor(bound, a.field !== 'waiting' && a.field !== 'failed', guard); this.db.exec('BEGIN IMMEDIATE'); try {if(a.field==='legacy') this.db.prepare("UPDATE channel_preferences SET event_types='[]' WHERE destination=? AND session_id=?").run(e.destination,bound); if(a.field==='paused' && !a.value) {this.db.prepare('UPDATE channel_preferences SET enabled=1 WHERE destination=? AND session_id=?').run(e.destination,bound);this.db.prepare("DELETE FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='waiting'").run(e.destination,bound,executionScope);} this.db.prepare('INSERT OR REPLACE INTO channel_notice_settings VALUES (?,?,?,?,?,?,?,?)').run(e.destination,bound,executionScope,Number(next.paused),Number(next.completed),Number(next.waiting),Number(next.failed),next.revision);if (policyCursor !== undefined) this.turnCards.noticePolicy([e.destination,bound,executionScope],this.noticePolicySequence(bound,policyCursor),priorPush,this.allowTurnPush(e.destination,bound,executionScope));this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;} const panel=this.noticePanel(e.destination,bound,executionScope,session);await reply({title:'通知设置',...panel});return next; }
+    if (a.action === 'notifications') {
+      if (session.revision !== a.revision || session.control.generation !== a.controlGeneration) throw new Error('stale revision');
+      const prior = this.allowTurnPush(e.destination,bound,executionScope);
+      const cursor = await this.noticePolicyCursor(bound, true, guard);
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.prepare('INSERT OR REPLACE INTO channel_preferences VALUES (?,?,?,?)').run(e.destination,bound,a.enabled ? 1 : 0,JSON.stringify(a.eventTypes));
+        this.turnCards.noticePolicy([e.destination,bound,executionScope],this.noticePolicySequence(bound,cursor),prior,this.allowTurnPush(e.destination,bound,executionScope));
+        this.db.exec('COMMIT');
+      } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+      await reply({title:'通知设置',text:a.enabled ? '通知已开启' : '通知已暂停',actions:[]});
+      return {status:'completed',enabled:a.enabled,eventTypes:a.eventTypes};
+    }
     if (a.action === 'models' || a.action === 'legacy_model') {
       if (a.action === 'legacy_model' && a.invalid) { await reply({title:'模型',text:'格式：/model <模型> <思考强度>；发送 /model 查看选项。',actions:[]}); return {status:'guidance'}; }
       if (a.action === 'legacy_model' && a.model && a.effort) { const op=await this.service.updateSessionSettings({context:current(),payload:{model:a.model,preferences:{reasoningEffort:a.effort}}}); if (needsOperationNotice(op)) await reply(operationCard(op)); return op; }
@@ -667,24 +701,6 @@ export class FeishuChannel {
     const card = operationCard(op); if (queuedInput) card.actions.push({label:'查看排队',value:{action:'panel'}});
     await reply(card); return op;
   }
-  private async longTextCard(destination:string, sessionId:string, title:string, text:string, actions:ChannelCard['actions'] = [], initialGuard?:()=>Promise<void>, onSend?:()=>void): Promise<ChannelCard> {
-    await initialGuard?.();
-    if ([...text].length <= 3000) return {title,text,actions};
-    const scope=this.bindingScope(destination); await this.checkBinding(destination,sessionId);
-    const digest=createHash('sha256').update(text,'utf8').digest('hex');
-    const id=`long:${createHash('sha256').update(JSON.stringify([destination,sessionId,scope,digest])).digest('hex')}`;
-    const guard=async()=>{ await initialGuard?.(); await this.checkBinding(destination,sessionId); if (scope!==this.bindingScope(destination)) throw new Error('binding changed'); };
-    const inserted=this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id);
-    if (inserted.changes) {
-      await this.checkBinding(destination,sessionId); if (scope!==this.bindingScope(destination)) throw new Error('binding changed');
-      try { onSend?.(); await this.port.sendFile(destination,`完整内容-${digest.slice(0,12)}.txt`,Buffer.from(text,'utf8'),id,guard); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); } catch { /* Delivery may have succeeded; leave unknown and never resend blindly. */ }
-    }
-    await this.checkBinding(destination,sessionId); if (scope!==this.bindingScope(destination)) throw new Error('binding changed');
-    const row=this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(id) as {state:string};
-    const url=row.state === 'sent' ? await this.port.fileMessageLink?.(destination,sessionId,id) ?? null : null;
-    await this.checkBinding(destination,sessionId); if (scope!==this.bindingScope(destination)) throw new Error('binding changed');
-    return {title,text:`${[...text].slice(0,1000).join('')}\n\n${row.state === 'sent' ? '全文已作为文件发送。' : '全文文件投递结果未知，请核对后再操作。'}`,actions:[...actions,...(url ? [{label:'打开全文',url,value:{action:'open_file'}}] : [])]};
-  }
   private noticeSettings(destination:string,sessionId:string,scope:string):{paused:boolean;completed:boolean;waiting:boolean;failed:boolean;revision:number} { const row=this.db.prepare('SELECT paused,completed,waiting,failed,revision FROM channel_notice_settings WHERE destination=? AND session_id=? AND binding_scope=?').get(destination,sessionId,scope) as {paused:number;completed:number;waiting:number;failed:number;revision:number}|undefined;const legacy=this.db.prepare('SELECT enabled FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {enabled:number}|undefined;return row ? {paused:!!row.paused || legacy?.enabled===0,completed:!!row.completed,waiting:!!row.waiting,failed:!!row.failed,revision:row.revision} : {paused:legacy?.enabled===0,completed:true,waiting:true,failed:true,revision:0}; }
   private noticePanel(destination:string,sessionId:string,scope:string,session:Session) {
     const legacy=this.db.prepare('SELECT event_types,enabled FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {event_types:string;enabled:number}|undefined;
@@ -708,25 +724,35 @@ export class FeishuChannel {
     const rows = this.db.prepare('SELECT interaction_id FROM channel_interaction_cards WHERE destination=? AND session_id=?').all(destination,sessionId) as Array<{interaction_id:string}>;
     for (const row of rows) await this.interactionCards.render(destination,sessionId,row.interaction_id,scope);
   }
-  protected async renderStreamMessage(destination:string, sessionId:string, scope:string, message:import('./contracts.js').Message):Promise<void> {
-    const sequence=Number.isSafeInteger(message.sequence) ? message.sequence : 0; const guard=()=>this.checkBinding(destination,sessionId,scope); await guard();
-    const row=this.db.prepare('SELECT card_id,revision,updated_at,final,current_message,latest_sequence FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,message.turnId || message.messageId) as {card_id:string|null;revision:number;updated_at:number;final:number;current_message:string;latest_sequence:number}|undefined;
-    if(row && (sequence<row.latest_sequence || (row.current_message!==message.messageId && sequence===row.latest_sequence))) return;
-    if(row && ((row.current_message===message.messageId && ((row.final && !message.final) || row.revision>=message.revision)))) return;
-    if(row && !message.final && Date.now()-row.updated_at<1000) {if(row.current_message!==message.messageId) this.db.prepare('UPDATE channel_stream_cards SET current_message=?,latest_sequence=?,revision=0,final=0 WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId); return;}
-    const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${escapeCardMarkdown(b.artifactId)}]`).join('\n');
-    const turnDone=this.db.prepare("SELECT 1 FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='completed' AND object_key=?").get(destination,sessionId,scope,message.turnId || message.messageId); const card=message.final ? await this.longTextCard(destination,sessionId,turnDone?'回复 · 本轮已完成':'回复',text,[],guard) : {title:'回复中',text:[...text].slice(0,1000).join(''),actions:[]};
-    await guard();
-    if(!row) { const id=`stream:${payloadDigest([scope,destination,sessionId,message.turnId || message.messageId])}`; this.db.prepare('INSERT INTO channel_stream_cards VALUES (?,?,?,?,NULL,0,0,0,?,?)').run(destination,sessionId,scope,message.turnId || message.messageId,message.messageId,sequence); const cardId=await this.deliver(destination,card,id,guard); await guard(); if(cardId) this.db.prepare('UPDATE channel_stream_cards SET card_id=?,revision=?,updated_at=?,final=?,current_message=?,latest_sequence=? WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(cardId,message.revision,Date.now(),Number(message.final),message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId); return; }
-    if(!row.card_id) return;
-    const id=`stream-update:${payloadDigest([scope,destination,sessionId,message.messageId,message.revision])}`;
-    if(!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) return;
-    await guard(); await this.port.update(destination,row.card_id,this.stampCard(destination,card),id,guard); await guard();
-    this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('UPDATE channel_stream_cards SET revision=?,updated_at=?,final=?,current_message=?,latest_sequence=? WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(message.revision,Date.now(),Number(message.final),message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId);
+  private allowTurnPush(destination: string, sessionId: string, scope: string): boolean {
+    const notice = this.noticeSettings(destination,sessionId,scope);
+    const preference = this.db.prepare('SELECT event_types FROM channel_preferences WHERE destination=? AND session_id=?')
+      .get(destination,sessionId) as {event_types:string} | undefined;
+    const types = preference ? JSON.parse(preference.event_types) as string[] : [];
+    return !notice.paused && notice.completed && (!types.length || types.includes('turn.updated'));
   }
-  private async markTurnCompleted(destination:string,sessionId:string,scope:string,turnId:string,messages:import('./contracts.js').Message[]):Promise<void> { const guard=()=>this.checkBinding(destination,sessionId,scope); await guard(); if(this.db.prepare("SELECT 1 FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='completed' AND object_key=?").get(destination,sessionId,scope,turnId)) return; const row=this.db.prepare('SELECT card_id,current_message FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,turnId) as {card_id:string|null;current_message:string}|undefined; const message=messages.find(m=>m.messageId===row?.current_message && m.final); if(!row?.card_id || !message) return; const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${escapeCardMarkdown(b.artifactId)}]`).join('\n'); const card=await this.longTextCard(destination,sessionId,'回复 · 本轮已完成',text,[],guard); const id=`turn-completed:${payloadDigest([scope,destination,sessionId,turnId])}`; if(!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) return; await guard(); await this.port.update(destination,row.card_id,this.stampCard(destination,card),id,guard); await guard(); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('INSERT OR IGNORE INTO channel_notice_markers VALUES (?,?,?,?,?)').run(destination,sessionId,scope,'completed',turnId); }
-  /** Poll using the bound owner's current authorization, never callback-provided identity. */
-  async sync(destination: string): Promise<void> {
+
+  private async noticePolicyCursor(sessionId: string, changed: boolean, guard: () => Promise<void>): Promise<string | undefined> {
+    if (!changed) return;
+    const cursor = this.service.eventWatermark ? '' : (await this.service.getSnapshot(sessionId)).cursor;
+    await guard();
+    return cursor;
+  }
+  private noticePolicySequence(sessionId: string, fallback?: string): number {
+    return this.service.eventWatermark?.(sessionId) ?? eventSequence(sessionId, fallback);
+  }
+
+  /** Poll using the bound owner's current authorization. Timer wakes share this flight. */
+  sync(destination: string): Promise<void> {
+    const active = this.topicSyncs.get(destination);
+    if (active) return active;
+    const work = (async () => { while (await this.syncTopic(destination)) { /* advance the topic cursor */ } })()
+      .finally(() => this.topicSyncs.delete(destination));
+    this.topicSyncs.set(destination, work);
+    return work;
+  }
+
+  private async syncTopic(destination: string): Promise<boolean> {
     const row=this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string}|undefined; if(!row) throw new Error('destination is not bound'); const sessionId=row.session_id, scope=JSON.stringify(row);
     const syncGuard=()=>this.checkBinding(destination,sessionId,scope);
     const syncTitle=(session:Session)=>syncTopicRootTitle(this.db,this.port,destination,scope,session,card=>this.stampCard(destination,card),syncGuard);
@@ -735,30 +761,34 @@ export class FeishuChannel {
     const preference = this.db.prepare('SELECT enabled,event_types FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {enabled:number;event_types:string} | undefined;
     await this.reconcileCards(destination,sessionId,scope); await syncGuard();
     const notice=this.noticeSettings(destination,sessionId,scope); const allowWaiting=!notice.paused && notice.waiting;
-    if (preference && !preference.enabled) return; // Keep cursor for replay after resume.
     const eventTypes = preference ? JSON.parse(preference.event_types) as string[] : [];
-    let expired = false;
+    let expiredFrom: number | undefined;
+    let more = false;
     let cursor = (this.db.prepare('SELECT cursor FROM channel_cursors WHERE destination=? AND session_id=? AND binding_scope=?').get(destination,sessionId,scope) as {cursor:string} | undefined)?.cursor;
+    const allowedPush = () => this.allowTurnPush(destination,sessionId,scope);
+    const scopeKey: [string, string, string] = [destination, sessionId, scope];
+    const remember = this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)');
+    const known = this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?');
+    const unseen = (m: Message) => Number((known.get(destination,sessionId,m.messageId) as {revision:number}|undefined)?.revision ?? -1) < m.revision;
     if (cursor) {
       const events = await this.service.subscribeEvents(sessionId,cursor,100); await syncGuard();
       if (events.status === 'events') {
         const snapshot=await this.service.getSnapshot(sessionId); await syncGuard();
         await syncTitle(snapshot.value.session);
         for (const i of snapshot.value.interactions) await this.interactionCards.render(destination,sessionId,i.interactionId,scope,allowWaiting);
-        const pending=this.db.prepare('SELECT current_message AS message_id FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND final=0').all(destination,sessionId,scope) as Array<{message_id:string}>; for(const p of pending) { const m=snapshot.value.messages.find(x=>x.messageId===p.message_id && x.role==='assistant'); if(m) await this.renderStreamMessage(destination,sessionId,scope,m); }
+        const messageIds = new Set(events.events.filter(event => event.type === 'message.updated').map(event => event.objectId));
+        const messages = snapshot.value.messages.filter(message => message.role === 'assistant' && messageIds.has(message.messageId) && unseen(message));
+        await this.turnCards.sync(scopeKey, snapshot.value, events.events, messages, allowedPush);
+        await syncGuard();
+        for (const message of messages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
         let retryCount=0; let firstRetry='';
         const visible=events.events.filter(event=>!eventTypes.length || eventTypes.includes(event.type));
         const failedTurnIds=new Set(visible.filter(event=>event.type==='operation.failed' && event.data && typeof event.data==='object').map(event=>(event.data as {result?:{kind?:string;turnId?:string}}).result).filter((result):result is {kind:string;turnId:string}=>result?.kind==='turn' && typeof result.turnId==='string').map(result=>result.turnId));
         const hasTurnFailure=visible.some(event=>event.type==='turn.updated' && (event.data as {status?:string}|null)?.status==='failed');
         for (const event of events.events) {
           await syncGuard();
-          const message=event.type==='message.updated' ? snapshot.value.messages.find(m=>m.messageId===event.objectId && m.role==='assistant') : undefined;
-          if (message) {
-            const known=this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?').get(destination,sessionId,message.messageId) as {revision:number}|undefined;
-            if(known && known.revision>=message.revision) continue;
-            await this.renderStreamMessage(destination,sessionId,scope,message);
-            if(message.final) { if(message.turnId && this.db.prepare('SELECT 1 FROM channel_completion_pending WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?').get(destination,sessionId,scope,message.turnId)) {if(!notice.paused && notice.completed) await this.markTurnCompleted(destination,sessionId,scope,message.turnId,snapshot.value.messages); this.db.prepare('DELETE FROM channel_completion_pending WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?').run(destination,sessionId,scope,message.turnId);} this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)').run(destination,sessionId,message.messageId,message.revision); } continue;
-          }
+          if (event.type === 'message.updated' || event.type === 'tool.updated' || event.type === 'artifact.available' ||
+            event.type === 'turn.updated' && (event.data as {status?:string} | undefined)?.status === 'completed') continue;
           const data=event.data && typeof event.data==='object' ? event.data as Record<string,unknown> : {};
           const statusValue=typeof data.status==='string' ? data.status : ''; const stopTurn=typeof data.turnId==='string'?data.turnId:event.objectId; const explicitStop=event.type==='turn.updated' && statusValue==='interrupted' && !!await this.service.hasStopRequest?.(sessionId,stopTurn); await syncGuard(); if((notice.paused || (eventTypes.length && !eventTypes.includes(event.type))) && !explicitStop) continue; const opId=typeof data.operationId==='string'?data.operationId:event.objectId; const previousOp=event.type.startsWith('operation.') ? this.db.prepare('SELECT state FROM channel_notice_operation_states WHERE destination=? AND session_id=? AND binding_scope=? AND operation_id=?').get(destination,sessionId,scope,opId) as {state:string}|undefined : undefined; if((event.type==='operation.unknown' && previousOp && previousOp.state!=='unknown') || (event.type==='operation.completed' && previousOp?.state==='completed')) continue; const resolvingUnknown=previousOp?.state==='unknown' && ['operation.failed','operation.completed'].includes(event.type); const resolving=event.type==='operation.completed' && resolvingUnknown; const category = event.type.startsWith('interaction.') || (event.type==='session.updated' && ['waiting_question','waiting_approval'].includes(statusValue)) ? 'waiting' : (resolving || event.type==='provider.api_retry' || event.type==='provider.usage_limit' || event.type==='adapter.stream_failed' || event.type==='operation.unknown' || event.type==='operation.failed' || (event.type==='turn.updated' && ['failed','interrupted'].includes(statusValue)) || (event.type==='session.updated' && statusValue==='failed')) ? 'failed' : (event.type==='turn.updated' && statusValue==='completed') ? 'completed' : null; if(category && !explicitStop && (notice.paused || !notice[category])) continue;
           if (event.type === 'provider.api_retry') { retryCount++; firstRetry ||= event.eventId; continue; }
@@ -769,14 +799,13 @@ export class FeishuChannel {
           // Pending interaction cards above already present the question or approval.
           if (event.type==='interaction.created') continue;
           if (event.type==='operation.completed' && !resolving && typeof data.action==='string' && SUPPRESSED_COMPLETED_ACTIONS.has(data.action)) continue;
-          if (event.type==='turn.updated' && status==='completed') { const turnId=typeof data.turnId==='string' ? data.turnId : event.objectId; const final=snapshot.value.messages.filter(m=>m.turnId===turnId && m.role==='assistant' && m.final).sort((a,b)=>b.sequence-a.sequence)[0]; if(final) {await this.renderStreamMessage(destination,sessionId,scope,final);await this.markTurnCompleted(destination,sessionId,scope,turnId,snapshot.value.messages);continue;} const slot=this.db.prepare('SELECT 1 FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,turnId); if(slot) {this.db.prepare('INSERT OR IGNORE INTO channel_completion_pending VALUES (?,?,?,?)').run(destination,sessionId,scope,turnId);continue;} }
           if (event.type==='turn.updated' && status==='failed' && failedTurnIds.has(typeof data.turnId==='string' ? data.turnId : event.objectId)) continue;
           if (event.type==='session.updated' && status==='failed' && (hasTurnFailure || failedTurnIds.size>0)) continue;
           const waitingSession=event.type==='session.updated' && ['waiting_question','waiting_approval'].includes(status);
           if (waitingSession && (snapshot.value.session.status!==status || snapshot.value.interactions.some(i=>['awaiting_answer','answer_pending_delivery'].includes(i.status) && (status==='waiting_approval' ? i.kind==='approval' : i.kind!=='approval')))) continue;
-          const critical=event.type==='operation.failed' || event.type==='operation.unknown' || event.type==='operation.completed' || (event.type==='turn.updated' && ['failed','completed','interrupted'].includes(status)) || (event.type==='session.updated' && ['failed','waiting_question','waiting_approval'].includes(status));
+          const critical=event.type==='operation.failed' || event.type==='operation.unknown' || event.type==='operation.completed' || (event.type==='turn.updated' && ['failed','interrupted'].includes(status)) || (event.type==='session.updated' && ['failed','waiting_question','waiting_approval'].includes(status));
           if (critical) {
-            const statusText:Record<string,string>={failed:'运行失败，未形成完整回复',completed:'运行已完成',interrupted:'本轮回复已中断，未形成完整回复；后台任务是否终止尚未确认',waiting_question:'等待回答',waiting_approval:'等待审批'};
+            const statusText:Record<string,string>={failed:'运行失败，未形成完整回复',interrupted:'本轮回复已中断，未形成完整回复；后台任务是否终止尚未确认',waiting_question:'等待回答',waiting_approval:'等待审批'};
             const waitingHint=this.accessMode(destination)==='read_only' && (snapshot.value.session.native.provider==='claude' || snapshot.value.session.native.provider==='agy') && ['waiting_question','waiting_approval'].includes(status) ? '；外部终端会话若仅同步等待状态，请回原终端处理。' : '';
             let card=event.type.startsWith('operation.') && typeof data.action==='string' && typeof data.status==='string' ? operationCard(data as unknown as import('./contracts.js').Operation) : {title:'会话更新',text:(statusText[status] ?? '会话状态已更新')+waitingHint,actions:[]}; if(event.type==='turn.updated' && status==='interrupted') {const turnId=typeof data.turnId==='string'?data.turnId:event.objectId; await syncGuard(); const residual=await this.service.inspectTurnResidual?.(sessionId,turnId) ?? {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'此provider未提供可信残留查询'};await syncGuard();card={...card,text:`本轮已确认中断。\n残留核对：${residual.reason}${residual.count===null?'':`（${residual.count}项）`}${residual.observedAt?`；核对时间 ${residual.observedAt}`:''}`};}
             const linked=data.result && typeof data.result==='object' ? data.result as {kind?:string;turnId?:string} : undefined; const objectKey=category==='waiting' ? `${event.objectId}:${status}` : linked?.kind==='turn' && linked.turnId ? linked.turnId : event.type==='turn.updated' ? (typeof data.turnId==='string'?data.turnId:event.objectId) : event.objectId; const noticeKey=category==='failed' ? `${objectKey}:${status || event.type}` : objectKey; const exists=category && this.db.prepare('SELECT 1 FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category=? AND object_key=?').get(destination,sessionId,scope,category,noticeKey); if(exists && !resolvingUnknown) continue;
@@ -784,25 +813,27 @@ export class FeishuChannel {
           }
         }
         if (retryCount) { await syncGuard(); await sendSync(destination,{title:'连接重试',text:`模型服务正在重试（本次收到 ${retryCount} 次重试通知）。`,actions:[]},`retry:${destination}:${sessionId}:${firstRetry}:${events.cursor}`); }
+        more = events.events.length === 100 && cursor !== events.cursor;
         cursor = events.cursor;
-      } else { cursor = undefined; expired = true; }
+      } else { expiredFrom = eventSequence(sessionId,cursor); cursor = undefined; }
     }
     if (!cursor) {
       const snapshot = await this.service.getSnapshot(sessionId); await syncGuard();
       await syncTitle(snapshot.value.session);
-      // A fresh binding records existing history without sending it. An expired
-      // cursor compares a consistent snapshot with that baseline and emits unseen finals.
+      if (expiredFrom === undefined) this.turnCards.baseline(scopeKey,snapshot.cursor);
+      await this.turnCards.sync(scopeKey, snapshot.value, [], snapshot.value.messages.filter(m =>
+        m.role === 'assistant' && (expiredFrom !== undefined ? unseen(m) : !m.final &&
+          snapshot.value.turnProgress?.timing.some(t => t.turnId === m.turnId && t.liveStartSequence !== null && t.liveEndSequence === null))),
+        allowedPush, expiredFrom);
+      await syncGuard();
       for (const m of snapshot.value.messages) {
-        const known = this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?').get(destination,sessionId,m.messageId) as {revision:number} | undefined;
-        if (expired && m.role === 'assistant' && (!known || known.revision < m.revision)) {
-          await syncGuard(); await this.renderStreamMessage(destination,sessionId,scope,m);
-        }
-        if(!expired || m.final) this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)').run(destination,sessionId,m.messageId,m.revision);
+        if (expiredFrom === undefined || m.final) remember.run(destination,sessionId,m.messageId,m.revision);
       }
       for (const i of snapshot.value.interactions) await this.interactionCards.render(destination,sessionId,i.interactionId,scope,allowWaiting);
       cursor = snapshot.cursor;
     }
     await syncGuard();
     this.db.prepare('INSERT OR REPLACE INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?)').run(destination,sessionId,cursor,scope);
+    return more && !this.closed;
   }
 }

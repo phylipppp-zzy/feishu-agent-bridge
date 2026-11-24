@@ -1,6 +1,6 @@
 import { verifiedMessageAppLink } from './feishu-message-link.js';
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseIncoming, parseCardAction } from '../feishu.js';
 import { parseFeishuAction, parseFeishuText } from './feishu-codec.js';
@@ -338,6 +338,26 @@ export class FeishuSdkPort implements FeishuPort {
     const response=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}});
     rejectCode(response.code); if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
     this.remember(deliveryId,response.data.message_id,destination,schema); return response.data.message_id;
+  }
+  async sendText(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string> {
+    await guard?.();
+    this.allowedTaskOrProduction(destination);
+    const route = this.route(destination);
+    if (!route) throw new Error('text completion requires a topic');
+    const known = await this.lookupMessageId(deliveryId);
+    if (known) return known;
+    await guard?.();
+    this.allowedTaskOrProduction(destination);
+    if (this.route(destination)?.root_id !== route.root_id) throw new Error('topic route changed');
+    const uuid = createHash('sha256').update(deliveryId).digest('hex').slice(0, 40);
+    const response = await this.client.im.message.reply({
+      path: { message_id: route.root_id },
+      data: { msg_type: 'text', reply_in_thread: true, content: JSON.stringify({ text }), uuid },
+    });
+    rejectCode(response.code);
+    if (!response.data?.message_id) throw new Error('Feishu text reply outcome unknown');
+    this.remember(deliveryId, response.data.message_id, destination);
+    return response.data.message_id;
   }
   async update(destination:string,messageId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     await guard?.(); this.allowedTaskOrProduction(destination); if(this.callbackDestination(this.route(destination)?.chat_id ?? destination,messageId)!==destination) throw new Error('message route mismatch');

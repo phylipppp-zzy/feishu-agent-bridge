@@ -618,3 +618,27 @@ test('partial text blocks converge on one message and omit tool and thinking', a
   push({type:'content_block_delta',index:2,delta:{type:'text_delta',text:'late'}});
   await tick(); const messages=f.events.filter(x=>x.type==='message').map(x=>x.message); assert.ok(messages.filter(x=>!x.final).length>=3); assert.ok(messages.every(x=>x.messageId==='inner')); assert.deepEqual(messages.at(-1).blocks,[{type:'text',text:'abc\nxyz'}]); assert.equal(messages.at(-1).final,true); f.end();
 });
+
+for (const is_error of [false, true]) test(`Claude emits safe tool lifecycle, error=${is_error}`, async () => {
+  const f = fixture();
+  const created = await f.adapter.create('/tmp/project', null);
+  const ref = created.createdSession!.native;
+  try {
+    const input = await f.adapter.input(ref, 'new', [{ type: 'text', text: 'tools' }], f.guard);
+    const call = { type: 'tool_use', name: 'Bash', id: 'tool-a', input: { command: 'npm test --token=private-data' } };
+    const start = { type: 'stream_event', event: { type: 'content_block_start', content_block: call } };
+    f.push({ ...start, parent_agent_id: 'child' });
+    f.push(start);
+    f.push({ type: 'assistant', uuid: 'm', message: { content: [call] } });
+    f.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-a', is_error, content: 'private output' }] } });
+    f.push(start);
+    await tick();
+    const tools = f.events.filter(o => o.type === 'event' && o.event.type === 'tool.updated');
+    assert.deepEqual(tools.map(o => o.event.data), [
+      { turnId: input.nativeReference, callId: 'tool-a', phase: 'running', tool: 'Bash', summary: 'Bash · npm test' },
+      { turnId: input.nativeReference, callId: 'tool-a', phase: is_error ? 'failed' : 'succeeded', tool: 'Bash', summary: 'Bash · npm test' },
+    ]);
+    assert.ok(tools.every(o => o.connectionGeneration === created.connectionGeneration));
+    assert.equal(f.events.some(o => o.type === 'message' && o.message.role === 'assistant'), false);
+  } finally { f.end(); }
+});
