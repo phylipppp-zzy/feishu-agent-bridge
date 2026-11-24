@@ -362,6 +362,11 @@ test('extractAgyUserInput and readAgyTranscript resolve USER_INPUT, PLANNER_RESP
       ) + '{"step_index":99,"partial":true',
     );
 
+    const compactOnly = await readAgyTranscript(convId, { brainDir });
+    const partial = compactOnly.messages.find(message => message.role === 'assistant');
+    assert.equal(partial?.final, false);
+    assert.equal(partial?.text, fullAssistantReply.slice(0, 120));
+
     await writeFile(
       fullPath,
       jsonl(

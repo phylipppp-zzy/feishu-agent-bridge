@@ -23,6 +23,8 @@ import {
   buildSwarmUnsupportedCard,
   buildTaskTopicHelpCard,
 } from '../help-cards.js';
+import { replyText } from '../turn-progress-card.js';
+import { readTurnReply } from '../turn-reply.js';
 import { taskPanelCard } from './cards.js';
 import { getBindingRow, getTargetRow } from './schema.js';
 import {
@@ -572,6 +574,26 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         `${eventId}:artifacts`,
       );
       result = page;
+    } else if (a.action === 'full_reply') {
+      const message = await readTurnReply(deps.service, row.session_id, a.messageId);
+      if (!message) return finalize('rejected', { status: 'rejected', reason: 'reply_not_found' });
+      const text = replyText(message);
+      const digest = payloadDigest(text);
+      const deliveryId = `task-full-reply:${payloadDigest([row.task_id, row.root_generation, row.target_id, row.target_generation, row.session_id, message.messageId, digest])}`;
+      const guard = async () => {
+        const current = await verifyCapturedTarget();
+        if (!current.ok) throw contractError(current.status === 'expired' ? 'stale_revision' : 'unauthorized');
+      };
+      await guard();
+      const claimed = deps.db.prepare(
+        "INSERT OR IGNORE INTO task_deliveries_v1(delivery_id, task_id, target_id, state) VALUES (?, ?, ?, 'unknown')",
+      ).run(deliveryId, row.task_id, row.target_id).changes;
+      if (claimed) {
+        await deps.port.sendFile(e.destination, `完整正文-${digest.slice(0, 12)}.txt`, Buffer.from(text, 'utf8'), deliveryId, guard);
+        deps.db.prepare("UPDATE task_deliveries_v1 SET state = 'sent' WHERE delivery_id = ?").run(deliveryId);
+      }
+      const delivery = deps.db.prepare('SELECT state FROM task_deliveries_v1 WHERE delivery_id=?').get(deliveryId);
+      result = { deliveryId, status: delivery?.state };
     } else if (a.action === 'file') {
       const page = await deps.service.listArtifacts(row.session_id, { limit: 100 });
       const file = page.items.find(

@@ -278,13 +278,14 @@ rl.on('line', async (line) => {
       ? params.prompt.map((b) => (b && b.type === 'text' ? b.text : '')).join('\\n')
       : '';
 
-    const emitChunk = (chunkText) => writeMsg({
+    const emitChunk = (chunkText, messageId) => writeMsg({
       jsonrpc: '2.0',
       method: 'session/update',
       params: {
         sessionId: sid,
         update: {
           sessionUpdate: 'agent_message_chunk',
+          messageId,
           content: { type: 'text', text: chunkText },
         },
       },
@@ -302,6 +303,33 @@ rl.on('line', async (line) => {
       { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
       { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
     ];
+
+    if (text === 'multi-step') {
+      emitChunk('Opening', 'step-a');
+      emitTool('step-tool', 'completed', { sessionUpdate: 'tool_call', name: 'read_file' });
+      emitChunk('After tool', 'step-a');
+      emitChunk('Next item', 'step-b');
+      emitTool('final-tool', 'completed', { name: 'read_file' });
+      reply({ stopReason: 'end_turn', response: 'Post-tool result' });
+      return;
+    }
+    if (text === 'completion-prefix') {
+      emitChunk('Partial');
+      reply({ stopReason: 'end_turn', response: 'Partial now complete' });
+      return;
+    }
+    if (text === 'completion-suffix') {
+      await new Promise(resolve => allowMatchingExecution.set(sid, resolve));
+      emitTool('before-stream', 'completed', { name: 'read_file' });
+      emitChunk('Later paragraph');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+    if (text === 'completion-divergent') {
+      emitChunk('Live only\\n\\nShared');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
 
     if (text.startsWith('tool-progress:')) {
       const terminal = text.split(':')[1];
@@ -904,6 +932,99 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       (err: unknown) => typeof err === 'object' && err !== null && (err as { code?: string }).code === 'unsupported',
     );
 
+    const earlierParagraph = '    earlier code\n    with preserved indentation';
+    const suffixSteps = [
+      { step_index: 11, type: 'USER_INPUT', content: '<USER_REQUEST>completion-suffix</USER_REQUEST>' },
+      { step_index: 12, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'earlier <truncated 30 bytes>', truncated_fields: ['content'] },
+      { step_index: 13, type: 'RUN_COMMAND', status: 'DONE' },
+      { step_index: 14, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Later paragraph' },
+    ];
+    const fullSuffix = [{ step_index: 12, type: 'PLANNER_RESPONSE', content: earlierParagraph }];
+    const liveReplies = new Map<string, Message>();
+    for (const [prompt, expected] of [
+      ['multi-step', 'Opening\n\nAfter tool\n\nNext item\n\nPost-tool result'],
+      ['completion-prefix', 'Partial now complete'],
+      ['completion-suffix', 'Later paragraph'],
+      ['completion-divergent', 'Live only\n\nShared'],
+    ] as const) {
+      const start = observed.length;
+      const ack = await adapter.input(liveRef, 'new', [{ type: 'text', text: prompt }], makeGuard(gen1));
+      if (prompt === 'completion-suffix') {
+        await writeTranscript(brainDir, liveRef.nativeSessionId, suffixSteps.slice(0, 2), fullSuffix);
+        const running = await adapter.read(liveRef);
+        assert.equal(running.messages.some(message => message.turnId === 'step-12'), false);
+        await transport.request('test/release_matching_execution', { sessionId: liveRef.nativeSessionId });
+      }
+      await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      const assistant = observed.slice(start).find(o =>
+        o.type === 'message' && o.message.role === 'assistant' && o.message.final);
+      assert.ok(assistant?.type === 'message');
+      assert.equal(assistant.message.turnId, ack.nativeReference);
+      assert.deepEqual(assistant.message.blocks, [{ type: 'text', text: expected }]);
+      liveReplies.set(prompt, assistant.message);
+    }
+    const preSuffix = [
+      { step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>multi-step</USER_REQUEST>' },
+      ...['Opening', 'After tool', 'Next item', 'Post-tool result'].map((content, i) =>
+        ({ step_index: i + 1, type: 'PLANNER_RESPONSE', status: 'DONE', content })),
+      { step_index: 5, type: 'USER_INPUT', content: '<USER_REQUEST>completion-prefix</USER_REQUEST>' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Partial now complete on disk' },
+      { step_index: 7, type: 'USER_INPUT', content: '<USER_REQUEST>unmatched native prompt</USER_REQUEST>' },
+      { step_index: 8, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'unmatched native reply' },
+    ];
+    const divergentSteps = [
+      { step_index: 15, type: 'USER_INPUT', content: 'completion-divergent' },
+      { step_index: 16, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Shared' },
+      { step_index: 17, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Transcript only' },
+    ];
+    await writeTranscript(brainDir, liveRef.nativeSessionId, [...preSuffix, ...suffixSteps, ...divergentSteps], fullSuffix);
+    const flushed = await adapter.read(liveRef);
+    assert.equal(flushed.messages.length, 10);
+    assert.deepEqual(flushed.messages.filter(message => message.turnId.startsWith('step-')).map(message => message.turnId),
+      ['step-7', 'step-8']);
+    const ingested = flushed.messages.find(message => message.messageId === liveReplies.get('completion-prefix')!.messageId);
+    assert.equal(ingested?.turnId, liveReplies.get('completion-prefix')!.turnId);
+    assert.deepEqual(ingested?.blocks, [{ type: 'text', text: 'Partial now complete on disk' }]);
+    const suffixId = liveReplies.get('completion-suffix')!.messageId;
+    const fullReplyBlocks = [{ type: 'text', text: `${earlierParagraph}\n\nLater paragraph` }];
+    assert.deepEqual(flushed.messages.find(message => message.messageId === suffixId)?.blocks, fullReplyBlocks);
+    const divergentId = liveReplies.get('completion-divergent')!.messageId;
+    assert.deepEqual(flushed.messages.find(message => message.messageId === divergentId)?.blocks,
+      [{ type: 'text', text: 'Live only\n\nShared\n\nTranscript only' }]);
+
+    // Reopen native history with an empty live cache. An external CLI turn used the same prompt.
+    await writeTranscript(brainDir, liveRef.nativeSessionId, [...preSuffix,
+      { step_index: 9, type: 'USER_INPUT', content: 'completion-suffix' },
+      { step_index: 10, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'external CLI answer' },
+      ...suffixSteps, ...divergentSteps,
+    ], fullSuffix);
+    createSummariesDb(dbPath, [{ conversation_id: liveRef.nativeSessionId,
+      workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]) }]);
+    const restarted = new AgyAdapter(new AgyAcpTransport({ agyBin: binPath }),
+      new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [join(root, 'workspace')] }), 'host-1', 'agy-svc-1', quota);
+    try {
+      const replay = await restarted.read(liveRef);
+      const expected = store.getSession(session.sessionId);
+      const before = store.findMessage(session.sessionId, suffixId)!;
+      const divergentBefore = store.findMessage(session.sessionId, divergentId)!;
+      assert.deepEqual(before.blocks, [{ type: 'text', text: 'Later paragraph' }]);
+      assert.equal(store.applyHistoryRefresh(expected, gen1, replay), true);
+      const restored = store.snapshot(session.sessionId).value.messages;
+      assert.deepEqual(restored.filter(message => message.turnId.startsWith('step-')).map(message => message.turnId),
+        ['step-7', 'step-8', 'step-9', 'step-10']);
+      assert.deepEqual(store.findMessage(session.sessionId, suffixId),
+        { ...before, revision: before.revision + 1, blocks: fullReplyBlocks });
+      assert.deepEqual(store.findMessage(session.sessionId, divergentId), divergentBefore);
+      const context = { operationId: 'reattach-agy', idempotencyKey: 'reattach-agy', targetId: expected.sessionId,
+        expectedRevision: expected.revision, controlGeneration: expected.control.generation,
+        identity: { source: 'feishu', subject: 'ou_owner' } };
+      store.attachSession(context, expected, { mode: 'read_only' }, null, replay);
+      assert.equal(store.applyHistoryRefresh(expected, gen1, replay), true);
+      assert.deepEqual(store.snapshot(session.sessionId).value.messages, restored);
+    } finally {
+      await restarted.close();
+    }
+
     for (const flow of ['flow-auto', 'flow-auto-incremental', 'flow-auto-scoped-root', 'flow-auto-deny']) {
       const start = observed.length;
       await adapter.input(liveRef, 'new', [{ type: 'text', text: flow }], makeGuard(gen1));
@@ -1013,7 +1134,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const finals = observed.slice(turn1Idx).filter((o): o is Extract<PlatformObservation, { type: 'message' }> => o.type === 'message' && o.message.final && o.message.role === 'assistant');
     assert.ok(partials.length >= 1, 'expected partial streaming message');
     assert.equal(finals.length, 1);
-    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /Working\.\.\..*Allowed!/);
+    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /^Working\.\.\.\n\n Waiting for execution\.\n\n Allowed!$/);
     assert.equal(store.getOperation('allow-approval').status, 'completed');
     assert.equal(store.getInteraction(permAllowInt.interactionId).status, 'resolved');
     assert.equal(store.getOutbox('allow-approval').state, 'done');

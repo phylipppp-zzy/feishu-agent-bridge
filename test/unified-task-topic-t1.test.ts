@@ -9,6 +9,7 @@ import { UnifiedCore } from '../src/unified/service.js';
 import { FeishuChannel, type FeishuPort, type TrustedEnvelope } from '../src/unified/feishu-channel.js';
 import { FeishuSdkPort } from '../src/unified/feishu-sdk-port.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import { parseFeishuAction } from '../src/unified/feishu-codec.js';
 import type { PlatformPort, PlatformObservation } from '../src/unified/adapter.js';
 import type {
   Capabilities,
@@ -18,7 +19,7 @@ import type {
   Provider,
   Session,
 } from '../src/unified/contracts.js';
-import { TaskTopicChannel, TaskChannelError } from '../src/unified/task-topic-channel.js';
+import { TaskTopicChannel, TaskChannelError, type TaskChannelAction } from '../src/unified/task-topic-channel.js';
 import { TaskHandoffService } from '../src/unified/task-handoff.js';
 
 const ALL_CAPS = Object.fromEntries(
@@ -130,6 +131,7 @@ function makeFakeProviderPort(provider: Provider) {
 function makeFakeFeishuPort() {
   const sent: Array<{ destination: string; messageId: string; card: ChannelCard; deliveryId: string }> = [];
   const updated: Array<{ destination: string; messageId: string; card: ChannelCard; deliveryId: string }> = [];
+  const files: Array<{ destination: string; name: string; content: Uint8Array }> = [];
   let seq = 0;
 
   const port: FeishuPort = {
@@ -143,8 +145,9 @@ function makeFakeFeishuPort() {
       await guard?.();
       updated.push({ destination, messageId, card, deliveryId });
     },
-    sendFile: async (_d, _n, _c, _id, guard) => {
+    sendFile: async (destination, name, content, _id, guard) => {
       await guard?.();
+      files.push({ destination, name, content });
     },
     lookupDelivery: async (deliveryId) =>
       sent.some((x) => x.deliveryId === deliveryId) || updated.some((x) => x.deliveryId === deliveryId)
@@ -154,7 +157,7 @@ function makeFakeFeishuPort() {
       sent.find((x) => x.deliveryId === deliveryId)?.messageId ?? null,
   };
 
-  return { port, sent, updated };
+  return { port, sent, updated, files };
 }
 
 test('T1: mounts claude + codex + agy concurrently in co-located channel.sqlite with isolated same-turnId stream cards', async () => {
@@ -194,7 +197,7 @@ test('T1: mounts claude + codex + agy concurrently in co-located channel.sqlite 
     feishu.port,
     async (id) => allowAuth && id.subject === 'owner-1',
     channelDbPath,
-    { streamThrottleMs: 0 },
+    { streamThrottleMs: 60_000 },
   );
 
   try {
@@ -262,12 +265,6 @@ test('T1: mounts claude + codex + agy concurrently in co-located channel.sqlite 
       /already mounted/,
     );
 
-    // Baseline sync establishes 3 independent cursors
-    const initSync = await taskChannel.syncTask('task-multi');
-    assert.deepEqual(initSync.syncedTargets, ['t-claude', 't-codex', 't-agy']);
-    assert.equal(initSync.failedTargets.length, 0);
-
-    // All three providers stream outputs concurrently with the EXACT SAME turnId!
     const sharedTurnId = 'shared-turn-1';
     const makeMsg = (s: Session, text: string, rev: number, final: boolean): Message => ({
       messageId: `msg-${s.native.provider}-1`,
@@ -280,7 +277,15 @@ test('T1: mounts claude + codex + agy concurrently in co-located channel.sqlite 
       final,
       source: s.native.provider,
     });
+    const earlier = { ...makeMsg(sClaude, 'Claude pre-mount paragraph', 1, true), messageId: 'claude-earlier' };
+    await core.observe({ type: 'message', ref: sClaude.native, message: earlier });
 
+    // Baseline sync establishes 3 independent cursors
+    const initSync = await taskChannel.syncTask('task-multi');
+    assert.deepEqual(initSync.syncedTargets, ['t-claude', 't-codex', 't-agy']);
+    assert.equal(initSync.failedTargets.length, 0);
+
+    // All three providers stream outputs concurrently with the EXACT SAME turnId!
     await core.observe({ type: 'message', ref: sClaude.native, message: makeMsg(sClaude, 'Claude partial', 1, false) });
     await core.observe({ type: 'message', ref: sCodex.native, message: makeMsg(sCodex, 'Codex partial', 1, false) });
     await core.observe({ type: 'message', ref: sAgy.native, message: makeMsg(sAgy, 'Agy partial', 1, false) });
@@ -292,13 +297,34 @@ test('T1: mounts claude + codex + agy concurrently in co-located channel.sqlite 
     assert.match(feishu.sent[0]!.card.title, /^Claude/);
     assert.match(feishu.sent[1]!.card.title, /^Codex/);
     assert.match(feishu.sent[2]!.card.title, /^Antigravity/);
+    assert.doesNotMatch(feishu.sent[0]!.card.text, /pre-mount paragraph/);
 
     const cardByProvider = new Map(
       feishu.sent.map((x) => [x.card.title.split(' ')[0], x.messageId]),
     );
 
-    // Final messages + turn completions on the same shared turnId update their own card slots only
-    await core.observe({ type: 'message', ref: sClaude.native, message: makeMsg(sClaude, 'Claude final', 2, true) });
+    const lateStep = { ...makeMsg(sClaude, 'Claude post-mount step', 1, true), messageId: 'claude-late' };
+    await core.observe({ type: 'message', ref: sClaude.native, message: lateStep });
+    await taskChannel.syncTask('task-multi');
+    assert.equal(feishu.updated.length, 0);
+    const channelDb = new DatabaseSync(channelDbPath);
+    try {
+      const isKnown = () => channelDb.prepare('SELECT 1 FROM task_known_messages_v1 WHERE message_id = ?')
+        .get(lateStep.messageId);
+      assert.equal(isKnown(), undefined);
+      channelDb.prepare('UPDATE task_stream_cards_v1 SET updated_at = 0 WHERE target_id = ?').run('t-claude');
+      await taskChannel.syncTask('task-multi');
+      assert.match(feishu.updated.at(-1)!.card.text, /post-mount step/);
+      assert.doesNotMatch(feishu.updated.at(-1)!.card.text, /pre-mount paragraph/);
+      assert.ok(isKnown());
+    } finally {
+      channelDb.close();
+    }
+    feishu.updated.length = 0;
+
+    // Final messages update their own card slots only
+    const longReply = 'Claude final\n' + '正文'.repeat(5_000);
+    await core.observe({ type: 'message', ref: sClaude.native, message: makeMsg(sClaude, longReply, 2, true) });
     await core.observe({ type: 'message', ref: sCodex.native, message: makeMsg(sCodex, 'Codex final', 2, true) });
     await core.observe({ type: 'message', ref: sAgy.native, message: makeMsg(sAgy, 'Agy final', 2, true) });
 
@@ -312,6 +338,30 @@ test('T1: mounts claude + codex + agy concurrently in co-located channel.sqlite 
     assert.ok(updatedClaude && updatedClaude.card.text.includes('Claude final'));
     assert.ok(updatedCodex && updatedCodex.card.text.includes('Codex final'));
     assert.ok(updatedAgy && updatedAgy.card.text.includes('Agy final'));
+
+    const fullReplyButton = updatedClaude.card.actions.find(action => action.value.action === 'full_reply');
+    assert.ok(fullReplyButton);
+    const fullReply = parseFeishuAction<Extract<TaskChannelAction, { action: 'full_reply' }>>(fullReplyButton.value);
+    const destination = 'topic:task-multi';
+    await taskChannel.handle({ eventId: 'card:switch-before-export', destination, identity: OWNER }, {
+      action: 'switch_target', taskId: 'task-multi', targetId: 't-codex', rootGeneration: 1,
+      activeRevision: taskChannel.getBinding('task-multi')!.activeRevision,
+    });
+    assert.equal(taskChannel.getBinding('task-multi')!.activeTargetId, 't-codex');
+    assert.notEqual(taskChannel.getBinding('task-multi')!.activeRevision, fullReply.activeRevision);
+    await assert.rejects(
+      taskChannel.intake({ eventId: 'card:full-reply-wrong-session', destination, identity: OWNER }, {
+        ...fullReply, sessionId: sCodex.sessionId,
+      }),
+      (error: unknown) => error instanceof TaskChannelError && error.code === 'stale_revision',
+    );
+    await taskChannel.handle({ eventId: 'card:full-reply-after-switch', destination, identity: OWNER }, fullReply);
+    assert.equal(feishu.files.length, 1);
+    assert.equal(feishu.files[0]!.destination, destination);
+    assert.match(feishu.files[0]!.name, /\.txt$/);
+    const exported = Buffer.from(feishu.files[0]!.content).toString('utf8');
+    assert.ok(exported.includes(longReply));
+    assert.match(exported, /Claude pre-mount paragraph/);
 
     // Verify 3 separate cursor rows exist in task_cursors_v1
     for (const t of targets) {

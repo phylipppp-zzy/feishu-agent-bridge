@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { answerDigest, canTransitionOperation, payloadDigest, SCHEMA_VERSION, validateResolution, validateWriteContext, type Event, type EventSubscription, type Artifact, type Turn, type Interaction, type Message, type NativeResult, type Operation, type OperationStatus, type ResolveInteraction, type ResponseEvidence, type Session, type SessionSnapshot, type Snapshot, type WriteContext } from './contracts.js';
 import { contractError, type ContractError, type ErrorCode } from './errors.js';
+import { reconcilePersistedAgyHistory } from './agy/transcript-reconciliation.js';
 
 export class StoreError extends Error {
   constructor(readonly detail: ContractError) { super(detail.message ?? detail.code); }
@@ -166,6 +167,9 @@ export class UnifiedStore {
       this.eventFor(existing.sessionId,existing.sessionId,updated.revision,'session.updated',null,updated);
     }
     if (observed) {
+      if (existing?.native.provider === 'agy') {
+        observed = this.reconcileAgyHistoryInTransaction(observed, this.messageMap(mapped.sessionId));
+      }
       for (const native of observed.turns ?? []) this.putTurnInTransaction({...native,sessionId:mapped.sessionId});
       for (const native of observed.messages) { const value={...native,sessionId:mapped.sessionId}; const prior=this.row('SELECT session_id FROM messages WHERE id=?',value.messageId); if(prior && prior.session_id !== mapped.sessionId) return fail('idempotency_conflict','message id belongs to another session'); if(!prior) { this.run('INSERT INTO messages(id,session_id,value) VALUES(?,?,?)',value.messageId,mapped.sessionId,JSON.stringify(value)); this.eventFor(mapped.sessionId,value.messageId,value.revision,'message.updated',null,value); } }
       for (const native of observed.interactions) { const value={...native,sessionId:mapped.sessionId}; const prior=this.row('SELECT session_id FROM interactions WHERE id=?',value.interactionId); if(prior && prior.session_id !== mapped.sessionId) return fail('idempotency_conflict','interaction id belongs to another session'); if(!prior) { if(value.connectionGeneration !== this.connectionGeneration(mapped.sessionId)) return fail('interaction_expired'); this.run('INSERT INTO interactions(id,session_id,value) VALUES(?,?,?)',value.interactionId,mapped.sessionId,JSON.stringify(value)); if(native.status === 'awaiting_answer') this.run('INSERT INTO native_interactions(id,value) VALUES(?,?)',value.interactionId,JSON.stringify(native)); this.eventFor(mapped.sessionId,value.interactionId,value.revision,'interaction.created',null,value); } }
@@ -384,6 +388,22 @@ export class UnifiedStore {
     } else { if (expectedRevision !== null) return fail('stale_revision'); this.run('INSERT INTO messages(id,session_id,value) VALUES(?,?,?)', value.messageId, value.sessionId, JSON.stringify(value)); }
     this.eventFor(value.sessionId, value.messageId, value.revision, 'message.updated', null, value);
   }
+  private messageMap(sessionId: string): Map<string,Message> {
+    return new Map(this.db.prepare('SELECT value FROM messages WHERE session_id=? ORDER BY rowid').all(sessionId).map(row => {
+      const message = parse<Message>(row.value);
+      return [message.messageId,message];
+    }));
+  }
+  private reconcileAgyHistoryInTransaction<T extends Pick<SessionSnapshot, 'messages' | 'turns'>>(
+    observed: T, messages: Map<string, Message>,
+  ): T {
+    const { snapshot, updated } = reconcilePersistedAgyHistory(observed, messages);
+    for (const message of updated) {
+      this.putMessageInTransaction(message, message.revision - 1);
+      messages.set(message.messageId, message);
+    }
+    return snapshot;
+  }
   /** Commit the snapshot only while the read's native identity and control scope still hold. */
   applyHistoryRefresh(expected: Session, generation: number, observed: SessionSnapshot): boolean { return this.transaction(() => {
     const id = expected.sessionId, current = this.session(id);
@@ -402,11 +422,9 @@ export class UnifiedStore {
         this.eventFor(id,id,next.revision,'session.updated',null,next);
       }
     }
+    const messages = this.messageMap(id);
+    if (current.native.provider === 'agy') observed = this.reconcileAgyHistoryInTransaction(observed, messages);
     for (const native of observed.turns ?? []) this.putTurnInTransaction({...native,sessionId:id});
-    const messages = new Map(this.db.prepare('SELECT value FROM messages WHERE session_id=?').all(id).map(row => {
-      const message = parse<Message>(row.value);
-      return [message.messageId,message] as const;
-    }));
     let sequence = 0;
     for (const message of messages.values()) sequence = Math.max(sequence,message.sequence);
     for (const native of observed.messages) {

@@ -29,6 +29,11 @@ import {
   type PendingAgyRequest,
 } from './adapter-types.js';
 
+function appendParagraph(text: string, paragraph: string): string {
+  const separator = !text || text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
+  return text + separator + paragraph;
+}
+
 export function handlePromptCompleted(
   ctx: AdapterContext,
   id: string,
@@ -44,7 +49,17 @@ export function handlePromptCompleted(
   const stopReason = typeof res.stopReason === 'string' ? res.stopReason : 'end_turn';
 
   if (!turnState.assistantFinalized) {
-    if (turnState.assistantMessageId && turnState.assistantText) {
+    const response = typeof res.response === 'string' ? res.response : '';
+    const text = turnState.assistantText;
+    if (response.trim()) {
+      if (!text || response.startsWith(text)) turnState.assistantText = response;
+      else if (turnState.needsParagraphBreak && !text.trimEnd().endsWith(response.trim())) {
+        turnState.assistantText = appendParagraph(text, response);
+      }
+    }
+    if (turnState.assistantText) {
+      turnState.assistantMessageId ??= randomUUID();
+      turnState.assistantSequence ??= ctx.nextSequence();
       turnState.assistantFinalized = true;
       const finalMsg: Message = {
         messageId: turnState.assistantMessageId,
@@ -52,32 +67,7 @@ export function handlePromptCompleted(
         turnId: turnState.turnId,
         role: 'assistant',
         blocks: [{ type: 'text', text: turnState.assistantText }],
-        sequence: turnState.assistantSequence ?? ctx.nextSequence(),
-        revision: ++turnState.assistantRevision,
-        final: true,
-        source: 'agy',
-      };
-      ctx.upsertLiveMessage(id, finalMsg);
-      ctx.emit({
-        type: 'message',
-        ref,
-        message: finalMsg,
-        connectionGeneration: turnState.generation,
-      });
-    } else if (typeof res.response === 'string' && res.response.trim()) {
-      const messageId = turnState.assistantMessageId ?? randomUUID();
-      const seq = turnState.assistantSequence ?? ctx.nextSequence();
-      turnState.assistantMessageId = messageId;
-      turnState.assistantSequence = seq;
-      turnState.assistantText = res.response;
-      turnState.assistantFinalized = true;
-      const finalMsg: Message = {
-        messageId,
-        sessionId: id,
-        turnId: turnState.turnId,
-        role: 'assistant',
-        blocks: [{ type: 'text', text: res.response }],
-        sequence: seq,
+        sequence: turnState.assistantSequence,
         revision: ++turnState.assistantRevision,
         final: true,
         source: 'agy',
@@ -287,6 +277,7 @@ export function handleAcpNotification(
   if (!turnState || turnState.generation !== notification.generation) return;
 
   if (kind === 'tool_call' || kind === 'tool_call_update') {
+    if (turnState.assistantText) turnState.needsParagraphBreak = true;
     const toolCallId = isString(update.toolCallId) ? update.toolCallId : null;
     if (toolCallId) {
       const previous = turnState.toolCalls.get(toolCallId);
@@ -337,7 +328,12 @@ export function handleAcpNotification(
       turnState.assistantMessageId = isString(update.messageId) ? update.messageId : randomUUID();
       turnState.assistantSequence = ctx.nextSequence();
     }
-    turnState.assistantText += chunkText;
+    const chunkId = isString(update.messageId) ? update.messageId : null;
+    const newMessage = chunkId && turnState.lastChunkMessageId && chunkId !== turnState.lastChunkMessageId;
+    turnState.assistantText = turnState.needsParagraphBreak || newMessage
+      ? appendParagraph(turnState.assistantText, chunkText) : turnState.assistantText + chunkText;
+    turnState.needsParagraphBreak = false;
+    if (chunkId) turnState.lastChunkMessageId = chunkId;
     const msg: Message = {
       messageId: turnState.assistantMessageId,
       sessionId,

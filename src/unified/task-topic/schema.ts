@@ -93,6 +93,15 @@ export function ensureTaskTopicSchema(db: DatabaseSync): void {
       revision INTEGER NOT NULL,
       PRIMARY KEY(task_id, target_id, target_generation, session_id, message_id)
     );
+    CREATE TABLE IF NOT EXISTS task_baseline_messages_v1 (
+      task_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      target_generation INTEGER NOT NULL,
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      PRIMARY KEY(task_id, target_id, target_generation, session_id, message_id)
+    );
     CREATE TABLE IF NOT EXISTS task_interaction_cards_v1 (
       task_id TEXT NOT NULL,
       destination TEXT NOT NULL,

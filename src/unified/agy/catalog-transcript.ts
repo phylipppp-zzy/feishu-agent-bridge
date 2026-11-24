@@ -370,6 +370,7 @@ export async function readAgyTranscript(
       : [];
 
     let resolvedFromFull = false;
+    let contentResolvedFromFull = false;
     if (truncatedFields.length > 0 && !usedFullFallback) {
       const idx = await loadFullIndex();
       if (idx) {
@@ -389,6 +390,7 @@ export async function readAgyTranscript(
             ) {
               row[field] = candidate[field];
               resolvedFromFull = true;
+              if (field === 'content' && typeof candidate[field] === 'string') contentResolvedFromFull = true;
             }
           }
         }
@@ -401,6 +403,8 @@ export async function readAgyTranscript(
     const model = typeof row.model === 'string' && row.model ? row.model : null;
     // IMPORTANT: PLANNER_RESPONSE stores assistant text in `content`, NOT `text`.
     const content = typeof row.content === 'string' ? row.content : '';
+    const contentIncomplete = truncatedFields.includes('content') && !contentResolvedFromFull;
+    const messageContent = contentIncomplete ? content.replace(/\s*<truncated \d+ bytes>\s*$/u, '') : content;
     const thinking = typeof row.thinking === 'string' && row.thinking ? row.thinking : null;
     const error = typeof row.error === 'string' && row.error ? row.error : null;
     const errorCode =
@@ -439,13 +443,13 @@ export async function readAgyTranscript(
     let msgText = '';
     if (stepType === 'USER_INPUT') {
       msgRole = 'user';
-      msgText = extractAgyUserInput(content);
+      msgText = extractAgyUserInput(messageContent);
     } else if (stepType === 'PLANNER_RESPONSE') {
       msgRole = 'assistant';
-      msgText = content.trim();
+      msgText = messageContent;
     }
 
-    if (msgRole && msgText) {
+    if (msgRole && msgText.trim()) {
       const messageId = stableAgyMessageId(conversationId, stepIndex, lineNumber, msgRole);
       const message: AgyTranscriptMessage = {
         messageId,
@@ -460,7 +464,7 @@ export async function readAgyTranscript(
         usage,
         status,
         source,
-        final: status === '' || TERMINAL_STEP_STATUSES.has(status),
+        final: !contentIncomplete && (status === '' || TERMINAL_STEP_STATUSES.has(status)),
         resolvedFromFull,
       };
       const existingIdx = messageIndexById.get(messageId);

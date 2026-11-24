@@ -1,3 +1,4 @@
+import { completionText } from '../src/unified/turn-progress-card.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync} from 'node:fs';
@@ -173,4 +174,10 @@ test('a snapshot-first completion can be followed by a same-generation live comp
     assert.equal(x.pushes.length, 1);
     assert.match(x.pushes[0]!.id, /^turn-push:/);
   } finally { x.close(); }
+});
+
+test('completion summary marks an abbreviated first line', () => {
+  const text = '结'.repeat(79) + ' 尾句';
+  const message = { blocks: [{ type: 'text', text }] } as Parameters<typeof completionText>[1];
+  assert.equal(completionText(120_000, message, 0), `✅ 本轮已完成（用时 2分00秒）· ${'结'.repeat(79)}…`);
 });

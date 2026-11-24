@@ -1,3 +1,6 @@
+import { DatabaseSync } from "node:sqlite";
+import { FeishuApiRejected } from "../src/unified/feishu-sdk-port.js";
+import type { ChannelCard } from "../src/unified/feishu-cards.js";
 import {test} from 'node:test'; import assert from 'node:assert/strict'; import {mkdtempSync,rmSync} from 'node:fs'; import {tmpdir} from 'node:os'; import {join} from 'node:path'; import {FeishuChannel} from '../src/unified/feishu-channel.js';
 test('one turn with several message items updates one card and final converges',async t=>{
  t.mock.timers.enable({apis:['Date','setTimeout'],now:Date.now()});
@@ -7,7 +10,7 @@ test('one turn with several message items updates one card and final converges',
  const port:any={async send(_d:any,c:any){sends.push(c);return `card-${sends.length}`},async update(_d:any,id:any,c:any){updates.push({id,c})},async sendFile(){}};
  const channel=new FeishuChannel(service,port,async()=>true,join(dir,'db')); const env={eventId:'bind',destination:'d',identity:{source:'feishu',subject:'owner'}};
  const add=(id:string,text:string,final:boolean)=>{messages.push({messageId:id,sessionId:'s',turnId:'turn',role:'assistant',blocks:[{type:'text',text}],sequence:messages.length+1,revision:1,final,source:'codex'});events.push({type:'message.updated',objectId:id,eventId:id,data:{}})};
- try {await channel.handle(env,{action:'bind',sessionId:'s'});await channel.sync('d');sends.length=0;add('one','first',false);await channel.sync('d');cursor=events.length;add('two','middle',true);add('three','final',true);await channel.sync('d');assert.equal(sends.length,1);assert.equal(updates.length,0);t.mock.timers.tick(1500);await channel.sync('d');assert.equal(updates.length,1);assert.equal(updates[0].c.text,'final');assert.equal(updates[0].id,'card-1');}finally{channel.close();rmSync(dir,{recursive:true,force:true})}
+ try {await channel.handle(env,{action:'bind',sessionId:'s'});await channel.sync('d');sends.length=0;add('one','first',false);await channel.sync('d');cursor=events.length;add('two','middle',true);add('three','final',true);await channel.sync('d');assert.equal(sends.length,1);assert.equal(updates.length,0);t.mock.timers.tick(1500);await channel.sync('d');assert.equal(updates.length,1);assert.equal(updates[0].c.text,'first\n\nmiddle\n\nfinal');assert.equal(updates[0].id,'card-1');}finally{channel.close();rmSync(dir,{recursive:true,force:true})}
 });
 
 test('twenty partials coalesce, restart reuses card, final applies after the trailing interval',async t=>{
@@ -190,4 +193,127 @@ test('runtime heartbeat stops when session status or input control becomes unava
       assert.equal(wake.length, count + 1, 'a connected running snapshot restores the heartbeat');
     }
   } finally { channel.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const { code, exhaust = false, rejectReplacement = false } of [
+  { code: 230429 }, { code: 230099 }, { code: 230031 }, { code: 230031, rejectReplacement: true },
+  { code: 230429, exhaust: true, rejectReplacement: true },
+]) test(`final card rejection ${code} settles (exhaust=${exhaust}, replacement rejects=${rejectReplacement})`, async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const dir = mkdtempSync(join(tmpdir(), 'turn-final-rejected-'));
+  const path = join(dir, 'db');
+  const start = Date.now();
+  const session = { sessionId: 's', native: { provider: 'claude' }, title: 'test', project: dir, status: 'running',
+    revision: 0, control: { input: 'unavailable', generation: 0 } };
+  let messages: any[] = [], events: any[] = [];
+  let completed = false;
+  const final = '核心结论\n' + '内容。'.repeat(code === 230099 ? 3000 : 1300) + '\n最终段落';
+  const writes: Array<{ id: string; card: ChannelCard }> = [];
+  const replacements: Array<{ id: string; card: ChannelCard }> = [];
+  const pushes: string[] = [], wake: string[] = [];
+  const service: any = {
+    getSession: async () => session,
+    getSnapshot: async () => ({ cursor: 'c', value: { session, messages, interactions: [],
+      turnProgress: { tools: [], timing: [{ turnId: 't', startedMs: start, endedMs: completed ? start + 120_000 : null,
+        liveStartSequence: 10, liveEndSequence: completed ? 11 : null }] } } }),
+    subscribeEvents: async () => ({ status: 'events', cursor: 'c', events }),
+  };
+  const port = {
+    async send(_destination: string, card: ChannelCard, delivery: string) {
+      if (!delivery.endsWith(':replace')) return 'stream-card';
+      replacements.push({ id: delivery, card });
+      if (rejectReplacement) throw new FeishuApiRejected(230031);
+      return 'replacement-card';
+    },
+    async update(_destination: string, id: string, card: ChannelCard, delivery: string) {
+      assert.equal(id, 'stream-card');
+      writes.push({ id: delivery, card });
+      if (exhaust || writes.length === 1) throw new FeishuApiRejected(code);
+    },
+    async sendText(_destination: string, text: string) {
+      assert.equal(writes.length, exhaust ? 7 : code === 230031 ? 1 : 2);
+      pushes.push(text);
+    },
+    async lookupDelivery() { return 'unknown' as const; },
+    async sendFile() {},
+  };
+  const open = () => new FeishuChannel(service, port, async () => true, path, undefined, false,
+    { onProgressWake: destination => wake.push(destination) });
+  let channel = open();
+  const db = new DatabaseSync(path);
+  try {
+    await channel.handle({ eventId: 'bind', destination: 'd', identity: { source: 'feishu', subject: 'owner' } },
+      { action: 'bind', sessionId: 's' });
+    await channel.sync('d');
+    messages = [{ messageId: 'm', sessionId: 's', sequence: 1, revision: 1, role: 'assistant', turnId: 't',
+      final: false, blocks: [{ type: 'text', text: 'stream' }] }];
+    events = [{ type: 'message.updated', objectId: 'm' }];
+    await channel.sync('d');
+    t.mock.timers.tick(120_000);
+    completed = true;
+    messages = [{ ...messages[0], revision: 2, final: true, blocks: [{ type: 'text', text: final }] }];
+    events = [{ type: 'turn.updated', objectId: 't', data: { status: 'completed' } }];
+    await channel.sync('d');
+    assert.match(writes[0]!.id, /^turn-final:/);
+    if (code === 230429) {
+      assert.equal(writes.length, 1);
+      assert.deepEqual(pushes, []);
+      assert.deepEqual({ ...db.prepare('SELECT status, dirty FROM channel_turn_card_views').get() }, { status: 'running', dirty: 1 });
+      assert.equal(db.prepare('SELECT revision FROM channel_stream_cards').get()?.revision, 1);
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM channel_turn_pending_finalization').get()?.n, 1);
+      assert.deepEqual(channel.pendingDeliveries(), []);
+      events = [];
+      channel.close();
+      channel = open();
+      await channel.sync('d');
+      t.mock.timers.tick(2999);
+      assert.deepEqual(wake, []);
+      t.mock.timers.tick(1);
+      assert.deepEqual(wake, ['d']);
+      await channel.sync('d');
+      assert.equal(writes[1]!.id, writes[0]!.id);
+      assert.equal(writes[1]!.card.text, final);
+      if (exhaust) {
+        for (const delay of [6000, 12_000, 24_000, 30_000, 30_000]) {
+          const count: number = writes.length;
+          t.mock.timers.tick(delay - 1);
+          await channel.sync('d');
+          assert.equal(writes.length, count);
+          t.mock.timers.tick(1);
+          await channel.sync('d');
+          assert.equal(writes.length, count + 1);
+        }
+        assert.ok(writes.every(write => write.id === writes[0]!.id));
+      }
+    } else if (code === 230099) {
+      assert.equal(writes[1]!.id, writes[0]!.id + ':plain');
+      assert.equal(writes[1]!.card.format, 'plain');
+      assert.equal(writes[1]!.card.text, writes[0]!.card.text);
+      assert.deepEqual(writes[1]!.card.actions, writes[0]!.card.actions);
+      assert.equal(writes[1]!.card.actions[0]?.value.action, 'full_reply');
+    }
+    if (code === 230031 || exhaust) {
+      assert.equal(replacements.length, 1);
+      assert.equal(replacements[0]!.id, writes[0]!.id + ':replace');
+      assert.equal(replacements[0]!.card.format, 'plain');
+      assert.equal(replacements[0]!.card.text, final);
+      assert.equal(db.prepare('SELECT platform_code FROM channel_delivery_diagnostics WHERE delivery_id=?')
+        .get(writes[0]!.id)?.platform_code, code);
+    }
+    assert.equal(db.prepare('SELECT dirty FROM channel_turn_card_views').get()?.dirty, 0);
+    assert.deepEqual({ ...db.prepare('SELECT card_id, revision FROM channel_stream_cards').get() }, {
+      card_id: code === 230031 && !rejectReplacement ? 'replacement-card' : 'stream-card',
+      revision: rejectReplacement ? 1 : 2,
+    });
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM channel_turn_card_attempts').get()?.n, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM channel_turn_pending_finalization').get()?.n, 0);
+    assert.deepEqual(channel.pendingDeliveries(), []);
+    assert.equal(pushes.length, 1);
+    const wakeCount = wake.length;
+    t.mock.timers.tick(120_000);
+    assert.equal(wake.length, wakeCount);
+    await channel.sync('d');
+    assert.equal(replacements.length, code === 230031 || exhaust ? 1 : 0);
+    assert.equal(pushes.length, 1);
+  } finally { db.close(); channel.close(); rmSync(dir, { recursive: true, force: true }); }
 });

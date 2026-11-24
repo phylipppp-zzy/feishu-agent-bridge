@@ -12,6 +12,7 @@ import { buildSessionPanel, noticePanel } from './feishu-session-panel.js';
 import { NewSessionDrafts } from './new-session-drafts.js';
 import { NewSessionFlow, type NewSessionAction } from './new-session-flow.js';
 import { operationCard, type ChannelCard } from './feishu-cards.js';
+import { readTurnReply } from './turn-reply.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 import { FeishuInteractionCards } from './feishu-interaction-cards.js';
 import { FeishuInbox } from './feishu-inbox.js';
@@ -257,7 +258,7 @@ export class FeishuChannel {
     const row = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(deliveryId) as {state:string} | undefined;
     if (!row) throw new Error('unknown delivery');
     if (row.state === 'sent') return 'sent';
-    if (row.state === 'expired') return 'not_sent';
+    if (row.state === 'expired' || row.state === 'rejected') return 'not_sent';
     const state = await this.port.lookupDelivery?.(deliveryId) ?? 'unknown';
     if (state === 'sent') this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
     return state;
@@ -321,7 +322,7 @@ export class FeishuChannel {
   async baselineReadonlyHistory(destination:string,sessionId:string,prepared?:{cursor:string;messages:Array<{messageId:string;revision:number}>}):Promise<void> {
     const scope=this.bindingScope(destination); await this.checkBinding(destination,sessionId,scope); if(this.accessMode(destination)!=='read_only') throw new Error('binding changed'); if(this.readonlyHydrated(destination,sessionId)) return;
     const snapshot=prepared ?? await this.service.getSnapshot(sessionId).then(s=>({cursor:s.cursor,messages:s.value.messages})); await this.checkBinding(destination,sessionId,scope); if(!snapshot || this.accessMode(destination)!=='read_only') throw new Error('binding changed');
-    this.db.exec('BEGIN IMMEDIATE'); try {if(scope!==this.bindingScope(destination)) throw new Error('binding changed'); const put=this.db.prepare('INSERT INTO channel_known_messages(destination,session_id,message_id,revision) VALUES (?,?,?,?) ON CONFLICT(destination,session_id,message_id) DO UPDATE SET revision=MAX(revision,excluded.revision)'); for(const m of snapshot.messages) put.run(destination,sessionId,m.messageId,m.revision); this.turnCards.baseline([destination,sessionId,scope],snapshot.cursor); this.db.prepare('INSERT INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?) ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,cursor=excluded.cursor,binding_scope=excluded.binding_scope WHERE channel_cursors.session_id<>excluded.session_id OR channel_cursors.binding_scope<>excluded.binding_scope').run(destination,sessionId,snapshot.cursor,scope); this.db.prepare('INSERT OR IGNORE INTO channel_history_baselines VALUES (?,?,?)').run(destination,sessionId,scope);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
+    this.db.exec('BEGIN IMMEDIATE'); try {if(scope!==this.bindingScope(destination)) throw new Error('binding changed'); const put=this.db.prepare('INSERT INTO channel_known_messages(destination,session_id,message_id,revision) VALUES (?,?,?,?) ON CONFLICT(destination,session_id,message_id) DO UPDATE SET revision=MAX(revision,excluded.revision)'); for(const m of snapshot.messages) put.run(destination,sessionId,m.messageId,m.revision); this.turnCards.baseline([destination,sessionId,scope],snapshot.cursor,snapshot.messages); this.db.prepare('INSERT INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?) ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,cursor=excluded.cursor,binding_scope=excluded.binding_scope WHERE channel_cursors.session_id<>excluded.session_id OR channel_cursors.binding_scope<>excluded.binding_scope').run(destination,sessionId,snapshot.cursor,scope); this.db.prepare('INSERT OR IGNORE INTO channel_history_baselines VALUES (?,?,?)').run(destination,sessionId,scope);this.db.exec('COMMIT');} catch(error) {this.db.exec('ROLLBACK');throw error;}
   }
   private binding(destination: string): string | null { return (this.db.prepare('SELECT session_id FROM channel_bindings WHERE destination=?').get(destination) as {session_id: string} | undefined)?.session_id ?? null; }
   private isCurrentOwnedScope(scope:{destination:string;bindingScope:string;ownerSource:string;ownerSubject:string},sessionId:string):boolean {const owner=this.db.prepare('SELECT owner_source,owner_subject FROM channel_bindings WHERE destination=?').get(scope.destination) as {owner_source:string;owner_subject:string}|undefined;return owner?.owner_source===scope.ownerSource && owner.owner_subject===scope.ownerSubject && this.binding(scope.destination)===sessionId && this.bindingScope(scope.destination)===scope.bindingScope;}
@@ -622,9 +623,8 @@ export class FeishuChannel {
       return { items: pageItems, nextCursor };
     }
     if (a.action === 'full_reply') {
-      const message = this.service.getMessage ? await this.service.getMessage(bound, a.messageId)
-        : (await this.service.getSnapshot(bound)).value.messages.find(m => m.messageId === a.messageId);
-      if (message?.sessionId !== bound || message.role !== 'assistant') throw new FileCommandError('此会话中没有该回复。');
+      const message = await readTurnReply(this.service, bound, a.messageId);
+      if (!message) throw new FileCommandError('此会话中没有该回复。');
       return this.turnCards.sendFullReply([e.destination,bound,executionScope], message, guard, reply, () => { effects.started = true; });
     }
     if (a.action === 'file') {

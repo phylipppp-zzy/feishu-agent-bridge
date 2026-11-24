@@ -150,7 +150,7 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     case 'bind': if (str(value.sessionId) && (value.mode === undefined || value.mode === 'read_only' || value.mode === 'interactive')) return {action:'bind',sessionId:value.sessionId,...(value.mode ? {mode:value.mode} : {})}; break;
     case 'create': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.project) && (value.model === null || str(value.model))) return {action:'create',provider:value.provider,project:value.project,model:value.model}; break;
     case 'artifacts': if ((value.sessionId === undefined || str(value.sessionId)) && (value.cursor === undefined || str(value.cursor))) return {action:'artifacts',...(str(value.sessionId) ? {sessionId:value.sessionId} : {}),...(str(value.cursor) ? {cursor:value.cursor} : {})}; break;
-    case 'full_reply': if (str(value.messageId) && value.messageId.length <= 512) return {action:'full_reply',messageId:value.messageId}; break;
+    case 'full_reply': if (str(value.messageId) && value.messageId.length <= 512) { const taskScope = parseTaskScope(value, true); return {action:'full_reply',messageId:value.messageId,...(taskScope ?? {})}; } break;
     case 'file': if (str(value.artifactId) && str(value.contentVersion)) { const taskScope = parseTaskScope(value, false); return {action:'file',artifactId:value.artifactId,contentVersion:value.contentVersion,...(taskScope ?? {})}; } break;
     case 'reconcile': case 'finish': if (str(value.operationId)) return {action:value.action,operationId:value.operationId}; break;
     case 'switch_target': {

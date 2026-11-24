@@ -19,6 +19,7 @@ import {
   readCaps,
   type AdapterContext,
 } from './adapter-types.js';
+import { agyPromptText, reconcileAgyReply } from './transcript-reconciliation.js';
 
 async function mergeAllSessions(ctx: AdapterContext): Promise<Array<Session & { subagentCount?: number }>> {
   const catalogSessions = await ctx.catalog.refreshAsync();
@@ -434,6 +435,58 @@ export async function readAutoActivityForSession(
   };
 }
 
+function visibleTranscript(
+  ctx: AdapterContext,
+  id: string,
+  transcript: readonly Message[],
+  live: readonly Message[],
+): Message[] {
+  const baseline = ctx.preLiveTranscriptIds.get(id);
+  const liveIds = new Set(live.map(message => message.messageId));
+  const prompts = live.filter(message => message.role === 'user');
+  const assistants = new Map(live.filter(message => message.role === 'assistant').map(message => [message.turnId, message]));
+  const visible: Message[] = [];
+  let nextPrompt = 0;
+  let counterpart: Message | undefined;
+  let pendingCounterpart = false;
+  let nativeReply: Message[] = [];
+
+  const settleReply = () => {
+    if (counterpart) {
+      const reply = reconcileAgyReply(counterpart, nativeReply, true);
+      if (reply !== counterpart) ctx.upsertLiveMessage(id, reply);
+    }
+    nativeReply = [];
+    counterpart = undefined;
+    pendingCounterpart = false;
+  };
+
+  for (const message of transcript) {
+    if (message.role === 'user' || baseline?.has(message.messageId)) settleReply();
+    if (baseline && !baseline.has(message.messageId)) {
+      if (message.role === 'user') {
+        const text = agyPromptText(message);
+        // Match only rows written after the baseline. Keep unmatched native turns visible.
+        const index = prompts.findIndex((prompt, i) => i >= nextPrompt &&
+          (agyPromptText(prompt) === text || !message.final && agyPromptText(prompt).startsWith(text)));
+        if (index >= 0) {
+          nextPrompt = index + 1;
+          const turnId = prompts[index]!.turnId;
+          counterpart = assistants.get(turnId);
+          pendingCounterpart = ctx.activeTurns.get(id)?.turnId === turnId;
+          continue;
+        }
+      } else if (message.role === 'assistant' && (counterpart || pendingCounterpart)) {
+        nativeReply.push(message);
+        continue;
+      }
+    }
+    if (!liveIds.has(message.messageId)) visible.push(message);
+  }
+  settleReply();
+  return visible;
+}
+
 export async function readSessionSnapshot(
   ctx: AdapterContext,
   ref: NativeSessionRef,
@@ -459,8 +512,7 @@ export async function readSessionSnapshot(
   }
 
   const live = ctx.liveMessages.get(id) ?? [];
-  const liveIds = new Set(live.map(m => m.messageId));
-  const historyVisible = transcriptMessages.filter(m => !liveIds.has(m.messageId));
+  const historyVisible = visibleTranscript(ctx, id, transcriptMessages, live);
   const baseSeq = historyVisible.length;
   const mergedLive = live.map((m, idx) => ({
     ...m,

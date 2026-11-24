@@ -85,10 +85,14 @@ export function resolveTargetForIntake(
   if (a.rootGeneration !== undefined && a.rootGeneration !== binding.root_generation) {
     throw new TaskChannelError('stale_revision', 'card rootGeneration mismatch');
   }
-  if (isCard && (a.taskId === undefined || a.rootGeneration === undefined || a.activeRevision === undefined)) {
+  if (a.action === 'full_reply') {
+    if (a.taskId === undefined || a.rootGeneration === undefined || !nonempty(a.targetId) ||
+      a.targetGeneration === undefined || !nonempty(a.sessionId)) {
+      throw new TaskChannelError('stale_revision', 'full reply missing explicit task target scope');
+    }
+  } else if (isCard && (a.taskId === undefined || a.rootGeneration === undefined || a.activeRevision === undefined)) {
     throw new TaskChannelError('stale_active_revision', 'card action missing task scope or activeRevision');
-  }
-  if (a.activeRevision !== undefined && a.activeRevision !== binding.active_revision) {
+  } else if (a.activeRevision !== undefined && a.activeRevision !== binding.active_revision) {
     throw new TaskChannelError('stale_active_revision', 'stale active_revision card rejected');
   }
 
@@ -247,7 +251,7 @@ export async function intakeTaskEvent(
       target.target_id !== preTarget.target_id ||
       target.target_generation !== preTarget.target_generation ||
       target.session_id !== preTarget.session_id ||
-      binding.active_revision !== preBinding.active_revision
+      (a.action !== 'full_reply' && binding.active_revision !== preBinding.active_revision)
     ) {
       throw new TaskChannelError('stale_active_revision', 'task target changed during intake');
     }

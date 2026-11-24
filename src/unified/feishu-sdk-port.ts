@@ -15,13 +15,60 @@ import {attachmentDisplayName,decodeTextAttachment,MAX_TEXT_ATTACHMENT_BYTES} fr
 import type { Readable } from 'node:stream';
 
 class ResourceRejected extends Error {}
-class FeishuApiRejected extends Error { readonly deliveryKind='api_rejected'; constructor(readonly platformCode:number) {super('Feishu API rejected request');} }
-function rejectCode(code:unknown):void {if(typeof code==='number' && Number.isSafeInteger(code) && code!==0) throw new FeishuApiRejected(code);}
+export class FeishuApiRejected extends Error {
+  readonly deliveryKind = 'api_rejected';
+  constructor(readonly platformCode: number) { super('Feishu API rejected request'); }
+}
+
+type FeishuErrorBody = { code?: unknown; msg?: unknown };
+
+function platformErrorCode(value: unknown): number | null {
+  const code = typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : value;
+  return typeof code === 'number' && Number.isSafeInteger(code) && code !== 0 ? code : null;
+}
+
+function readFeishuError(error: unknown): { code: number; msg: unknown } | undefined {
+  // The SDK can throw an Axios error, a Feishu response body or both in an array.
+  for (const entry of Array.isArray(error) ? error : [error]) {
+    if (!entry || typeof entry !== 'object') continue;
+    const failure = entry instanceof FeishuApiRejected ? { code: entry.platformCode } :
+      entry as FeishuErrorBody & { response?: { data?: FeishuErrorBody } };
+    for (const body of [failure.response?.data, failure]) {
+      const { code, msg } = body ?? {};
+      const numeric = platformErrorCode(code);
+      if (numeric !== null) return { code: numeric, msg };
+    }
+  }
+  return undefined;
+}
+
+export function extractFeishuErrorCode(error: unknown): number | null {
+  return readFeishuError(error)?.code ?? null;
+}
+
+function normalizeFeishuRejection(error: unknown): unknown {
+  const code = extractFeishuErrorCode(error);
+  return code === null || error instanceof FeishuApiRejected ? error : new FeishuApiRejected(code);
+}
+
+function rejectCode(code: unknown): void {
+  const rejection = platformErrorCode(code);
+  if (rejection !== null) throw new FeishuApiRejected(rejection);
+}
+
+async function feishuMessageWrite<T extends FeishuErrorBody>(write: () => Promise<T>): Promise<T> {
+  try {
+    const response = await write();
+    rejectCode(response?.code);
+    return response;
+  } catch (error) {
+    throw normalizeFeishuRejection(error);
+  }
+}
+
 function requiresCardSchemaV2(value: unknown): boolean {
-  const failure = value as { code?: unknown; msg?: unknown; response?: { data?: { code?: unknown; msg?: unknown } } } | null;
-  const { code, msg } = failure?.response?.data ?? failure ?? {};
-  return code === 200830 || code === '200830' ||
-    ((code === 230099 || code === '230099') && typeof msg === 'string' && /\bErrCode:\s*200830\b/.test(msg));
+  const { code, msg } = readFeishuError(value) ?? {};
+  return code === 200830 || (code === 230099 && typeof msg === 'string' && /\bErrCode:\s*200830\b/.test(msg));
 }
 class UnknownTopic extends Error {}
 class TaskPendingRoute extends Error {}
@@ -191,8 +238,10 @@ export class FeishuSdkPort implements FeishuPort {
         await guard?.();
         validate(destination);
         const schema = cardSchema(card);
-        const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(encodeCard(card,schema)),reply_in_thread:true}});
-        rejectCode(response.code);
+        const response = await feishuMessageWrite(() => this.client.im.message.reply({
+          path: { message_id: token.rootId },
+          data: { msg_type: 'interactive', content: JSON.stringify(encodeCard(card, schema)), reply_in_thread: true },
+        }));
         if(!response.data?.message_id)throw new Error('test delivery outcome unknown');
         this.remember(deliveryId,response.data.message_id,destination,schema);
         return response.data.message_id;
@@ -335,8 +384,10 @@ export class FeishuSdkPort implements FeishuPort {
   }
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
     await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const schema=cardSchema(card); const content=JSON.stringify(encodeCard(card,schema));
-    const response=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}});
-    rejectCode(response.code); if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
+    const response = await feishuMessageWrite(() => route
+      ? this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}})
+      : this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}}));
+    if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
     this.remember(deliveryId,response.data.message_id,destination,schema); return response.data.message_id;
   }
   async sendText(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string> {
@@ -350,11 +401,10 @@ export class FeishuSdkPort implements FeishuPort {
     this.allowedTaskOrProduction(destination);
     if (this.route(destination)?.root_id !== route.root_id) throw new Error('topic route changed');
     const uuid = createHash('sha256').update(deliveryId).digest('hex').slice(0, 40);
-    const response = await this.client.im.message.reply({
+    const response = await feishuMessageWrite(() => this.client.im.message.reply({
       path: { message_id: route.root_id },
       data: { msg_type: 'text', reply_in_thread: true, content: JSON.stringify({ text }), uuid },
-    });
-    rejectCode(response.code);
+    }));
     if (!response.data?.message_id) throw new Error('Feishu text reply outcome unknown');
     this.remember(deliveryId, response.data.message_id, destination);
     return response.data.message_id;
@@ -380,18 +430,19 @@ export class FeishuSdkPort implements FeishuPort {
       path: { message_id: messageId },
       data: { content: JSON.stringify(encodeCard(card,version)) },
     });
-    const canRetry = !row && schema === '1.0' && legacyRootGuard !== undefined;
-    const response = await patch(schema).catch(error => {
-      if (!canRetry || !requiresCardSchemaV2(error)) throw error;
-      return null;
-    });
-    if (canRetry && (response === null || requiresCardSchemaV2(response))) {
-      await legacyRootGuard();
-      rejectCode((await patch('2.0')).code);
-      return '2.0';
+    const retryGuard = !row && schema === '1.0' ? legacyRootGuard : undefined;
+    try {
+      const response = await patch(schema);
+      if (!retryGuard || !requiresCardSchemaV2(response)) {
+        rejectCode(response?.code);
+        return schema;
+      }
+    } catch (error) {
+      if (!retryGuard || !requiresCardSchemaV2(error)) throw normalizeFeishuRejection(error);
     }
-    rejectCode(response?.code);
-    return schema;
+    await retryGuard();
+    await feishuMessageWrite(() => patch('2.0'));
+    return '2.0';
   }
   async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     this.allowedTaskOrProduction(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});

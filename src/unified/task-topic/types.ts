@@ -155,6 +155,13 @@ export type TaskChannelAction = (
       sessionId?: string;
     }
   | {
+      action: 'full_reply';
+      targetId?: string;
+      targetGeneration?: number;
+      sessionId?: string;
+      messageId: string;
+    }
+  | {
       action: 'file';
       targetId?: string;
       targetGeneration?: number;

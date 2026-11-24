@@ -719,7 +719,7 @@ export class TaskTopicChannel {
     scope: string,
     message: Message,
     turnCompleted = false,
-  ): Promise<void> {
+  ): Promise<boolean> {
     return renderTaskStreamMessage(this.syncDeps(), binding, target, scope, message, turnCompleted);
   }
 

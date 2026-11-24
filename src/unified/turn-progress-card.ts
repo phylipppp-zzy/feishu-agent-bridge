@@ -4,7 +4,8 @@ import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import type { ToolProgress } from './tool-progress.js';
 import type { TurnToolCounts } from './turn-progress-store.js';
 
-const PREVIEW_LENGTH = 3000;
+import { formatCardReplyBody } from './turn-reply.js';
+
 const LOG_SIZE = 15;
 
 export function replyText(message: Message): string {
@@ -22,7 +23,8 @@ export function completionText(duration: number, message: Message | undefined, c
     .replace(/<[^>\r\n]*>/g, '')
     .split(/\r\n|[\r\n\u0085\u2028\u2029]/u).map(line => line.replace(/^\s*(?:(?:#{1,6}|>|[-*+]|\d+[.)])\s+)+/, '').replace(/[`*_~]/g, '').trim())
     .find(Boolean);
-  const summary = firstLine ? [...firstLine].slice(0, 80).join('') : `完成 ${count} 项工具操作`;
+  const chars = [...(firstLine ?? '')];
+  const summary = chars.length > 80 ? `${chars.slice(0, 79).join('').trimEnd()}…` : firstLine ?? `完成 ${count} 项工具操作`;
   return `✅ 本轮已完成（用时 ${formatDuration(duration)}）· ${summary}`.replace(/[\p{Cc}\p{Cf}]/gu, ' ');
 }
 
@@ -52,14 +54,11 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
           : { title: `${title} · 回复` };
   const raw = message?.blocks.map(block => block.type === 'text' ? block.text :
     `[文件 ${escapeCardMarkdown(block.artifactId)}]`).join('\n') ?? '';
-  const chars = [...raw];
-  const long = chars.length > PREVIEW_LENGTH;
-  const text = long
-    ? `仅显示正文末尾，点击底部按钮获取完整正文。\n\n${chars.slice(-PREVIEW_LENGTH).join('')}`
-    : raw || (running ? '正在处理…' : status === 'completed' ?
+  const preview = formatCardReplyBody(raw);
+  const text = preview.text || (running ? '正在处理…' : status === 'completed' ?
       (count ? `完成 ${count} 项工具操作` : '本轮处理完成。') : '本轮未形成完整回复。');
   const actions: ChannelCard['actions'] = [];
-  if (long && message) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
+  if (preview.truncated && message) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
   for (const file of files.slice(0, 3)) {
     const name = [...file.name];
     actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,

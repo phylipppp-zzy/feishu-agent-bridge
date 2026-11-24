@@ -100,6 +100,8 @@ export type ActiveTurnState = {
   assistantSequence: number | null;
   assistantRevision: number;
   assistantText: string;
+  needsParagraphBreak?: boolean;
+  lastChunkMessageId?: string;
   assistantFinalized: boolean;
   interrupted: boolean;
   inProgressToolCalls: Set<string>;
@@ -154,6 +156,7 @@ export interface AdapterContext {
   readonly activeTurns: Map<string, ActiveTurnState>;
   readonly sessionTurns: Map<string, Map<string, Turn>>;
   readonly liveMessages: Map<string, Message[]>;
+  readonly preLiveTranscriptIds: Map<string, Set<string>>;
   readonly requests: Map<string, PendingAgyRequest>;
   readonly listSnapshots: Map<string, ListSnapshot>;
   readonly recentDiscovery: Map<string, RecentDiscoveryState>;

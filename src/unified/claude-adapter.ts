@@ -131,7 +131,34 @@ export class ClaudeAdapter implements PlatformPort {
     const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter((x: any) => x?.type === 'text' && typeof x.text === 'string').map((x: any) => x.text).join('\n') : '';
     if (!text) return null; return { messageId: m.uuid, sessionId: id, turnId: m.uuid, role: m.type, blocks: [{ type: 'text', text }], sequence: seq, revision: 1, final: true, source: 'claude' };
   }
-  async read(ref: NativeSessionRef): Promise<SessionSnapshot> { const id = this.check(ref), info = await this.find(id), live = this.lives.get(id); const history = await this.boundedMetadata(`read:${id}`,()=>this.sdk.getSessionMessages(id, info.cwd ? { dir: info.cwd } : undefined)); const messages:Message[]=[]; for(const [i,raw] of history.entries()) {const m=this.normalize(id,raw,i+1); if(!m) continue; const alias=this.owned.messageAlias(id,raw.uuid); if(alias) m.messageId=alias; const old=messages.find(x=>x.messageId===m.messageId); if(old && alias) {const first=old.blocks[0],next=m.blocks[0];if(first?.type==='text' && next?.type==='text') first.text += '\n'+next.text;} else messages.push(m); } const liveIds=new Set(live?.messages.map(m=>m.messageId) ?? []); const visible=messages.filter(m=>!liveIds.has(m.messageId)); return { session: this.session(info), messages: [...visible, ...(live?.messages ?? [])], interactions: live ? [...live.pending.values()].map(p => p.interaction) : [], ...(live ? {connectionGeneration:live.generation} : {}) }; }
+  async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
+    const id = this.check(ref), info = await this.find(id), live = this.lives.get(id);
+    const history = await this.boundedMetadata(`read:${id}`, () =>
+      this.sdk.getSessionMessages(id, info.cwd ? { dir: info.cwd } : undefined));
+    const messages: Message[] = [];
+    for (const [i, raw] of history.entries()) {
+      const message = this.normalize(id, raw, i + 1);
+      if (!message) continue;
+      const link = this.owned.messageLink(id, raw.uuid);
+      if (link) {
+        message.messageId = link.id;
+        message.turnId = link.turnId ?? message.turnId;
+      }
+      const old = link && messages.find(entry => entry.messageId === message.messageId);
+      if (old) {
+        const first = old.blocks[0], next = message.blocks[0];
+        if (first?.type === 'text' && next?.type === 'text') first.text += '\n' + next.text;
+        if (link.turnId) old.turnId = link.turnId;
+      } else messages.push(message);
+    }
+    const liveIds = new Set(live?.messages.map(m => m.messageId));
+    return {
+      session: this.session(info),
+      messages: [...messages.filter(m => !liveIds.has(m.messageId)), ...(live?.messages ?? [])],
+      interactions: live ? [...live.pending.values()].map(p => p.interaction) : [],
+      ...(live ? { connectionGeneration: live.generation } : {}),
+    };
+  }
   async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { if (!cwd) throw contractError('invalid_request'); const id = randomUUID(); this.start(id, cwd, model, false); try { this.owned.put(id, { origin: 'bridge_sdk' }); } catch (e) { const live = this.lives.get(id); live?.queue.close(); live?.query.close(); throw e; } const live = this.lives.get(id)!; return {status:'submitted',nativeReference:id,createdSession:this.session({sessionId:id,cwd,summary:'',lastModified:0}),connectionGeneration:live.generation}; }
   async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> { const id = this.check(ref); if (this.lives.has(id)) { const generation = this.lives.get(id)!.generation; this.emit({type:'connection',ref,connectionGeneration:generation}); return {...ack(id),connectionGeneration:generation}; } const owned = this.owned.get(id); if (!owned) throw contractError('unsupported', 'external native sessions are read-only'); const info = await this.find(id); if (!info.cwd) throw contractError('temporarily_unavailable', 'session working directory unavailable'); this.start(id, info.cwd, null, true); const generation = this.lives.get(id)!.generation; this.emit({type:'connection',ref,connectionGeneration:generation}); return {...ack(id),connectionGeneration:generation}; }
   private start(id: string, cwd: string, model: string | null, resume: boolean): void {
@@ -237,7 +264,37 @@ export class ClaudeAdapter implements PlatformPort {
       }
       if (providerEvent && !this.closed && this.lives.get(live.id)===live) { const now = new Date().toISOString(), sequence = ++this.sequence; this.emit({ type: 'event', ref, connectionGeneration:live.generation, event: { schemaVersion: 1, eventId: randomUUID(), sessionId: live.id, objectId: live.turn ?? live.id, objectRevision: 0, sequence, type: providerEvent.type, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: providerEvent.data } }); }
       if(m.type==='stream_event' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id)===live) { const event=m.event; if(event?.type==='message_start' && typeof event.message?.id==='string') live.stream={id:event.message.id,blocks:new Map(),sequence:++this.sequence,revision:0,current:null,stopped:false}; const stream=live.stream; if(stream && event?.type==='content_block_start' && event.content_block?.type==='text' && typeof event.index==='number') {stream.blocks.set(event.index,typeof event.content_block.text==='string'?event.content_block.text:'');stream.current=event.index;} if(stream && !stream.stopped && event?.type==='content_block_delta' && event.delta?.type==='text_delta' && typeof event.delta.text==='string' && stream.blocks.has(event.index)) { stream.blocks.set(event.index,stream.blocks.get(event.index)!+event.delta.text); const text=[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n'); const value:Message={messageId:stream.id,sessionId:live.id,turnId:live.turn ?? stream.id,role:'assistant',blocks:[{type:'text',text}],sequence:stream.sequence,revision:++stream.revision,final:false,source:'claude'}; live.messages=live.messages.filter(x=>x.messageId!==value.messageId); live.messages.push(value); this.emit({type:'message',ref,message:value,connectionGeneration:live.generation}); } if(stream && event?.type==='message_stop' && !stream.stopped) {stream.stopped=true; const text=[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n'); if(text) {const value:Message={messageId:stream.id,sessionId:live.id,turnId:live.turn ?? stream.id,role:'assistant',blocks:[{type:'text',text}],sequence:stream.sequence,revision:++stream.revision,final:true,source:'claude'};live.messages=live.messages.filter(x=>x.messageId!==value.messageId);live.messages.push(value);this.emit({type:'message',ref,message:value,connectionGeneration:live.generation});} } }
-      if (m.type === 'assistant' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id)===live) { const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence); if (normalized) { const stream=live.stream; if(stream && m.message?.id===stream.id) {if(typeof m.uuid==='string') this.owned.linkMessage(live.id,m.uuid,stream.id,live.generation); const complete=Array.isArray(m.message?.content) ? m.message.content.filter((b:any)=>b?.type==='text' && typeof b.text==='string').map((b:any)=>b.text) as string[] : []; if(stream.stopped && stream.blocks.size>1) { if(complete.length!==stream.blocks.size) continue; [...stream.blocks.keys()].sort((a,b)=>a-b).forEach((key,index)=>stream.blocks.set(key,complete[index]!)); } else if(stream.current!==null) stream.blocks.set(stream.current,(normalized.blocks[0] as {type:'text';text:string}).text);normalized.messageId=stream.id;normalized.sequence=stream.sequence;normalized.revision=++stream.revision;normalized.final=stream.stopped; normalized.blocks=[{type:'text',text:[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n')}];} normalized.turnId = live.turn ?? normalized.turnId; live.messages=live.messages.filter(x=>x.messageId!==normalized.messageId); live.messages.push(normalized); this.emit({ type: 'message', ref, message: normalized,connectionGeneration:live.generation }); } }
+      if (m.type === 'assistant' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id) === live) {
+        const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence);
+        if (normalized) {
+          const stream = live.stream?.id === m.message?.id ? live.stream : null;
+          const priorLink = typeof m.uuid === 'string' ? this.owned.messageLink(live.id, m.uuid) : undefined;
+          const turnId = priorLink?.turnId ?? live.turn ?? undefined;
+          normalized.messageId = stream?.id ?? priorLink?.id ?? normalized.messageId;
+          normalized.turnId = turnId ?? normalized.turnId;
+          if (typeof m.uuid === 'string' && (stream || turnId)) {
+            this.owned.linkMessage(live.id, m.uuid, normalized.messageId, live.generation, turnId);
+          }
+          if (stream) {
+            const complete = Array.isArray(m.message?.content)
+              ? m.message.content.filter((b: any) => b?.type === 'text' && typeof b.text === 'string').map((b: any) => b.text) as string[]
+              : [];
+            if (stream.stopped && stream.blocks.size > 1) {
+              if (complete.length !== stream.blocks.size) continue;
+              [...stream.blocks.keys()].sort((a, b) => a - b).forEach((key, index) => stream.blocks.set(key, complete[index]!));
+            } else if (stream.current !== null) {
+              stream.blocks.set(stream.current, (normalized.blocks[0] as { type: 'text'; text: string }).text);
+            }
+            normalized.sequence = stream.sequence;
+            normalized.revision = ++stream.revision;
+            normalized.final = stream.stopped;
+            normalized.blocks = [{ type: 'text', text: [...stream.blocks.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v).join('\n') }];
+          }
+          live.messages = live.messages.filter(x => x.messageId !== normalized.messageId);
+          live.messages.push(normalized);
+          this.emit({ type: 'message', ref, message: normalized, connectionGeneration: live.generation });
+        }
+      }
       if (m.type === 'user' && Array.isArray(m.message?.content)) for (const b of m.message.content) if (b.type === 'tool_result') for (const p of live.pending.values()) if (p.toolId === b.tool_use_id && p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'resolved', revision: p.interaction.revision + 1, nativeResult: { status: 'unknown', source: b.is_error ? 'claude_tool_result_error' : 'claude_tool_result' } }; this.emit({ type: 'interaction', ref, interaction: p.interaction }); }
       if (m.type === 'result' && live.turn && !this.closed && this.lives.get(live.id)===live) { const turn: Turn = { turnId: live.turn, sessionId: live.id, status: live.interrupted ? 'interrupted' : m.subtype === 'success' && !m.is_error ? 'completed' : 'failed', inputId: null, startedAt: null, endedAt: new Date().toISOString(), model: live.turnModel, outputIds: [] }; live.turn = null; live.interrupted = false; this.emit({ type: 'turn', ref, turn,connectionGeneration:live.generation }); }
     } } catch (error) { const exitCode = error && typeof error === 'object' && 'exitCode' in error && Number.isSafeInteger((error as {exitCode:unknown}).exitCode) ? (error as {exitCode:number}).exitCode : null; streamFailure = {kind:'sdk_stream_error',exitCode}; } finally { const current=!this.closed && this.lives.get(live.id)===live;if (this.lives.get(live.id) === live) this.lives.delete(live.id); if (live.turn && current) { const failure = streamFailure ?? {kind:'sdk_stream_closed_without_result',exitCode:null}; const now = new Date().toISOString(); this.emit({type:'event',ref,connectionGeneration:live.generation,event:{schemaVersion:1,eventId:randomUUID(),sessionId:live.id,objectId:live.turn,objectRevision:0,sequence:++this.sequence,type:'adapter.stream_failed',occurredAt:now,receivedAt:now,operationId:null,cursor:String(this.sequence),data:failure}}); this.emit({type:'turn',ref,connectionGeneration:live.generation,turn:{turnId:live.turn,sessionId:live.id,status:'failed',inputId:null,startedAt:null,endedAt:now,model:live.turnModel,outputIds:[]}}); live.turn=null; }  for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'expired', revision: p.interaction.revision + 1, nativeResult: p.interaction.status === 'answer_pending_delivery' ? { status: 'unknown', source: 'connection_closed' } : null }; p.settle({ behavior: 'deny', message: 'connection closed' }); this.emit({ type: 'interaction', ref, interaction: p.interaction }); } }

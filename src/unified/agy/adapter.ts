@@ -78,6 +78,7 @@ export class AgyAdapter implements PlatformPort {
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly sessionTurns = new Map<string, Map<string, Turn>>();
   private readonly liveMessages = new Map<string, Message[]>();
+  private readonly preLiveTranscriptIds = new Map<string, Set<string>>();
   private readonly requests = new Map<string, PendingAgyRequest>();
   private readonly listeners = new Set<(event: PlatformObservation) => void>();
   private readonly sessionSettings = new Map<string, { model: string | null; effort?: AgyEffortLevel }>();
@@ -113,6 +114,7 @@ export class AgyAdapter implements PlatformPort {
       activeTurns: this.activeTurns,
       sessionTurns: this.sessionTurns,
       liveMessages: this.liveMessages,
+      preLiveTranscriptIds: this.preLiveTranscriptIds,
       requests: this.requests,
       listSnapshots: this.listSnapshots,
       recentDiscovery: this.recentDiscovery,
@@ -450,6 +452,7 @@ export class AgyAdapter implements PlatformPort {
       });
     }
 
+    this.preLiveTranscriptIds.set(sessionId, new Set());
     this.active.add(sessionId);
     this.controlEpoch.set(sessionId, 0);
     const generation = this.transport.connectionGeneration;
@@ -474,6 +477,15 @@ export class AgyAdapter implements PlatformPort {
     const cwd = summary?.project || liveMeta?.cwd || '';
     if (!cwd) {
       throw contractError('invalid_request', 'session working directory unavailable');
+    }
+
+    if (!this.preLiveTranscriptIds.has(id) && !this.liveMessages.has(id)) {
+      try {
+        const transcript = await this.catalog.readTranscript(id);
+        this.preLiveTranscriptIds.set(id, new Set(transcript.messages.map(message => message.messageId)));
+      } catch {
+        // With no baseline, keep the native transcript visible.
+      }
     }
 
     const res = (await this.transport.request('session/load', {
