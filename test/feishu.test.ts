@@ -67,8 +67,9 @@ test("splits outbound text at UTF-8 byte boundaries", () => {
 test("preserves snake_case and camelCase card form values", () => {
   for (const key of ["form_value", "formValue"] as const) {
     const action = parseCardAction({ context: { open_message_id: "card-1", open_chat_id: "chat-1" }, operator: { open_id: "ou-user" },
-      action: { tag: "button", value: { action: "submit_task" }, [key]: { task_prompt: "a task" } } });
+      action: { tag: "button", value: { action: "submit_task" }, [key]: { task_prompt: "a task", q0_multi: ["0", "2"] } } });
     assert.equal(action?.formValues.task_prompt, "a task");
+    assert.deepEqual(action?.formValues.q0_multi, ["0", "2"]);
   }
 });
 

@@ -21,11 +21,13 @@ export interface UnifiedService {
   selectProjectFiles?(sessionId:string, args:string):Promise<Artifact[]>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
   initialCursor?(sessionId:string):Promise<string>;
+  restoreInteractive?(sessionId:string,identity:WriteContext['identity'],stillAuthorized:()=>Promise<boolean>):Promise<void>;
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
   getTurn?(sessionId:string,turnId:string):Promise<Turn|null>;
   hasStopRequest?(sessionId:string,turnId:string):Promise<boolean>;
   getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
   submitInput(request: SubmitInput): Promise<Operation>;
+  resumeFirstPrompt?(operationId:string,authorized:boolean):Promise<Operation|null>;
   captureSteer?(identity:{source:string;subject:string},sessionId:string):Promise<{turnId:string;connectionGeneration:number;controlGeneration:number}>;
   listInteractions(sessionId: string, query: ListQuery): Promise<Page<Interaction>>;
   getInteraction(interactionId: string): Promise<Interaction>;

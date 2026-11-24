@@ -71,7 +71,12 @@ test('SDK topic reuse cannot elevate an existing read-only root; two parent chat
   assert.notEqual(rw.destination,ro.destination);assert.equal(rw.accessMode,'interactive');
   const submitted:any=await channel.handle(e('rw-input',rw.destination),{action:'input',text:'yes',mode:'new'});assert.equal(submitted.targetId,'s');
   assert.deepEqual(await channel.handle(e('ro-input',ro.destination),{action:'input',text:'no',mode:'new'}),{status:'rejected',reason:'read_only_binding'});
-  assert.equal(channel.boundDestinations().length,2); assert.ok(sent.some(x=>String(x.content).includes('此话题仍为只读')));
+  assert.equal(channel.boundDestinations().length,2);
+  const existing = sent.map(x => JSON.parse(String(x.content))).find(x => x.header?.title.content === '只读话题已存在');
+  assert.equal(existing.header.template, 'grey');
+  assert.deepEqual(existing.elements[1].actions.map((a: any) => [a.text.content, a.value.action]), [
+   ['一键接入并续聊', 'upgrade'], ['会话控制', 'panel'],
+  ]);
  } finally {channel.close();core.close();store.close();sdk.close();rmSync(dir,{recursive:true,force:true});}
 });
 

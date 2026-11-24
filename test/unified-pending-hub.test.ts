@@ -311,6 +311,12 @@ test('aggregates 4 categories across claude/codex/agy with filtering, pagination
     assert.ok(summarySend);
     assert.match(summarySend.card.text, /模型问答: 3 项 · 工具权限: 3 项 · 业务决定: 1 项 · 执行授权: 1 项/);
     assert.ok(summarySend.card.actions.some((a) => a.url?.startsWith('https://applink.feishu.cn/')));
+    const sourceApprovalId = hub.getRef('interaction:int-claude-a')?.source_card_message_id;
+    const sourceApproval = fake.sends.find(send => send.messageId === sourceApprovalId)?.card;
+    assert.ok(sourceApproval);
+    assert.equal(sourceApproval.template, 'orange');
+    assert.match(sourceApproval.text, /（已同步至「待处理」汇总，任一处处理即可）$/u);
+    assert.doesNotMatch(sourceApproval.text, /int-claude-a|轻量等待引用|awaiting_answer/u);
 
     const assertWithdrawn = (refId: string) => {
       const ref = hub.getRef(refId);

@@ -62,13 +62,18 @@ function isLegacyGemini3Model(model: ModelOption, baseLabel: string): boolean {
   return /^gemini[-_ ]3(?:\b|[-._])/i.test(model.id) || /^gemini\s+3(?:\b|\.)/i.test(baseLabel);
 }
 
+export function pendingHubDisabledCard(): ChannelCard {
+  return {title:'待处理汇总',text:'待处理汇总（PendingHub）当前未启用，所有审批与问题均可在各自会话话题内直接处理。',actions:[]};
+}
+
 export function buildMainHelpCard(): ChannelCard {
   return {
     title: '帮助',
     text: [
       '主群常用入口：',
       '• /sessions — 查看并打开已有会话',
-      '• /new — 新建会话（Antigravity / Codex / Claude）',
+      '• /new [后端] [首句] — 选择项目目录并新建会话',
+      '• /pending — 查看待处理审批与问题',
       '• /task <标题> — 新建多后端任务话题',
       '• /health — 查看服务健康状态',
       '',
@@ -87,7 +92,7 @@ export function buildAdminHelpCard(): ChannelCard {
     text: [
       '运维与调试命令：',
       '• /health — 查看各后端与通道健康状态',
-      '• /pending — 查看待完成操作',
+      '• /ops — 查看待完成的底层操作',
       '• /panel — 打开当前会话控制面板',
       '• /unbind — 解除当前话题的会话绑定',
       '• /export — 导出当前会话历史为 Markdown 文件',

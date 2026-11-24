@@ -130,7 +130,7 @@ test('a read-only panel callback patches the original card and immediately enabl
     assert.equal(x.patches[0]!.id,panel.id);
     assert.match(x.patches[0]!.content,/✅ 已接入，现在可直接发送消息续聊/);
     const patchedActions=JSON.parse(x.patches[0]!.content).elements.flatMap((element:any)=>element.actions ?? []);
-    assert.deepEqual(patchedActions.map((action:any)=>action.value?.action),['history','panel','artifacts']);
+    assert.deepEqual(patchedActions.map((action:any)=>action.value?.action),['history','models','artifacts','panel']);
     assert.ok(patchedActions.every((action:any)=>action.value?.bindingId===after?.bindingId));
 
     const unscoped=sessionCard(x.active,'unbound').actions.find(action=>action.value.mode==='interactive')!.value;
@@ -166,7 +166,8 @@ test('interactive topic card retries attachment when the original control is una
     x.store.updateSession(unavailable,current.revision,current.control.generation);
     x.observe(unavailable);
     const card=sessionCard(await x.core.getSession('s'),'interactive');
-    assert.match(card.text,/会话已绑定但原端控制暂不可用/);
+    assert.match(card.text,/连接暂不可用，可尝试重新接入/);
+    assert.equal(card.template,'orange');
     assert.doesNotMatch(card.text,/现在可直接发送消息续聊/);
     assert.deepEqual(card.actions.find(action=>action.label==='重新接入')?.value,{action:'upgrade'});
 
@@ -183,7 +184,7 @@ test('interactive topic card retries attachment when the original control is una
     x.store.updateSession(readOnly,unavailable.revision,unavailable.control.generation);
     x.observe({...x.active,control:{...x.active.control,generation:readOnly.control.generation+1}});
     const retryCard=sessionCard(await x.core.getSession('s'),'interactive');
-    assert.match(retryCard.text,/会话已绑定但原端控制暂不可用/);
+    assert.match(retryCard.text,/连接暂不可用，可尝试重新接入/);
     const retry=await x.sdk.send(original.destination,retryCard,'retry-card');
     assert.equal(await x.click('retry-ready',retry,upgrade),undefined);
     await x.tick();

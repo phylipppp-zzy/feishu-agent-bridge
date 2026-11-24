@@ -1,3 +1,4 @@
+import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from '../adapter.js';
 import { payloadDigest, type Interaction, type Message, type Provider } from '../contracts.js';
@@ -122,7 +123,7 @@ export async function renderTaskStreamMessage(
 
   const label = providerTitlePrefix(target.provider);
   const body = message.blocks
-    .map((b) => (b.type === 'text' ? b.text : `[文件 ${b.artifactId}]`))
+    .map((b) => (b.type === 'text' ? b.text : `[文件 ${escapeCardMarkdown(b.artifactId)}]`))
     .join('\n');
   const title = message.final
     ? turnCompleted

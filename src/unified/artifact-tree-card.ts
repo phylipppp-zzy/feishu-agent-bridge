@@ -27,7 +27,7 @@ export function buildProjectFilesCard(listing: DirectoryListing): ChannelCard {
     const body = treeLines.length ? treeLines.join('\n') : '(空目录)';
     text = `📁 ${listing.path}\n${body}\n显示 ${listing.entries.length}/${listing.total} 项，隐藏 ${listing.hidden} 项`;
   }
-  return { title: '项目目录', text, actions: [] };
+  return { title: '项目目录', format: 'plain', text, actions: [] };
 }
 
 export interface ArtifactTreeCardOptions {
@@ -137,7 +137,7 @@ export function buildArtifactTreeCard(
     text = `${headerLines.join('\n')}\n\n${treeLines.join('\n')}`;
   }
   return {
-    card: { title: '文件', text, actions },
+    card: { title: '文件', format: 'plain', text, actions },
     items: pageItems,
     nextCursor,
   };

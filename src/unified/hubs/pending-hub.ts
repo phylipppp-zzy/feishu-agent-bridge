@@ -7,7 +7,7 @@ import {
   type Operation,
   type Provider,
 } from '../contracts.js';
-import { interactionStatusText, type ChannelCard } from '../feishu-cards.js';
+import { interactionCard, interactionStatusText, type ChannelCard } from '../feishu-cards.js';
 import { StoreError } from '../store.js';
 import type { DecisionSyncStore } from './decision-store.js';
 import {
@@ -70,6 +70,7 @@ export class PendingHub {
   private readonly shouldRefreshSource: PendingHubOptions['shouldRefreshSource'];
   private readonly refLocks = new Map<string, Promise<void>>();
   private summaryLock = Promise.resolve();
+  private rootCreation: Promise<PendingHubRoot> | undefined;
   private summaryVersion = 0;
 
   constructor(options: PendingHubOptions) {
@@ -244,7 +245,12 @@ export class PendingHub {
     }
   }
 
-  async ensureRoot(): Promise<PendingHubRoot> {
+  ensureRoot(): Promise<PendingHubRoot> {
+    this.rootCreation ??= this.ensureRootOnce().finally(() => { this.rootCreation = undefined; });
+    return this.rootCreation;
+  }
+
+  private async ensureRootOnce(): Promise<PendingHubRoot> {
     this.checkBaseAuth(this.owner, this.destination);
     const now = this.now();
     const deliveryId = `pending-root:${payloadDigest([
@@ -656,11 +662,13 @@ export class PendingHub {
     const operation = await this.service.getResponseOperation?.(interactionId);
     const status = interactionStatusText(interaction, operation);
     if (status) {
-      return this.updateRefCards(ref, status, interaction.revision, {
-        title: `${interaction.kind === 'approval' ? '工具权限' : '模型问答'} · ${status}`,
+      const card: ChannelCard = interaction.kind === 'approval' ? interactionCard(interaction, false, operation) : {
+        title: `模型问答 · ${status}`,
         text: status,
+        schema: '2.0',
         actions: [],
-      });
+      };
+      return this.updateRefCards(ref, status, interaction.revision, card);
     }
 
     // Only an awaiting request needs a session-level check for expiry or lost control.
@@ -670,7 +678,7 @@ export class PendingHub {
     }
     const reason = interaction.expiresAt !== null && Date.parse(interaction.expiresAt) <= nowMs
       ? '该请求已过期'
-      : '原会话控制状态或连接代数已变化，卡片已失效';
+      : '原会话的连接或控制状态已变化，卡片已失效';
     return this.updateRefCards(ref, reason, interaction.revision);
   }
 

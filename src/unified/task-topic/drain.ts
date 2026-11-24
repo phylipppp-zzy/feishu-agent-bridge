@@ -9,6 +9,7 @@ import {
   type WriteContext,
 } from '../contracts.js';
 import { contractError, type ErrorCode } from '../errors.js';
+import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import {
   operationCard,
   providerTitlePrefix,
@@ -552,7 +553,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         row.target_id,
         {
           title: `${label} · 文件`,
-          text: page.items.map((f) => `${f.name} (${f.contentVersion})`).join('\n') || '暂无文件。',
+          text: page.items.map((f) => `${escapeCardMarkdown(f.name)} (${escapeCardMarkdown(f.contentVersion)})`).join('\n') || '暂无文件。',
           actions: page.items.map((f) => ({
             label: (counts.get(f.name) ?? 0) > 1 ? `${f.name} (${f.contentVersion.slice(0, 8)})` : f.name,
             value: {

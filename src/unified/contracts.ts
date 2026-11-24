@@ -9,7 +9,8 @@ export type Capability = { status: 'available' } | { status: 'unsupported' | 'te
 export type Capabilities = Record<CapabilityName, Capability>;
 export interface Identity { subject: string; source: string }
 /** Identity must be authenticated by the transport, not trusted from client input. */
-export interface WriteContext { operationId: string; idempotencyKey: string; targetId: string; expectedRevision: Revision; controlGeneration: number; identity: Identity }
+export interface ChannelInputScope { destination: string; bindingScope: string; ownerSource: string; ownerSubject: string }
+export interface WriteContext { operationId: string; idempotencyKey: string; targetId: string; expectedRevision: Revision; controlGeneration: number; identity: Identity; channelScope?: ChannelInputScope }
 export interface NativeSessionRef { provider: Provider; hostId: string; serviceId: string; nativeSessionId: string }
 export type RunStatus = 'idle' | 'running' | 'waiting_question' | 'waiting_approval' | 'interrupted' | 'failed' | 'unreachable' | 'read_only';
 export interface ControlState { serviceId: string; owner: string | null; input: 'available' | 'unavailable' | 'unknown'; generation: number; operationId: string | null; reason: string | null }
@@ -35,7 +36,7 @@ export interface ResponseEvidence {
   answerDigest: string;
 }
 export interface ResolveInteraction { context: WriteContext; interactionId: string; expectedConnectionGeneration: number; answer: Answer; toolInputDigest: string | null }
-export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?:{destination:string;bindingScope:string;ownerSource:string;ownerSubject:string} }
+export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?: ChannelInputScope }
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
 export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
 export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[]; partialFailure?:boolean }
@@ -57,6 +58,7 @@ export function validateSubmitInput(x: SubmitInput): Validation<SubmitInput> {
   if (!['new', 'queue', 'steer'].includes(x.mode) || !Array.isArray(x.blocks) || x.blocks.length === 0 || !x.blocks.every(b => b && (b.type === 'text' ? nonempty(b.text) : b.type === 'artifact' && nonempty(b.artifactId) && nonempty(b.contentVersion)))) return fail('invalid input blocks or mode');
   if (x.mode === 'steer' && (!nonempty(x.requiredTurnId) || !counter(x.expectedConnectionGeneration))) return fail('steer requires a captured turn and connection generation');
   if (x.channelScope && (!nonempty(x.channelScope.destination) || !nonempty(x.channelScope.bindingScope) || !nonempty(x.channelScope.ownerSource) || !nonempty(x.channelScope.ownerSubject) || x.channelScope.ownerSource!==x.context.identity.source || x.channelScope.ownerSubject!==x.context.identity.subject)) return fail('invalid channel scope');
+  if (x.context.channelScope && payloadDigest(x.context.channelScope) !== payloadDigest(x.channelScope ?? null)) return fail('channel scope mismatch');
   return { ok: true, value: x };
 }
 /** Compare against the authoritative interaction before atomic registration. The caller must separately authenticate identity and compare controlGeneration against the current session control in the same transaction. */

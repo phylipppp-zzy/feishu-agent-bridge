@@ -1331,20 +1331,19 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
         await channel!.handle({ eventId, destination, identity: ownerId }, action);
       };
 
-      // 1. /new guidance mentions codex / claude / agy & offers direct create buttons (never misleading list filter buttons)
+      // 1. /new starts a project picker with the three registered backends.
       await sendCmd('ev-new', 'chat-main', { action: 'new_help' });
       const newCard = sentCards.at(-1)!.card;
-      assert.match(newCard.text, /agy/);
-      assert.match(newCard.text, /Antigravity/);
-      assert.equal(newCard.actions.some((a) => a.value.action === 'list'), false);
-      assert.deepEqual(
-        newCard.actions.map((a) => ({ label: a.label, value: a.value })),
-        [
-          { label: '新建 Antigravity', value: { action: 'create', provider: 'agy', project: projectDir, model: null } },
-          { label: '新建 Codex', value: { action: 'create', provider: 'codex', project: projectDir, model: null } },
-          { label: '新建 Claude', value: { action: 'create', provider: 'claude', project: projectDir, model: null } },
-        ],
-      );
+      assert.match(newCard.text, /当前后端：Antigravity/);
+      const token = newCard.actions[0]!.value.t;
+      assert.match(String(token), /^[A-Za-z0-9_-]{22}$/);
+      assert.deepEqual(newCard.actions.map((a) => a.value), [
+        { action: 'new_provider', t: token, r: 0, p: 'agy' },
+        { action: 'new_provider', t: token, r: 0, p: 'codex' },
+        { action: 'new_provider', t: token, r: 0, p: 'claude' },
+        { action: 'new_pick', t: token, r: 0, i: 0 },
+      ]);
+      assert.equal(newCard.actions[3]!.label, 'proj');
 
       // 2. /sessions lists all 3 backends cleanly, and filtering by agy/antigravity isolates agy sessions
       await sendCmd('ev-list-all', 'chat-main', { action: 'list' });
@@ -1352,7 +1351,7 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
       assert.match(listAllCard.text, /Claude Task/);
       assert.match(listAllCard.text, /Codex Task/);
       assert.match(listAllCard.text, /Agy Existing Work/);
-      assert.match(listAllCard.text, /Antigravity \(agy\)/);
+      assert.match(listAllCard.text, /Antigravity · proj/);
       assert.ok(listAllCard.actions.some((a) => a.label === 'Antigravity'));
 
       await sendCmd('ev-list-agy', 'chat-main', { action: 'list', search: 'antigravity' });
@@ -1361,7 +1360,9 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
       assert.doesNotMatch(listAgyCard.text, /Claude Task/);
       assert.doesNotMatch(listAgyCard.text, /Codex Task/);
 
-      await sendCmd('ev-list-codex-filter', 'chat-main', { action: 'list', provider: 'codex', search: 'codex' });
+      const codexFilter = listAllCard.actions.find(a => a.label === 'Codex')!.value;
+      assert.deepEqual(codexFilter,{ action: 'list', provider: 'codex' });
+      await sendCmd('ev-list-codex-filter', 'chat-main', codexFilter as ChannelAction);
       const listCodexCard = sentCards.at(-1)!.card;
       assert.match(listCodexCard.text, /Codex Task/);
       assert.doesNotMatch(listCodexCard.text, /Agy Existing Work/);

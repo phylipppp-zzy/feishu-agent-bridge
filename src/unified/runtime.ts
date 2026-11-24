@@ -26,7 +26,7 @@ import { AgyQuotaClient } from './agy-quota.js';
 import { AgyAcpTransport } from './agy-transport.js';
 import { providerTitlePrefix } from './feishu-cards.js';
 import { DecisionSyncStore } from './decision-sync.js';
-import { PendingHub, type PendingQuery, type PendingSubmitPayload } from './pending-hub.js';
+import { PendingHub, type PendingQuery } from './pending-hub.js';
 import { TaskHandoffError, TaskHandoffService } from './task-handoff.js';
 import { TaskTopicChannel, TaskChannelError, type TaskAuthorize, type TaskChannelAction } from './task-topic-channel.js';
 import type { TaskTopicToken } from './task-topic-store.js';
@@ -34,6 +34,7 @@ import { handleTaskControlAction, isTaskControlAction } from './task-topic/contr
 import { WatchHub } from './watch-hub.js';
 import { RuntimeInteractive } from './runtime-interactive.js';
 import { runBackgroundWork } from './runtime-background.js';
+import { handlePendingAction } from './runtime-pending-actions.js';
 
 export interface AgyRuntimeConfig { enabled?:boolean; serviceId:string; summariesDbPath?:string; brainDir?:string; binPath?:string; quotaCachePath?:string; sandbox?:boolean; geminiDir?:string; appDataDir?:string }
 export interface WatchHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
@@ -147,11 +148,12 @@ export class UnifiedRuntime {
     const ownerIdentity:Identity = { source: 'feishu', subject: config.ownerOpenId };
     try {
       this.store = new UnifiedStore(config.coreDb);
-      this.restartPending=this.store.pendingOutbox();
       try { this.core = new UnifiedCore(this.store,providers,(identity,session)=>owner(identity) && (!options.canDiscover || options.canDiscover(session)),(identity)=>owner(identity),()=>false,options.canDiscover,archive,options.canInspectCandidate);
-        const defaultCreateProject = options.allowedProjectRoots?.[0] ?? config.allowedProjectRoots?.[0];
+        this.restartPending=this.store.pendingOutbox();
+        const allowedProjectRoots = options.allowedProjectRoots ?? config.allowedProjectRoots ?? [];
         const measuredPort=new Proxy(port,{get:(target,key)=>{const value=Reflect.get(target,key); if(typeof value!=='function') return value; if(['send','update','sendFile'].includes(String(key))) return async (...args:unknown[])=>{let guardFailed=false;const last=args.length-1; if(typeof args[last]==='function') {const guard=args[last] as ()=>Promise<void>;args[last]=async()=>{try {await guard();} catch(error) {guardFailed=true;throw error;}};} try {const result=await Reflect.apply(value,target,args); try {this.channel.recordHealth('feishu_delivery',(key==='send' && !result)?'unverified':'healthy',(key==='send' && !result)?'消息回执未确认':null);} catch {} return result;} catch(error) {const e=error && typeof error==='object' ? error as {deliveryKind?:unknown;platformCode?:unknown} : {}; const rejected=e.deliveryKind==='api_rejected' && typeof e.platformCode==='number' && Number.isSafeInteger(e.platformCode); const reason=guardFailed?'发送前权限或绑定变化':rejected?`平台拒绝（代码 ${e.platformCode}）`:'投递结果未知'; const deliveryId=args[key==='send'?2:3];try {if(typeof deliveryId==='string') this.channel.recordDeliveryDiagnostic(deliveryId,guardFailed?'guard_rejected':rejected?'api_rejected':'unknown',rejected?e.platformCode as number:null);} catch {} try {this.channel.recordHealth('feishu_delivery','degraded',reason);} catch {} throw error;}}; return value.bind(target);}}); this.sendPort=measuredPort; try { this.channel = new FeishuChannel(this.core,measuredPort,async (identity,destination,sessionId)=>{ if(!owner(identity) || !(this.port.authorizedDestination?.(destination) ?? destinations.has(destination))) return false; if(!sessionId || !options.canDiscover) return true; try {return options.canDiscover(this.store.getSession(sessionId));} catch {return options.allowDiscovered?.(sessionId) ?? false;} },config.channelDb,undefined,options.requireReadonlyHydration === true,{
-          ...(defaultCreateProject ? { defaultCreateProject } : {}),
+          ...(allowedProjectRoots[0] ? { defaultCreateProject: allowedProjectRoots[0] } : {}),
+          allowedProjectRoots, enabledProviders: providers.map(port => port.provider),
           onInteractionChanged: (sessionId, interactionId) => this.interactive.notifyInteraction(sessionId, interactionId),
         }); } catch(error) { this.core.close(); throw error; }
         this.core.validateSteerScope=(scope,sessionId)=>owner({source:scope.ownerSource,subject:scope.ownerSubject}) && (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) && this.channel.isCurrentSteerScope(scope,sessionId);
@@ -400,82 +402,20 @@ export class UnifiedRuntime {
           envelope.eventId,
         );
       }
-      if(this._pendingHub) {
-        const hubRoot=this._pendingHub.getRoot();
-        const hubBindingId=createHash('sha256').update('pending-hub:singleton').digest('hex').slice(0,16);
-        const inHubTopic=!!hubRoot?.topicDestination && hubRoot.topicDestination!==hubRoot.chatDestination && envelope.destination===hubRoot.topicDestination;
-        const meta=action as {entry?:unknown;bindingId?:unknown;sourceSessionId?:unknown};
-        const entry=meta.entry==='source' ? 'source' : (meta.entry==='hub' || meta.entry==='pending_hub') ? 'hub' : undefined;
-        if(action.action==='decision_answer') {
-          const payload:PendingSubmitPayload={
-            kind:'decision',
-            decisionId:action.decisionId,
-            expectedVersion:action.expectedVersion,
-            expectedDigest:action.expectedDigest,
-            ...(action.selectedOptionId!==undefined ? {selectedOptionId:action.selectedOptionId} : {}),
-            ...(action.freeText!==undefined ? {freeText:action.freeText} : {}),
-            ...(action.rawUtterance!==undefined ? {rawUtterance:action.rawUtterance} : {}),
-            ...(envelope.cardMessageId ? {cardMessageId:envelope.cardMessageId} : {}),
-          };
-          return this._pendingHub.submitAnswer(entry==='source' ? 'source' : 'hub',envelope,payload,{
-            notifyOperation: id => this.interactive.notifyOperation(id),
-            notifyInteraction: (sessionId,id) => this.interactive.notifyInteraction(sessionId,id),
-            notifyDecision: id => this.interactive.notifyDecision(id),
-            notifySummary: () => this.wake(),
-          });
-        }
-        if((action.action==='answer' || action.action==='answer_form') && (entry!==undefined || meta.bindingId===hubBindingId || inHubTopic)) {
-          const sourceSessionId=typeof meta.sourceSessionId==='string' && meta.sourceSessionId.trim()
-            ? meta.sourceSessionId
-            : (await this.core.getInteraction(action.interactionId)).sessionId;
-          const payload:PendingSubmitPayload=action.action==='answer_form'
-            ? {
-                kind:'question_form',
-                sourceSessionId,
-                interactionId:action.interactionId,
-                revision:action.revision,
-                connectionGeneration:action.connectionGeneration,
-                bindingId:typeof meta.bindingId==='string' ? meta.bindingId : '',
-                fields:action.fields,
-                ...(envelope.cardMessageId ? {cardMessageId:envelope.cardMessageId} : {}),
-              }
-            : {
-                kind:'interaction',
-                sourceSessionId,
-                interactionId:action.interactionId,
-                revision:action.revision,
-                connectionGeneration:action.connectionGeneration,
-                answer:action.answer,
-                toolInputDigest:action.toolInputDigest,
-                ...(envelope.cardMessageId ? {cardMessageId:envelope.cardMessageId} : {}),
-              };
-          return this._pendingHub.submitAnswer(entry==='source' ? 'source' : 'hub',envelope,payload,{
-            notifyOperation: id => this.interactive.notifyOperation(id),
-            notifyInteraction: (sessionId,id) => this.interactive.notifyInteraction(sessionId,id),
-            notifySummary: () => this.wake(),
-          });
-        }
-        if(action.action==='pending_page' && (inHubTopic || envelope.destination===this.config.pendingHub!.destination)) {
-          return this._pendingHub.renderPage(envelope,{
-            ...(action.cursor!==undefined ? {cursor:action.cursor} : {}),
-            ...(action.category!==undefined ? {category:action.category} : {}),
-            ...(action.provider!==undefined ? {provider:action.provider} : {}),
-          });
-        }
-      }
+      const pending = handlePendingAction({
+        hub: this._pendingHub, mainDestination: this.config.pendingHub?.destination, core: this.core, port: this.port,
+        sendPort: this.sendPort, interactive: this.interactive, wake: () => this.wake(),
+        authorize: e => e.identity.source === 'feishu' && e.identity.subject === this.config.ownerOpenId &&
+          ((this.port.authorizedDestination?.(e.destination) ?? (this.config.allowedDestinations.includes(e.destination) ||
+            this.channel.boundDestinations().includes(e.destination))) || !!this._taskChannel?.getBindingByDestination(e.destination)),
+      },envelope,action);
+      if (pending) return pending;
       if(this._taskChannel && this._taskChannel.getBindingByDestination(envelope.destination)) {
         if(action.action==='legacy_model') {
           if(!action.model && !action.invalid) return this.intakeTopic(envelope,{action:'models'});
           throw new TaskChannelError('invalid_request','use /models to switch target model');
         }
         return this.intakeTopic(envelope,action as TaskChannelAction);
-      }
-      if(this._pendingHub) {
-        const hubRoot=this._pendingHub.getRoot();
-        const inHubTopic=!!hubRoot?.topicDestination && hubRoot.topicDestination!==hubRoot.chatDestination && envelope.destination===hubRoot.topicDestination;
-        if(inHubTopic && action.action==='input') {
-          return this._pendingHub.handleHubText(envelope,action.text);
-        }
       }
       if(
         ['confirm_handoff','switch_target','decision_answer','pending_page'].includes(action.action) ||

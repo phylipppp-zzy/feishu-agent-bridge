@@ -277,6 +277,7 @@ test('Scene-scoped /help and Main Chat topic-only command guidance', async () =>
     assert.equal(mainHelp.title, '帮助');
     assert.match(mainHelp.text, /\/sessions/);
     assert.match(mainHelp.text, /\/new/);
+  assert.match(mainHelp.text, /\/pending.*待处理审批与问题/);
     assert.match(mainHelp.text, /\/task/);
     assert.match(mainHelp.text, /\/health/);
     assert.match(mainHelp.text, /\/help admin/);
@@ -294,7 +295,7 @@ test('Scene-scoped /help and Main Chat topic-only command guidance', async () =>
     await channel.handle(env('h-admin', 'chat-main'), parseFeishuText('/help admin'));
     const adminHelp = cards.at(-1)!.card;
     assert.match(adminHelp.title, /运维管理/);
-    for (const cmd of ['/health', '/pending', '/panel', '/unbind', '/export']) {
+    for (const cmd of ['/health', '/ops', '/panel', '/unbind', '/export']) {
       assert.ok(adminHelp.text.includes(cmd), `admin help should include ${cmd}`);
     }
 
@@ -502,8 +503,8 @@ test('TaskTopic /help, /swarm passthrough, and clickable taskScope-stamped /mode
     await runtime.tick();
     const emptyHelpCard = JSON.parse(sdk.replies.at(-1)!.content);
     assert.equal(emptyHelpCard.header.title.content, '帮助 · 任务话题');
-    assert.match(emptyHelpCard.elements[0].text.content, /\/handoff/);
-    assert.match(emptyHelpCard.elements[0].text.content, /\/swarm/);
+    assert.match(emptyHelpCard.elements[0].content, /\/handoff/);
+    assert.match(emptyHelpCard.elements[0].content, /\/swarm/);
 
     // 3. Mount interactive Agy target
     await runtime.handleTrusted(

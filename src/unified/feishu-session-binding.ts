@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from './adapter.js';
 import type { Operation, Session, WriteContext } from './contracts.js';
 import { operationCard, sessionCard, type ChannelCard } from './feishu-cards.js';
 import type { Authorize, AuthorizeBindingAdmin, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { needsOperationNotice, operationFromReceipt, pendingSessionAuthorization } from './feishu-operation-notices.js';
+import type { NewSessionDraft, NewSessionDrafts } from './new-session-drafts.js';
 import { BindingExpired, ReadAuthorizationRevoked, recordNewTopicRootTitle, topicRootCard } from './topic-title-sync.js';
 
 type AccessMode = 'read_only' | 'interactive';
@@ -59,6 +61,8 @@ function isExpiredCard(error: unknown): boolean {
 export class FeishuSessionBinding {
   private readonly advancing = new Map<string, Promise<Operation | null>>();
   private readonly writing = new Map<string, Promise<void>>();
+  private readonly registeringDrafts = new Map<string, Promise<Operation | undefined>>();
+  private readonly submittingFirstPrompts = new Map<string, Promise<Operation | null>>();
 
   constructor(
     private readonly db: DatabaseSync,
@@ -67,6 +71,7 @@ export class FeishuSessionBinding {
     private readonly authorize: Authorize,
     private readonly authorizeBindingAdmin: AuthorizeBindingAdmin | undefined,
     private readonly channel: ChannelAccess,
+    private readonly drafts: NewSessionDrafts,
   ) {
     db.exec(`
       CREATE INDEX IF NOT EXISTS channel_pending_destination ON channel_pending(destination,state);
@@ -104,8 +109,8 @@ export class FeishuSessionBinding {
     if (!await this.authorizeBindingAdmin?.(e.identity, destination, current.session_id)) throw new ReadAuthorizationRevoked('binding management unauthorized');
   }
 
-  recordPending(operationId: string, e: TrustedEnvelope, sessionId: string | null, kind: PendingRow['kind'], mode: PendingRow['mode']): void {
-    this.db.exec('BEGIN IMMEDIATE');
+  recordPending(operationId: string, e: TrustedEnvelope, sessionId: string | null, kind: PendingRow['kind'], mode: PendingRow['mode'], inTransaction = false): void {
+    if (!inTransaction) this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare("INSERT OR IGNORE INTO channel_pending VALUES (?,?,?,?,?,'pending')").run(operationId,e.destination,sessionId,kind,mode);
       this.db.prepare('INSERT OR IGNORE INTO channel_pending_scope VALUES (?,?)').run(operationId,this.channel.scope(e.destination));
@@ -113,9 +118,9 @@ export class FeishuSessionBinding {
       this.db.prepare('INSERT OR IGNORE INTO channel_pending_actors VALUES (?,?)').run(operationId,envelope);
       const row = this.db.prepare('SELECT envelope FROM channel_pending_actors WHERE operation_id=?').get(operationId);
       if (row?.envelope !== envelope) throw new Error('pending actor conflict');
-      this.db.exec('COMMIT');
+      if (!inTransaction) this.db.exec('COMMIT');
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if (!inTransaction) this.db.exec('ROLLBACK');
       throw error;
     }
   }
@@ -300,7 +305,55 @@ export class FeishuSessionBinding {
     try {
       return await this.service.getOperation(id);
     } catch (error) {
-      if (error && typeof error === 'object' && 'detail' in error && (error as {detail?:{code?:string}}).detail?.code === 'invalid_request') return;
+      const fault = error as {detail?:{code?:string};code?:string} | null;
+      if ((fault?.detail?.code ?? fault?.code) === 'invalid_request') return;
+      throw error;
+    }
+  }
+
+  async showDraftProgress(e: TrustedEnvelope, draft: NewSessionDraft, guard: Guard): Promise<void> {
+    await this.patch(e.destination,e.cardMessageId!,{
+      title:'正在创建会话…',template:'blue',text:'新话题建立后可以直接打开。',
+      actions:[],
+    },`${draft.create_operation_id}:draft-progress`,guard);
+  }
+
+  registerDraftCreate(draft: NewSessionDraft): Promise<Operation | undefined> {
+    const id = draft.create_operation_id!;
+    const active = this.registeringDrafts.get(id);
+    if (active) return active;
+    const work = this.registerCreation(draft, id).finally(() => this.registeringDrafts.delete(id));
+    this.registeringDrafts.set(id, work);
+    return work;
+  }
+
+  private async registerCreation(draft: NewSessionDraft, id: string): Promise<Operation | undefined> {
+    const existing = await this.readOperation(id);
+    if (existing || draft.state !== 'creating') return existing;
+    const context = draft.create_context!;
+    const current = () => this.channel.scope(draft.destination) === draft.scope;
+    if (!current() || !await this.authorize(context.identity,draft.destination,null) || !current()) {
+      this.rejectDraft(id);
+      return;
+    }
+    try {
+      return await this.service.createSession({context,payload:{provider:draft.provider,project:draft.projects[draft.chosen_index!]!,model:null}});
+    } catch (error) {
+      const code = (error as {detail?:{code?:string}} | null)?.detail?.code;
+      if (code === 'temporarily_unavailable') return;
+      if (code !== 'unauthorized' && code !== 'invalid_request' && code !== 'unsupported') throw error;
+      this.rejectDraft(id);
+    }
+  }
+
+  private rejectDraft(operationId: string): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.drafts.settle(operationId,'rejected');
+      this.completePending(operationId);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
       throw error;
     }
   }
@@ -315,6 +368,10 @@ export class FeishuSessionBinding {
     }
     const automatic = e.eventId === `auto-finish:${operationId}`;
     if (pending.state === 'completed') {
+      if (!automatic) {
+        const child = await this.advanceFirstPrompt(operationId);
+        if (child) return child;
+      }
       if (!automatic) await this.flushDeliveries(operationId);
       return {status:'completed'};
     }
@@ -357,6 +414,12 @@ export class FeishuSessionBinding {
     const session = await this.service.getSession(sessionId);
     if (session.sessionId !== sessionId) throw new Error('binding session mismatch');
     await guard();
+    const draft = this.drafts.forOperation(op.operationId);
+    if (draft && (op.action !== 'createSession' || !this.matchesDraftSession(draft,session))) {
+      this.rejectDraft(op.operationId);
+      await this.patch(source,original.cardMessageId!,{title:'会话创建未完成',template:'red',text:'原端返回的后端或目录与所选项目不一致。请重新发送 /new。',actions:[]},`${op.operationId}:draft-mismatch`,guard);
+      return {status:'rejected',reason:'draft_session_mismatch'};
+    }
     const sourceSession = this.channel.binding(source);
     const mode = pending.mode === 'interactive' ? 'interactive' : 'read_only';
     if (mode === 'interactive' && sourceSession && sessionId !== sourceSession &&
@@ -364,10 +427,12 @@ export class FeishuSessionBinding {
       throw new Error('upgrade session mismatch');
     }
 
-    if (mode === 'interactive' && (session.control.input !== 'available' || session.status === 'read_only')) {
+    if (mode === 'interactive' && !this.interactiveReady(session)) {
+      if (draft) return op;
       const reason = {title:'接入未完成',text:'原端尚未确认可交互权限。请刷新会话状态后重试。',actions:[]};
       await this.showOutcome(original,reason,'attach-unavailable',guard,(card,suffix) => this.channel.deliver(source,card,`${op.operationId}:${suffix}`,guard));
-      this.completePending(op.operationId);
+      if (draft) this.rejectDraft(op.operationId);
+      else this.completePending(op.operationId);
       return {status:'rejected',reason:'interactive_attach_unavailable'};
     }
 
@@ -377,14 +442,24 @@ export class FeishuSessionBinding {
     const existing = this.ownerRow(destination);
     await this.checkOwner(original,destination,existing);
     await guard();
+    if (draft?.initial_prompt && (destination === source ||
+        (this.port.isTopicDestination && !this.port.isTopicDestination(destination)) ||
+        (existing && (existing.session_id !== sessionId || existing.owner_source !== original.identity.source ||
+          existing.owner_subject !== original.identity.subject)))) {
+      this.rejectDraft(op.operationId);
+      await this.patch(source,original.cardMessageId!,{title:'话题创建未完成',template:'red',text:'无法确认新话题的会话归属。请核对会话后重新发送 /new。',actions:[]},`${op.operationId}:draft-topic-mismatch`,guard);
+      return {status:'rejected',reason:'draft_binding_mismatch'};
+    }
     if (existing?.session_id === sessionId && destination !== source && mode === 'interactive' && existing.access_mode === 'read_only') {
       if (targetScope !== this.channel.scope(destination)) throw new BindingExpired('binding changed');
-      this.completePending(op.operationId);
-      await this.channel.deliver(destination,{title:'只读话题已存在',text:'此话题仍为只读。请在这个话题打开会话控制并选择接入并续聊。',actions:[{label:'会话控制',value:{action:'panel',sessionId}}]},`${op.operationId}:existing-readonly`,() => this.channel.checkBinding(destination,sessionId,targetScope));
+      if (draft) this.rejectDraft(op.operationId);
+      else this.completePending(op.operationId);
+      await this.channel.deliver(destination,{title:'只读话题已存在',template:'grey',text:'可在此话题接入并续聊。',actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},{label:'会话控制',value:{action:'panel',sessionId}}]},`${op.operationId}:existing-readonly`,() => this.channel.checkBinding(destination,sessionId,targetScope));
       return {sessionId,accessMode:'read_only',destination,reason:'upgrade_in_existing_topic'};
     }
 
     const replace = !existing || existing.session_id !== sessionId;
+    const initialCursor = draft?.initial_prompt ? await this.initialEmptyCursor(sessionId) : undefined;
     let finalScope: string;
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -399,6 +474,13 @@ export class FeishuSessionBinding {
       this.completePending(op.operationId);
       const card = sessionCard(session,this.channel.accessMode(destination));
       this.rememberDelivery(op.operationId,destination,session,finalScope,original,card);
+      if (draft) {
+        this.drafts.settle(op.operationId,'completed');
+        if (initialCursor) {
+          this.seedCursor(destination,sessionId,finalScope,initialCursor);
+          this.drafts.enqueueFirstPrompt(draft,sessionId,destination,finalScope,original.identity);
+        }
+      }
       if (destination === source) {
         const callbacks = this.db.prepare('SELECT message_id,envelope FROM channel_binding_attach_cards WHERE operation_id=?')
           .all(op.operationId) as Array<{message_id:string;envelope:string}>;
@@ -415,8 +497,99 @@ export class FeishuSessionBinding {
     if (!existing && destination !== source) {
       await recordNewTopicRootTitle(this.db,this.port,destination,finalScope,session,`${op.operationId}:topic`);
     }
-    if (deliverNow) await this.flushDeliveries(op.operationId);
+    if (deliverNow) {
+      const child = await this.advanceFirstPrompt(op.operationId);
+      if (child) return child;
+      await this.flushDeliveries(op.operationId);
+    }
     return {sessionId,accessMode:mode,destination};
+  }
+
+  private interactiveReady(session: Session): boolean {
+    return session.control.input === 'available' && session.status !== 'read_only';
+  }
+
+  private matchesDraftSession(draft: NewSessionDraft, session: Session): boolean {
+    if (session.native.provider !== draft.provider) return false;
+    try {
+      return realpathSync(session.project) === draft.projects[draft.chosen_index!];
+    } catch {
+      return false;
+    }
+  }
+
+  private async initialEmptyCursor(sessionId: string): Promise<string> {
+    if (this.service.initialCursor) return this.service.initialCursor(sessionId);
+    const snapshot = await this.service.getSnapshot(sessionId);
+    if (snapshot.value.messages.length) throw new Error('initial cursor unavailable');
+    return snapshot.cursor;
+  }
+
+  private seedCursor(destination: string, sessionId: string, scope: string, cursor: string): void {
+    this.db.prepare(`
+      INSERT INTO channel_cursors(destination,session_id,binding_scope,cursor) VALUES (?,?,?,?)
+      ON CONFLICT(destination) DO UPDATE SET session_id=excluded.session_id,binding_scope=excluded.binding_scope,cursor=excluded.cursor
+      WHERE channel_cursors.session_id<>excluded.session_id OR channel_cursors.binding_scope<>excluded.binding_scope
+    `).run(destination,sessionId,scope,cursor);
+  }
+
+  private advanceFirstPrompt(operationId: string): Promise<Operation | null> {
+    const active = this.submittingFirstPrompts.get(operationId);
+    if (active) return active;
+    const work = this.submitFirstPrompt(operationId).finally(() => this.submittingFirstPrompts.delete(operationId));
+    this.submittingFirstPrompts.set(operationId,work);
+    return work;
+  }
+
+  private async submitFirstPrompt(operationId: string): Promise<Operation | null> {
+    const row = this.drafts.firstPrompt(operationId);
+    if (!row) return null;
+    const {destination,session_id:sessionId,final_scope:bindingScope,child_operation_id:childId} = row;
+    const identity = JSON.parse(row.identity) as TrustedEnvelope['identity'];
+    const owned = () => {
+      const binding = this.ownerRow(destination);
+      return binding?.session_id === sessionId && binding.owner_source === identity.source &&
+        binding.owner_subject === identity.subject && binding.access_mode === 'interactive' && this.channel.scope(destination) === bindingScope;
+    };
+    const authorized = async () => owned() && await this.authorize(identity,destination,sessionId) && owned();
+    const existing = await this.readOperation(childId);
+    if (!await authorized()) {
+      if (existing) await this.service.resumeFirstPrompt?.(childId,false);
+      this.drafts.finishFirstPrompt(operationId,'expired');
+      return null;
+    }
+    if (existing) {
+      if (existing.action !== 'submitInput' || existing.targetId !== sessionId || existing.idempotencyKey !== childId) throw new Error('first prompt operation mismatch');
+      if (existing.status !== 'received') {
+        this.drafts.finishFirstPrompt(operationId,'settled');
+        return null;
+      }
+      const resumed = this.service.resumeFirstPrompt ? await this.service.resumeFirstPrompt(childId,true) : existing;
+      if (resumed) this.drafts.finishFirstPrompt(operationId,resumed.status === 'received' ? 'registered' : 'settled');
+      return resumed;
+    }
+    if (row.state === 'registered') throw new Error('registered first prompt operation missing');
+    const current = await this.service.getSession(sessionId);
+    if (!this.interactiveReady(current)) return null;
+    const draft = this.drafts.forOperation(operationId);
+    if (!draft || !this.matchesDraftSession(draft,current)) {
+      this.drafts.finishFirstPrompt(operationId,'expired');
+      return null;
+    }
+    const cursor = await this.initialEmptyCursor(sessionId);
+    if (!await authorized()) {
+      this.drafts.finishFirstPrompt(operationId,'expired');
+      return null;
+    }
+    this.seedCursor(destination,sessionId,bindingScope,cursor);
+    const channelScope = {destination,bindingScope,ownerSource:identity.source,ownerSubject:identity.subject};
+    const context = {
+      operationId:childId,idempotencyKey:childId,targetId:sessionId,
+      expectedRevision:current.revision,controlGeneration:current.control.generation,identity,channelScope,
+    };
+    const child = await this.service.submitInput({context,mode:'new',blocks:[{type:'text',text:row.prompt_text}],channelScope});
+    this.drafts.finishFirstPrompt(operationId,child.status === 'received' ? 'registered' : 'settled');
+    return child;
   }
 
   private rememberDelivery(operationId: string, destination: string, session: Session, scope: string, original: TrustedEnvelope, card: ChannelCard, suffix = ''): void {
@@ -450,6 +623,23 @@ export class FeishuSessionBinding {
         } else {
           await this.channel.deliver(row.destination,card,row.delivery_id,guard);
           if (!await this.confirmDelivery(row.delivery_id,guard)) continue;
+          const draft = this.drafts.forOperation(operationId);
+          if (draft?.card_message_id) {
+            const draftGuard = async () => {
+              await guard();
+              if (this.channel.scope(draft.destination) !== draft.scope || !await this.authorize(original.identity,draft.destination,row.session_id) ||
+                  this.channel.scope(draft.destination) !== draft.scope) throw new ReadAuthorizationRevoked('draft authorization changed');
+            };
+            const url = await this.port.topicLinkForSession?.(draft.destination,row.session_id);
+            try {
+              await this.patch(draft.destination,draft.card_message_id,{
+                title:'会话已创建',template:'green',text:'在新话题中继续对话。',
+                actions:url ? [{label:'打开话题',value:{},url}] : [],
+              },`${row.delivery_id}:draft`,draftGuard);
+            } catch (error) {
+              if (!isExpiredCard(error)) throw error;
+            }
+          }
         }
         this.db.prepare("UPDATE channel_binding_deliveries SET state='completed' WHERE delivery_id=?").run(row.delivery_id);
       } catch (error) {
@@ -477,7 +667,7 @@ export class FeishuSessionBinding {
   async advanceCompleted(onDerived?: (operation: Operation) => void, skip?: (operationId: string) => boolean): Promise<void> {
     const rows = (table: string) => (this.db.prepare(`SELECT operation_id FROM ${table} WHERE state='pending' ORDER BY rowid`)
       .all() as Array<{operation_id:string}>).map(row=>row.operation_id);
-    const recovery = new Set([...rows('channel_pending'), ...rows('channel_binding_deliveries')]);
+    const recovery = new Set([...this.drafts.firstPromptOperations(), ...rows('channel_pending'), ...rows('channel_binding_deliveries')]);
     const errors: unknown[] = [];
     for (const operationId of recovery) {
       if (skip?.(operationId)) continue;
@@ -500,6 +690,8 @@ export class FeishuSessionBinding {
   }
 
   private async advance(operationId: string): Promise<Operation | null> {
+    const first = await this.advanceFirstPrompt(operationId);
+    if (first) return first;
     await this.flushDeliveries(operationId);
     const pending = this.pending(operationId);
     if (!pending || pending.state !== 'pending') return null;
@@ -507,7 +699,12 @@ export class FeishuSessionBinding {
     const original = JSON.parse(pending.envelope) as TrustedEnvelope;
     if (original.destination !== destination || pending.scope !== this.channel.scope(destination) ||
         !await this.authorize(original.identity,destination,this.channel.binding(destination))) return null;
-    const op = await this.readOperation(operationId);
+    let op = await this.readOperation(operationId);
+    if (!op) {
+      const draft = this.drafts.forOperation(operationId);
+      if (draft) op = await this.registerDraftCreate(draft);
+      if (op?.status === 'received') return op;
+    }
     if (!op) return null;
     const sessionOperation = kind === 'session' && ['createSession','attachSession'].includes(op.action) && op.targetId === `new:${destination}`;
     if (sessionOperation && needsOperationNotice(op)) {
@@ -517,13 +714,18 @@ export class FeishuSessionBinding {
         if (auth?.destination === destination) {
           const suffix = `outcome:${op.status}`;
           try {
-            await this.showOutcome(original,operationCard(op),suffix,auth.guard,
-              (card,id) => this.channel.deliver(destination,card,`${original.eventId}:${id}`,auth.guard));
+            if (this.drafts.forOperation(operationId) && original.cardMessageId) {
+              await this.patch(destination,original.cardMessageId,operationCard(op),`${operationId}:${suffix}`,auth.guard);
+            } else {
+              await this.showOutcome(original,operationCard(op),suffix,auth.guard,
+                (card,id) => this.channel.deliver(destination,card,`${original.eventId}:${id}`,auth.guard));
+            }
           } catch (error) {
             if (!(error instanceof ReadAuthorizationRevoked)) throw error;
           }
         }
       }
+      if (op.status === 'failed' && this.drafts.forOperation(operationId)) this.rejectDraft(operationId);
       return null;
     }
     if (op.status !== 'completed' || !op.result) return null;
@@ -531,10 +733,22 @@ export class FeishuSessionBinding {
       kind === 'artifact' && op.result.kind === 'artifact' && op.action === 'stageInputArtifact' &&
         !!pending.session_id && op.targetId === pending.session_id && this.channel.binding(destination) === pending.session_id;
     if (!proven) return null;
+    const draft = this.drafts.forOperation(operationId);
+    if (draft && op.result.kind === 'session') {
+      const session = await this.service.getSession(op.result.sessionId);
+      if (this.matchesDraftSession(draft,session) && !this.interactiveReady(session)) {
+        const stillAuthorized = async () => pending.scope === this.channel.scope(destination) &&
+          await this.authorize(original.identity,destination,session.sessionId) && pending.scope === this.channel.scope(destination);
+        await this.service.restoreInteractive?.(session.sessionId,original.identity,stillAuthorized);
+        if (!this.interactiveReady(await this.service.getSession(session.sessionId))) return null;
+      }
+    }
     const result = await this.channel.handle(
       {...original,eventId:`auto-finish:${operationId}`},
       {action:'finish',operationId},
     );
+    const child = await this.advanceFirstPrompt(operationId);
+    if (child) return child;
     await this.flushDeliveries(operationId);
     return operationFromReceipt(result);
   }

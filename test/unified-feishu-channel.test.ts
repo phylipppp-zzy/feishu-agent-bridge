@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js';
 import type { UnifiedService } from '../src/unified/adapter.js';
-import type { Session, WriteContext } from '../src/unified/contracts.js';
+import type { Interaction, Session, WriteContext } from '../src/unified/contracts.js';
+import { interactionCard } from '../src/unified/feishu-cards.js';
 
 // Establish an interactive fixture through the channel's authorized attach/finish path.
 async function interactiveBinding(channel:FeishuChannel, service:UnifiedService, env:{eventId:string;destination:string;identity:{source:string;subject:string}}, sessionId:string) {
@@ -50,13 +51,40 @@ for (const provider of ['claude', 'codex'] as const) test(`${provider}: same ent
 
 test('Feishu card and message codec preserves actionable answer without trusting identity', async () => {
  const {parseFeishuAction,parseFeishuText,toFeishuCard} = await import('../src/unified/feishu-codec.js');
- const {interactionCard} = await import('../src/unified/feishu-cards.js');
  const card = interactionCard({interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'n',connectionGeneration:2,revision:3,status:'awaiting_answer',expiresAt:null,toolInputDigest:'digest',nativeResult:null,kind:'approval',tool:'test',action:'write',scope:'test-only'});
  const json = toFeishuCard(card) as {elements:Array<{actions?:Array<{value:unknown}>}>};
  const answer = parseFeishuAction({...json.elements[1]!.actions![1]!.value as object,bindingId:'test-binding'});
  assert.equal(answer.action,'answer'); if (answer.action === 'answer' && answer.answer.kind === 'approval') assert.equal(answer.answer.decision,'deny');
  assert.deepEqual(parseFeishuText('/queue hello'),{action:'input',text:'hello',mode:'queue'});
  assert.throws(() => parseFeishuAction({action:'answer',identity:{subject:'spoof'}}),/invalid/);
+});
+
+for (const [tool, action, target] of [
+ ['Bash', '需要人工确认\n{"input":{"command":"pwd","untrusted":"hidden"},"blockedPath":"/tmp/check"}', 'pwd\n/tmp/check'],
+ ['file_change', '{"changes":[{"path":"check.txt","diff":"hidden"}],"grantRoot":"/tmp"}', '/tmp\ncheck.txt'],
+ ['run_command', '{"rawInput":{"CommandLine":"git status","untrusted":"hidden"},"locations":[{"path":"/tmp/check"}]}', 'git status\n/tmp/check'],
+ ['Read', 'plain.txt<at id="all">hidden</at>', 'plain.txt'],
+] as const) test(`approval displays the permitted fields for ${tool}`, () => {
+ const request: Extract<Interaction, {kind:'approval'}> = {
+  interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'n',connectionGeneration:2,revision:3,
+  status:'awaiting_answer',expiresAt:null,toolInputDigest:'digest',nativeResult:null,kind:'approval',tool,action,scope:'session',
+ };
+ const card = interactionCard(request);
+ assert.match(card.title, /^⚠️ 需人工确认 · /u);
+ assert.equal(card.template, 'orange');
+ assert.ok(card.text.includes('\n```\n' + target + '\n```\n'));
+ assert.match(card.text, /\*\*生效范围\*\*：本会话内同类操作/u);
+ assert.doesNotMatch(card.text, /hidden|awaiting_answer|<at/u);
+ assert.deepEqual(card.actions.map(button => button.label), ['允许本次', '拒绝']);
+ const unavailable = interactionCard({...request,allowedDecisions:[]});
+ assert.deepEqual(unavailable.actions, []);
+ assert.match(unavailable.text, /请在原端处理/u);
+ const confirmed = interactionCard({...request,status:'resolved',nativeResult:{status:'accepted',source:'fixture',answer:{kind:'approval',decision:'allow',scope:'session'}}});
+ assert.equal(confirmed.title, '审批 · 已确认');
+ assert.equal(confirmed.template, 'green');
+ const denied = interactionCard({...request,status:'resolved',nativeResult:{status:'accepted',source:'fixture',answer:{kind:'approval',decision:'deny',scope:'session'}}});
+ assert.equal(denied.title, '审批 · 已拒绝');
+ assert.equal(denied.template, 'grey');
 });
 
 test('sync rechecks authorization, resumes cursor after reopen, and removes answered actions', async () => {
@@ -106,7 +134,10 @@ for (const provider of ['claude','codex'] as const) test(`${provider}: generated
  try {
   await interactiveBinding(channel,service,env('b'),'s');
   await channel.handle(env('p'),parseFeishuText('/panel turn queue'));
-  const panel=cards.at(-1)!; const json=toFeishuCard(panel) as {elements:Array<{actions?:Array<{value:unknown}>}>};
+  const panel=cards.at(-1)!;
+  assert.match(panel.text,/通知：开启（完成：开 · 等待：开 · 失败：开）/);
+  assert.doesNotMatch(panel.text,/当前不支持|旧版/);
+  const json=toFeishuCard(panel) as {elements:Array<{actions?:Array<{value:unknown}>}>};
   for (const [i,button] of json.elements[1]!.actions!.entries()) await channel.handle(env(`a${i}`),parseFeishuAction(button.value));
   assert.deepEqual(calls.slice(0,6),['archive','archive','control','release','stop','cancel']);
   await channel.handle(env('models'),{action:'models'}); const model=toFeishuCard(cards.at(-1)!) as {elements:Array<{actions?:Array<{value:unknown}>}>}; await channel.handle(env('model-choice'),parseFeishuAction(model.elements[1]!.actions![0]!.value));
@@ -159,4 +190,20 @@ test('callback created under old binding cannot act on new binding', async () =>
  try {await interactiveBinding(channel,service,e('a'),'A');await channel.handle(e('p'),{action:'panel',turnId:'old'});const button=cards.at(-1)!.actions.find(x=>x.label==='中断当前回复')!;await channel.handle(e('b'),{action:'bind',sessionId:'B'});await assert.rejects(channel.handle(e('stale'),parseFeishuAction(button.value)),/binding changed/);assert.equal(stopped,0);}finally{channel.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-test('legacy commands expose reachable migration paths',async()=>{ const {parseFeishuText}=await import('../src/unified/feishu-codec.js'); assert.deepEqual(parseFeishuText('/sessions'),{action:'list'}); assert.deepEqual(parseFeishuText('/help'),{action:'help'}); assert.deepEqual(parseFeishuText('/new /tmp hello'),{action:'new_help'}); assert.deepEqual(parseFeishuText('/model'),{action:'legacy_model'}); assert.deepEqual(parseFeishuText('/model m high'),{action:'legacy_model',model:'m',effort:'high'}); assert.deepEqual(parseFeishuText('/model m'),{action:'legacy_model',invalid:true}); });
+test('legacy commands expose reachable migration paths',async()=>{ const {parseFeishuText}=await import('../src/unified/feishu-codec.js'); assert.deepEqual(parseFeishuText('/sessions'),{action:'list'}); assert.deepEqual(parseFeishuText('/help'),{action:'help'}); assert.deepEqual(parseFeishuText('/new /tmp hello'),{action:'new_help',initialPrompt:'/tmp hello'}); assert.deepEqual(parseFeishuText('/model'),{action:'legacy_model'}); assert.deepEqual(parseFeishuText('/model m high'),{action:'legacy_model',model:'m',effort:'high'}); assert.deepEqual(parseFeishuText('/model m'),{action:'legacy_model',invalid:true}); });
+
+test('new drafts preserve multiline prompts and keep compact callbacks', async () => {
+ const {parseFeishuAction,parseFeishuText}=await import('../src/unified/feishu-codec.js');
+ for (const [input,expected] of [
+  ['/new',{action:'new_help'}],
+  ['/new codex',{action:'new_help',provider:'codex'}],
+  ['/new agy 第一行\n  第二行  ',{action:'new_help',provider:'agy',initialPrompt:'第一行\n  第二行  '}],
+  ['/new Claude 第一行\n第二行',{action:'new_help',initialPrompt:'Claude 第一行\n第二行'}],
+ ] as const) assert.deepEqual(parseFeishuText(input),expected);
+ const t='abcdefghijklmnopqrstuv';
+ for (const action of [{action:'new_provider',t,r:1,p:'claude'}, {action:'new_pick',t,r:2,i:0}]) {
+  assert.deepEqual(parseFeishuAction(action),action);
+ }
+ assert.throws(() => parseFeishuAction({action:'new_pick',t,r:2,i:-1}),/invalid/);
+ assert.throws(() => parseFeishuAction({action:'new_provider',t:'short',r:1,p:'codex'}),/invalid/);
+});

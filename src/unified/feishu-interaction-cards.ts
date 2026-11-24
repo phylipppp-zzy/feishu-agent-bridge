@@ -54,6 +54,9 @@ export class FeishuInteractionCards {
     if (interaction.kind !== 'approval') {
       const binding = this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(destination) as {binding_id:string};
       const statusText = interactionStatusText(interaction,op);
+      view.schema = '2.0';
+      view.text = readOnly ? '请回原会话答复。' : '';
+      view.actions = [];
       view.form = questionForm(interaction,binding.binding_id,readOnly || !!statusText);
       if (statusText) view.form.statusText = statusText;
     }

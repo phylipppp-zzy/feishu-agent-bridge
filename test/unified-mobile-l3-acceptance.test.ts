@@ -13,9 +13,10 @@ import { FeishuSdkPort, receiveSdkMessage } from '../src/unified/feishu-sdk-port
 import { parseFeishuAction, parseFeishuText } from '../src/unified/feishu-codec.js';
 import { createMockAdapter } from '../src/unified/mock-adapter.js';
 import { AgyCatalog, readAgySummaries } from '../src/unified/agy-catalog.js';
-import { createIntegratedRuntime, validateRuntimeConfig, type RuntimeConfig } from '../src/unified/runtime.js';
+import { createIntegratedRuntime, UnifiedRuntime, validateRuntimeConfig, type RuntimeConfig } from '../src/unified/runtime.js';
 import { payloadDigest, type Capabilities, type Provider, type Session } from '../src/unified/contracts.js';
 import type { PlatformPort } from '../src/unified/adapter.js';
+import type { ChannelCard } from '../src/unified/feishu-cards.js';
 
 const fullCaps = Object.fromEntries(
   ['view', 'send', 'queue', 'steer', 'answer', 'approve', 'interrupt', 'handoff', 'files', 'config'].map((k) => [
@@ -562,16 +563,18 @@ test('runtime gracefully skips missing read_only archived project dirs while kee
       const healthRows = await runtime.core.health();
       assert.equal(healthRows.find((r) => r.component === 'core')?.status, 'healthy');
 
-      // Test /new direct create buttons wired via allowedProjectRoots[0]
       await runtime.handleTrusted({ eventId: 'ev-new', destination: 'chat', identity: { source: 'feishu', subject: 'owner' } }, { action: 'new_help' });
       await runtime.tick();
       const newCard = cards.at(-1);
       assert.equal(newCard.title, '新建会话');
       assert.deepEqual(
         newCard.actions.map((a: any) => a.label),
-        ['新建 Antigravity', '新建 Codex', '新建 Claude'],
+        ['✓ Codex', 'proj'],
       );
-      assert.deepEqual(newCard.actions[1].value, { action: 'create', provider: 'codex', project, model: null });
+      const token = newCard.actions[0].value.t;
+      assert.match(token, /^[A-Za-z0-9_-]{22}$/);
+      assert.deepEqual(newCard.actions[0].value, { action:'new_provider', t:token, r:0, p:'codex' });
+      assert.deepEqual(newCard.actions[1].value, { action:'new_pick', t:token, r:0, i:0 });
 
       // Creating in a non-existent dir still fails strict realpathSync validation
       await runtime.core.createSession({
@@ -601,6 +604,181 @@ test('runtime gracefully skips missing read_only archived project dirs while kee
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const failure of ['before registration', 'after registration'] as const) {
+  test(`/new freezes the chosen directory and recovers the first prompt after interruption ${failure}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'l3-new-draft-'));
+    const channelDb = join(dir,'channel.sqlite'), coreDb = join(dir,'core.sqlite');
+    const v1 = join(dir,'v1','app'), v2 = join(dir,'v2','app'), hidden = join(dir,'hidden');
+    for (const path of [v1,v2,hidden]) mkdirSync(path,{recursive:true});
+    const cards = new Map<string,ChannelCard>();
+    const sent: Array<{destination:string;card:ChannelCard}> = [];
+    const identity = {source:'feishu',subject:'owner'};
+    const e = {destination:'chat',identity};
+    const topic = 'topic:new';
+    const prompt = '修复路径\n先核对测试';
+    const patches: string[] = [];
+    const created: string[] = [], inputs: string[] = [];
+    const port: FeishuPort & {authorizedDestination: (destination: string) => boolean} = {
+      authorizedDestination: d => d === 'chat' || d === topic,
+      isTopicDestination: d => d === topic,
+      chatDestination: d => d === topic ? 'chat' : d,
+      createTopic: async (_d,_s,_card,_id,guard) => {await guard?.(); return topic;},
+      topicLinkForSession: async () => 'https://feishu.example/topic',
+      send: async (destination,card,id,guard) => {
+        await guard?.();
+        cards.set(id,card);
+        sent.push({destination,card});
+        return id;
+      },
+      update: async (_d,m,card,_id,guard) => {
+        await guard?.();
+        cards.set(m,card);
+        patches.push(card.title);
+      },
+      sendFile: async () => {},
+    };
+    let store: UnifiedStore, core: UnifiedCore, channel: FeishuChannel;
+    const provider = {
+      provider:'codex',
+      onObservation: () => () => {},
+      async create(project) {
+        created.push(project);
+        const session = makeSession('codex','new',project,'新会话');
+        session.control.input = 'available';
+        return {status:'submitted',nativeReference:'new',createdSession:session,connectionGeneration:1};
+      },
+      async input(ref,mode,blocks,guard) {
+        assert.equal(mode,'new');
+        assert.equal(ref.nativeSessionId,'new');
+        guard.assertCurrent();
+        inputs.push(blocks[0]?.type === 'text' ? blocks[0].text : '');
+        const session = store.listSessions().find(item => item.native.nativeSessionId === 'new')!;
+        store.putMessage({
+          messageId:'fast-reply',sessionId:session.sessionId,turnId:'fast-turn',role:'assistant',
+          blocks:[{type:'text',text:'即时回复'}],sequence:1,revision:0,final:true,source:'codex',
+        },null);
+        return {status:'submitted',nativeReference:'fast-turn'};
+      },
+    } satisfies Pick<PlatformPort,'provider'|'onObservation'|'create'|'input'>;
+    const connect = () => {
+      store = new UnifiedStore(coreDb);
+      core = new UnifiedCore(store,[provider,{...provider,provider:'claude'}] as unknown as PlatformPort[],() => true,() => true);
+      channel = new FeishuChannel(core,port,async (_id,_d,sessionId) => sessionId !== 'hidden',channelDb,undefined,false,
+        {defaultCreateProject:v1,allowedProjectRoots:[dir,v1]});
+      core.validateSteerScope = (scope,id) => channel.isCurrentSteerScope(scope,id);
+      return {close:async () => {channel.close();core.close();store.close();}};
+    };
+    let live: ReturnType<typeof connect> | undefined = connect();
+    const close = async () => {
+      const active = live;
+      live = undefined;
+      await active?.close();
+    };
+    try {
+      for (const [id,project] of [['recent',v2],['hidden',hidden]] as const) {
+        store!.insertSession({...makeSession('codex',id,project,id),sessionId:id});
+      }
+      const command = parseFeishuText(`/new claude ${prompt}`);
+      if (command?.action !== 'new_help') assert.fail('expected a /new draft command');
+      await channel!.handle({...e,eventId:'draft'},command);
+      const messageId = 'draft:new-draft';
+      const open = cards.get(messageId)!;
+      assert.deepEqual(open.actions.map(action => action.label),['Codex','✓ Claude','v1/app','v2/app',dir.split('/').at(-1)]);
+      assert.ok(open.text.includes(prompt));
+      for (const action of open.actions) {
+        assert.ok(Buffer.byteLength(JSON.stringify(action.value)) <= 256);
+      }
+      const pick = parseFeishuAction(open.actions[3]!.value);
+      const switched = parseFeishuAction(open.actions[0]!.value);
+      await channel!.handle({...e,eventId:'switch',cardMessageId:messageId},switched);
+      assert.equal(cards.get(messageId)?.actions[0]?.label,'✓ Codex');
+      assert.deepEqual(await channel!.handle({...e,eventId:'stale',cardMessageId:messageId},pick),{status:'expired'});
+      const currentPick = parseFeishuAction(cards.get(messageId)!.actions[3]!.value);
+      assert.deepEqual(await channel!.handle({...e,eventId:'imitated-card',cardMessageId:'other'},currentPick),{status:'expired'});
+      assert.deepEqual(await channel!.handle({...e,eventId:'foreign-owner',identity:{...identity,subject:'other'},cardMessageId:messageId},currentPick),{status:'expired'});
+      const op = await channel!.handle({...e,eventId:'pick',cardMessageId:messageId},currentPick) as {operationId:string};
+      const duplicate = await channel!.handle({...e,eventId:'duplicate-pick',cardMessageId:messageId},currentPick) as {operationId:string};
+      assert.equal(duplicate.operationId,op.operationId);
+      assert.equal(patches.filter(title => title === '正在创建会话…').length,1);
+      await core!.dispatch(op.operationId);
+      assert.deepEqual(created,[v2]);
+      const submit = core!.submitInput.bind(core!);
+      core!.submitInput = async request => {
+        if (failure === 'after registration') await submit(request);
+        throw new Error('simulated interruption');
+      };
+      await assert.rejects(channel!.advanceOperation(op.operationId),/simulated interruption/);
+      const db = new DatabaseSync(channelDb);
+      try {
+        assert.equal(db.prepare('SELECT state FROM channel_pending WHERE operation_id=?').get(op.operationId)?.state,'completed');
+        assert.equal(db.prepare('SELECT state FROM channel_new_session_first_prompts WHERE create_operation_id=?').get(op.operationId)?.state,'pending');
+        assert.ok(db.prepare('SELECT cursor FROM channel_cursors WHERE destination=?').get(topic)?.cursor);
+      } finally {db.close();}
+      await close();
+      let connection = 1, controlGeneration: number | undefined;
+      const recoveredProvider = {
+        ...provider,
+        seedConnectionGeneration: (minimum: number) => {connection = minimum;},
+        async read(ref: Session['native']) {
+          const session = store!.listSessions().find(item => item.native.nativeSessionId === ref.nativeSessionId)!;
+          const restored = controlGeneration === undefined ? session : {
+            ...session,status:'idle' as const,capabilities:fullCaps,
+            control:{...session.control,input:'available' as const,generation:controlGeneration},
+          };
+          return {session:restored,messages:[],interactions:[],connectionGeneration:connection};
+        },
+        async resume(ref: Session['native']) {
+          const session = store!.listSessions().find(item => item.native.nativeSessionId === ref.nativeSessionId)!;
+          controlGeneration = session.control.generation + 1;
+          return {status:'submitted' as const,nativeReference:ref.nativeSessionId,connectionGeneration:++connection};
+        },
+      };
+      const runtime = new UnifiedRuntime({
+        coreDb,channelDb,ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',
+        claudeServiceId:'claude',codexServiceId:'codex',claudeStateDir:join(dir,'claude'),
+        codexEndpoint:'ws://127.0.0.1:1234',intervalMs:1000,allowedProjectRoots:[v1,dir],
+      },port,[recoveredProvider as unknown as PlatformPort]);
+      live = {close:() => runtime.close()};
+      ({store,core,channel} = runtime);
+      const childId = `new-session-first:${open.actions[0]!.value.t}`;
+      const restoredSession = channel.bindingsForRestore().find(binding => binding.destination === topic)!.sessionId;
+      assert.equal(store.getSession(restoredSession).status,'read_only');
+      await runtime.restoreBindings();
+      assert.equal(store.getSession(restoredSession).control.input,'available');
+      if (failure === 'after registration') {
+        assert.equal(store.getOutbox(childId).state,'suspended');
+      }
+      let submitted = 0;
+      const resubmit = core.submitInput.bind(core);
+      core.submitInput = request => {
+        submitted++;
+        assert.equal(request.channelScope?.destination,topic);
+        assert.deepEqual(request.context.channelScope,request.channelScope);
+        return resubmit(request);
+      };
+      const derived: string[] = [];
+      const advance = channel.advanceCompleted.bind(channel);
+      channel.advanceCompleted = (onDerived,skip) => advance(child => {
+        derived.push(child.operationId);
+        onDerived?.(child);
+      },skip);
+      await runtime.tick();
+      await runtime.tick();
+      assert.deepEqual(derived,[childId]);
+      assert.equal(submitted,failure === 'before registration' ? 1 : 0);
+      assert.equal(core.store.getOutbox(childId).connectionGeneration,connection);
+      assert.deepEqual(inputs,[prompt]);
+      assert.equal(cards.get(messageId)?.actions[0]?.label,'打开话题');
+      assert.ok(sent.some(item => item.destination === topic && item.card.text === '即时回复'));
+      assert.deepEqual(await channel!.handle({eventId:'bound-new',destination:topic,identity},{action:'new_help',initialPrompt:'别发给旧会话'}),{status:'guidance'});
+      assert.deepEqual(inputs,[prompt]);
+    } finally {
+      await close();
+      rmSync(dir,{recursive:true,force:true});
+    }
+  });
+}
 
 test('agy-catalog falls back to bounded 16 KiB transcript <USER_REQUEST> when title and preview are empty', () => {
   const dir = mkdtempSync(join(tmpdir(), 'l3-agy-title-'));
@@ -779,12 +957,12 @@ test('autoMirror.showTitles validates and controls title masking for auto-mirror
 
     const masked = await runOnce(undefined);
     assert.equal(masked.isMarkedPrivate, true);
-    assert.match(masked.topicTitle, /^Codex 会话 · /);
+    assert.match(masked.topicTitle, /^\[Codex · proj\] Codex 会话 · /);
     assert.match(masked.presentedTitle, /^Codex 会话 · /);
 
     const visible = await runOnce(true);
     assert.equal(visible.isMarkedPrivate, false);
-    assert.equal(visible.topicTitle, realTitle);
+    assert.equal(visible.topicTitle, `[Codex · proj] ${realTitle}`);
     assert.equal(visible.presentedTitle, realTitle);
   } finally {
     rmSync(dir, { recursive: true, force: true });

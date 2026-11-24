@@ -6,8 +6,12 @@ import type { Answer, Identity, Operation, Provider, WriteContext, Session } fro
 import { payloadDigest } from './contracts.js';
 import { contractError } from './errors.js';
 import { decodeQuestionForm } from './feishu-question-forms.js';
-import { sessionListCard } from './session-list-card.js';
+import { listAllArtifacts, showSessionList } from './feishu-channel-lists.js';
+import { buildSessionPanel, noticePanel } from './feishu-session-panel.js';
+import { NewSessionDrafts } from './new-session-drafts.js';
+import { NewSessionFlow, type NewSessionAction } from './new-session-flow.js';
 import { operationCard, type ChannelCard } from './feishu-cards.js';
+import { escapeCardMarkdown } from './feishu-card-wire.js';
 import { FeishuInteractionCards } from './feishu-interaction-cards.js';
 import { FeishuInbox } from './feishu-inbox.js';
 import { FeishuSessionBinding } from './feishu-session-binding.js';
@@ -23,6 +27,7 @@ import {
   buildSessionHelpCard,
   buildSwarmReadOnlyAgyCard,
   buildSwarmUnsupportedCard,
+  pendingHubDisabledCard,
 } from './help-cards.js';
 
 /** Identity and destination must come from an authenticated, verified transport envelope. */
@@ -72,7 +77,7 @@ export type ChannelAction = (
  | { action: 'legacy_model'; model?: string; effort?: string; invalid?: boolean }
  | { action: 'help'; scope?: 'admin' }
  | { action: 'swarm'; prompt: string; rawText: string }
- | { action: 'new_help' }
+ | NewSessionAction
  | { action: 'settings'; model: string | null; preferences: Record<string, string>; revision: number; controlGeneration: number }
  | { action: 'notifications'; enabled: boolean; eventTypes: string[]; revision: number; controlGeneration: number }
  | { action:'notice_settings'; field:'paused'|'completed'|'waiting'|'failed'|'legacy'; value:boolean; settingsRevision:number; revision:number; controlGeneration:number }
@@ -82,6 +87,7 @@ export type ChannelAction = (
  | { action: 'reconcile'; operationId: string }
  | { action: 'finish'; operationId: string }
  | { action: 'pending' }
+ | { action: 'pending_open' }
  | { action: 'inspect_unknown'; operationId:string; cursor?:string; nativeId?:string }
  | { action: 'task_create'; title: string }
  | { action: 'task_mount'; sessionId: string; mode?: 'read_only' | 'interactive' }
@@ -94,12 +100,13 @@ export class FeishuChannel {
   private readonly db: DatabaseSync;
   private readonly inbox: FeishuInbox;
   private readonly sessionBinding: FeishuSessionBinding;
+  private readonly newSession: NewSessionFlow;
   private readonly interactionCards: FeishuInteractionCards;
   private migrationLocked=false;
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
-  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; onInteractionChanged?: (sessionId:string,interactionId:string) => void } = {}) {
+  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; onInteractionChanged?: (sessionId:string,interactionId:string) => void } = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL);`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
@@ -128,6 +135,7 @@ export class FeishuChannel {
     for(const table of ['channel_interaction_cards','channel_cursors']) {const fields=this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>;if(!fields.some(c=>c.name==='binding_scope')) this.db.exec(`ALTER TABLE ${table} ADD COLUMN binding_scope TEXT NOT NULL DEFAULT ''`);}
     this.db.exec('CREATE INDEX IF NOT EXISTS channel_bindings_session ON channel_bindings(session_id,destination)');
     this.inbox = new FeishuInbox(this.db);
+    const drafts = new NewSessionDrafts(this.db);
     this.sessionBinding = new FeishuSessionBinding(this.db,service,port,authorize,authorizeBindingAdmin,{
       scope: destination => this.bindingScope(destination),
       binding: destination => this.binding(destination),
@@ -137,7 +145,8 @@ export class FeishuChannel {
       deliver: (...args) => this.deliver(...args),
       stamp: (...args) => this.stampCard(...args),
       handle: (...args) => this.handle(...args),
-    });
+    },drafts);
+    this.newSession = new NewSessionFlow(drafts,service,port,authorize,this.sessionBinding,channelOptions);
     this.interactionCards = new FeishuInteractionCards(this.db,service,port,{
       checkBinding: (...args) => this.checkBinding(...args),
       accessMode: destination => this.accessMode(destination),
@@ -245,7 +254,7 @@ export class FeishuChannel {
     if (this.binding(destination) !== sessionId || (scope!==undefined && scope!==this.bindingScope(destination))) throw new BindingExpired('binding changed');
   }
   private bindingScope(destination: string): string { const row = this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination); return JSON.stringify(row ?? null); }
-  private actionScope(action: ChannelAction, destination: string): string { return ['list','health','pending','create','attach'].includes(action.action) ? 'global' : this.bindingScope(destination); }
+  private actionScope(action: ChannelAction, destination: string): string { return ['list','health','pending','pending_open','create','attach'].includes(action.action) ? 'global' : this.bindingScope(destination); }
   /** A successful initial history read is baselined once per binding epoch. */
   async isReadonlyBaselineAuthorized(destination:string,sessionId:string):Promise<boolean> {const scope=this.bindingScope(destination);try {await this.checkBinding(destination,sessionId,scope);return this.accessMode(destination)==='read_only' && scope===this.bindingScope(destination);} catch {return false;}}
   readonlyHydrated(destination:string, sessionId:string):boolean { const scope=this.bindingScope(destination);return !!this.db.prepare('SELECT 1 FROM channel_history_baselines WHERE destination=? AND session_id=? AND binding_scope=?').get(destination,sessionId,scope); }
@@ -438,7 +447,7 @@ export class FeishuChannel {
       const result={status:'rejected',reason:'read_only_binding'};
       this.db.exec('BEGIN IMMEDIATE');
       try { this.db.prepare("UPDATE channel_inbox SET state='rejected' WHERE event_id=? AND state='received'").run(eventId); this.db.prepare("UPDATE channel_receipts SET state='rejected',result=? WHERE event_id=?").run(JSON.stringify(result),eventId); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
-      await this.deliver(e.destination,{title:'操作未执行',text:'此话题为只读，不能执行此操作。可在本话题打开会话控制并选择转为可交互。',actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},{label:'会话控制',value:{action:'panel',sessionId:bound}}]},`${eventId}:readonly-rejected`);
+      await this.deliver(e.destination,{title:'操作未执行',template:'grey',text:'此话题为只读。点击「一键接入并续聊」后可在飞书继续操作。',actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},{label:'会话控制',value:{action:'panel',sessionId:bound}}]},`${eventId}:readonly-rejected`);
       return result;
     }
     if (bound && a.action === 'attach') throw new Error('use upgrade for a bound destination');
@@ -449,7 +458,7 @@ export class FeishuChannel {
     try { result=await this.execute(e,a,bound,executionScope,effects); }
     catch (error) {
       if(a.action==='list' && !effects.started && executionScope===this.bindingScope(e.destination) && await this.authorize(e.identity,e.destination,bound) && executionScope===this.bindingScope(e.destination)) {const result={status:'rejected',reason:'temporarily_unavailable'}; const current=async()=>{if(executionScope!==this.bindingScope(e.destination) || !await this.authorize(e.identity,e.destination,bound) || executionScope!==this.bindingScope(e.destination)) throw new Error('binding changed or unauthorized');}; await this.deliver(e.destination,{title:'会话列表暂不可用',text:'读取会话列表失败，请稍后重试。',actions:[]},`${eventId}:list-unavailable`,current);this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare("UPDATE channel_receipts SET state='completed',result=? WHERE event_id=?").run(JSON.stringify(result),eventId);this.db.prepare("UPDATE channel_inbox SET state='completed' WHERE event_id=?").run(eventId);this.db.exec('COMMIT');}catch(e){this.db.exec('ROLLBACK');throw e;}return result;}
-      const readOnly=['help','new_help','pending','list','health','panel','history','artifacts','project_files','deliver_files','export','file','models'].includes(a.action) || (a.action==='legacy_model' && !a.model);
+      const readOnly=['help','new_help','pending','pending_open','list','health','panel','history','artifacts','project_files','deliver_files','export','file','models'].includes(a.action) || (a.action==='legacy_model' && !a.model);
       if (readOnly && !effects.started && (error instanceof BindingExpired || error instanceof ReadAuthorizationRevoked)) { const result={status:error instanceof BindingExpired ? 'expired' : 'rejected',reason:error instanceof BindingExpired ? 'binding_changed' : 'unauthorized'}; this.db.exec('BEGIN IMMEDIATE'); try {this.db.prepare('UPDATE channel_inbox SET state=? WHERE event_id=?').run(result.status,eventId);this.db.prepare('UPDATE channel_receipts SET state=?,result=? WHERE event_id=?').run(result.status,JSON.stringify(result),eventId);this.db.exec('COMMIT');} catch(e) {this.db.exec('ROLLBACK');throw e;} return result; }
       if(error instanceof FileCommandError) { const allowed=executionScope===this.bindingScope(e.destination) && await this.authorize(e.identity,e.destination,bound); const stale=executionScope!==this.bindingScope(e.destination); if(stale || !allowed) {if(effects.started) throw error; const result={status:stale?'expired':'rejected',reason:stale?'binding_changed':'unauthorized'}; this.db.exec('BEGIN IMMEDIATE'); try {this.db.prepare('UPDATE channel_inbox SET state=? WHERE event_id=?').run(result.status,eventId); this.db.prepare('UPDATE channel_receipts SET state=?,result=? WHERE event_id=?').run(result.status,JSON.stringify(result),eventId); this.db.exec('COMMIT');} catch(e) {this.db.exec('ROLLBACK');throw e;} return result;} result={status:'rejected',reason:error.message}; await this.deliver(e.destination,{title:'文件操作未完成',text:error.message,actions:[]},`${eventId}:file-rejected`); this.db.prepare("UPDATE channel_receipts SET state='completed',result=? WHERE event_id=?").run(JSON.stringify(result),eventId); this.db.prepare("UPDATE channel_inbox SET state='completed' WHERE event_id=?").run(eventId); return result; }
       const detail=error && typeof error==='object' && 'detail' in error ? (error as {detail?:{code?:string}}).detail : undefined;
@@ -463,21 +472,6 @@ export class FeishuChannel {
     try { this.db.prepare("UPDATE channel_receipts SET state='completed',result=? WHERE event_id=?").run(JSON.stringify(result ?? null),eventId); this.db.prepare("UPDATE channel_inbox SET state='completed' WHERE event_id=?").run(eventId); this.db.exec('COMMIT'); }
     catch (error) {this.db.exec('ROLLBACK');throw error;}
     return result;
-  }
-  private async listAllArtifacts(sessionId: string): Promise<import('./contracts.js').Artifact[]> {
-    const items: import('./contracts.js').Artifact[] = [];
-    let cursor: string | undefined;
-    const seen = new Set<string>();
-    do {
-      const page = await this.service.listArtifacts(sessionId, { limit: 1000, ...(cursor ? { cursor } : {}) });
-      items.push(...page.items);
-      cursor = page.nextCursor ?? undefined;
-      if (cursor) {
-        if (seen.has(cursor) || seen.size >= 1000) throw new Error('invalid artifact pagination');
-        seen.add(cursor);
-      }
-    } while (cursor);
-    return items;
   }
   async handle(e: TrustedEnvelope, a: ChannelAction): Promise<unknown> { await this.intake(e,a); return this.drain(e.eventId); }
   private async execute(e: TrustedEnvelope, a: ChannelAction, bound: string | null, executionScope:string, effects:{started:boolean}): Promise<unknown> {
@@ -515,40 +509,13 @@ export class FeishuChannel {
       await reply(buildMainHelpCard());
       return {status:'guidance'};
     }
-    if (a.action === 'new_help') {
-      const defaultProject = this.channelOptions.defaultCreateProject?.trim() || undefined;
-      const text = defaultProject
-        ? `点击下方按钮可在默认目录（${defaultProject}）新建会话（支持 codex / claude / agy · Antigravity）；如需指定其他目录或模型，请发送 /create <codex|claude|agy> <项目目录> [模型]。创建完成后在新话题发送任务；目录须符合服务端允许范围。`
-        : '请先选择后端（codex / claude / agy · Antigravity）和可信项目目录，再发送 /create <codex|claude|agy> <项目目录> [模型]。创建完成后在新话题发送任务；目录须符合服务端允许范围。';
-      const actions: ChannelCard['actions'] = defaultProject
-        ? [
-            {label:'新建 Antigravity',value:{action:'create',provider:'agy',project:defaultProject,model:null}},
-            {label:'新建 Codex',value:{action:'create',provider:'codex',project:defaultProject,model:null}},
-            {label:'新建 Claude',value:{action:'create',provider:'claude',project:defaultProject,model:null}},
-          ]
-        : [];
-      await reply({title:'新建会话',text,actions});
-      return {status:'guidance'};
+    if (a.action === 'new_help' || a.action === 'new_provider' || a.action === 'new_pick') {
+      return this.newSession.handle(e,a,{scope:executionScope,guard,reply,context:this.context(e,`new:${e.destination}`,0,0),bound});
     }
-    if (a.action === 'pending') { const pending=this.pendingOperations(e.destination),actions:ChannelCard['actions']=[];for(const p of pending){actions.push({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}});if(p.kind==='session'&&this.service.inspectUnknownCreateCandidates&&this.service.unknownCreateProvider){try{if(await this.service.unknownCreateProvider(e.identity,e.destination,p.operationId)==='codex')actions.push({label:'查看 Codex 候选',value:{action:'inspect_unknown',operationId:p.operationId}})}catch{}}}await reply({title:'待完成操作',text:pending.length ? `查询完成结果后继续。操作 ID：${pending.map(p=>p.operationId).join('、')}` : '没有待完成操作',actions});return pending; }
-    if(a.action==='inspect_unknown'){const row=this.db.prepare("SELECT p.destination,p.kind,p.state,s.scope,a.envelope FROM channel_pending p JOIN channel_pending_scope s ON s.operation_id=p.operation_id JOIN channel_pending_actors a ON a.operation_id=p.operation_id WHERE p.operation_id=?").get(a.operationId) as {destination:string;kind:string;state:string;scope:string;envelope:string}|undefined;const actor=row?JSON.parse(row.envelope) as TrustedEnvelope:null;if(!row||row.destination!==e.destination||row.kind!=='session'||row.state!=='pending'||row.scope!==executionScope||!actor||actor.identity.source!==e.identity.source||actor.identity.subject!==e.identity.subject||!this.service.inspectUnknownCreateCandidates)throw new Error('candidate inspection unavailable');await guard();const result=await this.service.inspectUnknownCreateCandidates(e.identity,e.destination,a.operationId,{...(a.cursor?{cursor:a.cursor}:{}),...(a.nativeId?{nativeId:a.nativeId}:{})});await guard();const lines=result.items.map(x=>`Codex ${JSON.stringify(x.native.hostId)}/${JSON.stringify(x.native.serviceId)} · ${x.native.nativeSessionId} · ${JSON.stringify(x.project)} · 观测状态 ${x.status}`);await reply({title:'Codex 候选元数据',text:`原创建结果仍未知；以下候选不代表该次创建成功，历史未验证。${result.partial?' 部分候选未能读取。':''}\n${lines.length?lines.join('\n'):'当前页没有可展示的候选。'}`,actions:result.nextCursor?[{label:'下一页',value:{action:'inspect_unknown',operationId:a.operationId,cursor:result.nextCursor}}]:[]});return result;}
-    if (a.action === 'list') {
-      const search = a.search ?? (a.provider && a.provider !== 'all' ? a.provider : undefined);
-      const page=await this.service.listSessions({limit:5,...(search === undefined ? {} : {search}),...(a.provider && a.provider !== 'all' ? {provider:a.provider} : {}),...(a.cursor === undefined ? {} : {cursor:a.cursor})});
-      const sessions=[]; for(const s of page.items) if(await this.authorize(e.identity,e.destination,s.sessionId)) sessions.push(s);
-      const topicUrls=new Map<string,string>();const links=await Promise.all(sessions.map(async session=>{await guard();const url=await this.port.topicLinkForSession?.(e.destination,session.sessionId);await guard();return {sessionId:session.sessionId,url};}));for(const link of links) if(link.url) topicUrls.set(link.sessionId,link.url);
-      const visible:Array<(typeof page.items)[number]>=[];for(const session of sessions) {await guard();if(await this.authorize(e.identity,e.destination,session.sessionId)) visible.push(session);await guard();}
-      const listGuard=async()=>{for(const session of visible) {await guard();if(!await this.authorize(e.identity,e.destination,session.sessionId)) throw new ReadAuthorizationRevoked('unauthorized');}await guard();};
-      let hasAgyProvider = false;
-      if (typeof this.service.hasProvider === 'function') {
-        const has = this.service.hasProvider('agy') as unknown;
-        if (typeof has === 'boolean') hasAgyProvider = has;
-        else if (has && typeof (has as Promise<unknown>).catch === 'function') void (has as Promise<unknown>).catch(() => {});
-      }
-      const providerFilters=a.provider !== undefined || page.items.some(s => s.native.provider === 'agy') || hasAgyProvider;
-      const card=sessionListCard(visible,{topicUrls,nextCursor:page.nextCursor,...(providerFilters ? {providerFilters:true} : {}),...(a.search ? {search:a.search} : {}),...(a.provider !== undefined ? {provider:a.provider} : {})}); if(page.unavailableProviders?.length) card.text+=`\n暂不可用：${page.unavailableProviders.join('、')}；列表可能不完整。`;
-      await replyOrUpdate(card,'reply',listGuard);return {nextCursor:page.nextCursor};
-    }
+    if (a.action === 'pending_open') { await reply(pendingHubDisabledCard()); return {status:'guidance'}; }
+    if (a.action === 'pending') { const pending=this.pendingOperations(e.destination),actions:ChannelCard['actions']=[];for(const p of pending){actions.push({label:`继续 ${p.kind}`,value:{action:'finish',operationId:p.operationId}});if(p.kind==='session'&&this.service.inspectUnknownCreateCandidates&&this.service.unknownCreateProvider){try{if(await this.service.unknownCreateProvider(e.identity,e.destination,p.operationId)==='codex')actions.push({label:'查看 Codex 候选',value:{action:'inspect_unknown',operationId:p.operationId}})}catch{}}}await reply({title:'待完成操作',format:'plain',text:pending.length ? `查询完成结果后继续。操作 ID：${pending.map(p=>p.operationId).join('、')}` : '没有待完成操作',actions});return pending; }
+    if(a.action==='inspect_unknown'){const row=this.db.prepare("SELECT p.destination,p.kind,p.state,s.scope,a.envelope FROM channel_pending p JOIN channel_pending_scope s ON s.operation_id=p.operation_id JOIN channel_pending_actors a ON a.operation_id=p.operation_id WHERE p.operation_id=?").get(a.operationId) as {destination:string;kind:string;state:string;scope:string;envelope:string}|undefined;const actor=row?JSON.parse(row.envelope) as TrustedEnvelope:null;if(!row||row.destination!==e.destination||row.kind!=='session'||row.state!=='pending'||row.scope!==executionScope||!actor||actor.identity.source!==e.identity.source||actor.identity.subject!==e.identity.subject||!this.service.inspectUnknownCreateCandidates)throw new Error('candidate inspection unavailable');await guard();const result=await this.service.inspectUnknownCreateCandidates(e.identity,e.destination,a.operationId,{...(a.cursor?{cursor:a.cursor}:{}),...(a.nativeId?{nativeId:a.nativeId}:{})});await guard();const lines=result.items.map(x=>`Codex ${JSON.stringify(x.native.hostId)}/${JSON.stringify(x.native.serviceId)} · ${x.native.nativeSessionId} · ${JSON.stringify(x.project)} · 观测状态 ${x.status}`);await reply({title:'Codex 候选元数据',format:'plain',text:`原创建结果仍未知；以下候选不代表该次创建成功，历史未验证。${result.partial?' 部分候选未能读取。':''}\n${lines.length?lines.join('\n'):'当前页没有可展示的候选。'}`,actions:result.nextCursor?[{label:'下一页',value:{action:'inspect_unknown',operationId:a.operationId,cursor:result.nextCursor}}]:[]});return result;}
+    if (a.action === 'list') return showSessionList(this.service,this.port,this.authorize,e,a,guard,replyOrUpdate);
     if (a.action === 'health') {
       const health = await this.service.health();
       await reply(buildHealthCard(health));
@@ -600,21 +567,12 @@ export class FeishuChannel {
     const session = await this.service.getSession(bound);
     const current = () => this.context(e, bound, session.revision, session.control.generation);
     if (a.action === 'unbind') { this.db.prepare('DELETE FROM channel_bindings WHERE destination=?').run(e.destination); this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(e.destination); return { unbound: true }; }
-    if (a.action === 'panel' && this.accessMode(e.destination) === 'read_only') { if(a.sessionId && a.sessionId!==bound) throw new Error('session mismatch'); const notice=this.noticePanel(e.destination,bound,executionScope,session); await reply({title:'只读会话',text:'此话题只读，可查看历史与文件。外部终端启动的 Claude 若仅同步等待状态、未接入响应通道，请回原终端处理。\n'+notice.text,actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},...notice.actions]}); return {accessMode:'read_only'}; }
     if (a.action === 'panel') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
-      const base={revision:session.revision,controlGeneration:session.control.generation};
-      const work=await this.service.getWorkState(bound);
-      const interruptAvailable=session.capabilities?.interrupt?.status === 'available' && session.control.input === 'available';
-      const queueAvailable=session.capabilities?.queue?.status === 'available' && session.control.input === 'available';
-      const actions:ChannelCard['actions']=[
-        ...this.noticePanel(e.destination,bound,executionScope,session).actions,
-        ...(work.canArchive ? [{label:'归档',value:{action:'archive',archived:true,...base}},{label:'恢复归档',value:{action:'archive',archived:false,...base}}] : []),
-        ...(session.capabilities?.handoff?.status === 'available' ? [{label:'切换到飞书',value:{action:'control',owner:'feishu',strategy:'wait',...base}}, {label:'释放控制',value:{action:'control',owner:'feishu',strategy:'wait',release:true,...base}}] : []),
-        ...(interruptAvailable ? work.runningTurns.map((turn,index)=>({label:work.runningTurns.length===1 ? '中断当前回复' : `中断本轮回复 ${index+1}`,value:{action:'stop',turnId:turn.turnId,...base}})) : []),
-        ...(queueAvailable ? work.queuedInputs.map((item,index)=>({label:`取消排队输入 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}})) : [])];
-      const text=[this.noticePanel(e.destination,bound,executionScope,session).text,interruptAvailable ? (work.runningTurns.length ? '可中断当前回复；已启动的后台任务是否终止尚未确认。' : '当前没有可中断的回复。') : '当前不支持中断回复。',queueAvailable ? (work.queuedInputs.length ? `排队中：${work.queuedInputs.length} 条。` : '当前没有排队输入。') : '当前不支持取消排队输入。',work.canArchive ? '' : '当前不支持归档。',session.capabilities?.handoff?.status === 'available' ? '' : '当前不支持切换控制。'].filter(Boolean).join('\n');
-      await reply({title:'会话控制',text,actions}); return {running:work.runningTurns.length,queued:work.queuedInputs.length};
+      const mode=this.accessMode(e.destination);
+      const work=mode === 'interactive' ? await this.service.getWorkState(bound) : null;
+      await reply(buildSessionPanel(session,this.noticePanel(e.destination,bound,executionScope,session),work));
+      return work ? {running:work.runningTurns.length,queued:work.queuedInputs.length} : {accessMode:mode};
     }
     if (a.action === 'legacy_stop') { const work=await this.service.getWorkState(bound); await guard(); if(work.runningTurns.length!==1) {await reply({title:'中断回复',text:work.runningTurns.length===0 ? '当前没有可中断的回复。' : '当前有多个进行中的回复，请打开会话控制选择本轮。',actions:[{label:'会话控制',value:{action:'panel'}}]});return {status:'rejected',reason:work.runningTurns.length===0?'no_running_turn':'ambiguous_running_turn'};} const op=await this.service.interruptTurn({context:current(),payload:{turnId:work.runningTurns[0]!.turnId}});if (needsOperationNotice(op)) await reply(operationCard(op));return op; }
     if (a.action === 'project_files') {
@@ -623,7 +581,7 @@ export class FeishuChannel {
       await reply(buildProjectFilesCard(listing));
       return listing;
     }
-    if (a.action === 'deliver_files') { if(!this.service.selectProjectFiles) throw new Error('file selection unavailable'); const scope=executionScope; await guard(); let files:Awaited<ReturnType<NonNullable<UnifiedService['selectProjectFiles']>>>; try {files=await this.service.selectProjectFiles(bound,a.args);} catch {throw new FileCommandError('文件选择失败：仅支持项目内路径和 *、?、[]、** 模式；凭据、符号链接、超限或不可读文件不会发送。');} if(files.length>20 || files.reduce((n,f)=>n+f.size,0)>20*1024*1024) throw new FileCommandError('文件数量超过 20 个或总大小超过 20 MiB，未发送。'); const contents:Uint8Array[]=[]; for(const f of files) {await guard();contents.push(await this.service.readArtifact(bound,f.artifactId,f.contentVersion));} await guard(); const results=[]; for(let i=0;i<files.length;i++) {const f=files[i]!; const id=`file:v2:${payloadDigest([scope,e.destination,bound,f.artifactId,f.contentVersion])}`; await guard(); if(this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {effects.started=true;await this.port.sendFile(e.destination,f.name,contents[i]!,id,guard);this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);results.push({name:f.name,status:'sent'});} else {const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null;await guard();results.push({name:f.name,status:url?'located':'unknown',url});}} await reply({title:'文件发送结果',text:results.map(r=>`${r.name}: ${r.status}`).join('\n'),actions:results.filter(r=>r.url).map(r=>({label:`定位 ${r.name}`,value:{},url:r.url!}))}); return results; }
+    if (a.action === 'deliver_files') { if(!this.service.selectProjectFiles) throw new Error('file selection unavailable'); const scope=executionScope; await guard(); let files:Awaited<ReturnType<NonNullable<UnifiedService['selectProjectFiles']>>>; try {files=await this.service.selectProjectFiles(bound,a.args);} catch {throw new FileCommandError('文件选择失败：仅支持项目内路径和 *、?、[]、** 模式；凭据、符号链接、超限或不可读文件不会发送。');} if(files.length>20 || files.reduce((n,f)=>n+f.size,0)>20*1024*1024) throw new FileCommandError('文件数量超过 20 个或总大小超过 20 MiB，未发送。'); const contents:Uint8Array[]=[]; for(const f of files) {await guard();contents.push(await this.service.readArtifact(bound,f.artifactId,f.contentVersion));} await guard(); const results=[]; for(let i=0;i<files.length;i++) {const f=files[i]!; const id=`file:v2:${payloadDigest([scope,e.destination,bound,f.artifactId,f.contentVersion])}`; await guard(); if(this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {effects.started=true;await this.port.sendFile(e.destination,f.name,contents[i]!,id,guard);this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);results.push({name:f.name,status:'sent'});} else {const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null;await guard();results.push({name:f.name,status:url?'located':'unknown',url});}} await reply({title:'文件发送结果',format:'plain',text:results.map(r=>`${r.name}: ${r.status}`).join('\n'),actions:results.filter(r=>r.url).map(r=>({label:`定位 ${r.name}`,value:{},url:r.url!}))}); return results; }
     if (a.action === 'export') {
       const scope=executionScope;
       const collect=async()=>{ const items:Awaited<ReturnType<UnifiedService['readHistory']>>['items']=[]; let cursor:string|undefined; const seen=new Set<string>(); let bytes=0;
@@ -635,10 +593,10 @@ export class FeishuChannel {
       if(this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) { effects.started=true; await this.port.sendFile(e.destination,'会话历史.md',content,id,guard); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); return {deliveryId:id}; }
       const url=await this.port.fileMessageLink?.(e.destination,bound,id) ?? null; await guard(); await reply(url ? {title:'历史已导出',text:'可打开原消息查看文件。',actions:[{label:'定位原文件消息',value:{},url}]} : {title:'导出状态未知',text:'尚无法定位原消息；不会重复上传。',actions:[]}); return {deliveryId:id,status:url ? 'located' : 'unknown'};
     }
-    if (a.action === 'history') { const hydrate=(this.service as UnifiedService & {hydrateSessionHistory?:(id:string)=>Promise<boolean>}).hydrateSessionHistory; if(this.requireReadonlyHydration && this.accessMode(e.destination)==='read_only' && !this.readonlyHydrated(e.destination,bound) && hydrate) {await guard(); if(await hydrate.call(this.service,bound)) {await guard();await this.baselineReadonlyHistory(e.destination,bound);} await guard();} const page = await this.service.readHistory(bound,{limit:20,...(a.cursor ? {cursor:a.cursor}:{})}); await reply(await this.longTextCard(e.destination,bound,'会话历史',page.items.map(m => `${m.role}: ${m.blocks.map(b => b.type === 'text' ? b.text : `[文件 ${b.artifactId}]`).join(' ')}`).join('\n'),page.nextCursor ? [{label:'下一页',value:{action:'history',cursor:page.nextCursor}}] : [],guard,()=>{effects.started=true;})); return page; }
+    if (a.action === 'history') { const hydrate=(this.service as UnifiedService & {hydrateSessionHistory?:(id:string)=>Promise<boolean>}).hydrateSessionHistory; if(this.requireReadonlyHydration && this.accessMode(e.destination)==='read_only' && !this.readonlyHydrated(e.destination,bound) && hydrate) {await guard(); if(await hydrate.call(this.service,bound)) {await guard();await this.baselineReadonlyHistory(e.destination,bound);} await guard();} const page = await this.service.readHistory(bound,{limit:20,...(a.cursor ? {cursor:a.cursor}:{})}); await reply(await this.longTextCard(e.destination,bound,'会话历史',page.items.map(m => `${m.role}: ${m.blocks.map(b => b.type === 'text' ? b.text : `[文件 ${escapeCardMarkdown(b.artifactId)}]`).join(' ')}`).join('\n'),page.nextCursor ? [{label:'下一页',value:{action:'history',cursor:page.nextCursor}}] : [],guard,()=>{effects.started=true;})); return page; }
     if (a.action === 'artifacts') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
-      const rawItems = await this.listAllArtifacts(bound);
+      const rawItems = await listAllArtifacts(this.service,bound);
       const { card, items: pageItems, nextCursor } = buildArtifactTreeCard(rawItems, {
         projectDir: session.project,
         ...(a.cursor !== undefined ? { cursor: a.cursor } : {}),
@@ -649,7 +607,7 @@ export class FeishuChannel {
     }
     if (a.action === 'file') {
       const scope=executionScope;
-      const files = await this.listAllArtifacts(bound);
+      const files = await listAllArtifacts(this.service,bound);
       const file = files.find(f => f.artifactId === a.artifactId && f.contentVersion === a.contentVersion);
       if (!file) throw new Error('artifact not found');
       const id = `file:v2:${payloadDigest([scope,e.destination,bound,file.artifactId,file.contentVersion])}`;
@@ -728,7 +686,10 @@ export class FeishuChannel {
     return {title,text:`${[...text].slice(0,1000).join('')}\n\n${row.state === 'sent' ? '全文已作为文件发送。' : '全文文件投递结果未知，请核对后再操作。'}`,actions:[...actions,...(url ? [{label:'打开全文',url,value:{action:'open_file'}}] : [])]};
   }
   private noticeSettings(destination:string,sessionId:string,scope:string):{paused:boolean;completed:boolean;waiting:boolean;failed:boolean;revision:number} { const row=this.db.prepare('SELECT paused,completed,waiting,failed,revision FROM channel_notice_settings WHERE destination=? AND session_id=? AND binding_scope=?').get(destination,sessionId,scope) as {paused:number;completed:number;waiting:number;failed:number;revision:number}|undefined;const legacy=this.db.prepare('SELECT enabled FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {enabled:number}|undefined;return row ? {paused:!!row.paused || legacy?.enabled===0,completed:!!row.completed,waiting:!!row.waiting,failed:!!row.failed,revision:row.revision} : {paused:legacy?.enabled===0,completed:true,waiting:true,failed:true,revision:0}; }
-  private noticePanel(destination:string,sessionId:string,scope:string,session:Session):{text:string;actions:ChannelCard['actions']} {const n=this.noticeSettings(destination,sessionId,scope); const legacy=this.db.prepare('SELECT event_types,enabled FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {event_types:string;enabled:number}|undefined; const legacyFilter=!!legacy && JSON.parse(legacy.event_types).length>0; const base={action:'notice_settings',revision:session.revision,controlGeneration:session.control.generation,settingsRevision:n.revision};const names={completed:'完成',waiting:'等待',failed:'失败'} as const;return {text:`通知：${n.paused?'已暂停':'开启'}；完成 ${n.completed?'开':'关'}（回复卡标注或无回复时提醒），等待 ${n.waiting?'开':'关'}，失败 ${n.failed?'开':'关'}。${legacy?.enabled===0?'旧版暂停同时停止回复同步，恢复通知后继续。':'暂停期间不补发提醒；回复和已有互动卡状态仍同步。'}${legacyFilter?'已有旧版筛选仍同时生效。':''}`,actions:[{label:n.paused?'恢复通知':'暂停通知',value:{...base,field:'paused',value:!n.paused}},...(['completed','waiting','failed'] as const).map(field=>({label:`${n[field]?'关闭':'开启'}${names[field]}提醒`,value:{...base,field,value:!n[field]}})),...(legacyFilter?[{label:'清除旧版筛选',value:{...base,field:'legacy',value:false}}]:[])]};}
+  private noticePanel(destination:string,sessionId:string,scope:string,session:Session) {
+    const legacy=this.db.prepare('SELECT event_types,enabled FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {event_types:string;enabled:number}|undefined;
+    return noticePanel(session,this.noticeSettings(destination,sessionId,scope),legacy);
+  }
   ownsInteractionCard(destination: string, sessionId: string, interactionId: string, messageId: string): boolean {
     return this.binding(destination) === sessionId &&
       this.interactionCards.owns(destination,sessionId,interactionId,messageId,this.bindingScope(destination));
@@ -753,7 +714,7 @@ export class FeishuChannel {
     if(row && (sequence<row.latest_sequence || (row.current_message!==message.messageId && sequence===row.latest_sequence))) return;
     if(row && ((row.current_message===message.messageId && ((row.final && !message.final) || row.revision>=message.revision)))) return;
     if(row && !message.final && Date.now()-row.updated_at<1000) {if(row.current_message!==message.messageId) this.db.prepare('UPDATE channel_stream_cards SET current_message=?,latest_sequence=?,revision=0,final=0 WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId); return;}
-    const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${b.artifactId}]`).join('\n');
+    const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${escapeCardMarkdown(b.artifactId)}]`).join('\n');
     const turnDone=this.db.prepare("SELECT 1 FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='completed' AND object_key=?").get(destination,sessionId,scope,message.turnId || message.messageId); const card=message.final ? await this.longTextCard(destination,sessionId,turnDone?'回复 · 本轮已完成':'回复',text,[],guard) : {title:'回复中',text:[...text].slice(0,1000).join(''),actions:[]};
     await guard();
     if(!row) { const id=`stream:${payloadDigest([scope,destination,sessionId,message.turnId || message.messageId])}`; this.db.prepare('INSERT INTO channel_stream_cards VALUES (?,?,?,?,NULL,0,0,0,?,?)').run(destination,sessionId,scope,message.turnId || message.messageId,message.messageId,sequence); const cardId=await this.deliver(destination,card,id,guard); await guard(); if(cardId) this.db.prepare('UPDATE channel_stream_cards SET card_id=?,revision=?,updated_at=?,final=?,current_message=?,latest_sequence=? WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(cardId,message.revision,Date.now(),Number(message.final),message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId); return; }
@@ -763,7 +724,7 @@ export class FeishuChannel {
     await guard(); await this.port.update(destination,row.card_id,this.stampCard(destination,card),id,guard); await guard();
     this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('UPDATE channel_stream_cards SET revision=?,updated_at=?,final=?,current_message=?,latest_sequence=? WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').run(message.revision,Date.now(),Number(message.final),message.messageId,sequence,destination,sessionId,scope,message.turnId || message.messageId);
   }
-  private async markTurnCompleted(destination:string,sessionId:string,scope:string,turnId:string,messages:import('./contracts.js').Message[]):Promise<void> { const guard=()=>this.checkBinding(destination,sessionId,scope); await guard(); if(this.db.prepare("SELECT 1 FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='completed' AND object_key=?").get(destination,sessionId,scope,turnId)) return; const row=this.db.prepare('SELECT card_id,current_message FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,turnId) as {card_id:string|null;current_message:string}|undefined; const message=messages.find(m=>m.messageId===row?.current_message && m.final); if(!row?.card_id || !message) return; const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${b.artifactId}]`).join('\n'); const card=await this.longTextCard(destination,sessionId,'回复 · 本轮已完成',text,[],guard); const id=`turn-completed:${payloadDigest([scope,destination,sessionId,turnId])}`; if(!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) return; await guard(); await this.port.update(destination,row.card_id,this.stampCard(destination,card),id,guard); await guard(); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('INSERT OR IGNORE INTO channel_notice_markers VALUES (?,?,?,?,?)').run(destination,sessionId,scope,'completed',turnId); }
+  private async markTurnCompleted(destination:string,sessionId:string,scope:string,turnId:string,messages:import('./contracts.js').Message[]):Promise<void> { const guard=()=>this.checkBinding(destination,sessionId,scope); await guard(); if(this.db.prepare("SELECT 1 FROM channel_notice_markers WHERE destination=? AND session_id=? AND binding_scope=? AND category='completed' AND object_key=?").get(destination,sessionId,scope,turnId)) return; const row=this.db.prepare('SELECT card_id,current_message FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,sessionId,scope,turnId) as {card_id:string|null;current_message:string}|undefined; const message=messages.find(m=>m.messageId===row?.current_message && m.final); if(!row?.card_id || !message) return; const text=message.blocks.map(b=>b.type==='text'?b.text:`[文件 ${escapeCardMarkdown(b.artifactId)}]`).join('\n'); const card=await this.longTextCard(destination,sessionId,'回复 · 本轮已完成',text,[],guard); const id=`turn-completed:${payloadDigest([scope,destination,sessionId,turnId])}`; if(!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) return; await guard(); await this.port.update(destination,row.card_id,this.stampCard(destination,card),id,guard); await guard(); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('INSERT OR IGNORE INTO channel_notice_markers VALUES (?,?,?,?,?)').run(destination,sessionId,scope,'completed',turnId); }
   /** Poll using the bound owner's current authorization, never callback-provided identity. */
   async sync(destination: string): Promise<void> {
     const row=this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string}|undefined; if(!row) throw new Error('destination is not bound'); const sessionId=row.session_id, scope=JSON.stringify(row);

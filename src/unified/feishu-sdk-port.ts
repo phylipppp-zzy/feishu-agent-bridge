@@ -3,7 +3,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseIncoming, parseCardAction } from '../feishu.js';
-import { toFeishuCard, parseFeishuAction, parseFeishuText } from './feishu-codec.js';
+import { parseFeishuAction, parseFeishuText } from './feishu-codec.js';
+import { cardSchema, encodeCard, type CardSchema } from './feishu-card-wire.js';
 import type { ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import type { RuntimeTrustedAction } from './runtime.js';
 import type { ChannelCard } from './feishu-cards.js';
@@ -22,13 +23,6 @@ function requiresCardSchemaV2(value: unknown): boolean {
   return code === 200830 || code === '200830' ||
     ((code === 230099 || code === '230099') && typeof msg === 'string' && /\bErrCode:\s*200830\b/.test(msg));
 }
-function topicRootSchemaV2(card: ChannelCard): object {
-  return {
-    schema: '2.0',
-    header: { title: { tag: 'plain_text', content: card.title } },
-    body: { elements: [{ tag: 'div', text: { tag: 'plain_text', content: card.text } }] },
-  };
-}
 class UnknownTopic extends Error {}
 class TaskPendingRoute extends Error {}
 class UnknownCardRoute extends Error {}
@@ -41,7 +35,7 @@ type ResourceMetadata={name?:string;mime?:string};
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
 export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:string, destinations:ReadonlySet<string>, download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>, handle:(e:TrustedEnvelope,a:ChannelAction)=>Promise<unknown>, queueResource?:(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',metadata?:ResourceMetadata)=>void|Promise<void>, resolveDestination?:(chatId:string,rootId?:string,parentId?:string,threadId?:string)=>string):Promise<void> {
-  const m=parseIncoming(data,botId); if (!m) return;
+  const m=parseIncoming(data,botId,true); if (!m) return;
   const threadId=(data.message as unknown as {thread_id?:string}).thread_id;
   const inTopic=Boolean(m.rootId || m.parentId || threadId);
   if (m.mentionedBot) {
@@ -52,7 +46,8 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
     if (!inTopic && !isMainSlash) return;
   }
   let textAction:ChannelAction | undefined;
-  if (data.message.message_type === 'text' && m.text) { try { textAction=parseFeishuText(m.text); } catch (error) { if (!m.text.startsWith('/')) throw error; textAction={action:'help'}; } }
+  const hasText = m.text.trim().length > 0;
+  if (data.message.message_type === 'text' && hasText) { try { textAction=parseFeishuText(m.text); } catch (error) { if (!m.text.trimStart().startsWith('/')) throw error; textAction={action:'help'}; } }
   let destination:string;
   try {
     destination=resolveDestination ? resolveDestination(m.chatId,m.rootId,m.parentId,threadId) : m.chatId;
@@ -62,7 +57,7 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
   }
   const envelope={eventId:`message:${m.messageId}`,destination,identity:{source:'feishu',subject:m.senderOpenId}};
   if (textAction) { await handle(envelope,textAction); return; }
-  if (!m.mentionedBot && data.message.message_type === 'text' && !m.text) return;
+  if (!m.mentionedBot && data.message.message_type === 'text' && !hasText) return;
   if (data.message.message_type !== 'image' && data.message.message_type !== 'file') throw new Error('unsupported inbound message type');
   let body:unknown; try { body=JSON.parse(data.message.content); } catch { throw new Error('invalid resource message'); }
   if (!body || typeof body !== 'object') throw new Error('invalid resource message');
@@ -126,7 +121,6 @@ export class FeishuSdkPort implements FeishuPort {
   private routeGeneration=0;
   private readonly linkCache=new Map<string,{url:string;expires:number}>();
   private readonly linkFlights=new Map<string,Promise<string|null>>();
-  private readonly schemaV2TopicRoots = new Set<string>();
   private dbClosed = false;
   constructor(credentials: {appId:string; appSecret:string}, dbPath:string, private readonly destinations: ReadonlySet<string>, private readonly owner:string,private readonly taskEnabled=false,private readonly taskTopicRuntimeEnabled=false) {
     if (!credentials.appId || !credentials.appSecret || !destinations.size || !owner) throw new Error('missing SDK configuration');
@@ -134,17 +128,18 @@ export class FeishuSdkPort implements FeishuPort {
     const base = { appId: credentials.appId, appSecret: credentials.appSecret, appType:Lark.AppType.SelfBuild, domain:Lark.Domain.Feishu };
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
     this.db = new DatabaseSync(dbPath); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_task_creations_v1 (operation_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,state TEXT NOT NULL,root_id TEXT,destination TEXT,payload_digest TEXT NOT NULL,delivery_id TEXT NOT NULL UNIQUE)"); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_text_resources_v1 (event_id TEXT PRIMARY KEY,envelope TEXT NOT NULL,message_id TEXT NOT NULL,resource_key TEXT NOT NULL,metadata TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,reason TEXT,next_attempt INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sdk_text_resource_tokens_v1 (event_id TEXT PRIMARY KEY,token TEXT NOT NULL)"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_creations (operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, provider TEXT NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, root_id TEXT, destination TEXT)'); this.db.exec("DROP INDEX IF EXISTS sdk_lane_creation_provider; CREATE UNIQUE INDEX IF NOT EXISTS sdk_lane_creation_reserved ON sdk_lane_creations(provider) WHERE state<>'rejected'; CREATE TABLE IF NOT EXISTS sdk_lane_resource_tokens (event_id TEXT PRIMARY KEY, token TEXT NOT NULL)"); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_native_lane_creations (operation_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,provider TEXT NOT NULL,delivery_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,root_id TEXT,destination TEXT); CREATE UNIQUE INDEX IF NOT EXISTS sdk_native_lane_reserved ON sdk_native_lane_creations(provider) WHERE state<>'rejected'"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_registry (root_id TEXT PRIMARY KEY, destination TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, owner TEXT NOT NULL, lane_id TEXT NOT NULL, namespace TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, operation_id TEXT NOT NULL, delivery_id TEXT NOT NULL, created_at INTEGER NOT NULL)'); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
+    this.db.exec('CREATE TABLE IF NOT EXISTS sdk_card_schemas (message_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL)');
     this.taskStore=new TaskTopicStore(this.db,this.appId,this.owner,this.destinations);
   }
   /** Only a local, constrained operator can create either mock provider root. */
   /** Explicitly enabled, owner-scoped task creation; no implicit topic creation. */
   createTaskTopic(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {if(!this.taskEnabled||this.closing) return Promise.reject(new Error('task topic unavailable'));const flight=this.createTaskTopicOnce(chatId,taskId,operationId,owner);this.testCreates.add(flight);void flight.finally(()=>{this.testCreates.delete(flight);if(this.closeRequested&&!this.testCreates.size&&!this.dbClosed){this.dbClosed=true;this.db.close();}}).catch(()=>{});return flight;}
-  private async createTaskTopicOnce(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {const claim=this.taskStore.claim(chatId,taskId,operationId,owner);if(claim.existing)return claim.existing;const rootText=this.taskTopicRuntimeEnabled?'任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。':'任务话题已建立，目标功能待启用。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务话题',text:rootText,actions:[]}))}});if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.taskStore.rejected(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw Error('task creation outcome unknown');const token=this.taskStore.record(chatId,taskId,operationId,response.data.message_id,response.data.thread_id??null,this.closing);if(!token)throw Error('task topic created and closed');return token;}
+  private async createTaskTopicOnce(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {const claim=this.taskStore.claim(chatId,taskId,operationId,owner);if(claim.existing)return claim.existing;const rootText=this.taskTopicRuntimeEnabled?'任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。':'任务话题已建立，目标功能待启用。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务话题',text:rootText,actions:[]},'1.0'))}});if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.taskStore.rejected(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw Error('task creation outcome unknown');const token=this.taskStore.record(chatId,taskId,operationId,response.data.message_id,response.data.thread_id??null,this.closing);if(!token)throw Error('task topic created and closed');return token;}
   recoverKnownTaskTopic(chatId:string,taskId:string,operationId:string,owner:string):TaskTopicToken|null {if(!this.taskEnabled||this.closing)throw Error('task topic unavailable');return this.taskStore.finishKnown(chatId,taskId,operationId,owner);}
   lookupTaskTopic(destination:string,owner:string):TaskTopicToken|null {if(!this.taskEnabled||this.closing||owner!==this.owner)return null;return this.taskStore.lookup(destination);}
   closeTaskTopic(token:TaskTopicToken,owner:string):void {if(!this.taskEnabled||this.closing)throw Error('task topic unavailable');this.taskStore.close(token,owner);this.routeGeneration++;}
   private taskToken(destination:string):TaskTopicToken|null{return this.taskEnabled&&!this.closing?this.taskStore.lookup(destination):null;}
-  private async handleTask(e:TrustedEnvelope,token:TaskTopicToken):Promise<unknown> {if(e.identity.source!=='feishu'||e.identity.subject!==this.owner||JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const id=`task-t0:${e.eventId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes){const prior=this.db.prepare('SELECT message_id FROM sdk_deliveries WHERE id=?').get(id) as {message_id:string|null}|undefined;return {status:prior?.message_id?'sent':'unknown'};}if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务话题',text:'任务目标功能尚未启用，当前未发送模型输入。',actions:[]})),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw Error('task delivery outcome unknown');if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');this.remember(id,response.data.message_id,token.destination);return {status:'unavailable'};}
+  private async handleTask(e:TrustedEnvelope,token:TaskTopicToken):Promise<unknown> {if(e.identity.source!=='feishu'||e.identity.subject!==this.owner||JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const id=`task-t0:${e.eventId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes){const prior=this.db.prepare('SELECT message_id FROM sdk_deliveries WHERE id=?').get(id) as {message_id:string|null}|undefined;return {status:prior?.message_id?'sent':'unknown'};}if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务话题',text:'任务目标功能尚未启用，当前未发送模型输入。',actions:[]},'1.0')),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw Error('task delivery outcome unknown');if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');this.remember(id,response.data.message_id,token.destination,'1.0');return {status:'unavailable'};}
   createTestTopic(chatId:string,provider:'codex'|'claude',operationId:string,active:()=>boolean):Promise<TestLaneToken> {const flight=this.createTestTopicInner(chatId,provider,operationId,active);this.testCreates.add(flight);void flight.finally(()=>{this.testCreates.delete(flight);if(this.closeRequested && !this.testCreates.size && !this.dbClosed){this.dbClosed=true;this.db.close();}}).catch(()=>{});return flight;}
   async drainTestCreates():Promise<void>{await Promise.allSettled([...this.testCreates]);}
   private async createTestTopicInner(chatId:string,provider:'codex'|'claude',operationId:string,active:()=>boolean):Promise<TestLaneToken> {
@@ -153,12 +148,12 @@ export class FeishuSdkPort implements FeishuPort {
     if(prior){if(prior.state==='rejected')throw new Error('test creation rejected');if(prior.state==='known')throw new PendingKnownTestCreation('test root known; route recovery required');if(prior.state==='closed')throw new ClosedKnownTestCreation('test topic created and closed');if(prior.state==='active'&&prior.destination){const token=this.testToken(prior.destination);if(token&&token.chatId===chatId&&token.provider===provider)return token;}throw new Error('test creation outcome unknown');}
     if(this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE provider=? AND state<>'rejected' LIMIT 1").get(provider)) throw new Error('test provider already reserved');const attempts=this.db.prepare('SELECT COUNT(*) AS n FROM sdk_lane_creations WHERE provider=?').get(provider) as {n:number};if(attempts.n>=3)throw new Error('test creation attempt limit reached');
     this.db.prepare("INSERT INTO sdk_lane_creations VALUES (?,?,?,?,'unknown',NULL,NULL)").run(operationId,chatId,provider,deliveryId);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'测试话题',text:`${provider} 模拟测试`,actions:[]}))}});
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'测试话题',text:`${provider} 模拟测试`,actions:[]},'1.0'))}});
     if(typeof response.code==='number' && Number.isSafeInteger(response.code) && response.code!==0){this.db.prepare("UPDATE sdk_lane_creations SET state='rejected' WHERE operation_id=? AND state='unknown'").run(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw new Error('test creation outcome unknown');
     const root=response.data.message_id,destination=`topic:${randomUUID()}`,namespace=`mock-test:${provider}`,lane='mock-test';
     this.db.prepare("UPDATE sdk_lane_creations SET state='known',root_id=?,destination=? WHERE operation_id=? AND state='unknown'").run(root,destination,operationId);
     const closed=this.closing || !active(),state=closed?'closed':'active';
-    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,lane,namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.db.prepare("UPDATE sdk_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,lane,namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.recordCardSchema(root,'1.0');this.db.prepare("UPDATE sdk_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
     if(closed)throw new ClosedKnownTestCreation('test topic created and closed');const token=this.testToken(destination);if(!token)throw new Error('test creation outcome unknown');return token;
   }
   /** Explicit opt-in native Claude root; separate from the immutable mock creation ledger. */
@@ -169,10 +164,10 @@ export class FeishuSdkPort implements FeishuPort {
     if(prior){if(prior.state==='rejected')throw new Error('test creation rejected');if(prior.state==='active'&&prior.destination){const token=this.testToken(prior.destination);if(token?.laneId==='native-test'&&token.chatId===chatId&&token.provider===provider)return token;}throw new Error('test creation outcome unknown');}
     if(this.db.prepare("SELECT 1 FROM sdk_native_lane_creations WHERE provider=? AND state<>'rejected' LIMIT 1").get(provider))throw new Error('native test provider already reserved');const count=this.db.prepare("SELECT COUNT(*) AS n FROM sdk_native_lane_creations WHERE provider=?").get(provider) as {n:number};if(count.n>=3)throw new Error('test creation attempt limit reached');
     const deliveryId=`native-test-root:${operationId}`;this.db.prepare("INSERT INTO sdk_native_lane_creations VALUES (?,?,?,?,'unknown',NULL,NULL)").run(operationId,chatId,provider,deliveryId);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'原生隔离测试',text:`${provider==='claude'?'Claude':'Codex'} · 本地模拟服务`,actions:[]}))}});
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'原生隔离测试',text:`${provider==='claude'?'Claude':'Codex'} · 本地模拟服务`,actions:[]},'1.0'))}});
     if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.db.prepare("UPDATE sdk_native_lane_creations SET state='rejected' WHERE operation_id=? AND state='unknown'").run(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw new Error('test creation outcome unknown');
     const root=response.data.message_id,destination=`topic:${randomUUID()}`,namespace=`native-test:${provider}`;this.db.prepare("UPDATE sdk_native_lane_creations SET state='known',root_id=?,destination=? WHERE operation_id=? AND state='unknown'").run(root,destination,operationId);const closed=this.closing||!active(),state=closed?'closed':'active';
-    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,'native-test',namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.db.prepare("UPDATE sdk_native_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,'native-test',namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.recordCardSchema(root,'1.0');this.db.prepare("UPDATE sdk_native_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
     if(closed)throw new ClosedKnownTestCreation('test topic created and closed');const token=this.testToken(destination);if(!token)throw new Error('test creation outcome unknown');return token;
   }
   private testToken(destination:string):TestLaneToken|null {
@@ -192,8 +187,17 @@ export class FeishuSdkPort implements FeishuPort {
     return {
       isTopicDestination:(destination)=>{try{validate(destination);return true;}catch{return false;}},
       authorizedDestination:(destination)=>{try{validate(destination);return true;}catch{return false;}},
-      send:async(destination,card,deliveryId,guard)=>{await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(toFeishuCard(card)),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);return response.data.message_id;},
-      update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const response=await this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(toFeishuCard(card))}});rejectCode(response.code);this.remember(deliveryId,messageId,destination);},
+      send:async(destination,card,deliveryId,guard)=>{
+        await guard?.();
+        validate(destination);
+        const schema = cardSchema(card);
+        const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(encodeCard(card,schema)),reply_in_thread:true}});
+        rejectCode(response.code);
+        if(!response.data?.message_id)throw new Error('test delivery outcome unknown');
+        this.remember(deliveryId,response.data.message_id,destination,schema);
+        return response.data.message_id;
+      },
+      update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const schema=await this.patchCard(messageId,card);this.remember(deliveryId,messageId,destination,schema);},
       sendFile:async(destination,name,content,deliveryId,guard)=>{if(content.length>1024*1024 || !/^[^/\\\x00-\x1f]{1,80}$/.test(name))throw new Error('test fixture rejected');await guard?.();validate(destination);const uploaded=await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});if(!uploaded?.file_key)throw new Error('test upload outcome unknown');await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'file',content:JSON.stringify({file_key:uploaded.file_key}),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);},
       lookupDelivery:async(deliveryId)=>{validate(token.destination);const row=this.db.prepare('SELECT m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {destination:string}|undefined;return row?.destination===token.destination?'sent':'unknown';}
     };
@@ -285,9 +289,24 @@ export class FeishuSdkPort implements FeishuPort {
     if ((route?.chat_id ?? row.destination)!==chatId) throw new UnknownCardRoute('card chat mismatch');
     return row.destination;
   }
-  private remember(id:string, messageId:string|null,destination:string):void {
-    const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined; if(prior && prior.destination!==destination) this.routeGeneration++;
-    this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT OR REPLACE INTO sdk_deliveries VALUES (?,?)').run(id,messageId); if(messageId) this.db.prepare('INSERT OR REPLACE INTO sdk_message_routes VALUES (?,?)').run(messageId,destination); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+  private recordCardSchema(messageId: string, schema: CardSchema): void {
+    this.db.prepare('INSERT INTO sdk_card_schemas(message_id,schema_version) VALUES (?,?) ON CONFLICT(message_id) DO NOTHING').run(messageId,schema);
+  }
+  private remember(id:string, messageId:string|null,destination:string,schema?:CardSchema):void {
+    const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined;
+    if(prior && prior.destination!==destination) this.routeGeneration++;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT OR REPLACE INTO sdk_deliveries VALUES (?,?)').run(id,messageId);
+      if (messageId) {
+        this.db.prepare('INSERT OR REPLACE INTO sdk_message_routes VALUES (?,?)').run(messageId,destination);
+        if (schema) this.recordCardSchema(messageId,schema);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   async createTopic(destination:string,sessionId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<string> {
     this.allowed(destination); const chat=this.route(destination)?.chat_id ?? destination;
@@ -296,39 +315,63 @@ export class FeishuSdkPort implements FeishuPort {
     // An uncertain root creation must never be replayed automatically.
     if (!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes) throw new Error('topic creation outcome unknown');
     await guard?.(); this.allowed(destination);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content:JSON.stringify(toFeishuCard(card))}});
+    const schema = cardSchema(card);
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content:JSON.stringify(encodeCard(card,schema))}});
     rejectCode(response.code); if(!response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
     const root=response.data.message_id; const key=`topic:${randomUUID()}`;
-    this.routeGeneration++; this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId); this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key); this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+    this.routeGeneration++;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId);
+      this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key);
+      this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId);
+      this.recordCardSchema(root,schema);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     return key;
   }
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
-    await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const content=JSON.stringify(toFeishuCard(card));
+    await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const schema=cardSchema(card); const content=JSON.stringify(encodeCard(card,schema));
     const response=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}});
     rejectCode(response.code); if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
-    this.remember(deliveryId,response.data.message_id,destination); return response.data.message_id;
+    this.remember(deliveryId,response.data.message_id,destination,schema); return response.data.message_id;
   }
   async update(destination:string,messageId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     await guard?.(); this.allowedTaskOrProduction(destination); if(this.callbackDestination(this.route(destination)?.chat_id ?? destination,messageId)!==destination) throw new Error('message route mismatch');
     const isTitlePatch = deliveryId.startsWith('topic-title:') && this.route(destination)?.root_id === messageId &&
       !card.form && !card.table && card.actions.length === 0;
-    const useV2 = isTitlePatch && this.schemaV2TopicRoots.has(messageId);
-    const patch = (content: object) => this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(content)}});
-    const response = await patch(useV2 ? topicRootSchemaV2(card) : toFeishuCard(card)).catch(error => {
-      if (!isTitlePatch || useV2 || !requiresCardSchemaV2(error)) throw error;
-      return null;
-    });
-    if (isTitlePatch && !useV2 && (response === null || requiresCardSchemaV2(response))) {
-      this.schemaV2TopicRoots.add(messageId);
+    const schema = await this.patchCard(messageId,card,isTitlePatch ? async () => {
       await guard?.();
       this.allowedTaskOrProduction(destination);
       const route = this.route(destination);
       if (route?.root_id !== messageId || this.callbackDestination(route.chat_id,messageId) !== destination) throw new Error('message route mismatch');
-      rejectCode((await patch(topicRootSchemaV2(card))).code);
-    } else {
-      rejectCode(response?.code);
+    } : undefined);
+    this.remember(deliveryId,messageId,destination,schema);
+  }
+  private async patchCard(messageId: string, card: ChannelCard, legacyRootGuard?: () => Promise<void>): Promise<CardSchema> {
+    const row = this.db.prepare('SELECT schema_version FROM sdk_card_schemas WHERE message_id=?').get(messageId) as {schema_version:string}|undefined;
+    const recorded = row?.schema_version;
+    if (recorded !== undefined && recorded !== '1.0' && recorded !== '2.0') throw new Error('invalid stored card schema');
+    const schema = recorded ?? cardSchema(card);
+    const patch = (version: CardSchema) => this.client.im.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(encodeCard(card,version)) },
+    });
+    const canRetry = !row && schema === '1.0' && legacyRootGuard !== undefined;
+    const response = await patch(schema).catch(error => {
+      if (!canRetry || !requiresCardSchemaV2(error)) throw error;
+      return null;
+    });
+    if (canRetry && (response === null || requiresCardSchemaV2(response))) {
+      await legacyRootGuard();
+      rejectCode((await patch('2.0')).code);
+      return '2.0';
     }
-    this.remember(deliveryId,messageId,destination);
+    rejectCode(response?.code);
+    return schema;
   }
   async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     this.allowedTaskOrProduction(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
@@ -430,12 +473,12 @@ export class FeishuSdkPort implements FeishuPort {
     if(!hasRoot&&data.message.message_type==='text'&&['/help','/health','/sessions'].includes(m.text))return false;
     const id=`task-pending-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes)return true;if(this.closing)throw new Error('SDK port closing');
     if(!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId))return true;
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务提示',text:'任务话题待核查，写入暂不可用。',actions:[]}))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(id,response.data.message_id,m.chatId);return true;
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务提示',text:'任务话题待核查，写入暂不可用。',actions:[]},'1.0'))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(id,response.data.message_id,m.chatId,'1.0');return true;
   }
   private async guideTestUnavailable(data:MessageEvent,botId:string):Promise<boolean>{
     const info=this.parseEligibleMessage(data,botId);if(!info)return false;const {m,thread}=info;const ids=[m.rootId,m.parentId,thread].filter((x):x is string=>!!x);if(!ids.length)return false;
     const task=ids.some(id=>!!this.db.prepare("SELECT 1 FROM sdk_lane_registry l JOIN sdk_topic_routes r ON r.destination=l.destination LEFT JOIN sdk_message_routes m ON m.destination=l.destination WHERE l.chat_id=? AND l.lane_id='task' AND (l.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1").get(m.chatId,id,id,id));if(task)return false;const closed=ids.some(id=>!!this.db.prepare("SELECT 1 FROM sdk_lane_registry l JOIN sdk_topic_routes r ON r.destination=l.destination LEFT JOIN sdk_message_routes m ON m.destination=l.destination WHERE l.chat_id=? AND l.lane_id IN ('mock-test','native-test') AND l.state='closed' AND (l.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1").get(m.chatId,id,id,id));const taskPending=!!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId);const unknown=!!this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE chat_id=? AND state IN ('unknown','known')").get(m.chatId);if(!closed&&(taskPending||!unknown))return false;
-    const deliveryId=`test-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes)return true;if(this.closing)throw new Error('SDK port closing');const text=closed?'此测试话题已关闭。':'测试话题创建结果待核查，请联系管理员。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'测试提示',text,actions:[]}))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(deliveryId,response.data.message_id,m.chatId);return true;
+    const deliveryId=`test-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes)return true;if(this.closing)throw new Error('SDK port closing');const text=closed?'此测试话题已关闭。':'测试话题创建结果待核查，请联系管理员。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'测试提示',text,actions:[]},'1.0'))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(deliveryId,response.data.message_id,m.chatId,'1.0');return true;
   }
   async start(handle:(envelope:TrustedEnvelope,action:ChannelAction)=>Promise<unknown>, captureScope:(e:TrustedEnvelope)=>Promise<string>):Promise<void> {
     if (this.started || this.closing) throw new Error('already started or closing'); this.started = true;

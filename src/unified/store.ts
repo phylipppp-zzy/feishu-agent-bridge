@@ -48,6 +48,7 @@ export class UnifiedStore {
       CREATE TABLE IF NOT EXISTS native_interactions(id TEXT PRIMARY KEY REFERENCES interactions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS outbox(operation_id TEXT PRIMARY KEY REFERENCES operations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, context TEXT NOT NULL, connection_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','in_flight','unknown','done','cancelled')));
+      CREATE TABLE IF NOT EXISTS first_prompt_suspensions(operation_id TEXT PRIMARY KEY REFERENCES outbox(operation_id));
       CREATE TABLE IF NOT EXISTS steer_outbox_v1(operation_id TEXT PRIMARY KEY REFERENCES operations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, context TEXT NOT NULL, connection_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','in_flight','unknown','done','cancelled')));
       CREATE INDEX IF NOT EXISTS outbox_by_target ON outbox(json_extract(context,'$.targetId'),state,kind);
       CREATE INDEX IF NOT EXISTS steer_outbox_by_target ON steer_outbox_v1(json_extract(context,'$.targetId'),state,kind);
@@ -284,12 +285,36 @@ export class UnifiedStore {
   }
   hasStopRequest(sessionId:string,turnId:string):boolean {return !!this.db.prepare("SELECT 1 FROM outbox WHERE kind='interruptTurn' AND state IN ('in_flight','unknown','done') AND json_extract(context,'$.targetId')=? AND json_extract(payload,'$.turnId')=? LIMIT 1").get(sessionId,turnId);}
   hasPendingOutbox(id: string): boolean {
-    return !!this.row("SELECT 1 FROM outbox WHERE operation_id=? AND state='pending' UNION ALL SELECT 1 FROM steer_outbox_v1 WHERE operation_id=? AND state='pending' LIMIT 1",id,id);
+    return !!this.row("SELECT 1 FROM outbox WHERE operation_id=? AND state='pending' AND operation_id NOT IN (SELECT operation_id FROM first_prompt_suspensions) UNION ALL SELECT 1 FROM steer_outbox_v1 WHERE operation_id=? AND state='pending' LIMIT 1",id,id);
+  }
+  /** Preserve only undispatched draft first prompts while the runtime restores control. */
+  suspendFirstPromptDispatches(): void {
+    this.run(`
+      INSERT OR IGNORE INTO first_prompt_suspensions(operation_id)
+      SELECT operation_id FROM outbox
+      WHERE state='pending' AND kind='submitInput' AND operation_id LIKE 'new-session-first:%'
+        AND json_extract(payload,'$.mode')='new' AND json_type(context,'$.channelScope')='object'
+    `);
+  }
+
+  rebindFirstPrompt(id: string, session: Session): boolean {
+    return this.transaction(() => {
+      const out = this.getOutbox(id);
+      if (out.state !== 'suspended' || out.context.targetId !== session.sessionId || this.getOperation(id).status !== 'received') return false;
+      const current = this.session(session.sessionId);
+      if (current.revision !== session.revision || current.control.generation !== session.control.generation ||
+          current.control.input !== 'available' || this.isDetached(session.sessionId)) return false;
+      const context = {...out.context,expectedRevision:session.revision,controlGeneration:session.control.generation};
+      this.run("UPDATE outbox SET context=?,connection_generation=? WHERE operation_id=? AND state='pending'",
+        JSON.stringify(context),this.connectionGeneration(session.sessionId),id);
+      this.run('DELETE FROM first_prompt_suspensions WHERE operation_id=?',id);
+      return true;
+    });
   }
   pendingOutbox(targetId?: string, kind?: string): string[] {
     const where = "state='pending'" + (targetId === undefined ? '' : " AND json_extract(context,'$.targetId')=?") + (kind === undefined ? '' : ' AND kind=?');
     const params = [targetId,kind].filter((value): value is string => value !== undefined);
-    const rows = this.db.prepare(`SELECT o.id FROM (SELECT operation_id FROM outbox WHERE ${where} UNION ALL SELECT operation_id FROM steer_outbox_v1 WHERE ${where}) pending JOIN operations o ON o.id=pending.operation_id ORDER BY o.rowid`).all(...params,...params) as Record<string,unknown>[];
+    const rows = this.db.prepare(`SELECT o.id FROM (SELECT operation_id FROM outbox WHERE ${where} AND operation_id NOT IN (SELECT operation_id FROM first_prompt_suspensions) UNION ALL SELECT operation_id FROM steer_outbox_v1 WHERE ${where}) pending JOIN operations o ON o.id=pending.operation_id ORDER BY o.rowid`).all(...params,...params) as Record<string,unknown>[];
     return rows.map(row=>String(row.id));
   }
   notificationPreference(id: string): { enabled: boolean; eventTypes: string[] } | null { this.session(id); const row = this.row('SELECT value FROM notification_preferences WHERE session_id=?', id); return row ? parse(row.value) : null; }
@@ -496,11 +521,16 @@ export class UnifiedStore {
     return resolved;
   }
   private outboxTable(id:string):'outbox'|'steer_outbox_v1' { return this.row('SELECT operation_id FROM steer_outbox_v1 WHERE operation_id=?',id)?'steer_outbox_v1':'outbox'; }
-  getOutbox(id: string): { kind: string; payload: unknown; context: WriteContext; connectionGeneration: number; state: string } { const r = this.row(`SELECT kind,payload,context,connection_generation,state FROM ${this.outboxTable(id)} WHERE operation_id=?`, id); if (!r) return fail('invalid_request', 'unknown outbox'); return { kind: String(r.kind), payload: parse(r.payload), context: parse<WriteContext>(r.context), connectionGeneration: Number(r.connection_generation), state: String(r.state) }; }
+  getOutbox(id: string): { kind: string; payload: unknown; context: WriteContext; connectionGeneration: number; state: string } {
+    const r = this.row(`SELECT kind,payload,context,connection_generation,state FROM ${this.outboxTable(id)} WHERE operation_id=?`, id);
+    if (!r) return fail('invalid_request', 'unknown outbox');
+    const state = r.state === 'pending' && this.row('SELECT 1 FROM first_prompt_suspensions WHERE operation_id=?',id) ? 'suspended' : String(r.state);
+    return {kind:String(r.kind),payload:parse(r.payload),context:parse<WriteContext>(r.context),connectionGeneration:Number(r.connection_generation),state};
+  }
   /** SQLite serializes claim and generation changes; native submission still requires an adapter-side final fence. */
   claimOutbox(id: string, now = Date.now()): boolean { return this.transaction(() => {
     const table=this.outboxTable(id); const row = this.row(`SELECT kind,payload,context,connection_generation,state FROM ${table} WHERE operation_id=?`, id);
-    if (!row || row.state !== 'pending') return false;
+    if (!row || row.state !== 'pending' || this.row('SELECT 1 FROM first_prompt_suspensions WHERE operation_id=?',id)) return false;
     const context = parse<WriteContext>(row.context);
     const session = this.row('SELECT control_generation,connection_generation FROM sessions WHERE id=?', context.targetId);
     let valid = !!session && Number(session.control_generation) === context.controlGeneration && Number(session.connection_generation) === Number(row.connection_generation);
@@ -537,7 +567,7 @@ export class UnifiedStore {
     return this.updateOperationInTransaction(op, 'failed', error);
   }
   private invalidateDeliveries(sessionId: string, expireInteractions: boolean): void {
-    const rows = this.db.prepare("SELECT operation_id,state FROM outbox WHERE json_extract(context,'$.targetId')=? AND state IN ('pending','in_flight') UNION ALL SELECT operation_id,state FROM steer_outbox_v1 WHERE json_extract(context,'$.targetId')=? AND state IN ('pending','in_flight')").all(sessionId,sessionId) as Record<string, unknown>[];
+    const rows = this.db.prepare("SELECT operation_id,state FROM outbox WHERE json_extract(context,'$.targetId')=? AND state IN ('pending','in_flight') AND operation_id NOT IN (SELECT operation_id FROM first_prompt_suspensions) UNION ALL SELECT operation_id,state FROM steer_outbox_v1 WHERE json_extract(context,'$.targetId')=? AND state IN ('pending','in_flight')").all(sessionId,sessionId) as Record<string, unknown>[];
     for (const row of rows) {
       if (row.state === 'pending') this.cancelPending(String(row.operation_id)); else this.markUnknownInTransaction(String(row.operation_id));
     }
@@ -585,7 +615,7 @@ export class UnifiedStore {
       return this.failResponseInTransaction(op, error ?? contractError('interaction_expired'));
     }
     const next: Operation = { ...op, status, revision: op.revision + 1, error }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id);
-    this.run(`UPDATE ${this.outboxTable(id)} SET state=? WHERE operation_id=?`, status === 'accepted' ? 'in_flight' : 'done', id); this.eventFor(op.targetId, id, next.revision, `operation.${status}`, id, next); return next;
+    this.run(`UPDATE ${this.outboxTable(id)} SET state=? WHERE operation_id=?`, status === 'accepted' ? 'in_flight' : 'done', id); this.run('DELETE FROM first_prompt_suspensions WHERE operation_id=?',id); this.eventFor(op.targetId, id, next.revision, `operation.${status}`, id, next); return next;
   }); }
   private eventFor(sessionId: string, objectId: string, revision: number, type: string, operationId: string | null, data: unknown): void {
     const now = new Date().toISOString();

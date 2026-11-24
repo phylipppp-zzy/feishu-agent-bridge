@@ -68,10 +68,15 @@ export class UnifiedCore implements UnifiedService {
   private observationFailure: string | null = null;
   private closed=false;
   validateSteerScope?: (scope:NonNullable<SubmitInput['channelScope']>,sessionId:string)=>boolean;
+  private inputScopeCurrent(input: SubmitInput, sessionId: string): boolean {
+    return !input.channelScope || (input.mode !== 'steer' && input.mode !== 'new') ||
+      this.validateSteerScope?.(input.channelScope,sessionId) === true;
+  }
   onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
   hasProvider(provider: Provider): boolean { return this.providers.has(provider); }
   constructor(readonly store: UnifiedStore, providers: PlatformPort[], private readonly authorize: Authorize, private readonly authorizeBootstrap: (identity: WriteContext['identity'], provider: Provider) => boolean = () => false, private readonly mayDetach: (session: Session) => boolean = () => false, private readonly canDiscover?: (session: Session) => boolean, private readonly historyReader?: HistoryReader,private readonly canInspectCandidate?:(native:Session['native'],project:string)=>boolean) {
+    store.suspendFirstPromptDispatches();
     for (const port of providers) {
       if (this.providers.has(port.provider)) throw new Error('duplicate provider');
       port.seedConnectionGeneration?.(store.maxConnectionGeneration());
@@ -290,7 +295,7 @@ export class UnifiedCore implements UnifiedService {
     }
     });
   }
-  /** Called only after the runtime has revalidated the persisted channel binding. */
+  /** The caller revalidates persisted channel authorization for this exact session across native reads. */
   async restoreInteractive(id:string, identity:WriteContext['identity'], stillAuthorized:()=>Promise<boolean>):Promise<void> {
     let attempted=false;
     try {
@@ -333,7 +338,7 @@ export class UnifiedCore implements UnifiedService {
     const valid = validateSubmitInput(request); if (!valid.ok) throw new StoreError(valid.error);
     const s = this.check(request.context, 'submitInput');
     if(request.mode==='steer' && s.native.provider!=='codex')return fail('unsupported','steer is available only for Codex');
-    if(request.mode==='steer' && request.channelScope && !this.validateSteerScope?.(request.channelScope,s.sessionId)) return fail('control_conflict','binding changed');
+    if (!this.inputScopeCurrent(request,s.sessionId)) return fail('control_conflict','binding changed');
     const prior = this.store.findIdempotent(request.context, 'submitInput', request); if (prior) return prior;
     const capability = request.mode === 'new' ? 'send' : request.mode;
     if (this.present(s).capabilities[capability].status !== 'available') return fail('unsupported', `${capability} unavailable`);
@@ -341,6 +346,24 @@ export class UnifiedCore implements UnifiedService {
     for (const block of request.blocks) if (block.type === 'artifact' && !this.store.stagedArtifact(s.sessionId,block.artifactId,block.contentVersion)) return fail('invalid_request','artifact is not staged for this session');
     if(request.mode==='steer') return this.store.registerSteer(request);
     return this.store.registerOperation(request.context, 'submitInput', request);
+  }
+  async resumeFirstPrompt(id: string, authorized: boolean): Promise<Operation | null> {
+    const op = this.store.getOperation(id);
+    const out = this.store.getOutbox(id);
+    const input = out.payload as SubmitInput;
+    if (!id.startsWith('new-session-first:') || out.kind !== 'submitInput' || input.mode !== 'new' || !input.channelScope) return null;
+    if (out.state !== 'suspended' && out.state !== 'pending') return op;
+    if (!authorized || !this.inputScopeCurrent(input,op.targetId)) {
+      return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));
+    }
+    if (out.state === 'pending') return op;
+    const session = this.store.getSession(op.targetId);
+    if (this.store.isDetached(session.sessionId) || !this.authorize(out.context.identity,session,'submitInput')) {
+      return this.store.reconcileOperation(id,'failed',contractError('unauthorized'));
+    }
+    if (this.closed || this.unavailableProviders.has(session.native.provider) || this.store.recoveryQuarantined(session.sessionId) ||
+        session.status === 'read_only' || session.control.input !== 'available') return null;
+    return this.store.rebindFirstPrompt(id,session) ? op : null;
   }
   async captureSteer(identity:{source:string;subject:string},sessionId:string) {
     const session=this.store.getSession(sessionId);
@@ -391,7 +414,7 @@ export class UnifiedCore implements UnifiedService {
       const out = this.store.getOutbox(id);
       if (out.state !== 'pending') return this.store.getOperation(id);
       const session = this.check(out.context, out.kind);
-      if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const scope=(out.payload as SubmitInput).channelScope;if(scope && !this.validateSteerScope?.(scope,session.sessionId))return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));}
+      if (out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));
       const earlier = out.kind === 'submitInput' ? this.store.pendingOutbox(session.sessionId, 'submitInput')[0] : id;
       if (earlier !== id) return fail('busy', 'earlier input awaits dispatch');
       if (out.kind === 'submitInput') { const barrier=this.store.settingsBarrier(session.sessionId); if(barrier) return fail(barrier === 'unknown' ? 'outcome_unknown' : 'busy','settings must be reconciled before input'); }
@@ -409,7 +432,7 @@ export class UnifiedCore implements UnifiedService {
           if (!this.authorize(out.context.identity,current,out.kind) || this.store.isDetached(session.sessionId) || this.store.recoveryQuarantined(session.sessionId)) return fail('unauthorized');
           if (current.control.generation !== out.context.controlGeneration || (out.kind !== 'requestControl' && current.control.input !== 'available')) return fail('control_conflict');
           if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration) return fail('interaction_expired');
-          if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const scope=(out.payload as SubmitInput).channelScope;if(scope && !this.validateSteerScope?.(scope,session.sessionId))return fail('control_conflict','binding changed');}
+          if (out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) return fail('control_conflict','binding changed');
           if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || input.expectedConnectionGeneration!==out.connectionGeneration)return fail('interaction_expired','captured turn changed');}
           if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
           if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
@@ -431,7 +454,9 @@ export class UnifiedCore implements UnifiedService {
         if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {if(nativeReference!==(out.payload as SubmitInput).requiredTurnId)return this.store.markDeliveryUnknown(id);return this.store.completeSteer(id);}
         return this.store.acceptSubmission(id,nativeReference);
       } catch (error) {
-        if(!guarded && error instanceof StoreError && out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer' && ['busy','control_conflict','interaction_expired','unauthorized'].includes(error.detail.code))return this.store.reconcileOperation(id,'failed',error.detail);
+        const input = out.kind === 'submitInput' ? out.payload as SubmitInput : null;
+        if (!guarded && error instanceof StoreError && (input?.mode === 'steer' || (input?.mode === 'new' && input.channelScope)) &&
+            ['busy','control_conflict','interaction_expired','unauthorized'].includes(error.detail.code)) return this.store.reconcileOperation(id,'failed',error.detail);
         if (!guarded && error && typeof error === 'object' && 'code' in error) { const code=(error as {code:unknown}).code; if (code === 'unsupported' || code === 'invalid_request' || (out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer' && (code==='busy'||code==='control_conflict'||code==='interaction_expired'||code==='unauthorized'))) return this.store.reconcileOperation(id,'failed',contractError(code)); }
         // The transport may have written before losing its acknowledgement.
         return this.store.markDeliveryUnknown(id);

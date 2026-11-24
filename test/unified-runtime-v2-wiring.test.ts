@@ -28,7 +28,7 @@ import {
   type RuntimeConfig,
 } from '../src/unified/runtime.js';
 import { StoreError } from '../src/unified/store.js';
-import { parseFeishuText } from '../src/unified/feishu-codec.js';
+import { parseFeishuAction, parseFeishuText } from '../src/unified/feishu-codec.js';
 
 const ALL_CAPS = Object.fromEntries(
   ['view', 'send', 'queue', 'steer', 'answer', 'approve', 'interrupt', 'handoff', 'files', 'config'].map(
@@ -392,6 +392,13 @@ test('omitted or disabled T1/T2/N1/N2/D1 flags produce zero side effects and zer
         parseFeishuText('/help'),
       );
       await direct.tick();
+      for (const [cmd,title] of [['/pending','待处理汇总'],['/ops','待完成操作']] as const) {
+        await direct.handleTrusted({eventId:`evt-${cmd}`,destination:'chat-main',identity:OWNER},parseFeishuText(cmd));
+        await direct.flushInteractive();
+        assert.equal(fake.sent.at(-1)?.card.title,title);
+      }
+      assert.match(fake.sent.find(s => s.card.title === '待处理汇总')!.card.text,/当前未启用/);
+      assert.deepEqual(parseFeishuAction({action:'pending'}),{action:'pending'});
       assert.equal(existsSync(join(dir, 'watch-hub.sqlite')), false);
       assert.equal(existsSync(join(dir, 'pending-hub.sqlite')), false);
       assert.equal(existsSync(join(dir, 'decision-sync.sqlite')), false);
@@ -680,9 +687,26 @@ test('opt-in T1/T2/N1/N2/D1 joint workflow across claude + codex + agy and clean
       assert.ok(intRef.source_card_message_id);
       assert.ok(intRef.hub_card_message_id);
       const taskSourceCardsForAgy = fake.sent.filter(
-        (s) => s.destination === 'topic:task-joint-1' && s.card.title.includes('审批'),
+        (s) => s.destination === 'topic:task-joint-1' && s.card.title.includes('⚠️ 需人工确认'),
       );
       assert.equal(taskSourceCardsForAgy.length, 1);
+
+      for (const destination of ['chat-main', pendingRoot.topicDestination!, binding.destination]) {
+        const result = await runtime.handleTrusted({eventId:`pending:${destination}`,destination,identity:OWNER},parseFeishuText('/pending'));
+        assert.equal((result as {total:number}).total,2);
+        const sent = fake.sent.at(-1)!;
+        assert.equal(sent.destination,destination);
+        if (destination === binding.destination) {
+          assert.match(sent.card.text,/2 项待处理/);
+          assert.deepEqual(sent.card.actions.map(a => a.label),['打开待处理汇总话题']);
+          assert.match(sent.card.actions[0]!.url!,/openthreadid=th-pending-hub/);
+        } else {
+          assert.match(sent.card.title,/待处理.*汇总（共 2 项）/);
+        }
+      }
+      await assert.rejects(runtime.handleTrusted(
+        {eventId:'foreign-pending',destination:'topic:unknown',identity:OWNER},parseFeishuText('/pending'),
+      ),(e:unknown) => (e as {code?:string}).code === 'unauthorized');
 
       // Ordinary text in PendingHub topic NEVER approves anything
       const chatRes = (await runtime.handleTrusted(

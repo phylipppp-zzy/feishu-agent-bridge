@@ -1,10 +1,12 @@
+import {displayTopicTitle} from '../src/unified/topic-title-sync.js';
 import {deriveTitleFromInputBlocks, isGenericSessionTitle, normalizeTopicTitle} from '../src/unified/session-title.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UnifiedService } from '../src/unified/adapter.js';
+import { shortenHomePath } from '../src/unified/card-formatters.js';
 import type { Operation, Session, WriteContext } from '../src/unified/contracts.js';
 import { contractError } from '../src/unified/errors.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
@@ -93,7 +95,9 @@ test('interactive bind, attach and upgrade only send the finished session panel'
     assert.equal(sent.length, 0);
     await channel.advanceCompleted();
     assert.equal(sent.length, 1);
-    assert.match(sent[0]!.text, /绑定模式: interactive/);
+    assert.equal(sent[0]!.template, 'green');
+    assert.equal(sent[0]!.text, 'Codex · /project · 空闲\n✅ 已接入，现在可直接发送消息续聊');
+    assert.deepEqual(sent[0]!.actions.map(action => action.label), ['查看历史', '切换模型', '查看文件', '会话控制']);
   } finally { x.close(); }
 });
 
@@ -132,7 +136,7 @@ for (const lookup of [undefined, 'not_sent'] as const) test(`a committed upgrade
       assert.deepEqual(recovered.pendingDeliveries(), []);
       assert.equal(x.updates[0]!.id,'source-panel');
       assert.match(x.updates[0]!.card.text,/✅ 已接入，现在可直接发送消息续聊/);
-      assert.deepEqual(x.updates[0]!.card.actions.map(action=>action.value.action),['history','panel','artifacts']);
+      assert.deepEqual(x.updates[0]!.card.actions.map(action=>action.value.action),['history','models','artifacts','panel']);
       assert.ok(x.updates[0]!.card.actions.every(action=>action.value.bindingId===committed?.bindingId));
       assert.deepEqual(recovered.bindingsForRestore(),[committed]);
     } finally { recovered.close(); }
@@ -280,6 +284,17 @@ test('titles use the first nonempty text line, with an attachment name fallback 
   assert.equal(deriveTitleFromInputBlocks([file, {type: 'text', text: '\n本周  进展\r\n下一段'}]), '本周 进展');
   assert.equal(deriveTitleFromInputBlocks([{type: 'text', text: '🧪'.repeat(49)}]), '🧪'.repeat(47) + '…');
   assert.equal(normalizeTopicTitle('🧪'.repeat(61)), '🧪'.repeat(59) + '…');
+  assert.equal(displayTopicTitle({ ...session, title: '[Codex · project] 已加前缀' }), '[Codex · project] 已加前缀');
+  assert.equal(displayTopicTitle({ ...session, title: '🧪'.repeat(61) }), '[Codex · project] ' + '🧪'.repeat(41) + '…');
+  const longDirectory = '🧪'.repeat(40);
+  const shortDirectory = '🧪'.repeat(23) + '…';
+  for (const name of [longDirectory, shortDirectory]) {
+    assert.equal(displayTopicTitle({ ...session, project: `/work/${longDirectory}`, title: `[Codex · ${name}] 会话名` }), `[Codex · ${shortDirectory}] 会话名`);
+  }
+  assert.equal(displayTopicTitle({ ...session, native: { ...session.native, provider: 'agy' }, project: '' }), '[AGY · 项目未知] 会话名');
+  assert.equal(shortenHomePath(homedir()), '~');
+  assert.equal(shortenHomePath(`${homedir()}/work`), '~/work');
+  assert.equal(shortenHomePath(`${homedir()}-other/work`), `${homedir()}-other/work`);
   assert.equal(normalizeTopicTitle('  '), '未命名会话');
   assert.equal(isGenericSessionTitle('Claude 会话 · ffffffff'), true);
   assert.equal(isGenericSessionTitle('调试 Claude 会话 · ffffffff'), false);
