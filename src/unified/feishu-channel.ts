@@ -569,7 +569,8 @@ export class FeishuChannel {
       return this.sessionBinding.beginInteractiveAttach(e,bound,executionScope,guard,reply);
     }
     if (a.action === 'finish') return this.sessionBinding.finish(e,a.operationId,bound,guard,reply);
-    if (!bound && ['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','full_reply','history','swarm'].includes(a.action)) {
+    if (!bound && (['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','full_reply','history','export','swarm'].includes(a.action) ||
+      (a.action === 'input' && this.port.isTopicDestination?.(e.destination) === false))) {
       await reply(buildMainChatTopicOnlyGuidanceCard(a.action === 'swarm'));
       return {status:'guidance'};
     }

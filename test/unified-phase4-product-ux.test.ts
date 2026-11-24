@@ -15,6 +15,7 @@ import {
   type Session,
 } from '../src/unified/contracts.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import type { FeishuCallbackValues } from '../src/unified/feishu-callback-values.js';
 import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js';
 import { parseFeishuAction, parseFeishuText } from '../src/unified/feishu-codec.js';
 import { FeishuSdkPort, handleSdkCardCallback } from '../src/unified/feishu-sdk-port.js';
@@ -518,22 +519,41 @@ test('TaskTopic /help, /swarm passthrough, and clickable taskScope-stamped /mode
       parseFeishuText('/models'),
     );
     await runtime.tick();
-    const modelsCard = JSON.parse(sdk.replies.at(-1)!.content);
+    const modelsReply = sdk.replies.at(-1)!;
+    const modelsCard = JSON.parse(modelsReply.content);
     assert.equal(modelsCard.header.title.content, 'Antigravity · 模型');
     const actionBlock = modelsCard.elements.find((e: { tag: string }) => e.tag === 'action');
     assert.ok(actionBlock && actionBlock.actions.length >= 3, 'TaskTopic /models should render clickable buttons');
     const firstBtn = actionBlock.actions[0];
-    assert.equal(firstBtn.value.action, 'settings');
-    assert.equal(firstBtn.value.model, 'gemini-4-carbon');
-    assert.equal(firstBtn.value.taskId, created.taskId);
-    assert.equal(firstBtn.value.sessionId, sAgy.sessionId);
+    assert.ok(Buffer.byteLength(JSON.stringify(firstBtn.value)) <= 256);
+    assert.match(firstBtn.value.callback_ref, /^[\w-]{43}$/);
 
-    // Clicking the stamped button parses cleanly and updates settings on the active Agy target
-    const parsedModelAction = parseFeishuAction<RuntimeTrustedAction>(firstBtn.value);
-    await runtime.handleTrusted(
-      { eventId: 'card:ev-task-model-click', destination: created.destination, identity: OWNER },
-      parsedModelAction,
+    // Clicking the compacted button resolves the stored action and updates the active Agy target
+    const { callbackValues } = port as unknown as { callbackValues: FeishuCallbackValues };
+    let parsedModelAction: RuntimeTrustedAction | undefined;
+    const toast = await handleSdkCardCallback<RuntimeTrustedAction>(
+      {
+        event_id: 'ev-task-model-click',
+        context: { open_message_id: modelsReply.message_id, open_chat_id: 'chat-main' },
+        operator: { open_id: OWNER_ID },
+        action: { tag: 'button', value: firstBtn.value },
+      } as Parameters<typeof handleSdkCardCallback>[0],
+      OWNER_ID,
+      new Set(['chat-main']),
+      (chatId, messageId) => port.callbackDestination(chatId, messageId),
+      (env, action) => {
+        parsedModelAction = action;
+        return runtime.handleTrusted(env, action);
+      },
+      (messageId, value) => callbackValues.resolve(messageId, value),
     );
+    assert.partialDeepStrictEqual(parsedModelAction, {
+      action: 'settings',
+      model: 'gemini-4-carbon',
+      taskId: created.taskId,
+      sessionId: sAgy.sessionId,
+    });
+    assert.deepEqual(toast, { toast: { type: 'success', content: '已确认' } });
     await runtime.tick();
     assert.equal(agy.settingsUpdates.length, 1);
     assert.equal(agy.settingsUpdates[0]!.model, 'gemini-4-carbon');

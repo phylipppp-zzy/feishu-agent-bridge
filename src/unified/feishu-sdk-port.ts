@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseIncoming, parseCardAction } from '../feishu.js';
 import { parseFeishuAction, parseFeishuText } from './feishu-codec.js';
+import { FeishuCallbackValues, packCardCallbacks, type CallbackReferences } from './feishu-callback-values.js';
 import { cardSchema, encodeCard, type CardSchema } from './feishu-card-wire.js';
 import type { ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import type { RuntimeTrustedAction } from './runtime.js';
@@ -140,11 +141,11 @@ function isAlreadyHandledCardError(error: unknown): boolean {
   );
 }
 /** Old or malformed cards are guidance only; their untrusted values never reach the channel. */
-export async function handleSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:T)=>Promise<unknown>):Promise<{toast:{type:'info'|'success';content:string}} | undefined> {
+export async function handleSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:T)=>Promise<unknown>, expandValue?:(messageId:string,value:Record<string,unknown>)=>unknown):Promise<{toast:{type:'info'|'success';content:string}} | undefined> {
   const a=parseCardAction(data); if (!a || !a.eventId) return undefined;
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:T;
-  try { action=parseFeishuAction<T>(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
+  try { action=parseFeishuAction<T>(expandValue ? expandValue(a.openMessageId,a.value) : a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
   let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof TaskPendingRoute ? {toast:{type:'info',content:'任务话题待核查，写入暂不可用。'}} : error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownTestRoute ? {toast:{type:'info',content:'测试话题创建结果待核查，请联系管理员。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
   const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})};
   try {await handle(envelope,action);} catch (error) {return isAlreadyHandledCardError(error) ? {toast:{type:'info',content:'该项已处理完成，无需重复操作。'}} : {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};}
@@ -157,6 +158,7 @@ type TestLaneHandler={handle:(e:TrustedEnvelope,a:ChannelAction,token:TestLaneTo
 export class FeishuSdkPort implements FeishuPort {
   private readonly client: Lark.Client;
   private readonly appId:string;
+  private readonly callbackValues: FeishuCallbackValues;
   private testHandler:TestLaneHandler|undefined;
   private readonly testResourceFlights=new Map<string,Promise<void>>();
   private readonly testCreates=new Set<Promise<unknown>>();private readonly taskStore:TaskTopicStore;private closeRequested=false;
@@ -176,6 +178,7 @@ export class FeishuSdkPort implements FeishuPort {
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
     this.db = new DatabaseSync(dbPath); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_task_creations_v1 (operation_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,state TEXT NOT NULL,root_id TEXT,destination TEXT,payload_digest TEXT NOT NULL,delivery_id TEXT NOT NULL UNIQUE)"); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_text_resources_v1 (event_id TEXT PRIMARY KEY,envelope TEXT NOT NULL,message_id TEXT NOT NULL,resource_key TEXT NOT NULL,metadata TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,reason TEXT,next_attempt INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sdk_text_resource_tokens_v1 (event_id TEXT PRIMARY KEY,token TEXT NOT NULL)"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_creations (operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, provider TEXT NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, root_id TEXT, destination TEXT)'); this.db.exec("DROP INDEX IF EXISTS sdk_lane_creation_provider; CREATE UNIQUE INDEX IF NOT EXISTS sdk_lane_creation_reserved ON sdk_lane_creations(provider) WHERE state<>'rejected'; CREATE TABLE IF NOT EXISTS sdk_lane_resource_tokens (event_id TEXT PRIMARY KEY, token TEXT NOT NULL)"); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_native_lane_creations (operation_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,provider TEXT NOT NULL,delivery_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,root_id TEXT,destination TEXT); CREATE UNIQUE INDEX IF NOT EXISTS sdk_native_lane_reserved ON sdk_native_lane_creations(provider) WHERE state<>'rejected'"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_registry (root_id TEXT PRIMARY KEY, destination TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, owner TEXT NOT NULL, lane_id TEXT NOT NULL, namespace TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, operation_id TEXT NOT NULL, delivery_id TEXT NOT NULL, created_at INTEGER NOT NULL)'); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
     this.db.exec('CREATE TABLE IF NOT EXISTS sdk_card_schemas (message_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL)');
+    this.callbackValues=new FeishuCallbackValues(this.db);
     this.taskStore=new TaskTopicStore(this.db,this.appId,this.owner,this.destinations);
   }
   /** Only a local, constrained operator can create either mock provider root. */
@@ -238,12 +241,13 @@ export class FeishuSdkPort implements FeishuPort {
         await guard?.();
         validate(destination);
         const schema = cardSchema(card);
+        const {content,references} = packCardCallbacks(encodeCard(card,schema));
         const response = await feishuMessageWrite(() => this.client.im.message.reply({
           path: { message_id: token.rootId },
-          data: { msg_type: 'interactive', content: JSON.stringify(encodeCard(card, schema)), reply_in_thread: true },
+          data: { msg_type: 'interactive', content, reply_in_thread: true },
         }));
         if(!response.data?.message_id)throw new Error('test delivery outcome unknown');
-        this.remember(deliveryId,response.data.message_id,destination,schema);
+        this.remember(deliveryId,response.data.message_id,destination,schema,references);
         return response.data.message_id;
       },
       update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const schema=await this.patchCard(messageId,card);this.remember(deliveryId,messageId,destination,schema);},
@@ -341,7 +345,7 @@ export class FeishuSdkPort implements FeishuPort {
   private recordCardSchema(messageId: string, schema: CardSchema): void {
     this.db.prepare('INSERT INTO sdk_card_schemas(message_id,schema_version) VALUES (?,?) ON CONFLICT(message_id) DO NOTHING').run(messageId,schema);
   }
-  private remember(id:string, messageId:string|null,destination:string,schema?:CardSchema):void {
+  private remember(id:string, messageId:string|null,destination:string,schema?:CardSchema,references?:CallbackReferences):void {
     const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined;
     if(prior && prior.destination!==destination) this.routeGeneration++;
     this.db.exec('BEGIN IMMEDIATE');
@@ -350,6 +354,7 @@ export class FeishuSdkPort implements FeishuPort {
       if (messageId) {
         this.db.prepare('INSERT OR REPLACE INTO sdk_message_routes VALUES (?,?)').run(messageId,destination);
         if (schema) this.recordCardSchema(messageId,schema);
+        if (references) this.callbackValues.store(messageId,references);
       }
       this.db.exec('COMMIT');
     } catch (error) {
@@ -365,7 +370,8 @@ export class FeishuSdkPort implements FeishuPort {
     if (!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes) throw new Error('topic creation outcome unknown');
     await guard?.(); this.allowed(destination);
     const schema = cardSchema(card);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content:JSON.stringify(encodeCard(card,schema))}});
+    const {content,references} = packCardCallbacks(encodeCard(card,schema));
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content}});
     rejectCode(response.code); if(!response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
     const root=response.data.message_id; const key=`topic:${randomUUID()}`;
     this.routeGeneration++;
@@ -375,6 +381,7 @@ export class FeishuSdkPort implements FeishuPort {
       this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key);
       this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId);
       this.recordCardSchema(root,schema);
+      this.callbackValues.store(root,references);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -383,12 +390,12 @@ export class FeishuSdkPort implements FeishuPort {
     return key;
   }
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
-    await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const schema=cardSchema(card); const content=JSON.stringify(encodeCard(card,schema));
+    await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const schema=cardSchema(card); const {content,references}=packCardCallbacks(encodeCard(card,schema));
     const response = await feishuMessageWrite(() => route
       ? this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}})
       : this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}}));
     if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
-    this.remember(deliveryId,response.data.message_id,destination,schema); return response.data.message_id;
+    this.remember(deliveryId,response.data.message_id,destination,schema,references); return response.data.message_id;
   }
   async sendText(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string> {
     await guard?.();
@@ -426,10 +433,11 @@ export class FeishuSdkPort implements FeishuPort {
     const recorded = row?.schema_version;
     if (recorded !== undefined && recorded !== '1.0' && recorded !== '2.0') throw new Error('invalid stored card schema');
     const schema = recorded ?? cardSchema(card);
-    const patch = (version: CardSchema) => this.client.im.message.patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(encodeCard(card,version)) },
-    });
+    const patch = (version: CardSchema) => {
+      const {content,references}=packCardCallbacks(encodeCard(card,version));
+      this.callbackValues.store(messageId,references);
+      return this.client.im.message.patch({path:{message_id:messageId},data:{content}});
+    };
     const retryGuard = !row && schema === '1.0' ? legacyRootGuard : undefined;
     try {
       const response = await patch(schema);
@@ -561,7 +569,7 @@ export class FeishuSdkPort implements FeishuPort {
     const handles: Partial<Lark.EventHandles> & {'card.action.trigger':(data:Lark.RawCardActionEvent)=>Promise<any>} = {
       'im.message.receive_v1': async data => { try {if(await this.guideTaskPending(data,botId))return;await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),async (e,a)=>{if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId))return this.guideTaskPending(data,botId);return this.dispatchLane(e,a,handle);},async (e,id,key,type,metadata)=>{if(await this.guideTaskPending(data,botId))return;const task=this.taskToken(e.destination);if(task){if(e.identity.source!=='feishu'||e.identity.subject!==this.owner)throw Error('task topic unauthorized');if(!this.taskTopicRuntimeEnabled){this.taskStore.holdResource(task,e,e.eventId,id,key,type,metadata);await this.handleTask(e,task);return;}const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;this.queueResource(e,id,key,type,scope,metadata);return;}const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);const scope=await handler.capture(e,token);if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);this.queueTestResource(e,id,key,type,scope,token,metadata);}else{const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId)){await this.guideTaskPending(data,botId);return;}this.queueResource(e,id,key,type,scope,metadata);}},(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread));}catch(error){if(error instanceof UnknownTopic && await this.guideTaskPending(data,botId,true))return;if(error instanceof UnknownTopic && await this.guideTestUnavailable(data,botId))return;throw error;} },
       'card.action.trigger': async data => {
-        const work = handleSdkCardCallback<RuntimeTrustedAction>(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle));
+        const work = handleSdkCardCallback<RuntimeTrustedAction>(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle),(message,value)=>this.callbackValues.resolve(message,value));
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<{toast:{type:'info';content:string}}>(resolve => {
           timer = setTimeout(() => resolve({toast:{type:'info',content:'正在处理…'}}), 1500);
