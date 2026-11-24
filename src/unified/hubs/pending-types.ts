@@ -38,6 +38,12 @@ export interface PendingHubOptions {
   autoDispatch?: boolean;
   authorize?: (identity: Identity, destination: string, targetId: string) => Promise<boolean> | boolean;
   resolveTopicLink?: (sessionId: string, hubDestination: string) => Promise<string | null> | string | null;
+  shouldRefreshSource?: (card: {
+    interactionId: string;
+    sessionId: string;
+    destination: string;
+    messageId: string;
+  }) => boolean;
   now?: () => number;
 }
 
@@ -144,6 +150,14 @@ export type PendingSubmitPayload =
   | SubmitInteractionPayload
   | SubmitQuestionFormPayload
   | SubmitDecisionPayload;
+
+/** Runtime callbacks enqueue work after durable acceptance. Direct callers may await it. */
+export interface PendingSubmitNotifications {
+  notifyOperation(operationId: string): void;
+  notifyInteraction(sessionId: string, interactionId: string): void;
+  notifyDecision?(decisionId: string): void;
+  notifySummary(): void;
+}
 
 export interface PendingSubmitResult {
   status: 'submitted';

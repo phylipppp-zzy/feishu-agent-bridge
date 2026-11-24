@@ -16,6 +16,7 @@ export class NativeTestWorker {
       if(key==='getSession')return (id:string)=>self.session(id);
       if(key==='getSnapshot')return (id:string)=>self.snapshot(id);
       if(key==='getInteraction')return (id:string)=>self.interaction(id);
+      if(key==='getResponseOperation')return async()=>null;
       if(key==='resolveInteraction')return (request:ResolveInteraction)=>self.resolve(request);
       if(key==='getOperation')return (id:string)=>self.operation(id);
       if(key==='listSessions')return async()=>({items:[await self.session(self.sessionId)],nextCursor:null});

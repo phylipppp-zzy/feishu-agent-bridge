@@ -1,6 +1,7 @@
-import type { Interaction } from '../contracts.js';
+import type { Interaction, Operation } from '../contracts.js';
 import {
   interactionCard,
+  interactionStatusText,
   providerDisplayLabel,
   providerTitlePrefix,
   type ChannelCard,
@@ -49,9 +50,10 @@ export function taskInteractionCard(
   target: TaskTargetRecord,
   interaction: Interaction,
   controlGeneration = 0,
+  operation?: Operation | null,
 ): ChannelCard {
   const readOnly = target.accessMode === 'read_only';
-  const baseCard = interactionCard(interaction, readOnly);
+  const baseCard = interactionCard(interaction, readOnly, operation);
   const label = providerTitlePrefix(target.native.provider);
   const stamp = {
     taskId: binding.taskId,
@@ -71,13 +73,15 @@ export function taskInteractionCard(
     })),
   };
   if (interaction.kind !== 'approval') {
+    const statusText = interactionStatusText(interaction, operation);
     card.form = questionForm(
       interaction,
       interactionFormBindingId(target.taskId, target.targetId, target.targetGeneration),
-      readOnly,
+      readOnly || !!statusText,
       Date.now(),
       stamp,
     );
+    if (statusText) card.form.statusText = statusText;
   }
   return card;
 }

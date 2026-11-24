@@ -81,6 +81,7 @@ export interface TaskDrainDeps extends TaskDeliverDeps {
     expectedRootGeneration: number;
     owner: Identity;
   }) => Promise<TaskBindingRecord>;
+  onInteractionChanged?: (sessionId: string, interactionId: string) => void;
   renderInteraction: (
     binding: BindingRow,
     target: TargetRow,
@@ -626,7 +627,8 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       (result as Operation).status !== 'failed' &&
       (result as Operation).status !== 'unknown'
     ) {
-      try {
+      if (deps.onInteractionChanged) deps.onInteractionChanged(row.session_id, a.interactionId);
+      else try {
         const updatedInteraction = await deps.service.getInteraction(a.interactionId);
         const currentBinding = getBindingRow(deps.db, row.task_id);
         const currentTarget = getTargetRow(deps.db, row.task_id, row.target_id);

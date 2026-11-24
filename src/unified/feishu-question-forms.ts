@@ -11,6 +11,7 @@ export interface QuestionForm {
   questions: Question[];
   kind: 'question' | 'question_group';
   submittable: boolean;
+  statusText?: string;
   submitValueFields?: Record<string, unknown>;
 }
 export interface FormAnswerAction {
@@ -47,6 +48,7 @@ export function renderQuestionForm(form: QuestionForm): Record<string,unknown> {
     }
     if (q.allowFreeText) elements.push({tag:'input',name:`q${i}_text`,element_id:`q${i}_text`,required:false,placeholder:plain('输入文字答复'),max_length:QUESTION_INPUT_MAX_LENGTH,input_type:'multiline_text',rows:4,auto_resize:true,max_rows:8});
   }
+  if (form.statusText) elements.push({tag:'markdown',content:form.statusText});
   if (!form.submittable) return {schema:'2.0',header:{title:plain('问题已不可答复')},body:{elements}};
   const metadata={...(form.submitValueFields ?? {}),action:'answer_form',bindingId:form.bindingId,interactionId:form.interactionId,revision:form.revision,connectionGeneration:form.connectionGeneration};
   elements.push({tag:'button',name:'submit_question',element_id:'submit_question',text:plain('提交答复'),type:'primary',form_action_type:'submit',behaviors:[{type:'callback',value:metadata}]});

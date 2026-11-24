@@ -9,9 +9,11 @@ import { payloadDigest, type Answer, type Artifact, type Capabilities, type Inte
 import { contractError } from './errors.js';
 import { ClaudeState } from './claude-state.js';
 import { ClaudeResidualObservation } from './claude-residual.js';
+import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type ApprovalRequest, type ApprovalScope } from './approval-policy.js';
+import { unknown as unknownApprovalScope } from './approval-policy-paths.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
-type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
+type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; operationId?: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
 type Live = { title?: string; completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
@@ -21,6 +23,44 @@ const available = { status: 'available' as const };
 const unsupported = { status: 'unsupported' as const, reason: 'Claude SDK port does not support this capability' };
 const liveCaps: Capabilities = { view: available, send: available, queue: unsupported, steer: unsupported, answer: available, approve: available, interrupt: available, handoff: unsupported, files: unsupported, config: available };
 const readCaps: Capabilities = { ...liveCaps, send: unsupported, answer: unsupported, approve: unsupported, interrupt: unsupported, handoff: unsupported, config: unsupported };
+
+const readTools = new Set(['Read', 'Glob', 'Grep', 'LS']);
+const claudeToolFields: Record<string, readonly string[]> = {
+  Bash: ['command', 'description', 'timeout', 'run_in_background', 'dangerouslyDisableSandbox'],
+  Read: ['file_path', 'offset', 'limit', 'pages'],
+  Write: ['file_path', 'content'],
+  Edit: ['file_path', 'old_string', 'new_string', 'replace_all'],
+  MultiEdit: ['file_path', 'edits'],
+  Glob: ['pattern', 'path'],
+  Grep: ['pattern', 'path', 'glob', 'output_mode', '-B', '-A', '-C', 'context', '-n', '-i', '-o', 'type', 'head_limit', 'offset', 'multiline'],
+  LS: ['path', 'ignore'],
+  NotebookEdit: ['notebook_path', 'cell_id', 'new_source', 'cell_type', 'edit_mode'],
+};
+
+type ClaudeApprovalRequest = ApprovalRequest & { incomplete?: boolean };
+
+function claudeApprovalRequest(tool: string, input: unknown): ClaudeApprovalRequest {
+  if (tool === 'AskUserQuestion' || tool === 'business_decision') return { kind: 'question' };
+  if (!input || typeof input !== 'object' || Array.isArray(input) || !Object.hasOwn(claudeToolFields, tool)) return { kind: 'unknown' };
+  const fields = input as Record<string, unknown>;
+  const extraFields = Object.keys(fields).some(field => !claudeToolFields[tool]!.includes(field));
+  if (tool === 'Bash') {
+    const incomplete = extraFields || fields.dangerouslyDisableSandbox !== undefined && fields.dangerouslyDisableSandbox !== false;
+    return { kind: 'command', incomplete, ...(typeof fields.command === 'string' ? { command: fields.command } : {}) };
+  }
+  const incomplete = extraFields || tool === 'MultiEdit' && (!Array.isArray(fields.edits) || fields.edits.some(edit =>
+    !edit || typeof edit !== 'object' || Array.isArray(edit)
+    || Object.keys(edit).some(field => !['old_string', 'new_string', 'replace_all'].includes(field))));
+  const read = readTools.has(tool);
+  const search = read && tool !== 'Read';
+  const path = search ? fields.path === undefined ? '.' : fields.path : tool === 'NotebookEdit' ? fields.notebook_path : fields.file_path;
+  return { kind: read ? 'read' : 'write', incomplete, ...(typeof path === 'string' ? { paths: [path] } : {}) };
+}
+
+async function evaluateClaudeApproval(request: ClaudeApprovalRequest, context: ApprovalContext) {
+  const decision = evaluateApproval(await resolveApprovalFacts(request, context));
+  return decision.kind === 'allow_once' && request.incomplete ? { kind: 'ask' as const, reason: unknownApprovalScope } : decision;
+}
 
 /** SDK sessions created by this instance are interactive; discovered external sessions are read-only. */
 export class ClaudeAdapter implements PlatformPort {
@@ -33,7 +73,14 @@ export class ClaudeAdapter implements PlatformPort {
   private readonly metadataPending=new Map<string,Promise<unknown>>();
   private sequence = 0;
   private closed = false;
-  constructor(readonly hostId: string, readonly serviceId: string, stateDir: string, private readonly sdk: SDK = { query, listSessions, getSessionMessages }, private readonly claudeBin: string = process.env.CLAUDE_BIN?.trim() || 'claude') {
+  constructor(
+    readonly hostId: string,
+    readonly serviceId: string,
+    stateDir: string,
+    private readonly sdk: SDK = { query, listSessions, getSessionMessages },
+    private readonly claudeBin: string = process.env.CLAUDE_BIN?.trim() || 'claude',
+    private readonly options: { approvalPolicy?: ApprovalScope } = {},
+  ) {
     if (!hostId || !serviceId) throw contractError('invalid_request'); this.owned = new ClaudeState(stateDir, hostId, serviceId);
   }
   private async boundedMetadata<T>(kind:string,call:()=>Promise<T>):Promise<T> {
@@ -43,6 +90,10 @@ export class ClaudeAdapter implements PlatformPort {
   }
   private ref(id: string): NativeSessionRef { return { provider: 'claude', hostId: this.hostId, serviceId: this.serviceId, nativeSessionId: id }; }
   private check(ref: NativeSessionRef): string { if (ref.provider !== 'claude' || ref.hostId !== this.hostId || ref.serviceId !== this.serviceId || !ref.nativeSessionId) throw contractError('invalid_request'); return ref.nativeSessionId; }
+  hasActiveNativeSession(ref: NativeSessionRef): boolean {
+    return !this.closed && ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
+      && this.lives.has(ref.nativeSessionId) && !!this.owned.get(ref.nativeSessionId);
+  }
   private emit(o: PlatformObservation): void { for (const f of this.listeners) f(o); }
   onObservation(f: (o: PlatformObservation) => void): () => void { this.listeners.add(f); return () => this.listeners.delete(f); }
   private session(info: SDKSessionInfo): Session {
@@ -85,25 +136,70 @@ export class ClaudeAdapter implements PlatformPort {
   private start(id: string, cwd: string, model: string | null, resume: boolean): void {
     if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
     const queue = new InputQueue<SDKUserMessage>(); const generation = this.owned.nextGeneration();
-    const canUseTool: CanUseTool = (tool, input, opts) => new Promise(resolve => {
-      const live = this.lives.get(id); if (!live || opts.signal.aborted) { resolve({ behavior: 'deny', message: 'session closed' }); return; }
-      const interactionId = randomUUID(), base = { interactionId, sessionId: id, turnId: live.turn ?? '', nativeRequestId: opts.toolUseID, connectionGeneration: generation, revision: 1, status: 'awaiting_answer' as const, expiresAt: null, nativeResult: null };
-      let interaction: Interaction;
-      if (tool === 'AskUserQuestion' && Array.isArray(input.questions) && input.questions.length) {
-        const prompts = input.questions.map((q: any) => q?.question);
-        if (prompts.some((q: unknown) => typeof q !== 'string' || !q.trim()) || new Set(prompts).size !== prompts.length) {
-          const now = new Date().toISOString(), sequence = ++this.sequence;
-          this.emit({ type: 'event', ref: this.ref(id), event: { schemaVersion: 1, eventId: randomUUID(), sessionId: id, objectId: opts.toolUseID, objectRevision: 0, sequence, type: 'interaction.unsupported', occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: { reason: 'duplicate or invalid question text cannot be represented by Claude answers' } } });
-          resolve({ behavior: 'deny', message: 'Unsupported question group: question text must be unique and non-empty' }); return;
+    const hookCwds = new Map<string, string>();
+    const approvalContext = { ...this.options.approvalPolicy, project: cwd };
+    const canUseTool: CanUseTool = async (tool, input, opts) => {
+      const toolCwd = hookCwds.get(opts.toolUseID) ?? cwd;
+      hookCwds.delete(opts.toolUseID);
+      const context = { ...approvalContext, cwd: toolCwd };
+      const request = claudeApprovalRequest(tool, input);
+      let decision = request.kind === 'question' ? { kind: 'question' as const }
+        : await evaluateClaudeApproval(request, context);
+      if (decision.kind !== 'deny' && typeof opts.blockedPath === 'string' && opts.blockedPath) {
+        const blocked = evaluateApproval(await resolveApprovalFacts({
+          kind: readTools.has(tool) ? 'read' : 'write', paths: [opts.blockedPath],
+        }, { ...context, enabled: true }));
+        if (blocked.kind === 'deny') decision = blocked;
+      }
+      const live = this.lives.get(id);
+      if (this.closed || live?.generation !== generation || opts.signal.aborted) return { behavior: 'deny', message: 'session closed' };
+      if (decision.kind === 'deny') return { behavior: 'deny', message: decision.reason };
+      if (decision.kind !== 'question' && (opts.matchedAskRule !== undefined || opts.blockedPath !== undefined || opts.defaultToNo === true)) {
+        decision = { kind: 'ask', reason: opts.decisionReason || '原生权限规则要求人工确认' };
+      }
+      if (decision.kind === 'allow_once') return { behavior: 'allow', updatedInput: input };
+      return new Promise(resolve => {
+        const interactionId = randomUUID(), base = { interactionId, sessionId: id, turnId: live.turn ?? '', nativeRequestId: opts.toolUseID, connectionGeneration: generation, revision: 1, status: 'awaiting_answer' as const, expiresAt: null, nativeResult: null };
+        let interaction: Interaction;
+        if (decision.kind === 'question') {
+          const questionsInput = Array.isArray(input.questions) ? input.questions
+            : typeof input.question === 'string' ? [{ question: input.question }] : [];
+          const prompts = questionsInput.map((q: any) => q?.question);
+          if (!prompts.length || prompts.some((q: unknown) => typeof q !== 'string' || !q.trim()) || new Set(prompts).size !== prompts.length) {
+            const now = new Date().toISOString(), sequence = ++this.sequence;
+            this.emit({ type: 'event', ref: this.ref(id), event: { schemaVersion: 1, eventId: randomUUID(), sessionId: id, objectId: opts.toolUseID, objectRevision: 0, sequence, type: 'interaction.unsupported', occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: { reason: 'duplicate or invalid question text cannot be represented by Claude answers' } } });
+            resolve({ behavior: 'deny', message: 'Unsupported question group: question text must be unique and non-empty' }); return;
+          }
+          const questions = questionsInput.map((q: any, n: number) => ({ id: String(n), prompt: String(q.question ?? ''), choices: Array.isArray(q.options) ? q.options.map((o: any) => String(o.label ?? '')).filter(Boolean) : [], multiple: !!q.multiSelect, allowFreeText: true }));
+          interaction = { ...base, kind: 'question_group', toolInputDigest: null, questions };
+        } else {
+          const details = opts.blockedPath ? { input, blockedPath: opts.blockedPath } : input;
+          interaction = { ...base, kind: 'approval', tool, action: `${decision.reason}\n${JSON.stringify(details)}`, scope: 'this_request', toolInputDigest: payloadDigest(input) };
         }
-        const questions = input.questions.map((q: any, n: number) => ({ id: String(n), prompt: String(q.question ?? ''), choices: Array.isArray(q.options) ? q.options.map((o: any) => String(o.label ?? '')).filter(Boolean) : [], multiple: !!q.multiSelect, allowFreeText: true }));
-        interaction = { ...base, kind: 'question_group', toolInputDigest: null, questions };
-      } else interaction = { ...base, kind: 'approval', tool, action: JSON.stringify(input), scope: 'this_request', toolInputDigest: payloadDigest(input) };
-      const pending: Pending = { interaction, input, toolId: opts.toolUseID, settle: resolve }; live.pending.set(interactionId, pending);
-      opts.signal.addEventListener('abort', () => { if (pending.interaction.status === 'resolved' || pending.interaction.status === 'expired') return; pending.interaction = { ...pending.interaction, status: 'expired', revision: pending.interaction.revision + 1 }; this.emit({ type: 'interaction', ref: this.ref(id), interaction: pending.interaction }); resolve({ behavior: 'deny', message: 'request expired' }); }, { once: true });
-      this.emit({ type: 'interaction', ref: this.ref(id), interaction });
-    });
-    const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool };
+        const pendingInput = decision.kind === 'question' && !Array.isArray(input.questions) ? { ...input, questions: [{ question: input.question }] } : input;
+        const pending: Pending = { interaction, input: pendingInput, toolId: opts.toolUseID, settle: resolve }; live.pending.set(interactionId, pending);
+        opts.signal.addEventListener('abort', () => { if (pending.interaction.status === 'resolved' || pending.interaction.status === 'expired') return; pending.interaction = { ...pending.interaction, status: 'expired', revision: pending.interaction.revision + 1 }; this.emit({ type: 'interaction', ref: this.ref(id), interaction: pending.interaction }); resolve({ behavior: 'deny', message: 'request expired' }); }, { once: true });
+        this.emit({ type: 'interaction', ref: this.ref(id), interaction });
+      });
+    };
+    const hooks: Options['hooks'] = { PreToolUse: [{ hooks: [async (event, _, { signal }) => {
+      if (event.hook_event_name !== 'PreToolUse') return {};
+      const live = this.lives.get(id);
+      if (this.closed || live?.generation !== generation || signal.aborted) {
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: '会话已关闭' } };
+      }
+      const decision = await evaluateClaudeApproval(claudeApprovalRequest(event.tool_name, event.tool_input), { ...approvalContext, cwd: event.cwd });
+      if (this.closed || this.lives.get(id) !== live || signal.aborted) {
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: '会话已关闭' } };
+      }
+      if (decision.kind === 'allow_once' || decision.kind === 'question') return {};
+      if (decision.kind === 'ask') {
+        if (hookCwds.size >= 128) hookCwds.delete(hookCwds.keys().next().value!);
+        hookCwds.set(event.tool_use_id, event.cwd);
+      }
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: decision.kind, permissionDecisionReason: decision.reason } };
+    }] }] };
+    const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool, hooks };
     const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream:null, residual:new ClaudeResidualObservation(id) }; this.lives.set(id, live); live.completion = this.consume(live);
   }
   private async consume(live: Live): Promise<void> {
@@ -163,7 +259,7 @@ export class ClaudeAdapter implements PlatformPort {
   async respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard), p = live.pending.get(interaction.interactionId), i = p?.interaction; if (!p || !i || i.status !== 'awaiting_answer' || i.connectionGeneration !== interaction.connectionGeneration || i.connectionGeneration !== guard.expectedConnectionGeneration) throw contractError('interaction_expired'); if (i.revision !== interaction.revision || i.toolInputDigest !== interaction.toolInputDigest || i.nativeRequestId !== interaction.nativeRequestId) throw contractError('stale_revision'); let result: Awaited<ReturnType<CanUseTool>>;
     if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope) result = answer.decision === 'allow' ? { behavior: 'allow', updatedInput: p.input } : { behavior: 'deny', message: 'Denied by user' };
     else if (i.kind === 'question_group' && answer.kind === 'question_group' && Object.keys(answer.answers).length === i.questions.length && i.questions.every(q => Array.isArray(answer.answers[q.id]) && answer.answers[q.id]!.length && (q.multiple || answer.answers[q.id]!.length === 1) && answer.answers[q.id]!.every(x => typeof x === 'string' && x.trim()))) { const questions = p.input.questions as Array<{ question: string }>; result = { behavior: 'allow', updatedInput: { ...p.input, answers: Object.fromEntries(i.questions.map((q, n) => [questions[n]!.question, answer.answers[q.id]!.join(', ')])) } }; } else throw contractError('invalid_request');
-    guard.assertCurrent(); p.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 }; p.settle(result); this.emit({ type: 'interaction', ref, interaction: p.interaction }); return ack(); }
+    guard.assertCurrent(); p.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 }; p.settle(result); if (guard.operationId) p.operationId = guard.operationId; this.emit({ type: 'interaction', ref, interaction: p.interaction }); return ack(); }
   async listArtifacts(ref: NativeSessionRef): Promise<Artifact[]> { this.check(ref); throw contractError('unsupported'); }
   async readArtifact(ref: NativeSessionRef, _id: string, _version: string): Promise<Uint8Array> { this.check(ref); throw contractError('unsupported'); }
   async listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string; reasoningEfforts?: string[] }>> {

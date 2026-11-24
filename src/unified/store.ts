@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { canTransitionOperation, payloadDigest, SCHEMA_VERSION, validateResolution, validateWriteContext, type Event, type EventSubscription, type Artifact, type Turn, type Interaction, type Message, type NativeResult, type Operation, type OperationStatus, type ResolveInteraction, type Session, type Snapshot, type WriteContext } from './contracts.js';
+import { answerDigest, canTransitionOperation, payloadDigest, SCHEMA_VERSION, validateResolution, validateWriteContext, type Event, type EventSubscription, type Artifact, type Turn, type Interaction, type Message, type NativeResult, type Operation, type OperationStatus, type ResolveInteraction, type ResponseEvidence, type Session, type SessionSnapshot, type Snapshot, type WriteContext } from './contracts.js';
 import { contractError, type ContractError, type ErrorCode } from './errors.js';
 
 export class StoreError extends Error {
@@ -8,6 +8,8 @@ export class StoreError extends Error {
 }
 const fail = (code: ErrorCode, message?: string): never => { throw new StoreError(contractError(code, message)); };
 const parse = <T>(value: unknown): T => JSON.parse(String(value)) as T;
+/** Responses have their own lease so the native input waiting for an answer cannot block it. */
+export const responseLeaseKey = (interactionId: string): string => `interaction:${interactionId}`;
 const cursor = (sessionId: string, sequence: number): string => Buffer.from(JSON.stringify([sessionId, sequence])).toString('base64url');
 function readCursor(value: string, sessionId: string): number {
   try { const c: unknown = JSON.parse(Buffer.from(value, 'base64url').toString()); if (Array.isArray(c) && c.length === 2 && c[0] === sessionId && Number.isSafeInteger(c[1]) && c[1] >= 0 && cursor(sessionId, c[1]) === value) return c[1]; } catch { /* invalid cursor */ }
@@ -40,11 +42,16 @@ export class UnifiedStore {
       CREATE TABLE IF NOT EXISTS dispatch_leases(session_id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires INTEGER NOT NULL, generation INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS turns(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS messages_by_session ON messages(session_id);
       CREATE TABLE IF NOT EXISTS interactions(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS interactions_by_session ON interactions(session_id);
       CREATE TABLE IF NOT EXISTS native_interactions(id TEXT PRIMARY KEY REFERENCES interactions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS outbox(operation_id TEXT PRIMARY KEY REFERENCES operations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, context TEXT NOT NULL, connection_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','in_flight','unknown','done','cancelled')));
       CREATE TABLE IF NOT EXISTS steer_outbox_v1(operation_id TEXT PRIMARY KEY REFERENCES operations(id), kind TEXT NOT NULL, payload TEXT NOT NULL, context TEXT NOT NULL, connection_generation INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','in_flight','unknown','done','cancelled')));
+      CREATE INDEX IF NOT EXISTS outbox_by_target ON outbox(json_extract(context,'$.targetId'),state,kind);
+      CREATE INDEX IF NOT EXISTS steer_outbox_by_target ON steer_outbox_v1(json_extract(context,'$.targetId'),state,kind);
+      CREATE INDEX IF NOT EXISTS outbox_by_interaction ON outbox(json_extract(payload,'$.interactionId')) WHERE kind='resolveInteraction';
       CREATE TABLE IF NOT EXISTS notification_preferences(session_id TEXT PRIMARY KEY REFERENCES sessions(id), value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS event_keys(event_id TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL, value TEXT NOT NULL, UNIQUE(session_id, seq));
@@ -60,7 +67,8 @@ export class UnifiedStore {
   private run(sql: string, ...args: (string | number)[]): void { this.db.prepare(sql).run(...args); }
   private session(id: string): Session { const r = this.row('SELECT value FROM sessions WHERE id=?', id); if (!r) return fail('invalid_request', 'unknown session'); return parse<Session>(r.value); }
   getSession(id: string): Session { return this.session(id); }
-  getInteraction(id: string): Interaction { const r = this.row('SELECT value FROM interactions WHERE id=?', id); if (!r) return fail('invalid_request', 'unknown interaction'); return parse<Interaction>(r.value); }
+  findInteraction(id: string): Interaction | null { const row = this.row('SELECT value FROM interactions WHERE id=?', id); return row ? parse<Interaction>(row.value) : null; }
+  getInteraction(id: string): Interaction { return this.findInteraction(id) ?? fail('invalid_request', 'unknown interaction'); }
   getOperation(id: string): Operation { const r = this.row('SELECT value FROM operations WHERE id=?', id); if (!r) return fail('invalid_request', 'unknown operation'); return parse<Operation>(r.value); }
   /** Bootstrap a new normalized session. Existing IDs cannot be overwritten. */
   insertSession(session: Session): void { this.transaction(() => { if (this.findSession(session.native)) return fail('idempotency_conflict', 'native session already mapped'); this.run('INSERT INTO sessions(id,value,revision,control_generation) VALUES(?,?,?,?)', session.sessionId, JSON.stringify(session), session.revision, session.control.generation); }); }
@@ -179,7 +187,10 @@ export class UnifiedStore {
     this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id); this.run("UPDATE outbox SET state='done' WHERE operation_id=?",id); this.eventFor(turn.sessionId,id,next.revision,`operation.${status}`,id,next);
   }
   confirmedSettings(id: string): {model:string|null; preferences:Record<string,string>; revision:number} | null { this.session(id); const row=this.row('SELECT value,revision FROM session_settings WHERE session_id=?',id); return row ? {...parse<{model:string|null;preferences:Record<string,string>}>(row.value),revision:Number(row.revision)} : null; }
-  settingsBarrier(id: string): 'pending' | 'unknown' | null { const rows=this.db.prepare("SELECT context,state FROM outbox WHERE kind='updateSessionSettings' AND state IN ('pending','in_flight','unknown')").all() as Record<string,unknown>[]; const states=rows.filter(row=>parse<WriteContext>(row.context).targetId===id).map(row=>row.state); return states.includes('unknown') ? 'unknown' : states.length ? 'pending' : null; }
+  settingsBarrier(id: string): 'pending' | 'unknown' | null {
+    const rows = this.db.prepare("SELECT state FROM outbox WHERE json_extract(context,'$.targetId')=? AND kind='updateSessionSettings' AND state IN ('pending','in_flight','unknown')").all(id);
+    return rows.some(row => row.state === 'unknown') ? 'unknown' : rows.length ? 'pending' : null;
+  }
   confirmSettings(id: string, value: {model:string|null;preferences:Record<string,string>}): Operation { return this.transaction(()=>{
     const op=this.getOperation(id), out=this.getOutbox(id); if(op.action!=='updateSessionSettings'||out.state!=='in_flight'||op.status!=='received'||payloadDigest(out.payload)!==payloadDigest(value)) return fail('invalid_request');
     this.run('INSERT INTO session_settings(session_id,value,revision,operation_id) VALUES(?,?,1,?) ON CONFLICT(session_id) DO UPDATE SET value=excluded.value,revision=session_settings.revision+1,operation_id=excluded.operation_id',op.targetId,JSON.stringify(value),id);
@@ -188,12 +199,28 @@ export class UnifiedStore {
   }); }
   /** Persist the actual native turn reference and handle observations that arrived before the acknowledgement. */
   acceptSubmission(id: string, nativeReference: string | null): Operation { return this.transaction(() => {
-    const op=this.getOperation(id); const out=this.getOutbox(id); if (out.state !== 'in_flight' || !canTransitionOperation(op.status,'accepted')) return fail('invalid_request');
+    const op=this.getOperation(id); const out=this.getOutbox(id); if (out.kind === 'resolveInteraction' || out.state !== 'in_flight' || !canTransitionOperation(op.status,'accepted')) return fail('invalid_request');
     if (op.action === 'submitInput' && nativeReference) this.run('INSERT INTO operation_turns(operation_id,session_id,turn_id) VALUES(?,?,?)',id,op.targetId,nativeReference);
     const next: Operation = {...op,status:'accepted',revision:op.revision+1,error:null}; this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id); this.eventFor(op.targetId,id,next.revision,'operation.accepted',id,next);
     if (op.action === 'submitInput' && nativeReference) {const row=this.row('SELECT value FROM turns WHERE id=? AND session_id=?',nativeReference,op.targetId); if(row) this.settleTurn(parse<Turn>(row.value));}
     return this.getOperation(id);
   }); }
+  /** A locally written reply has no remaining send work. Keep its payload for native evidence. */
+  acceptResponseSubmission(id: string): Operation { return this.transaction(() => {
+    const op = this.getOperation(id), out = this.getOutbox(id);
+    if (out.kind !== 'resolveInteraction' || op.action !== out.kind || out.state === 'pending') return fail('invalid_request');
+    if (out.state !== 'in_flight') return op;
+    if (op.status !== 'accepted' && !canTransitionOperation(op.status, 'accepted')) return fail('invalid_request');
+    const accepted = op.status === 'accepted' ? op : this.updateOperationInTransaction(op, 'accepted');
+    this.run("UPDATE outbox SET state='done' WHERE operation_id=?", id);
+    return accepted;
+  }); }
+  private updateOperationInTransaction(op: Operation, status: OperationStatus, error: ContractError | null = null): Operation {
+    const next: Operation = { ...op, status, revision: op.revision + 1, error };
+    this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), op.operationId);
+    this.eventFor(op.targetId, op.operationId, next.revision, `operation.${status}`, op.operationId, next);
+    return next;
+  }
   private putTurnInTransaction(turn: Turn): void { this.session(turn.sessionId); const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId); if (old) {const prior=parse<Turn>(old.value); if(prior.sessionId !== turn.sessionId) return fail('invalid_request'); if(JSON.stringify(prior) === JSON.stringify(turn)) { this.settleTurn(prior); return; } if (['completed','failed','interrupted'].includes(prior.status)) { this.settleTurn(prior); return; } } this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',turn.turnId,turn.sessionId,JSON.stringify(turn)); this.eventFor(turn.sessionId,turn.turnId,0,'turn.updated',null,turn); this.settleTurn(turn); }
   putTurn(turn: Turn): void { this.transaction(() => this.putTurnInTransaction(turn)); }
   /** Record already-proven old terminal turns as baseline without emitting historical events. */
@@ -222,7 +249,7 @@ export class UnifiedStore {
     if(status!==current.status) {const next={...current,status,revision:current.revision+1};this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,sessionId);this.eventFor(sessionId,sessionId,next.revision,'session.updated',null,next);}
   }); }
   listTurns(sessionId: string): Turn[] { this.session(sessionId); return (this.db.prepare('SELECT value FROM turns WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string,unknown>[]).map(r => parse<Turn>(r.value)); }
-  queuedInputs(sessionId:string): Array<{inputId:string}> { this.session(sessionId); return this.pendingOutbox().filter(id=>{const o=this.getOutbox(id);return o.context.targetId===sessionId && o.kind==='submitInput' && (o.payload as {mode?:string}).mode==='queue';}).map(inputId=>({inputId})); }
+  queuedInputs(sessionId:string): Array<{inputId:string}> { this.session(sessionId); return this.pendingOutbox(sessionId,'submitInput').filter(id=>(this.getOutbox(id).payload as {mode?:string}).mode==='queue').map(inputId=>({inputId})); }
   cancelQueuedInput(context: WriteContext, inputId: string): Operation { return this.transaction(() => {
     const payload = {inputId}; const existing = this.existing(context,'cancelQueuedInput',payload); if (existing.operation) return existing.operation;
     const session = this.session(context.targetId); if (session.revision !== context.expectedRevision) return fail('stale_revision'); if (session.control.generation !== context.controlGeneration) return fail('control_conflict');
@@ -233,10 +260,38 @@ export class UnifiedStore {
   listSessions(): Session[] { return (this.db.prepare('SELECT value FROM sessions ORDER BY rowid').all() as Record<string, unknown>[]).map(r => parse<Session>(r.value)); }
   findSession(native: Session['native']): Session | undefined { const row = this.row("SELECT value FROM sessions WHERE json_extract(value,'$.native.provider')=? AND json_extract(value,'$.native.hostId')=? AND json_extract(value,'$.native.serviceId')=? AND json_extract(value,'$.native.nativeSessionId')=?",native.provider,native.hostId,native.serviceId,native.nativeSessionId); return row ? parse<Session>(row.value) : undefined; }
   connectionGeneration(id: string): number { const row = this.row('SELECT connection_generation FROM sessions WHERE id=?', id); if (!row) return fail('invalid_request', 'unknown session'); return Number(row.connection_generation); }
-  hasUnsettledInput(sessionId: string, exceptId: string): boolean { const rows = this.db.prepare("SELECT operation_id,context FROM outbox WHERE kind='submitInput' AND state IN ('in_flight','unknown')").all() as Record<string,unknown>[]; return rows.some(row => row.operation_id !== exceptId && parse<WriteContext>(row.context).targetId === sessionId); }
-  interactionHealthCounts():{pending:number;unknown:number} {const row=this.db.prepare("SELECT COALESCE(SUM(CASE WHEN json_extract(value,'$.status')='answer_pending_delivery' THEN 1 ELSE 0 END),0) AS pending, COALESCE(SUM(CASE WHEN json_extract(value,'$.status')='answer_pending_delivery' OR (json_extract(value,'$.status')='resolved' AND json_extract(value,'$.nativeResult.status')='unknown') THEN 1 ELSE 0 END),0) AS unknown FROM interactions").get() as {pending:number;unknown:number};return {pending:Number(row.pending),unknown:Number(row.unknown)};}
+  hasUnsettledInput(sessionId: string, exceptId: string): boolean { return !!this.row("SELECT 1 FROM outbox WHERE json_extract(context,'$.targetId')=? AND kind='submitInput' AND state IN ('in_flight','unknown') AND operation_id<>? LIMIT 1",sessionId,exceptId); }
+  hasOpenInteraction(sessionId: string): boolean { return !!this.row("SELECT 1 FROM interactions WHERE session_id=? AND json_extract(value,'$.status') IN ('awaiting_answer','answer_pending_delivery') LIMIT 1",sessionId); }
+  interactionHealthCounts(): {pending:number; unknown:number} {
+    const row = this.db.prepare(`
+      WITH responses AS (
+        SELECT json_extract(i.value,'$.status') AS interaction_status,
+          json_extract(i.value,'$.nativeResult.status') AS native_status,
+          json_extract(o.value,'$.status') AS response_status
+        FROM interactions i
+        LEFT JOIN outbox x ON x.kind='resolveInteraction' AND json_extract(x.payload,'$.interactionId')=i.id
+        LEFT JOIN operations o ON o.id=x.operation_id
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE interaction_status='answer_pending_delivery') AS pending,
+        COUNT(*) FILTER (WHERE response_status='unknown' OR (
+          response_status IS NULL AND (interaction_status='answer_pending_delivery' OR
+            (interaction_status='resolved' AND native_status='unknown'))
+        )) AS unknown
+      FROM responses
+    `).get()!;
+    return {pending:Number(row.pending),unknown:Number(row.unknown)};
+  }
   hasStopRequest(sessionId:string,turnId:string):boolean {return !!this.db.prepare("SELECT 1 FROM outbox WHERE kind='interruptTurn' AND state IN ('in_flight','unknown','done') AND json_extract(context,'$.targetId')=? AND json_extract(payload,'$.turnId')=? LIMIT 1").get(sessionId,turnId);}
-  pendingOutbox(): string[] { return (this.db.prepare("SELECT o.id FROM operations o WHERE EXISTS(SELECT 1 FROM outbox x WHERE x.operation_id=o.id AND x.state='pending') OR EXISTS(SELECT 1 FROM steer_outbox_v1 x WHERE x.operation_id=o.id AND x.state='pending') ORDER BY o.rowid").all() as Record<string, unknown>[]).map(r => String(r.id)); }
+  hasPendingOutbox(id: string): boolean {
+    return !!this.row("SELECT 1 FROM outbox WHERE operation_id=? AND state='pending' UNION ALL SELECT 1 FROM steer_outbox_v1 WHERE operation_id=? AND state='pending' LIMIT 1",id,id);
+  }
+  pendingOutbox(targetId?: string, kind?: string): string[] {
+    const where = "state='pending'" + (targetId === undefined ? '' : " AND json_extract(context,'$.targetId')=?") + (kind === undefined ? '' : ' AND kind=?');
+    const params = [targetId,kind].filter((value): value is string => value !== undefined);
+    const rows = this.db.prepare(`SELECT o.id FROM (SELECT operation_id FROM outbox WHERE ${where} UNION ALL SELECT operation_id FROM steer_outbox_v1 WHERE ${where}) pending JOIN operations o ON o.id=pending.operation_id ORDER BY o.rowid`).all(...params,...params) as Record<string,unknown>[];
+    return rows.map(row=>String(row.id));
+  }
   notificationPreference(id: string): { enabled: boolean; eventTypes: string[] } | null { this.session(id); const row = this.row('SELECT value FROM notification_preferences WHERE session_id=?', id); return row ? parse(row.value) : null; }
   /** Preference and operation receipt are committed together; no provider RPC is involved. */
   setNotificationPreference(context: WriteContext, value: { enabled: boolean; eventTypes: string[] }): Operation { return this.transaction(() => {
@@ -256,12 +311,48 @@ export class UnifiedStore {
     this.run('UPDATE sessions SET value=?,revision=?,control_generation=? WHERE id=?', JSON.stringify(session), session.revision, session.control.generation, session.sessionId);
     this.eventFor(session.sessionId, session.sessionId, session.revision, 'session.updated', null, session);
   }); }
-  putMessage(value: Message, expectedRevision: number | null): void { this.transaction(() => {
+  putMessage(value: Message, expectedRevision: number | null): void { this.transaction(() => this.putMessageInTransaction(value,expectedRevision)); }
+  private putMessageInTransaction(value: Message, expectedRevision: number | null): void {
     this.session(value.sessionId); const row = this.row('SELECT value FROM messages WHERE id=?', value.messageId);
     if (row) { const old = parse<Message>(row.value); if (old.sessionId !== value.sessionId || old.revision !== expectedRevision || value.revision !== old.revision + 1) return fail('stale_revision');
       this.run('UPDATE messages SET value=? WHERE id=?', JSON.stringify(value), value.messageId);
     } else { if (expectedRevision !== null) return fail('stale_revision'); this.run('INSERT INTO messages(id,session_id,value) VALUES(?,?,?)', value.messageId, value.sessionId, JSON.stringify(value)); }
     this.eventFor(value.sessionId, value.messageId, value.revision, 'message.updated', null, value);
+  }
+  /** Commit the snapshot only while the read's native identity and control scope still hold. */
+  applyHistoryRefresh(expected: Session, generation: number, observed: SessionSnapshot): boolean { return this.transaction(() => {
+    const id = expected.sessionId, current = this.session(id);
+    const readonly = current.status === 'read_only' && current.control.input !== 'available';
+    if (this.isDetached(id) || this.recoveryQuarantined(id) || this.connectionGeneration(id) !== generation ||
+        current.control.generation !== expected.control.generation || current.control.input !== expected.control.input ||
+        (current.status === 'read_only') !== (expected.status === 'read_only') ||
+        current.project !== expected.project || payloadDigest(current.native) !== payloadDigest(expected.native)) return false;
+    if (readonly) {
+      const title = observed.session.title?.trim() || current.title;
+      const candidateTime = Date.parse(observed.session.updatedAt ?? ''), currentTime = Date.parse(current.updatedAt ?? '');
+      const updatedAt = Number.isFinite(candidateTime) && (!Number.isFinite(currentTime) || candidateTime > currentTime) ? observed.session.updatedAt : current.updatedAt;
+      if (title !== current.title || updatedAt !== current.updatedAt) {
+        const next = {...current,title,...(updatedAt ? {updatedAt} : {}),revision:current.revision+1};
+        this.run('UPDATE sessions SET value=?,revision=? WHERE id=?',JSON.stringify(next),next.revision,id);
+        this.eventFor(id,id,next.revision,'session.updated',null,next);
+      }
+    }
+    for (const native of observed.turns ?? []) this.putTurnInTransaction({...native,sessionId:id});
+    const messages = new Map(this.db.prepare('SELECT value FROM messages WHERE session_id=?').all(id).map(row => {
+      const message = parse<Message>(row.value);
+      return [message.messageId,message] as const;
+    }));
+    let sequence = 0;
+    for (const message of messages.values()) sequence = Math.max(sequence,message.sequence);
+    for (const native of observed.messages) {
+      const old = messages.get(native.messageId);
+      const value = {...native,sessionId:id,sequence:old?.sequence ?? ++sequence,revision:old?.revision ?? native.revision};
+      if (old && (payloadDigest(value) === payloadDigest(old) || old.final && !value.final)) continue;
+      const next = old ? {...value,revision:old.revision+1} : value;
+      this.putMessageInTransaction(next,old?.revision ?? null);
+      messages.set(next.messageId,next);
+    }
+    return true;
   }); }
   setConnectionGeneration(sessionId: string, expected: number, next: number): void { this.transaction(() => {
     const row = this.row('SELECT connection_generation FROM sessions WHERE id=?', sessionId);
@@ -279,13 +370,40 @@ export class UnifiedStore {
     this.eventFor(value.sessionId, value.interactionId, value.revision, 'interaction.created', null, value);
   }); }
   getNativeInteraction(id: string): Interaction { const row = this.row('SELECT value FROM native_interactions WHERE id=?',id); if (!row) return fail('temporarily_unavailable','original native interaction snapshot unavailable'); return parse<Interaction>(row.value); }
+  private responseDelivery(id: string): { operationId: string; state: string } | null {
+    const row = this.row("SELECT operation_id,state FROM outbox WHERE kind='resolveInteraction' AND json_extract(payload,'$.interactionId')=? ORDER BY rowid DESC LIMIT 1", id);
+    return row ? {operationId: String(row.operation_id), state: String(row.state)} : null;
+  }
+  getResponseOperation(id: string): Operation | null {
+    const delivery = this.responseDelivery(id);
+    return delivery ? this.getOperation(delivery.operationId) : null;
+  }
+  private updateInteractionInTransaction(current: Interaction, status: Interaction['status'], nativeResult: NativeResult | null, eventType: string, operationId: string | null = null): Interaction {
+    if (current.status === status && payloadDigest(current.nativeResult) === payloadDigest(nativeResult)) return current;
+    const updated: Interaction = { ...current, status, nativeResult, revision: current.revision + 1 };
+    this.run('UPDATE interactions SET value=? WHERE id=?', JSON.stringify(updated), updated.interactionId);
+    this.eventFor(updated.sessionId, updated.interactionId, updated.revision, eventType, operationId, updated);
+    return updated;
+  }
+  private closeResponseDelivery(delivery: ReturnType<UnifiedStore['responseDelivery']>): void {
+    if (delivery?.state === 'pending') this.cancelPending(delivery.operationId);
+    if (delivery?.state === 'in_flight') this.markUnknownInTransaction(delivery.operationId);
+  }
+  private weakNativeResult(result: NativeResult | null, delivery: ReturnType<UnifiedStore['responseDelivery']>): NativeResult | null {
+    if (delivery && ['done','unknown','in_flight'].includes(delivery.state)) {
+      if (result?.status === 'unknown') return result;
+      if (result?.status === 'accepted') return {status: 'unknown', source: result.source};
+      return {status: 'unknown', source: 'native_request_closed'};
+    }
+    return result;
+  }
   expireNativeInteraction(id: string, generation: number, requestId: string, status: 'expired' | 'cancelled', nativeResult: NativeResult | null = null): Interaction { return this.transaction(() => {
     const current = this.getInteraction(id); const connection = this.connectionGeneration(current.sessionId);
     if (connection !== generation || current.connectionGeneration !== generation || current.nativeRequestId !== requestId) return fail('interaction_expired');
-    if (current.status === status || current.status === 'resolved' || current.status === 'expired' || current.status === 'cancelled') return current;
-    const updated: Interaction = {...current,status,nativeResult:nativeResult ?? current.nativeResult,revision:current.revision+1}; this.run('UPDATE interactions SET value=? WHERE id=?',JSON.stringify(updated),id); this.eventFor(current.sessionId,id,updated.revision,`interaction.${status}`,null,updated);
-    const rows = this.db.prepare("SELECT operation_id,payload,state FROM outbox WHERE kind='resolveInteraction' AND state IN ('pending','in_flight')").all() as Record<string,unknown>[];
-    for (const row of rows) if (parse<ResolveInteraction>(row.payload).interactionId === id) { if (row.state === 'pending') this.cancelPending(String(row.operation_id)); else this.markUnknownInTransaction(String(row.operation_id)); }
+    if (current.status !== 'awaiting_answer' && current.status !== 'answer_pending_delivery') return current;
+    const delivery = this.responseDelivery(id);
+    const updated = this.updateInteractionInTransaction(current, status, this.weakNativeResult(nativeResult ?? current.nativeResult, delivery), `interaction.${status}`);
+    this.closeResponseDelivery(delivery);
     return updated;
   }); }
   private existing(context: WriteContext, action: string, payload: unknown): { digest: string; operation?: Operation } {
@@ -332,7 +450,7 @@ export class UnifiedStore {
   resolveInteraction(request: ResolveInteraction, now = Date.now()): Operation { return this.transaction(() => {
     const { context } = request; const existing = this.existing(context, 'resolveInteraction', request); if (existing.operation) return existing.operation;
     const session = this.session(context.targetId);
-    if (session.control.generation !== context.controlGeneration) return fail('control_conflict');
+    if (session.control.generation !== context.controlGeneration || session.control.input !== 'available' || this.isDetached(session.sessionId) || this.recoveryQuarantined(session.sessionId)) return fail('control_conflict');
     const interaction = this.getInteraction(request.interactionId);
     const connection = this.row('SELECT connection_generation FROM sessions WHERE id=?', context.targetId);
     if (!connection || Number(connection.connection_generation) !== request.expectedConnectionGeneration) return fail('interaction_expired');
@@ -342,36 +460,41 @@ export class UnifiedStore {
     this.eventFor(updated.sessionId, updated.interactionId, updated.revision, 'interaction.answer_pending_delivery', context.operationId, updated);
     return this.receipt(context, 'resolveInteraction', existing.digest, request);
   }); }
-  /** Apply an observed native result only to the same native connection and request. */
-  recordNativeResult(id: string, connectionGeneration: number, nativeRequestId: string, result: NativeResult, terminal = false): Interaction { return this.transaction(() => {
+  /** A request closure settles delivery only when the adapter can attribute the native result. */
+  recordNativeResult(id: string, connectionGeneration: number, nativeRequestId: string, result: NativeResult, terminal = false, evidence?: ResponseEvidence): Interaction { return this.transaction(() => {
     const current = this.getInteraction(id);
-    const connection = this.row('SELECT connection_generation FROM sessions WHERE id=?', current.sessionId);
-    if (!connection || Number(connection.connection_generation) !== connectionGeneration || current.connectionGeneration !== connectionGeneration || current.nativeRequestId !== nativeRequestId) return fail('interaction_expired');
-    if (current.status === 'resolved') {
-      if (payloadDigest(current.nativeResult) !== payloadDigest(result)) return fail('stale_revision', 'conflicting native result');
-      return current;
-    }
-    if (current.status === 'expired' || current.status === 'cancelled') return fail('interaction_expired');
-    const updated: Interaction = { ...current, nativeResult: result, status: result.status === 'accepted' || terminal ? 'resolved' : current.status, revision: current.revision + 1 };
-    this.run('UPDATE interactions SET value=? WHERE id=?', JSON.stringify(updated), id);
-    this.eventFor(updated.sessionId, id, updated.revision, 'interaction.native_result', null, updated);
-    if (result.status === 'accepted' || terminal) {
-      // Cancel only work not yet handed out; in-flight delivery must be reconciled by the adapter.
-      const rows = this.db.prepare("SELECT operation_id,payload,state FROM outbox WHERE kind='resolveInteraction' AND state IN ('pending','in_flight','unknown')").all() as Record<string, unknown>[];
-      for (const row of rows) { const req = parse<ResolveInteraction>(row.payload); if (req.interactionId === id) {
-        const opId = String(row.operation_id); this.run('UPDATE outbox SET state=? WHERE operation_id=?', row.state === 'pending' ? 'cancelled' : 'unknown', opId);
-        const op = this.getOperation(opId);
-        if (row.state === 'pending' && canTransitionOperation(op.status, 'failed')) {
-          const next: Operation = { ...op, status: 'failed', revision: op.revision + 1, error: contractError('interaction_expired', 'native request already answered') };
-          this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), opId); this.eventFor(op.targetId, opId, next.revision, 'operation.failed', opId, next);
-        } else if (row.state !== 'pending' && op.status !== 'unknown' && canTransitionOperation(op.status, 'unknown')) {
-          const next: Operation = { ...op, status: 'unknown', revision: op.revision + 1, error: contractError('outcome_unknown') };
-          this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), opId); this.eventFor(op.targetId, opId, next.revision, 'operation.unknown', opId, next);
-        }
-      } }
-    }
-    return updated;
+    if (current.connectionGeneration !== connectionGeneration || current.nativeRequestId !== nativeRequestId) return fail('interaction_expired');
+    if (evidence) return this.confirmResponseInTransaction(current, result, evidence);
+    if (this.connectionGeneration(current.sessionId) !== connectionGeneration) return fail('interaction_expired');
+    if (current.status === 'resolved' || current.status === 'expired' || current.status === 'cancelled') return current;
+    if (!terminal && result.status !== 'accepted') return this.updateInteractionInTransaction(current, current.status, result, 'interaction.native_result');
+    const delivery = this.responseDelivery(id);
+    const closed = this.updateInteractionInTransaction(current, 'resolved', this.weakNativeResult(result, delivery), 'interaction.native_result');
+    // A closure without attribution cancels unsent intent, but claimed work may already have been written.
+    this.closeResponseDelivery(delivery);
+    return closed;
   }); }
+  private confirmResponseInTransaction(current: Interaction, result: NativeResult, evidence: ResponseEvidence): Interaction {
+    const op = this.getOperation(evidence.operationId), out = this.getOutbox(evidence.operationId);
+    const request = out.payload as ResolveInteraction;
+    if (op.action !== 'resolveInteraction' || out.kind !== op.action ||
+        op.targetId !== current.sessionId || out.context.targetId !== current.sessionId ||
+        out.context.operationId !== evidence.operationId || request.interactionId !== current.interactionId ||
+        evidence.interactionId !== current.interactionId || evidence.nativeRequestId !== current.nativeRequestId ||
+        evidence.connectionGeneration !== current.connectionGeneration || out.connectionGeneration !== current.connectionGeneration ||
+        request.expectedConnectionGeneration !== current.connectionGeneration ||
+        result.status !== 'accepted' || !result.answer || evidence.answerDigest !== answerDigest(result.answer) ||
+        evidence.answerDigest !== answerDigest(request.answer)) return fail('invalid_request', 'response evidence does not match the persisted request');
+    if (op.status === 'completed' && out.state === 'done') return current;
+    if (!(op.status === 'received' && out.state === 'in_flight' ||
+        op.status === 'accepted' && (out.state === 'in_flight' || out.state === 'done') ||
+        op.status === 'unknown' && out.state === 'unknown')) return fail('invalid_request', 'response was not dispatched');
+    const accepted = op.status === 'received' ? this.updateOperationInTransaction(op, 'accepted') : op;
+    const resolved = this.updateInteractionInTransaction(current, 'resolved', result, 'interaction.native_result', op.operationId);
+    this.updateOperationInTransaction(accepted, 'completed');
+    this.run("UPDATE outbox SET state='done' WHERE operation_id=?", op.operationId);
+    return resolved;
+  }
   private outboxTable(id:string):'outbox'|'steer_outbox_v1' { return this.row('SELECT operation_id FROM steer_outbox_v1 WHERE operation_id=?',id)?'steer_outbox_v1':'outbox'; }
   getOutbox(id: string): { kind: string; payload: unknown; context: WriteContext; connectionGeneration: number; state: string } { const r = this.row(`SELECT kind,payload,context,connection_generation,state FROM ${this.outboxTable(id)} WHERE operation_id=?`, id); if (!r) return fail('invalid_request', 'unknown outbox'); return { kind: String(r.kind), payload: parse(r.payload), context: parse<WriteContext>(r.context), connectionGeneration: Number(r.connection_generation), state: String(r.state) }; }
   /** SQLite serializes claim and generation changes; native submission still requires an adapter-side final fence. */
@@ -392,35 +515,63 @@ export class UnifiedStore {
   /** Pending at restart is not proof of a currently authorized delivery context. */
   failUnreboundPending(ids:string[]):void { this.transaction(()=>{ for(const id of ids) { const out=this.getOutbox(id); if(out.state!=='pending') continue; if(this.row('SELECT id FROM sessions WHERE id=?',out.context.targetId)) {this.cancelPending(id);continue;} const op=this.getOperation(id); if(canTransitionOperation(op.status,'failed')) {const next:Operation={...op,status:'failed',revision:op.revision+1,error:contractError('control_conflict','restart requires a new authorized request')};this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id);this.run("UPDATE outbox SET state='cancelled' WHERE operation_id=?",id);} } }); }
   private cancelPending(id: string): void {
-    this.run(`UPDATE ${this.outboxTable(id)} SET state='cancelled' WHERE operation_id=? AND state='pending'`, id);
     const op = this.getOperation(id);
-    if (canTransitionOperation(op.status, 'failed')) { const next: Operation = { ...op, status: 'failed', revision: op.revision + 1, error: op.action === 'resolveInteraction' ? contractError('interaction_expired', 'delivery context no longer valid') : contractError('control_conflict', 'request was not executed; submit again after control is restored') }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id); this.eventFor(op.targetId, id, next.revision, 'operation.failed', id, next); }
+    if (op.action === 'resolveInteraction') {
+      this.failResponseInTransaction(op, contractError('interaction_expired', 'delivery context no longer valid'));
+      return;
+    }
+    this.run(`UPDATE ${this.outboxTable(id)} SET state='cancelled' WHERE operation_id=? AND state='pending'`, id);
+    if (canTransitionOperation(op.status, 'failed')) this.updateOperationInTransaction(op, 'failed', contractError('control_conflict', 'request was not executed; submit again after control is restored'));
+  }
+  failResponseSubmission(id: string, error: ContractError): Operation { return this.transaction(() => {
+    const op = this.getOperation(id);
+    if (op.action !== 'resolveInteraction') return fail('invalid_request');
+    return this.failResponseInTransaction(op, error);
+  }); }
+  private failResponseInTransaction(op: Operation, error: ContractError): Operation {
+    const out = this.getOutbox(op.operationId);
+    if (!['pending','in_flight','unknown'].includes(out.state) || op.status === 'accepted' || !canTransitionOperation(op.status, 'failed')) return op;
+    const interaction = this.getInteraction((out.payload as ResolveInteraction).interactionId);
+    if (interaction.status === 'answer_pending_delivery') this.updateInteractionInTransaction(interaction, 'expired', interaction.nativeResult, 'interaction.expired', op.operationId);
+    this.run("UPDATE outbox SET state='cancelled' WHERE operation_id=?", op.operationId);
+    return this.updateOperationInTransaction(op, 'failed', error);
   }
   private invalidateDeliveries(sessionId: string, expireInteractions: boolean): void {
-    const rows = this.db.prepare("SELECT operation_id,state,context FROM outbox WHERE state IN ('pending','in_flight') UNION ALL SELECT operation_id,state,context FROM steer_outbox_v1 WHERE state IN ('pending','in_flight')").all() as Record<string, unknown>[];
-    for (const row of rows) if (parse<WriteContext>(row.context).targetId === sessionId) {
+    const rows = this.db.prepare("SELECT operation_id,state FROM outbox WHERE json_extract(context,'$.targetId')=? AND state IN ('pending','in_flight') UNION ALL SELECT operation_id,state FROM steer_outbox_v1 WHERE json_extract(context,'$.targetId')=? AND state IN ('pending','in_flight')").all(sessionId,sessionId) as Record<string, unknown>[];
+    for (const row of rows) {
       if (row.state === 'pending') this.cancelPending(String(row.operation_id)); else this.markUnknownInTransaction(String(row.operation_id));
     }
-    {
-      const interactions = this.db.prepare('SELECT value FROM interactions WHERE session_id=?').all(sessionId) as Record<string, unknown>[];
-      for (const row of interactions) { const current = parse<Interaction>(row.value);
-        if ((expireInteractions && current.status === 'awaiting_answer') || current.status === 'answer_pending_delivery') {
-          const next: Interaction = { ...current, status: 'expired', revision: current.revision + 1 };
-          this.run('UPDATE interactions SET value=? WHERE id=?', JSON.stringify(next), next.interactionId); this.eventFor(sessionId, next.interactionId, next.revision, 'interaction.expired', null, next);
-        }
+    for (const current of this.snapshotInteractions(sessionId)) {
+      if ((expireInteractions && current.status === 'awaiting_answer') || current.status === 'answer_pending_delivery') {
+        const delivery = this.responseDelivery(current.interactionId);
+        const result = delivery?.state === 'done' ? {status:'unknown' as const,source:'delivery_context_changed'} : current.nativeResult;
+        this.updateInteractionInTransaction(current, 'expired', result, 'interaction.expired');
       }
     }
   }
   /** Only recover work whose dispatch lease has expired; active workers remain untouched. */
   recoverAbandonedInFlight(now = Date.now()): Operation[] { return this.transaction(() => {
     const rows = this.db.prepare("SELECT operation_id,context FROM outbox WHERE state='in_flight' UNION ALL SELECT operation_id,context FROM steer_outbox_v1 WHERE state='in_flight'").all() as Record<string,unknown>[]; const recovered: Operation[] = [];
-    for (const row of rows) { const op = this.getOperation(String(row.operation_id)); if (op.status === 'accepted') continue; const context = parse<WriteContext>(row.context); const lease = this.row('SELECT expires FROM dispatch_leases WHERE session_id=?',context.targetId); if (!lease || Number(lease.expires) <= now) recovered.push(this.markUnknownInTransaction(String(row.operation_id))); } return recovered;
+    for (const row of rows) {
+      const op = this.getOperation(String(row.operation_id));
+      if (op.status === 'accepted') continue;
+      const context = parse<WriteContext>(row.context), out = this.getOutbox(op.operationId);
+      const responseLease = out.kind === 'resolveInteraction' ? this.row('SELECT expires FROM dispatch_leases WHERE session_id=?',responseLeaseKey((out.payload as ResolveInteraction).interactionId)) : undefined;
+      const lease = responseLease ?? this.row('SELECT expires FROM dispatch_leases WHERE session_id=?',context.targetId);
+      if (!lease || Number(lease.expires) <= now) recovered.push(this.markUnknownInTransaction(op.operationId));
+    }
+    return recovered;
   }); }
   recoverInFlight(): Operation[] { return this.transaction(() => {
     const rows = this.db.prepare("SELECT operation_id FROM outbox WHERE state='in_flight' UNION ALL SELECT operation_id FROM steer_outbox_v1 WHERE state='in_flight'").all() as Record<string, unknown>[];
     return rows.map(row => this.markUnknownInTransaction(String(row.operation_id)));
   }); }
   markDeliveryUnknown(id: string): Operation { return this.transaction(() => this.markUnknownInTransaction(id)); }
+  markResponseDeliveryUnknown(id: string): Operation { return this.transaction(() => {
+    const out = this.getOutbox(id);
+    if (out.kind !== 'resolveInteraction') return fail('invalid_request');
+    return out.state === 'in_flight' ? this.markUnknownInTransaction(id) : this.getOperation(id);
+  }); }
   private markUnknownInTransaction(id: string): Operation {
     const out = this.getOutbox(id); if (out.state !== 'in_flight' && out.state !== 'unknown') return fail('invalid_request', 'delivery was not in flight');
     const op = this.getOperation(id); if (op.status !== 'unknown' && !canTransitionOperation(op.status, 'unknown')) return fail('invalid_request', 'invalid operation transition');
@@ -429,6 +580,10 @@ export class UnifiedStore {
   }
   reconcileOperation(id: string, status: Extract<OperationStatus, 'accepted' | 'completed' | 'failed'>, error: ContractError | null = null): Operation { return this.transaction(() => {
     const op = this.getOperation(id); if (!canTransitionOperation(op.status, status)) return fail('invalid_request', 'invalid operation transition');
+    if (op.action === 'resolveInteraction') {
+      if (status !== 'failed') return fail('invalid_request', 'response reconciliation needs native evidence');
+      return this.failResponseInTransaction(op, error ?? contractError('interaction_expired'));
+    }
     const next: Operation = { ...op, status, revision: op.revision + 1, error }; this.run('UPDATE operations SET value=? WHERE id=?', JSON.stringify(next), id);
     this.run(`UPDATE ${this.outboxTable(id)} SET state=? WHERE operation_id=?`, status === 'accepted' ? 'in_flight' : 'done', id); this.eventFor(op.targetId, id, next.revision, `operation.${status}`, id, next); return next;
   }); }

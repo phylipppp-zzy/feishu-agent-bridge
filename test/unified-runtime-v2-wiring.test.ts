@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DispatchGuard, PlatformObservation, PlatformPort } from '../src/unified/adapter.js';
 import { ArtifactRegistry } from '../src/unified/artifact-registry.js';
+import { ClaudeAdapter } from '../src/unified/claude-adapter.js';
+import { CodexAdapter } from '../src/unified/codex-adapter.js';
+import { isLocalCodexEndpoint } from '../src/unified/codex-approval.js';
 import {
   payloadDigest,
   type Answer,
@@ -299,6 +302,54 @@ test('validateRuntimeConfig checks optional watchHub/pendingHub/decisionSync and
       ),
       /distinct SDK database required/,
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('live runtime wires Codex approval to explicit or verified local filesystem scope', async t => {
+  for (const endpoint of ['codex-proxy://default', 'ws://localhost:1', 'wss://127.0.0.1', 'ws://[::1]:1']) {
+    assert.equal(isLocalCodexEndpoint(endpoint), true, endpoint);
+  }
+  for (const endpoint of ['ws://localhost.example.test:1', 'wss://192.0.2.1', 'codex-proxy://localhost', 'invalid']) {
+    assert.equal(isLocalCodexEndpoint(endpoint), false, endpoint);
+  }
+  const seen = new Map<string, { approvalPolicy: { enabled: boolean }; proveSharedFilesystem?: (path: unknown) => Promise<boolean> }>();
+  for (const prototype of [CodexAdapter.prototype, ClaudeAdapter.prototype]) {
+    const original = prototype.onObservation;
+    t.mock.method(prototype, 'onObservation', function (
+      this: CodexAdapter | ClaudeAdapter, listener: (observation: PlatformObservation) => void,
+    ) {
+      seen.set(this.provider, Reflect.get(this, 'options'));
+      return original.call(this, listener);
+    });
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-v2-approval-'));
+  try {
+    const base = makeBaseIntegratedConfig(dir);
+    const rollout = join(dir, 'codex-logs', 'rollout.jsonl');
+    writeFileSync(rollout, '');
+    for (const [codexEndpoint, enabled, shared, withRollout, withoutRollout] of [
+      ['wss://codex.example.test', true, undefined, false, false],
+      ['wss://codex.example.test', true, true, true, true],
+      ['ws://127.0.0.1:1', true, undefined, true, false],
+      ['ws://127.0.0.1:1', false, false, false, false],
+    ] as const) {
+      seen.clear();
+      const live = await createLiveRuntime({
+        ...base, codexEndpoint, approvalPolicy: { enabled, ...(shared === undefined ? {} : { codexSharedFilesystem: shared }) },
+      }, { appId: 'cli_test', appSecret: 'sec_test' }, join(dir, 'sdk.sqlite'));
+      try {
+        const codex = seen.get('codex');
+        assert.ok(codex?.proveSharedFilesystem);
+        assert.equal(codex.approvalPolicy.enabled, enabled);
+        assert.equal(await codex.proveSharedFilesystem(rollout), withRollout);
+        assert.equal(await codex.proveSharedFilesystem(undefined), withoutRollout);
+        assert.equal(seen.get('claude')?.approvalPolicy.enabled, enabled);
+      } finally {
+        await live.close();
+      }
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -644,7 +695,7 @@ test('opt-in T1/T2/N1/N2/D1 joint workflow across claude + codex + agy and clean
 
       // Answer agy approval through PendingHub -> withdraws BOTH task topic card and hub card
       await runtime.handleTrusted(
-        { eventId: 'card:hub-ans-agy', destination: pendingRoot.topicDestination!, identity: OWNER },
+        { eventId: 'card:hub-ans-agy', destination: pendingRoot.topicDestination!, identity: OWNER, cardMessageId: intRef.hub_card_message_id! },
         {
           action: 'answer',
           entry: 'hub',
@@ -656,6 +707,7 @@ test('opt-in T1/T2/N1/N2/D1 joint workflow across claude + codex + agy and clean
           toolInputDigest: approvalDigest,
         } as never,
       );
+      await runtime.flushInteractive();
       assert.equal(agy.responds.length, 1);
       assert.equal(runtime.pendingHub!.getRef('interaction:int-agy-joint')?.card_active, 0);
       assert.ok(

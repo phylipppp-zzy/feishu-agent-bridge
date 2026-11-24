@@ -364,9 +364,9 @@ test('/swarm passthrough in interactive agy, one-click upgrade in read-only agy 
 
   const service = {
     getSession: async (id: string) => sessions.get(id)!,
-    attachSession: async ({ context, payload }: { context: { operationId: string }; payload: { provider: Provider } }) => {
+    attachSession: async ({ context, payload }: { context: { operationId: string; targetId: string }; payload: { provider: Provider } }) => {
       const sessionId = payload.provider === 'agy' ? 's-agy' : `s-${payload.provider}`;
-      const op = { operationId: context.operationId, status: 'completed', action: 'attachSession', error: null, result: { kind: 'session', sessionId } };
+      const op = { operationId: context.operationId, targetId: context.targetId, status: 'completed', action: 'attachSession', error: null, result: { kind: 'session', sessionId } };
       ops.set(op.operationId, op);
       return op;
     },
@@ -739,6 +739,8 @@ test('handleSdkCardCallback -> runtime.handleTrusted double-click on already-ans
     });
     await runtime.tick();
     const hubDest = runtime.pendingHub!.getRoot()?.topicDestination ?? 'chat-main';
+    const decisionCard = runtime.pendingHub!.getRef(`decision:${decision.decisionId}`)?.hub_card_message_id;
+    assert.ok(decisionCard);
 
     const cardValue = {
       action: 'decision_answer',
@@ -750,7 +752,7 @@ test('handleSdkCardCallback -> runtime.handleTrusted double-click on already-ans
     const makeCardEvt = (eventId: string) =>
       ({
         event_id: eventId,
-        context: { open_message_id: 'om_dec_card_1', open_chat_id: 'chat-main' },
+        context: { open_message_id: decisionCard, open_chat_id: 'chat-main' },
         operator: { open_id: OWNER_ID },
         action: { tag: 'button', value: cardValue },
       }) as Parameters<typeof handleSdkCardCallback>[0];

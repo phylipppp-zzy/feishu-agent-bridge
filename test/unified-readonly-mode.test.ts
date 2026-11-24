@@ -13,7 +13,7 @@ test('binding modes isolate writes, persist and require successful attach to upg
  const identity={source:'feishu',subject:'owner'}; const env=(eventId:string,destination='ro')=>({eventId,destination,identity});
  const session={sessionId:'s',title:'s',project:'p',status:'idle',revision:1,native:{provider:'codex',hostId:'h',serviceId:'svc',nativeSessionId:'n'},control:{input:'available',generation:1}};
  let writes=0, fail=false, reads=0; const ops=new Map<string,unknown>(); const cards:Array<any>=[];
- const service={getSession:async()=>session,readHistory:async()=>{reads++;return {items:[],nextCursor:null};},attachSession:async({context}:any)=>{ if(fail) throw Error('resume failed'); const op={operationId:context.operationId,status:'completed',action:'attachSession',error:null,result:{kind:'session',sessionId:'s'}}; ops.set(op.operationId,op); return op; },getOperation:async(id:string)=>ops.get(id),submitInput:async()=>{writes++;return {status:'completed',action:'input',error:null}},resolveInteraction:async()=>{writes++;},getInteraction:async()=>({sessionId:'s'}),stageInputArtifact:async()=>{writes++;}} as unknown as UnifiedService;
+ const service={getSession:async()=>session,readHistory:async()=>{reads++;return {items:[],nextCursor:null};},attachSession:async({context}:any)=>{ if(fail) throw Error('resume failed'); const op={operationId:context.operationId,targetId:context.targetId,status:'completed',action:'attachSession',error:null,result:{kind:'session',sessionId:'s'}}; ops.set(op.operationId,op); return op; },getOperation:async(id:string)=>ops.get(id),submitInput:async()=>{writes++;return {status:'completed',action:'input',error:null}},resolveInteraction:async()=>{writes++;},getInteraction:async()=>({sessionId:'s'}),stageInputArtifact:async()=>{writes++;}} as unknown as UnifiedService;
  const port={send:async(_d:string,c:any)=>{cards.push(c);return 'm'},update:async()=>{},sendFile:async()=>{}};
  let channel=new FeishuChannel(service,port,async()=>true,path); const handle=(id:string,d:string,a:any)=>channel.handle(env(id,d),a);
  try {
@@ -26,10 +26,18 @@ test('binding modes isolate writes, persist and require successful attach to upg
   await handle('history','ro',{action:'history'}); await handle('notifications','ro',{action:'notifications',enabled:false,eventTypes:[],revision:1,controlGeneration:1}); assert.equal(reads,1);
   channel.close(); channel=new FeishuChannel(service,port,async()=>true,path);
   assert.deepEqual(await handle('ro-restart','ro',{action:'input',text:'x',mode:'new'}),{status:'rejected',reason:'read_only_binding'}); await handle('rw-restart','rw',{action:'input',text:'x',mode:'new'}); assert.equal(writes,2);
-  const requested:any=await handle('forged-bind','ro',{action:'bind',sessionId:'s',mode:'interactive'});assert.equal(requested.status,'completed');await assert.rejects(channel.captureBindingScope(env('pending-bind')),/read-only/);
   await handle('panel','ro',{action:'panel'}); const old=cards.at(-1).actions.find((x:any)=>x.value.action==='upgrade').value;
-  fail=true; await assert.rejects(handle('upgrade-fail','ro',{action:'upgrade'}),/resume failed/); assert.deepEqual(await handle('still-ro','ro',{action:'input',text:'x',mode:'new'}),{status:'rejected',reason:'read_only_binding'});
-  fail=false; const upgrade:any=await handle('upgrade','ro',parseFeishuAction(old)); await handle('finish-upgrade','ro',{action:'finish',operationId:upgrade.operationId});
+  fail=true;
+  assert.deepEqual(await handle('upgrade-fail','ro',{action:'upgrade'}),{status:'rejected',reason:'temporarily_unavailable'});
+  assert.match(cards.at(-1).text,/原端暂时无法完成接入/);
+  assert.deepEqual(await handle('still-ro','ro',{action:'input',text:'x',mode:'new'}),{status:'rejected',reason:'read_only_binding'});
+  fail=false;
+  const requested:any=await handle('legacy-bind','ro',{action:'bind',sessionId:'s',mode:'interactive'});
+  assert.equal(requested.status,'completed');
+  await assert.rejects(channel.captureBindingScope(env('pending-bind')),/read-only/);
+  const upgrade:any=await handle('upgrade','ro',parseFeishuAction(old));
+  assert.equal(upgrade.operationId,requested.operationId);
+  await handle('finish-upgrade','ro',{action:'finish',operationId:upgrade.operationId});
   await assert.rejects(handle('old-card','ro',parseFeishuAction(old)),/binding changed/);
   channel.close(); channel=new FeishuChannel(service,port,async()=>true,path);
   await handle('after-restart','ro',{action:'input',text:'x',mode:'new'}); assert.equal(writes,3);

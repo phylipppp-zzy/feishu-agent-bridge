@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { AgyAdapter } from '../src/unified/agy-adapter.js';
+import { classifyAgyPermission, mergeAgyToolCall } from '../src/unified/agy/adapter-permission.js';
 import { AgyCatalog } from '../src/unified/agy-catalog.js';
 import { AgyQuotaClient } from '../src/unified/agy-quota.js';
 import { AgyAcpTransport } from '../src/unified/agy-transport.js';
@@ -140,7 +141,7 @@ async function writeTranscript(
 
 async function writeFakeAgyBinary(binPath: string, rpcLogPath: string, dropFlagPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
-import { appendFileSync, existsSync, unlinkSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, unlinkSync, writeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const args = process.argv.slice(2);
@@ -149,7 +150,7 @@ const dropFlagPath = ${JSON.stringify(dropFlagPath)};
 const log = (entry) => appendFileSync(rpcLogPath, JSON.stringify(entry) + '\\n');
 
 if (args.includes('/usage')) {
-  process.stdout.write(JSON.stringify({
+  writeSync(1, JSON.stringify({
     status: 'SUCCESS',
     command: {
       data: {
@@ -164,7 +165,7 @@ if (args.includes('/usage')) {
 }
 
 if (!args.includes('acp')) {
-  process.stderr.write('unexpected command: ' + args.join(' ') + '\\n');
+  writeSync(2, 'unexpected command: ' + args.join(' ') + '\\n');
   process.exit(2);
 }
 
@@ -172,9 +173,10 @@ let seq = 0;
 let srvReqId = 1000;
 const pendingServerReplies = new Map();
 const activePrompts = new Map();
+const allowMatchingExecution = new Map();
 
 const writeMsg = (obj) => {
-  process.stdout.write(JSON.stringify(obj) + '\\n');
+  writeSync(1, JSON.stringify(obj) + '\\n');
 };
 
 const sendServerRequest = (method, params) => {
@@ -185,7 +187,8 @@ const sendServerRequest = (method, params) => {
   });
 };
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+// Read the inherited descriptor directly so the mock works in restricted stdio environments.
+const rl = createInterface({ input: createReadStream(undefined, { fd: 0, autoClose: false }), crlfDelay: Infinity });
 rl.on('line', async (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -251,6 +254,13 @@ rl.on('line', async (line) => {
     return;
   }
 
+  if (method === 'test/release_matching_execution') {
+    allowMatchingExecution.get(params.sessionId)?.();
+    allowMatchingExecution.delete(params.sessionId);
+    reply({});
+    return;
+  }
+
   if (method === 'session/cancel') {
     const entry = activePrompts.get(params.sessionId);
     if (entry) {
@@ -279,20 +289,80 @@ rl.on('line', async (line) => {
         },
       },
     });
+    const emitTool = (toolCallId, status, args = {}) => writeMsg({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: sid,
+        update: { sessionUpdate: 'tool_call_update', toolCallId, status, ...args },
+      },
+    });
+    const permissionOptions = [
+      { optionId: 'allow_always', kind: 'allow_always', name: 'Always allow' },
+      { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+      { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
+    ];
 
     if (text.includes('flow-allow') || text.includes('flow-deny')) {
       emitChunk('Working...');
+      emitTool('tc-perm-1', 'pending', {
+        kind: 'execute', rawInput: { CommandLine: 'sudo systemctl restart nginx' },
+      });
       const permRes = await sendServerRequest('session/request_permission', {
         sessionId: sid,
-        toolCall: { toolCallId: 'tc-perm-1', title: 'Run shell check', kind: 'execute' },
-        options: [
-          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
-          { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
-        ],
+        toolCall: {
+          toolCallId: 'tc-perm-1', title: 'Run shell check', kind: 'execute',
+          rawInput: { CommandLine: 'sudo systemctl restart nginx' },
+        },
+        options: permissionOptions,
       });
-      log({ permissionReply: permRes });
+      log({ permissionCase: text, permissionReply: permRes });
       const accepted = permRes?.outcome?.optionId === 'allow_once';
+      if (accepted) {
+        const release = new Promise(resolve => allowMatchingExecution.set(sid, resolve));
+        emitTool('unrelated-tool', 'in_progress');
+        emitChunk(' Waiting for execution.');
+        await release;
+      }
+      emitTool('tc-perm-1', 'in_progress');
       emitChunk(accepted ? ' Allowed!' : ' Denied!');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
+    if (text.startsWith('flow-auto')) {
+      const toolCallId = 'tc-auto';
+      const command = 'git status -sb && rg -n "UnifiedCore" src/unified | head -n 5';
+      const rawInput = { CommandLine: command };
+      let toolCall = { toolCallId, title: 'Run shell check', kind: 'execute', rawInput };
+      let options = permissionOptions;
+      if (text === 'flow-auto-incremental') {
+        emitTool(toolCallId, 'pending', { ...toolCall, args: rawInput });
+        toolCall = { toolCallId };
+        options = [{ optionId: 'allow_always', kind: 'allow_always' }, { optionId: 'allow_once' }];
+      } else if (text === 'flow-auto-scoped-root') {
+        toolCall = { ...toolCall, rawInput: { CommandLine: 'pwd', Cwd: '..' } };
+      } else if (text === 'flow-auto-bypass') {
+        toolCall = { ...toolCall, rawInput: { ...rawInput, BypassSandbox: true } };
+      } else if (text === 'flow-auto-updated') {
+        emitTool(toolCallId, 'pending', { kind: 'execute', rawInput: { CommandLine: 'pwd' } });
+        toolCall = { ...toolCall, rawInput: { CommandLine: 'pwd', WaitMsBeforeAsync: 500 } };
+      } else if (text === 'flow-auto-evicted') {
+        emitTool(toolCallId, 'pending', { kind: 'execute', rawInput: { CommandLine: 'pwd', BypassSandbox: true } });
+        for (let i = 0; i < 128; i++) emitTool('pending-' + i, 'pending', { rawInput });
+        for (const status of ['completed', 'failed', 'cancelled']) {
+          emitTool(status, status, { kind: 'execute', content: ['large'.repeat(1024)], rawOutput: rawInput, args: rawInput });
+        }
+        toolCall = { ...toolCall, rawInput: { CommandLine: 'pwd' } };
+      } else if (text === 'flow-auto-deny') {
+        toolCall = {
+          toolCallId, title: 'Edit project file', kind: 'edit',
+          rawInput: { TargetFile: '/home/zhangzy/projects/projtool/src/index.ts' },
+        };
+        options = [{ optionId: 'allow_always', kind: 'allow_always' }, { optionId: 'reject_always', kind: 'reject_always' }];
+      }
+      const result = await sendServerRequest('session/request_permission', { sessionId: sid, toolCall, options });
+      log({ permissionCase: text, permissionReply: result });
       reply({ stopReason: 'end_turn' });
       return;
     }
@@ -319,12 +389,15 @@ rl.on('line', async (line) => {
     if (text.includes('flow-drop')) {
       void sendServerRequest('session/request_permission', {
         sessionId: sid,
-        toolCall: { toolCallId: 'tc-drop-1', title: 'Pending before crash' },
-        options: [{ optionId: 'allow_once', kind: 'allow_once' }],
+        toolCall: {
+          toolCallId: 'tc-drop-1', title: 'Pending before crash', kind: 'execute',
+          rawInput: { CommandLine: 'sudo true' },
+        },
+        options: permissionOptions,
       }).catch(() => {});
       if (existsSync(dropFlagPath)) {
         try { unlinkSync(dropFlagPath); } catch {}
-        setTimeout(() => process.exit(1), 60);
+        setTimeout(() => process.kill(process.pid, 'SIGKILL'), 60);
       }
       return;
     }
@@ -581,6 +654,67 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4000, msg = 'condit
   assert.ok(predicate(), msg);
 }
 
+test('Agy permission requires known tool identities and complete, scoped inputs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-approval-'));
+  try {
+    const project = join(root, 'project');
+    const outside = join(root, 'other');
+    await Promise.all([mkdir(project), mkdir(outside)]);
+    await symlink(outside, join(project, 'linked'));
+
+    const command = { CommandLine: 'pwd' };
+    const execute = { kind: 'execute', rawInput: command };
+    const read = { name: 'view_file', kind: 'read', rawInput: { TargetFile: 'src/index.ts', StartLine: 1 } };
+    const write = { name: 'write_to_file', kind: 'edit', rawInput: { TargetFile: 'notes.md', Content: 'hello' } };
+    const edit = {
+      name: 'edit_file', kind: 'edit',
+      rawInput: { Path: 'src/index.ts', Target: `~/original\n${'source content '.repeat(40)}`, Replacement: 'new source' },
+    };
+    const validCommand = {
+      ...execute, name: 'run_command', rawInput: {
+        ...command, Cwd: './', BypassSandbox: false, IsDaemon: false, WaitMsBeforeAsync: 500,
+        NotificationTimeoutSeconds: 1, toolSummary: 'Print working directory',
+      },
+    };
+    for (const tool of [validCommand, read, write, edit]) {
+      assert.equal((await classifyAgyPermission(tool, project)).kind, 'allow_once', JSON.stringify(tool));
+    }
+
+    for (const tool of [
+      { rawInput: command },
+      { ...execute, name: 'upload_file' },
+      { ...execute, toolName: 'read_file' },
+      { ...execute, toolName: '' },
+      { ...execute, rawInput: { ...command, BypassSandbox: true } },
+      { ...execute, rawInput: { ...command, BypassSandbox: 'false' } },
+      { ...execute, rawInput: { ...command, Shell: 'custom' } },
+      { ...execute, args: { Environment: { PATH: '/tmp/custom' } } },
+      { ...execute, _meta: { BypassSandbox: true } },
+      { ...execute, args: { commandLine: 'git status' } },
+      mergeAgyToolCall({ ...execute, rawInput: { ...command, BypassSandbox: true } },
+        { rawInput: { BypassSandbox: false } }),
+      mergeAgyToolCall({ ...execute, name: 'unknown' }, { name: 'run_command' }),
+      { ...read, rawInput: { ...read.rawInput, FollowSymlinks: true } },
+      { ...read, locations: [{ path: join(outside, 'data.txt'), line: 1 }] },
+      { ...read, args: { TargetFile: 'linked/data.txt' } },
+      { ...write, rawInput: { ...write.rawInput, ArtifactMetadata: { path: join(outside, 'artifact') } } },
+      { ...write, rawInput: { ...write.rawInput, Content: { path: join(outside, 'artifact') } } },
+      { ...edit, rawInput: { ...edit.rawInput, Target: { path: join(outside, 'artifact') } } },
+      { ...edit, rawInput: { ...edit.rawInput, Path: join(outside, 'artifact') } },
+    ]) {
+      assert.equal((await classifyAgyPermission(tool, project)).kind, 'ask', JSON.stringify(tool));
+    }
+
+    const otherDirectory = { ...execute, rawInput: { ...command, Cwd: outside } };
+    assert.equal((await classifyAgyPermission(otherDirectory, project)).kind, 'ask');
+    assert.equal((await classifyAgyPermission(otherDirectory, project, { allowedRoots: [outside] })).kind, 'allow_once');
+    assert.equal((await classifyAgyPermission(execute, project, { allowedRoots: [] })).kind, 'allow_once');
+    assert.equal((await classifyAgyPermission(execute, project, { enabled: false })).kind, 'ask');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfill, permission/elicitation, stale generation, cancel, resume', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agy-adapter-e2e-'));
   try {
@@ -666,13 +800,20 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const transport = new AgyAcpTransport({ agyBin: binPath, connectTimeoutMs: 3000, requestTimeoutMs: 5000 });
     const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [join(root, 'workspace')] });
     const quota = new AgyQuotaClient({ agyBin: binPath });
-    const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc-1', quota);
+    const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc-1', quota, {
+      approvalPolicy: { allowedRoots: [join(root, 'workspace')] },
+    });
+    const store = new UnifiedStore(join(root, 'response-evidence.sqlite'));
+    const core = new UnifiedCore(store, [adapter], () => true);
     try {
 
     const observed: PlatformObservation[] = [];
     adapter.onObservation((obs) => observed.push(obs));
 
     // 1. Read-only discovery & subagent retention & honest boundary
+    const refresh = catalog.refreshAsync();
+    assert.equal(catalog.refreshAsync(), refresh);
+    await refresh;
     const listed = await adapter.list(null, 20);
     assert.equal(listed.items.length, 1);
     const roSession = listed.items[0]!;
@@ -716,6 +857,27 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(createdAck.status, 'submitted');
     assert.equal(createdAck.nativeReference, 'agy-live-1');
     const liveRef = createdAck.createdSession!.native;
+    const session = createdAck.createdSession!;
+    store.insertSession(session);
+    store.setConnectionGeneration(session.sessionId, 0, gen1);
+    assert.equal(adapter.hasActiveNativeSession(liveRef), true);
+    assert.equal(adapter.hasActiveNativeSession(roSession.native), false);
+    assert.equal(adapter.hasActiveNativeSession({ ...liveRef, hostId: 'different-host' }), false);
+    const submitDecision = async (interaction: Interaction, operationId: string, decision: 'allow' | 'deny') => {
+      await core.resolveInteraction({
+        context: {
+          operationId, idempotencyKey: operationId, targetId: session.sessionId,
+          expectedRevision: interaction.revision, controlGeneration: session.control.generation,
+          identity: { source: 'feishu', subject: 'ou_owner' },
+        },
+        interactionId: interaction.interactionId,
+        toolInputDigest: interaction.toolInputDigest,
+        expectedConnectionGeneration: interaction.connectionGeneration,
+        answer: { kind: 'approval', scope: 'this_request', decision },
+      });
+      assert.equal((await core.dispatch(operationId)).status, 'accepted');
+      assert.equal(store.getOutbox(operationId).state, 'done');
+    };
 
     const models = await adapter.listModels(liveRef);
     assert.ok(models.some((m) => m.id === 'gemini-4-hydrogen' && m.reasoningEfforts?.includes('xhigh')));
@@ -729,6 +891,66 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       () => adapter.input(liveRef, 'steer', [{ type: 'text', text: 'noop' }], makeGuard(gen1)),
       (err: unknown) => typeof err === 'object' && err !== null && (err as { code?: string }).code === 'unsupported',
     );
+
+    for (const flow of ['flow-auto', 'flow-auto-incremental', 'flow-auto-scoped-root', 'flow-auto-deny']) {
+      const start = observed.length;
+      await adapter.input(liveRef, 'new', [{ type: 'text', text: flow }], makeGuard(gen1));
+      await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      assert.equal(observed.slice(start).filter(o => o.type === 'interaction').length, 0, flow);
+    }
+
+    const bypassStart = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-bypass' }], makeGuard(gen1));
+    const isBypassApproval = (o: PlatformObservation): o is Extract<PlatformObservation, { type: 'interaction' }> =>
+      o.type === 'interaction' && o.interaction.kind === 'approval' && o.interaction.status === 'awaiting_answer';
+    await waitFor(() => observed.slice(bypassStart).some(isBypassApproval));
+    await submitDecision(observed.slice(bypassStart).find(isBypassApproval)!.interaction, 'deny-bypass', 'deny');
+    await waitFor(() => observed.slice(bypassStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+
+    const updatedStart = observed.length;
+    const onServerRequest = transport.onServerRequest;
+    transport.onServerRequest = request => {
+      onServerRequest(request);
+      // The handler has started classifying and cannot resume before this update is processed.
+      transport.onNotification({
+        generation: gen1, method: 'session/update', params: {
+          sessionId: liveRef.nativeSessionId,
+          update: {
+            sessionUpdate: 'tool_call_update', toolCallId: 'tc-auto', status: 'cancelled',
+            rawInput: { CommandLine: 'pwd -P' },
+          },
+        },
+      });
+    };
+    try {
+      await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-updated' }], makeGuard(gen1));
+      await waitFor(() => observed.slice(updatedStart).some(isBypassApproval));
+      const updatedApproval = observed.slice(updatedStart).find(isBypassApproval)!.interaction;
+      assert.equal(updatedApproval.kind, 'approval');
+      assert.match(updatedApproval.action, /工具调用参数在审批检查期间发生变化/);
+      const latestCall = JSON.parse(updatedApproval.action.split('\n')[1]!);
+      assert.deepEqual(latestCall.rawInput, { CommandLine: 'pwd -P', WaitMsBeforeAsync: 500 });
+      assert.equal(latestCall.status, 'cancelled');
+      assert.equal(adapter['activeTurns'].get(liveRef.nativeSessionId)!.toolCalls.get('tc-auto')?.rawInput, undefined);
+      await submitDecision(updatedApproval, 'deny-updated', 'deny');
+      await waitFor(() => observed.slice(updatedStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+    } finally {
+      transport.onServerRequest = onServerRequest;
+    }
+
+    const evictedStart = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-evicted' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(evictedStart).some(isBypassApproval));
+    const cachedTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
+    assert.equal(cachedTurn.fullToolCalls.size, 128);
+    assert.deepEqual(cachedTurn.toolCalls.get('tc-auto'), { toolCallId: 'tc-auto', status: 'pending', kind: 'execute' });
+    for (const status of ['completed', 'failed', 'cancelled']) {
+      assert.deepEqual(cachedTurn.toolCalls.get(status), { toolCallId: status, status, kind: 'execute' });
+    }
+    const evictedApproval = observed.slice(evictedStart).find(isBypassApproval)!.interaction;
+    assert.ok(evictedApproval.kind === 'approval' && evictedApproval.action.includes('缺少工具调用的完整参数记录'));
+    await submitDecision(evictedApproval, 'deny-evicted', 'deny');
+    await waitFor(() => observed.slice(evictedStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
 
     // 4. Streaming input + permission allow
     const turn1Idx = observed.length;
@@ -747,7 +969,17 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
         o.type === 'interaction' && o.interaction.kind === 'approval' && o.interaction.status === 'awaiting_answer',
       )!.interaction;
 
-    await adapter.respond(liveRef, permAllowInt, { kind: 'approval', scope: 'this_request', decision: 'allow' }, makeGuard(gen1));
+    const allowTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
+    assert.ok(allowTurn.toolCalls.get('tc-perm-1')?.rawInput);
+    await submitDecision(permAllowInt, 'allow-approval', 'allow');
+    await waitFor(() => observed.slice(turn1Idx).some(o =>
+      o.type === 'message' && !o.message.final &&
+      o.message.blocks.some(block => block.type === 'text' && block.text.includes('Waiting for execution')),
+    ));
+    assert.equal(store.getOperation('allow-approval').status, 'accepted');
+    assert.equal(store.getInteraction(permAllowInt.interactionId).status, 'answer_pending_delivery');
+    assert.deepEqual(allowTurn.toolCalls.get('tc-perm-1'), { toolCallId: 'tc-perm-1', status: 'pending', kind: 'execute' });
+    await transport.request('test/release_matching_execution', { sessionId: liveRef.nativeSessionId });
     await waitFor(
       () => observed.slice(turn1Idx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
       3000,
@@ -757,7 +989,10 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const finals = observed.slice(turn1Idx).filter((o): o is Extract<PlatformObservation, { type: 'message' }> => o.type === 'message' && o.message.final && o.message.role === 'assistant');
     assert.ok(partials.length >= 1, 'expected partial streaming message');
     assert.equal(finals.length, 1);
-    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /Working\.\.\.\s*Allowed!/);
+    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /Working\.\.\..*Allowed!/);
+    assert.equal(store.getOperation('allow-approval').status, 'completed');
+    assert.equal(store.getInteraction(permAllowInt.interactionId).status, 'resolved');
+    assert.equal(store.getOutbox('allow-approval').state, 'done');
 
     // 5. Permission deny
     const turnDenyIdx = observed.length;
@@ -769,11 +1004,23 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const permDenyInt = observed
       .slice(turnDenyIdx)
       .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
-    await adapter.respond(liveRef, permDenyInt, { kind: 'approval', scope: 'this_request', decision: 'deny' }, makeGuard(gen1));
+    const denyTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
+    transport.onNotification({
+      generation: gen1, method: 'session/update', params: {
+        sessionId: liveRef.nativeSessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc-perm-1', status: 'cancelled', rawOutput: 'large'.repeat(1024) },
+      },
+    });
+    assert.ok(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, 'keep terminal payload while the permission request is unanswered');
+    await submitDecision(permDenyInt, 'deny-approval', 'deny');
+    assert.equal(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, undefined);
     await waitFor(
       () => observed.slice(turnDenyIdx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
       3000,
     );
+    assert.equal(store.getOperation('deny-approval').status, 'accepted');
+    assert.equal(store.getInteraction(permDenyInt.interactionId).nativeResult?.status, 'unknown');
+    assert.equal(store.getOutbox('deny-approval').state, 'done');
 
     // 6. Elicitation Q&A
     const turnElicitIdx = observed.length;
@@ -830,6 +1077,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
 
     // Wait for child process unexpected crash & reconnect
     await waitFor(() => !transport.connected, 3000, 'expected transport disconnect after crash');
+    assert.equal(adapter.hasActiveNativeSession(liveRef), false);
     await transport.connect();
     const gen2 = transport.connectionGeneration;
     assert.ok(gen2 > gen1, 'reconnect must increment connectionGeneration');
@@ -855,7 +1103,15 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     }
     const setCfgCalls = rpcEntries.filter((e) => e.method === 'session/set_config_option');
     assert.ok(setCfgCalls.some((c) => (c.params as { value: string }).value === 'xhigh'));
-    assert.ok(rpcEntries.some((e) => (e.permissionReply as { outcome?: { optionId?: string } })?.outcome?.optionId === 'reject_once'));
+    for (const [flow, optionId] of [
+      ['flow-auto', 'allow_once'], ['flow-auto-incremental', 'allow_once'], ['flow-auto-scoped-root', 'allow_once'],
+      ['flow-auto-deny', null], ['flow-auto-bypass', 'reject_once'], ['flow-auto-evicted', 'reject_once'],
+      ['flow-auto-updated', 'reject_once'],
+      ['flow-allow', 'allow_once'], ['flow-deny', 'reject_once'],
+    ]) {
+      const replies = rpcEntries.filter(e => e.permissionCase === flow).map(e => e.permissionReply);
+      assert.deepEqual(replies, [{ outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' } }], flow!);
+    }
     assert.ok(
       rpcEntries.some(
         (e) =>
@@ -865,7 +1121,9 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     );
 
     } finally {
+      core.close();
       await adapter.close();
+      store.close();
     }
   } finally {
     await rm(root, { recursive: true, force: true });

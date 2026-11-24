@@ -16,23 +16,51 @@ export interface ChannelCardTable {
 }
 /** Presentation-neutral cards; an injected transport converts these to Feishu SDK payloads. */
 export interface ChannelCard { form?: QuestionForm; title: string; text: string; table?: ChannelCardTable; actions: Array<{ label: string; value: Record<string, unknown>; url?: string }> }
-export function sessionCard(session: Session): ChannelCard {
-  return { title: session.title, text: `${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}\n控制: ${session.control.input}`, actions: [
-    { label: '查看历史', value: { action: 'history' } },
-    { label: '接入并续聊', value: { action: 'bind', sessionId: session.sessionId, mode:'interactive' } },
-    { label: '会话控制', value: { action: 'panel', sessionId: session.sessionId } },
-    { label: '查看文件', value: { action: 'artifacts', sessionId: session.sessionId } },
+export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only' | 'interactive' = 'unbound'): ChannelCard {
+  const connected = session.control.input === 'available' && session.status !== 'read_only';
+  const controls: ChannelCard['actions'] = accessMode === 'unbound'
+    ? [{label:'接入并续聊',value:{action:'bind',sessionId:session.sessionId,mode:'interactive'}}]
+    : accessMode === 'read_only' ? [{label:'接入并续聊',value:{action:'upgrade'}}]
+    : connected ? [] : [{label:'重新接入',value:{action:'upgrade'}}];
+  const access = accessMode === 'interactive'
+    ? `\n${connected ? '✅ 已接入，现在可直接发送消息续聊' : '⚠️ 会话已绑定但原端控制暂不可用，请重新接入或查看会话控制'}\n绑定模式: interactive`
+    : accessMode === 'read_only' ? '\n绑定模式: read_only' : '';
+  return { title:session.title, text:`${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}\n控制: ${session.control.input}${access}`, actions:[
+    { label:'查看历史', value:{action:'history'} },
+    ...controls,
+    { label:'会话控制', value:{action:'panel',sessionId:session.sessionId} },
+    { label:'查看文件', value:{action:'artifacts',sessionId:session.sessionId} },
   ] };
 }
-export function interactionCard(i: Interaction, readOnly = false): ChannelCard {
+
+export function interactionStatusText(interaction: Interaction, operation?: Operation | null): string | null {
+  if (operation?.status === 'completed') return '原端已确认答复';
+  if (operation?.status === 'unknown') return '答复结果未知，请查看原会话';
+  if (operation?.status === 'failed' || interaction.status === 'expired') {
+    if (operation?.status === 'accepted') return '原请求已结束，答复结果未确认';
+    return '原请求已过期或失效';
+  }
+  if (interaction.status === 'answer_pending_delivery' || (interaction.status === 'awaiting_answer' && operation && ['received','queued','accepted'].includes(operation.status))) return '答复已提交，等待原端确认';
+  if (interaction.status === 'resolved') {
+    if (operation?.status === 'accepted') return '原请求已结束，答复结果未确认';
+    if (interaction.nativeResult?.status === 'unknown') return '答复结果未知，请查看原会话';
+    return interaction.nativeResult?.status === 'accepted' && interaction.nativeResult.answer ? '原端已确认答复' : '已在原终端完成处理';
+  }
+  if (interaction.status === 'cancelled') return operation?.status === 'accepted'
+    ? '原请求已结束，答复结果未确认' : '原请求已取消';
+  return null;
+}
+
+export function interactionCard(i: Interaction, readOnly = false, operation?: Operation | null): ChannelCard {
   const text = i.kind === 'approval' ? `${i.tool}: ${i.action}\n范围: ${i.scope}` : i.kind === 'question' ? i.prompt : i.questions.map(q => `${q.id}: ${q.prompt}`).join('\n');
   const base = { action: 'answer', interactionId: i.interactionId, revision: i.revision, connectionGeneration: i.connectionGeneration };
+  const status = interactionStatusText(i,operation);
   let actions: ChannelCard['actions'] = [];
-  if (!readOnly && i.status === 'awaiting_answer') {
-    if (i.kind === 'approval') actions = ['allow', 'deny'].map(decision => ({ label: decision === 'allow' ? '允许' : '拒绝', value: { ...base, answer: { kind: 'approval', decision, scope: i.scope }, toolInputDigest: i.toolInputDigest } }));
+  if (!readOnly && !status && i.status === 'awaiting_answer') {
+    if (i.kind === 'approval') actions = (i.allowedDecisions ?? ['allow', 'deny']).map(decision => ({ label: decision === 'allow' ? '允许' : '拒绝', value: { ...base, answer: { kind: 'approval', decision, scope: i.scope }, toolInputDigest: i.toolInputDigest } }));
     else if (i.kind === 'question' && !i.multiple) actions = i.choices.map(choice => ({ label: choice, value: { ...base, answer: { kind: 'question', values: [choice] }, toolInputDigest: null } }));
   }
-  return { title: i.kind === 'approval' ? '审批' : '问题', text: `${text}\n状态: ${i.status}${readOnly ? '\n此话题为只读，不能在此答复。外部终端启动的 Claude 若仅同步等待状态，需回原终端处理。' : i.kind !== 'approval' && i.status === 'awaiting_answer' ? '\n可通过答复入口提交文字或多选。' : ''}`, actions };
+  return { title: i.kind === 'approval' ? '审批' : '问题', text: `${text}\n状态: ${status ?? i.status}${readOnly ? '\n此话题为只读，不能在此答复。外部终端启动的 Claude 若仅同步等待状态，需回原终端处理。' : i.kind !== 'approval' && !status && i.status === 'awaiting_answer' ? '\n可通过答复入口提交文字或多选。' : ''}`, actions };
 }
 export function operationCard(op: Operation): ChannelCard {
   const actions:Record<string,string>={submitInput:'发送输入',stageInputArtifact:'提交附件',interruptTurn:'中断当前回复',cancelQueuedInput:'取消排队输入',resolveInteraction:'提交答复',attachSession:'接入会话',createSession:'创建会话',requestControl:'切换控制',releaseControl:'释放控制',updateSessionSettings:'更新设置',archiveSession:'更新归档'};

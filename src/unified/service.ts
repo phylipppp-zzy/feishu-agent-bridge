@@ -2,8 +2,8 @@ import type { HistoryReader } from './history-port.js';
 import { randomUUID } from 'node:crypto';
 import type { PlatformInputBlock, UnifiedService, DispatchGuard, ListQuery, PlatformObservation, PlatformPort } from './adapter.js';
 import { payloadDigest, validateSubmitInput, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SessionSnapshot, type SubmitInput, type WriteContext } from './contracts.js';
-import { contractError } from './errors.js';
-import { StoreError, UnifiedStore } from './store.js';
+import { contractError, type ContractError } from './errors.js';
+import { responseLeaseKey, StoreError, UnifiedStore } from './store.js';
 
 /** Authentication is supplied by the channel; an identity string alone is never trusted. */
 export type Authorize = (identity: WriteContext['identity'], session: Session, action: string) => boolean;
@@ -39,6 +39,17 @@ function mergeDiscoveredReadonlyMetadata(current: Session, discovered: Session):
   };
 }
 const fail = (code: Parameters<typeof contractError>[0], message?: string): never => { throw new StoreError(contractError(code, message)); };
+function responsePrewriteError(error: unknown): ContractError | null {
+  if (error instanceof StoreError) return error.detail;
+  if (!error || typeof error !== 'object' || !('code' in error)) return null;
+  const message = 'message' in error && typeof error.message === 'string' ? error.message : undefined;
+  switch (error.code) {
+    case 'interaction_expired': case 'stale_revision': case 'control_conflict': case 'unauthorized':
+    case 'temporarily_unavailable': case 'unsupported': case 'invalid_request': case 'busy':
+      return contractError(error.code, message);
+    default: return null;
+  }
+}
 function page<T>(items: T[], q: ListQuery) {
   const start = q.cursor === undefined ? 0 : Number(q.cursor);
   if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(q.limit) || q.limit < 1 || q.limit > 1000) return fail('invalid_request');
@@ -196,23 +207,24 @@ export class UnifiedCore implements UnifiedService {
   async readHistory(id: string, q: ListQuery) { const snapshot=this.store.snapshot(id).value; const archived=await this.historyReader?.read(snapshot.session) ?? []; const current=snapshot.messages; const ids=new Set(current.map(m=>m.messageId)); const items=[...archived.filter(m=>!ids.has(m.messageId)),...current]; if(!q.stable) return page(items,q); const fingerprint=payloadDigest(items); let offset=0; if(q.cursor) {let c:any; try {c=JSON.parse(Buffer.from(q.cursor,'base64url').toString());} catch {return fail('invalid_request');} if(c.id!==id || c.fingerprint!==fingerprint || !Number.isSafeInteger(c.offset) || c.offset<0 || c.offset>items.length) return fail('snapshot_required'); offset=c.offset;} if(!Number.isSafeInteger(q.limit)||q.limit<1||q.limit>1000) return fail('invalid_request'); const end=Math.min(offset+q.limit,items.length); return {items:items.slice(offset,end),nextCursor:end<items.length ? Buffer.from(JSON.stringify({id,fingerprint,offset:end})).toString('base64url') : null}; }
   async listInteractions(id: string, q: ListQuery) { return page(this.store.snapshot(id).value.interactions, q); }
   async getInteraction(id: string) { return this.store.getInteraction(id); }
+  async getResponseOperation(id: string) { return this.store.getResponseOperation(id); }
   /** Trusted runtime polling for a read-only attachment; never resumes or acquires control. */
-  async refreshReadOnlySession(id: string, observed?:SessionSnapshot): Promise<void> { return this.refreshHistory(id,false,observed); }
+  async refreshReadOnlySession(id: string, observed?:SessionSnapshot): Promise<boolean> { return this.refreshHistory(id,false,observed); }
   /** Initial history baseline is read-only even when another binding has interactive control. */
-  async hydrateSessionHistory(id:string):Promise<void> { return this.refreshHistory(id,true); }
-  private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot):Promise<void> {
+  async hydrateSessionHistory(id:string):Promise<boolean> { return this.refreshHistory(id,true); }
+  private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot):Promise<boolean> {
     let current:Session|undefined;
     try {
       current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
+      if (this.store.isDetached(id) || this.store.recoveryQuarantined(id)) return false;
+      const generation = this.store.connectionGeneration(id);
       const observed=supplied ?? await this.port(current).read(current.native); if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project) return fail('invalid_request','provider returned wrong native session or project');
-      if (observed.connectionGeneration !== undefined && observed.connectionGeneration < this.store.connectionGeneration(id)) return fail('control_conflict','stale connection generation');
+      if (observed.connectionGeneration !== undefined && (observed.connectionGeneration < generation || current.control.input === 'available' && observed.connectionGeneration !== generation)) return fail('control_conflict','stale connection generation');
       if ((observed.turns ?? []).some(t=>t.sessionId!==current!.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
-      // Only refresh presentation metadata on the still-readonly, same native session.
-      const latest=this.store.getSession(id); if(latest.status==='read_only' && latest.control.input!=='available' && payloadDigest(latest.native)===payloadDigest(current.native) && latest.project===current.project) {const title=observed.session.title?.trim() || latest.title; const candidateTime=observed.session.updatedAt; const updatedAt=candidateTime && Number.isFinite(Date.parse(candidateTime)) && (!latest.updatedAt || !Number.isFinite(Date.parse(latest.updatedAt)) || Date.parse(candidateTime)>Date.parse(latest.updatedAt)) ? candidateTime : latest.updatedAt; if(title!==latest.title || updatedAt!==latest.updatedAt) {try {this.store.updateSession({...latest,title,...(updatedAt ? {updatedAt}:{}),revision:latest.revision+1},latest.revision,latest.control.generation);} catch(error) {const code=error instanceof StoreError ? error.detail.code : undefined;if(code!=='stale_revision' && code!=='control_conflict')throw error;}}}
-
-      for (const native of observed.turns ?? []) this.store.putTurn({...native,sessionId:id});
-      for (const native of observed.messages) { const snapshot=this.store.snapshot(id); const old=snapshot.value.messages.find(m=>m.messageId===native.messageId); const value={...native,sessionId:id,sequence:old?.sequence ?? Math.max(0,...snapshot.value.messages.map(m=>m.sequence))+1,revision:old?.revision ?? native.revision}; if(old && payloadDigest(value)===payloadDigest(old)) continue; if(old?.final && !value.final) continue; this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null); }
-      if(this.observationFailure==='read-only refresh failed') this.observationFailure=null;
+      if (this.closed) return false;
+      const committed = this.store.applyHistoryRefresh(current,generation,observed);
+      if(committed && this.observationFailure==='read-only refresh failed') this.observationFailure=null;
+      return committed;
     } catch (error) {
       const suppress=!!current && current.status==='read_only' && current.control.input!=='available' && (isMissingNativeSessionError(error) || this.unavailableProviders.has(current.native.provider));
       if(!suppress) this.observationFailure='read-only refresh failed';
@@ -291,16 +303,11 @@ export class UnifiedCore implements UnifiedService {
       attempted=true; await this.attachSession({context:{operationId:`restore:${token}`,idempotencyKey:`restore:${token}`,targetId:id,expectedRevision:current.revision,controlGeneration:current.control.generation,identity},payload:{...current.native,mode:'interactive'}});
       if (!await stillAuthorized()) return fail('unauthorized','restore authorization changed');
       // Re-read trusted provider output after the new generation is established.
-      const restored=this.store.getSession(id); const snapshot=await this.port(restored).read(restored.native);
-      if (payloadDigest(snapshot.session.native)!==payloadDigest(restored.native) || snapshot.session.project!==current.project || snapshot.connectionGeneration!==this.store.connectionGeneration(id) || !await stillAuthorized()) return fail('unauthorized','restore metadata changed');
+      const restored=this.store.getSession(id), generation=this.store.connectionGeneration(id);
+      const snapshot=await this.port(restored).read(restored.native);
+      if (payloadDigest(snapshot.session.native)!==payloadDigest(restored.native) || snapshot.session.project!==current.project || snapshot.connectionGeneration!==generation || this.store.connectionGeneration(id)!==generation || !await stillAuthorized()) return fail('unauthorized','restore metadata changed');
       if ((snapshot.turns ?? []).some(t=>t.sessionId!==restored.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
-      for (const native of snapshot.turns ?? []) this.store.putTurn({...native,sessionId:id});
-      for (const native of snapshot.messages) {
-        const messages=this.store.snapshot(id).value.messages; const old=messages.find(m=>m.messageId===native.messageId);
-        const value={...native,sessionId:id,sequence:old?.sequence ?? Math.max(0,...messages.map(m=>m.sequence))+1,revision:old?.revision ?? native.revision};
-        if (old && (payloadDigest(value)===payloadDigest(old) || (old.final && !value.final))) continue;
-        this.store.putMessage(old ? {...value,revision:old.revision+1} : value,old?.revision ?? null);
-      }
+      this.store.applyHistoryRefresh(restored,generation,snapshot);
     } catch(error) {
       if(attempted) {
         // Fence observations before awaiting the release: native events have no trusted generation tag.
@@ -361,6 +368,8 @@ export class UnifiedCore implements UnifiedService {
   /** Dispatch one persisted item; unknown/in-flight work is never automatically resent. */
   async dispatch(id: string): Promise<Operation> {
     const pending = this.store.getOutbox(id);
+    if (pending.state !== 'pending') return this.store.getOperation(id);
+    if (pending.kind === 'resolveInteraction') return this.dispatchResponse(id, pending, pending.payload as ResolveInteraction);
     return this.serial(pending.context.targetId, async () => {
       const owner = randomUUID(); const generation = this.store.acquireDispatchLease(pending.context.targetId, owner, Date.now(), 30000); if (generation === null) return fail('busy', 'another dispatcher owns this session');
       try {
@@ -383,17 +392,16 @@ export class UnifiedCore implements UnifiedService {
       if (out.state !== 'pending') return this.store.getOperation(id);
       const session = this.check(out.context, out.kind);
       if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const scope=(out.payload as SubmitInput).channelScope;if(scope && !this.validateSteerScope?.(scope,session.sessionId))return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));}
-      const earlier = out.kind === 'submitInput' ? this.store.pendingOutbox().find(other => { const candidate = this.store.getOutbox(other); return candidate.context.targetId === session.sessionId && candidate.kind === 'submitInput'; }) : id;
+      const earlier = out.kind === 'submitInput' ? this.store.pendingOutbox(session.sessionId, 'submitInput')[0] : id;
       if (earlier !== id) return fail('busy', 'earlier input awaits dispatch');
       if (out.kind === 'submitInput') { const barrier=this.store.settingsBarrier(session.sessionId); if(barrier) return fail(barrier === 'unknown' ? 'outcome_unknown' : 'busy','settings must be reconciled before input'); }
-      if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(session.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.snapshot(session.sessionId).value.interactions.some(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery') || this.store.hasUnsettledInput(session.sessionId,id))) return this.store.getOperation(id);
+      if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(session.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return this.store.getOperation(id);
       if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || this.store.connectionGeneration(session.sessionId)!==input.expectedConnectionGeneration)return this.store.reconcileOperation(id,'failed',contractError('interaction_expired','captured turn changed'));}
       if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return this.store.reconcileOperation(id,'failed',contractError('busy','turn is no longer running'));
       if (!this.store.claimOutbox(id)) return this.store.getOperation(id);
-      const originalInteraction = out.kind === 'resolveInteraction' ? this.store.getInteraction((out.payload as ResolveInteraction).interactionId) : null;
       let guarded = false;
       const guard: DispatchGuard = {
-        expectedControlGeneration: out.context.controlGeneration, expectedConnectionGeneration: out.connectionGeneration,
+        operationId: id, expectedControlGeneration: out.context.controlGeneration, expectedConnectionGeneration: out.connectionGeneration,
         assertCurrent: () => {
           if(this.closed) return fail('control_conflict','core closed');
           this.store.assertDispatchLease(session.sessionId, owner, generation);
@@ -403,19 +411,14 @@ export class UnifiedCore implements UnifiedService {
           if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration) return fail('interaction_expired');
           if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const scope=(out.payload as SubmitInput).channelScope;if(scope && !this.validateSteerScope?.(scope,session.sessionId))return fail('control_conflict','binding changed');}
           if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || input.expectedConnectionGeneration!==out.connectionGeneration)return fail('interaction_expired','captured turn changed');}
-          if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.snapshot(session.sessionId).value.interactions.some(i=>i.status==='awaiting_answer'||i.status==='answer_pending_delivery') || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
+          if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
           if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
-          if (originalInteraction) {
-            const now = this.store.getInteraction(originalInteraction.interactionId);
-            if (now.revision !== originalInteraction.revision || now.status !== 'answer_pending_delivery' || now.nativeRequestId !== originalInteraction.nativeRequestId || now.nativeResult !== null || (now.expiresAt !== null && Date.parse(now.expiresAt) <= Date.now())) return fail('interaction_expired');
-          }
           guarded = true;
         },
       };
       try {
         const port = this.port(session); let nativeReference: string | null = null;
         if (out.kind === 'submitInput') { const input = out.payload as SubmitInput; const setting = input.mode==='steer'?null:this.store.confirmedSettings(session.sessionId); if(setting){const restored=await port.updateSettings(session.native,{model:setting.model,preferences:setting.preferences},guard);if(restored.settingsApplied!==true) return this.store.markDeliveryUnknown(id);} const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; }); nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard,input.requiredTurnId)).nativeReference; }
-        else if (out.kind === 'resolveInteraction') { const req = out.payload as ResolveInteraction; await port.respond(session.native, this.store.getNativeInteraction(req.interactionId), req.answer, guard); }
         else if (out.kind === 'archiveSession') { if (!port.archive) return this.store.reconcileOperation(id,'failed',contractError('unsupported')); await port.archive(session.native,(out.payload as {archived:boolean}).archived,guard); }
         else if (out.kind === 'updateSessionSettings') { const settings=out.payload as {model:string|null;preferences:Record<string,string>}; const receipt=await port.updateSettings(session.native,settings,guard); if (guarded && receipt.settingsApplied === true && this.store.getOutbox(id).state === 'in_flight') return this.store.confirmSettings(id,settings); }
         else if (out.kind === 'requestControl' || out.kind === 'releaseControl') { await port.control(session.native, out.kind === 'requestControl' ? 'acquire' : 'release', guard); }
@@ -436,7 +439,63 @@ export class UnifiedCore implements UnifiedService {
       } finally { this.store.releaseDispatchLease(pending.context.targetId,owner,generation); }
     });
   }
-  async dispatchPending(): Promise<void> { for (const id of this.store.pendingOutbox()) try {await this.dispatch(id);} catch(error) {if(error instanceof StoreError && error.detail.code==='temporarily_unavailable') {this.store.failUnreboundPending([id]);continue;}throw error;} }
+  private async dispatchResponse(id: string, out: ReturnType<UnifiedStore['getOutbox']>, request: ResolveInteraction): Promise<Operation> {
+    const key = responseLeaseKey(request.interactionId);
+    return this.serial(key, async () => {
+      if (!this.store.hasPendingOutbox(id)) return this.store.getOperation(id);
+      const owner = randomUUID();
+      const lease = this.store.acquireDispatchLease(key,owner,Date.now(),30000);
+      if (lease === null) return fail('busy','another dispatcher owns this interaction');
+      let guarded = false;
+      try {
+        const session = this.check(out.context,out.kind);
+        if (!this.store.claimOutbox(id)) return this.store.getOperation(id);
+        const original = this.store.getInteraction(request.interactionId);
+        const guard: DispatchGuard = {
+          operationId: id,
+          expectedControlGeneration: out.context.controlGeneration,
+          expectedConnectionGeneration: out.connectionGeneration,
+          assertCurrent: () => {
+            if (this.closed) return fail('control_conflict','core closed');
+            this.store.assertDispatchLease(key,owner,lease);
+            const current = this.check(out.context,out.kind);
+            if (this.store.isDetached(session.sessionId)) return fail('unauthorized');
+            if (current.control.generation !== out.context.controlGeneration || current.control.input !== 'available' ||
+                payloadDigest(current.native) !== payloadDigest(session.native) || current.project !== session.project) return fail('control_conflict');
+            const interaction = this.store.getInteraction(original.interactionId);
+            if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration ||
+                interaction.revision !== original.revision || interaction.status !== 'answer_pending_delivery' ||
+                interaction.nativeRequestId !== original.nativeRequestId || interaction.nativeResult !== null ||
+                (interaction.expiresAt !== null && Date.parse(interaction.expiresAt) <= Date.now()) ||
+                this.store.getOutbox(id).state !== 'in_flight') return fail('interaction_expired');
+            guarded = true;
+          },
+        };
+        const receipt = await this.port(session).respond(session.native,this.store.getNativeInteraction(request.interactionId),request.answer,guard);
+        return guarded && receipt.status === 'submitted'
+          ? this.store.acceptResponseSubmission(id)
+          : this.store.markResponseDeliveryUnknown(id);
+      } catch (error) {
+        const prewrite = !guarded ? responsePrewriteError(error) : null;
+        if (prewrite) return this.store.failResponseSubmission(id,prewrite);
+        // The transport may have written before losing its acknowledgement.
+        return this.store.markResponseDeliveryUnknown(id);
+      } finally {
+        this.store.releaseDispatchLease(key,owner,lease);
+      }
+    });
+  }
+  async dispatchPending(skip?: (id: string) => boolean): Promise<void> {
+    for (const id of this.store.pendingOutbox()) {
+      if (skip?.(id)) continue;
+      try { await this.dispatch(id); }
+      catch (error) {
+        if (error instanceof StoreError && error.detail.code === 'busy') continue;
+        if (error instanceof StoreError && error.detail.code === 'temporarily_unavailable') { this.store.failUnreboundPending([id]); continue; }
+        throw error;
+      }
+    }
+  }
   /** Native acknowledgement alone does not establish completion; callers must supply observed evidence. */
   reconcileObserved(id: string, status: 'accepted' | 'completed' | 'failed', error: ReturnType<typeof contractError> | null = null): Operation { return this.store.reconcileOperation(id, status, error); }
   async reconcile(id: string): Promise<Operation> {
@@ -464,21 +523,38 @@ export class UnifiedCore implements UnifiedService {
       if (object.sessionId !== observation.ref.nativeSessionId && object.sessionId !== mapped.sessionId) return fail('invalid_request','observation session mismatch');
       if (observation.type === 'session' && (payloadDigest(observation.session.native)!==payloadDigest(observation.ref) || observation.session.project!==mapped.project)) return fail('invalid_request','observation native reference mismatch');
     }
-    if (observation.type === 'connection') { const previous = this.store.connectionGeneration(mapped.sessionId); if (!Number.isSafeInteger(observation.connectionGeneration) || observation.connectionGeneration < previous) return fail('control_conflict'); if (observation.connectionGeneration > previous) this.store.setConnectionGeneration(mapped.sessionId,previous,observation.connectionGeneration); return; }
+    if (observation.type === 'connection') {
+      const previous = this.store.connectionGeneration(mapped.sessionId);
+      if (!Number.isSafeInteger(observation.connectionGeneration) || observation.connectionGeneration < previous) return fail('control_conflict');
+      if (observation.connectionGeneration > previous) {
+        this.store.setConnectionGeneration(mapped.sessionId,previous,observation.connectionGeneration);
+        this.onAcceptedObservation?.(observation);
+      }
+      return;
+    }
     if (observation.type === 'message') {
       const m: Message = {...observation.message, sessionId:mapped.sessionId}; const generation=observation.connectionGeneration; if(generation!==undefined && generation!==this.store.connectionGeneration(mapped.sessionId)) return; const snapshot = this.store.snapshot(m.sessionId); const prior = snapshot.value.messages.find(x => x.messageId === m.messageId);
       const key=JSON.stringify([mapped.sessionId,generation,m.messageId]); const seen=this.messageObservations.get(key); if((seen!==undefined && m.revision<=seen) || (generation===undefined && prior && m.revision<=prior.revision) || (prior?.final && !m.final)) return; this.messageObservations.set(key,m.revision); if(prior && payloadDigest({...m,sequence:prior.sequence,revision:prior.revision})===payloadDigest(prior)) return;
       this.store.putMessage(prior ? {...m,sequence:prior.sequence,revision:prior.revision+1} : {...m,sequence:Math.max(0,...snapshot.value.messages.map(x=>x.sequence))+1}, prior?.revision ?? null); this.onAcceptedObservation?.(observation); return;
     }
     if (observation.type === 'interaction') {
-      {
-        if (this.store.isDetached(mapped.sessionId) || this.store.recoveryQuarantined(mapped.sessionId)) return;
-        const i: Interaction = {...observation.interaction, sessionId:mapped.sessionId}; const connection = this.store.connectionGeneration(mapped.sessionId); if (i.connectionGeneration > connection) this.store.setConnectionGeneration(mapped.sessionId,connection,i.connectionGeneration); if (i.connectionGeneration < connection) return fail('interaction_expired'); const snapshot = this.store.snapshot(i.sessionId); const prior = snapshot.value.interactions.find(x => x.interactionId === i.interactionId);
-        if (!prior) this.store.insertInteraction(i,observation.interaction);
-        else if (i.status === 'expired' || i.status === 'cancelled') this.store.expireNativeInteraction(i.interactionId,i.connectionGeneration,i.nativeRequestId,i.status,i.nativeResult);
-        else if (i.nativeResult) this.store.recordNativeResult(i.interactionId, i.connectionGeneration, i.nativeRequestId, i.nativeResult, i.status === 'resolved');
-        this.store.observeInteractionStatus(i.sessionId,i.turnId); const persisted=this.store.getInteraction(i.interactionId); if(persisted.status===i.status && (!prior || payloadDigest(prior)!==payloadDigest(persisted))) this.onAcceptedObservation?.({...observation,interaction:persisted});
-      } return;
+      const i: Interaction = {...observation.interaction,sessionId:mapped.sessionId};
+      const prior = this.store.findInteraction(i.interactionId);
+      const evidence = observation.responseEvidence;
+      if (prior && (prior.sessionId !== i.sessionId || prior.turnId !== i.turnId)) return fail('invalid_request','interaction observation target mismatch');
+      if (evidence && (!prior || i.status !== 'resolved' || !i.nativeResult)) return fail('invalid_request','response evidence needs an existing resolved request');
+      const connection = this.store.connectionGeneration(mapped.sessionId);
+      if (!evidence && i.connectionGeneration > connection) {
+        this.store.setConnectionGeneration(mapped.sessionId,connection,i.connectionGeneration);
+        this.onAcceptedObservation?.({type:'connection',ref:observation.ref,connectionGeneration:i.connectionGeneration});
+      } else if (!evidence && i.connectionGeneration < connection) return fail('interaction_expired');
+      if (!prior) this.store.insertInteraction(i,observation.interaction);
+      else if (i.status === 'expired' || i.status === 'cancelled') this.store.expireNativeInteraction(i.interactionId,i.connectionGeneration,i.nativeRequestId,i.status,i.nativeResult);
+      else if (i.nativeResult) this.store.recordNativeResult(i.interactionId,i.connectionGeneration,i.nativeRequestId,i.nativeResult,i.status === 'resolved',evidence);
+      this.store.observeInteractionStatus(i.sessionId,i.turnId);
+      const persisted = this.store.getInteraction(i.interactionId);
+      if (!prior || prior.revision !== persisted.revision) this.onAcceptedObservation?.({...observation,interaction:persisted});
+      return;
     }
     if (observation.type === 'event') {
       if(observation.connectionGeneration!==undefined && observation.connectionGeneration!==this.store.connectionGeneration(mapped.sessionId))return;

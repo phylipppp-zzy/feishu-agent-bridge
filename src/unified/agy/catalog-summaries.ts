@@ -166,6 +166,7 @@ function readTranscriptTitleFromBrain(
   conversationId: string,
   canonicalBrainDir: string | null,
   maxLength: number,
+  cache?: AgyTitleCache,
 ): string | null {
   if (!canonicalBrainDir) return null;
   try {
@@ -188,59 +189,72 @@ function readTranscriptTitleFromBrain(
     if (!isInside(canonicalPath, canonicalSessionDir)) return null;
 
     let fd: number | undefined;
-    let bytesRead = 0;
-    let truncatedAtCap = false;
-    let rawText = '';
     try {
       fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
       const st = fstatSync(fd);
       if (!st.isFile()) return null;
+      const stamp = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}:${maxLength}`;
+      const cached = cache?.previous.get(canonicalPath);
+      if (cached?.stamp === stamp) {
+        cache?.next.set(canonicalPath, cached);
+        return cached.title;
+      }
       const toRead = Math.min(st.size, TITLE_TRANSCRIPT_READ_BYTES);
       if (toRead <= 0) return null;
       const buf = Buffer.allocUnsafe(toRead);
+      let bytesRead = 0;
       while (bytesRead < toRead) {
         const n = readSync(fd, buf, bytesRead, toRead - bytesRead, bytesRead);
         if (n <= 0) break;
         bytesRead += n;
       }
-      truncatedAtCap = st.size > bytesRead;
-      rawText = buf.subarray(0, bytesRead).toString('utf8');
+      const title = transcriptTitle(buf.subarray(0, bytesRead).toString('utf8'), st.size > bytesRead, maxLength);
+      cache?.next.set(canonicalPath, { stamp, title });
+      return title;
     } finally {
       if (fd !== undefined) {
         try { closeSync(fd); } catch {}
       }
     }
-
-    const rawLines = rawText.split(/\r?\n/);
-    const completeLines = truncatedAtCap ? rawLines.slice(0, -1) : rawLines;
-    for (const line of completeLines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
-      if (!isPlainRecord(parsed) || parsed.type !== 'USER_INPUT' || typeof parsed.content !== 'string') continue;
-      const extracted = cleanUserRequestLine(parsed.content, maxLength);
-      if (extracted) return extracted;
-    }
-
-    if (truncatedAtCap) {
-      const trailing = rawLines.at(-1) ?? '';
-      if (/"type"\s*:\s*"USER_INPUT"/.test(trailing)) {
-        const partialContent = decodePartialJsonStringField(trailing, 'content');
-        if (partialContent) {
-          const extracted = cleanUserRequestLine(partialContent, maxLength);
-          if (extracted) return extracted;
-        }
-      }
-    }
-    return null;
   } catch {
     return null;
   }
+}
+
+function transcriptTitle(rawText: string, truncatedAtCap: boolean, maxLength: number): string | null {
+  const rawLines = rawText.split(/\r?\n/);
+  const completeLines = truncatedAtCap ? rawLines.slice(0, -1) : rawLines;
+  for (const line of completeLines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!isPlainRecord(parsed) || parsed.type !== 'USER_INPUT' || typeof parsed.content !== 'string') continue;
+    const extracted = cleanUserRequestLine(parsed.content, maxLength);
+    if (extracted) return extracted;
+  }
+
+  if (truncatedAtCap) {
+    const trailing = rawLines.at(-1) ?? '';
+    if (/"type"\s*:\s*"USER_INPUT"/.test(trailing)) {
+      const partialContent = decodePartialJsonStringField(trailing, 'content');
+      if (partialContent) {
+        const extracted = cleanUserRequestLine(partialContent, maxLength);
+        if (extracted) return extracted;
+      }
+    }
+  }
+  return null;
+}
+
+export type AgyTitleCacheEntry = { stamp: string; title: string | null };
+interface AgyTitleCache {
+  previous: Map<string, AgyTitleCacheEntry>;
+  next: Map<string, AgyTitleCacheEntry>;
 }
 
 /** Derive a display title: non-empty `title`, else cleaned `preview` first line, else `Antigravity 会话 · <shortId>`. */
@@ -280,6 +294,7 @@ export function readAgySummaries(
     includeOutsideRoots?: boolean;
     maxTitleLength?: number;
   } = {},
+  titleCache?: AgyTitleCache,
 ): AgyDiscoveredSession[] {
   const dbPath = resolve(expandHomePath(options.dbPath ?? DEFAULT_AGY_SUMMARIES_DB_PATH));
   const brainDir = resolve(expandHomePath(options.brainDir ?? DEFAULT_AGY_BRAIN_DIR));
@@ -386,7 +401,7 @@ export function readAgySummaries(
     const rawStatus = typeof row.status === 'string' ? row.status : '';
     const derivedTitle =
       derivePresentAgyTitle(rawTitle, preview, maxTitleLength) ??
-      readTranscriptTitleFromBrain(row.conversation_id, canonicalBrainDir, maxTitleLength) ??
+      readTranscriptTitleFromBrain(row.conversation_id, canonicalBrainDir, maxTitleLength, titleCache) ??
       deriveAgySessionTitle(row.conversation_id, '', '', maxTitleLength);
     sessions.push({
       conversationId: row.conversation_id,

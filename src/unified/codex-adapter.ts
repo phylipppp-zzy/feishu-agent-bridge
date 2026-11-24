@@ -5,15 +5,40 @@ import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, Platf
 import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
 import { contractError } from './errors.js';
 import { CodexTransport } from './codex-transport.js';
+import type { ApprovalScope } from './approval-policy.js';
+import { codexApprovalChoices, evaluateCodexApproval } from './codex-approval.js';
 
 type Obj = Record<string, any>;
-type NativeRequest = { id: string | number; generation: number; interaction: Interaction };
+type ApprovalChoices = ReturnType<typeof codexApprovalChoices>;
+type NativeRequest = { id: string | number; generation: number; interaction: Interaction; operationId?: string; approvalChoices?: ApprovalChoices };
+type ChangePaths = { paths: string[]; complete: boolean };
+type ApprovalTurn = { id: string; generation: number; changes: Map<string, ChangePaths> };
+type CodexAdapterOptions = { approvalPolicy?: ApprovalScope; proveSharedFilesystem?: (path: unknown) => Promise<boolean> };
 const unavailable = { status: 'temporarily_unavailable' as const, reason: 'control and native arbitration are not verified' };
 const unsupported = { status: 'unsupported' as const, reason: 'not implemented by this port' };
 const caps: Capabilities = { view: { status: 'available' }, send: unavailable, queue: unsupported, steer: unavailable, answer: unavailable, approve: unavailable, interrupt: unavailable, handoff: unsupported, files: unsupported, config: unsupported };
 const ack = (nativeReference: string | null = null): PlatformAcknowledgement => ({ status: 'submitted', nativeReference });
 const isString = (x: unknown): x is string => typeof x === 'string' && x.length > 0;
 const invalidNative = (): never => { throw contractError('temporarily_unavailable', 'invalid app-server response'); };
+function changePaths(changes: unknown): ChangePaths {
+  if (!Array.isArray(changes) || !changes.length) return { paths: [], complete: false };
+  let complete = changes.length <= 256;
+  const paths: string[] = [];
+  for (const change of changes.slice(0, 256)) {
+    if (!change || typeof change !== 'object') { complete = false; continue; }
+    if (!isString(change.path) || Object.keys(change).some(field => !['path', 'kind', 'diff', 'movePath', 'move_path'].includes(field))) complete = false;
+    const kind = change.kind;
+    if (kind != null && (typeof kind !== 'object' || !['add', 'delete', 'update'].includes(kind.type)
+      || Object.keys(kind).some(field => !['type', 'movePath', 'move_path'].includes(field)))) complete = false;
+    if (isString(change.path)) paths.push(change.path);
+    for (const moved of [change.movePath, change.move_path, kind?.movePath, kind?.move_path]) {
+      if (moved == null) continue;
+      if (isString(moved)) paths.push(moved);
+      else complete = false;
+    }
+  }
+  return { paths, complete };
+}
 /** Native identifiers in normalized objects are provider-local; core maps and persists them. */
 export class CodexAdapter implements PlatformPort {
   readonly provider = 'codex' as const;
@@ -27,16 +52,24 @@ export class CodexAdapter implements PlatformPort {
   private readonly knownSessions = new Map<string, Obj>();
   private requests = new Map<string, NativeRequest>();
   private nativeIndex = new Map<string, string>();
+  private readonly approvalTurns = new Map<string, ApprovalTurn>();
+  private readonly evaluatingApprovals = new Map<string, { thread: string }>();
+  private readonly answeredRequests = new Set<string>();
   private listeners = new Set<(event: PlatformObservation) => void>();
   private messages = new Map<string, Message>();
   private readonly residualTurns=new Map<string,{generation:number;items:Set<string>;version:number;overflow:boolean}>();
   private readonly residualQueries=new Map<string,Promise<TurnResidual>>();
   private sequence = 0;
   private settings = new Map<string, {model:string|null; effort?:string}>();
-  constructor(readonly transport: CodexTransport, readonly hostId: string, readonly serviceId: string) {
+  constructor(readonly transport: CodexTransport, readonly hostId: string, readonly serviceId: string,
+    private readonly options: CodexAdapterOptions = {}) {
     if (!isString(hostId) || !isString(serviceId)) throw contractError('invalid_request');
     transport.onMessage = (message, generation) => this.receive(message as Obj, generation);
     transport.onDisconnect = generation => {
+      this.approvalTurns.clear();
+      this.evaluatingApprovals.clear();
+      this.answeredRequests.clear();
+      this.nativeIndex.clear();
       for (const id of this.active) { this.active.delete(id); this.controlEpoch.set(id,(this.controlEpoch.get(id) ?? 0)+1); const info=this.knownSessions.get(id); if(info) this.emit({type:'session',ref:this.ref(id),session:this.session(info)}); }
       for (const entry of this.requests.values()) if (entry.generation === generation && entry.interaction.status !== 'resolved' && entry.interaction.status !== 'expired') {
         entry.interaction = { ...entry.interaction, status: 'expired', revision: entry.interaction.revision + 1 }; this.emitInteraction(entry.interaction);
@@ -78,31 +111,102 @@ export class CodexAdapter implements PlatformPort {
     if (!native || !isString(native.id) || !['inProgress','completed','failed','interrupted'].includes(native.status)) return invalidNative();
     return {turnId:native.id,sessionId:thread,status:native.status === 'inProgress' ? 'running' : native.status,inputId:null,startedAt:null,endedAt:null,model:null,outputIds:[]};
   }
+  private trackApprovalTurn(thread: string, id: string, generation: number): void {
+    const turn = this.approvalTurns.get(thread);
+    if (turn?.id === id && turn.generation === generation) return;
+    this.approvalTurns.set(thread, { id, generation, changes: new Map() });
+  }
+  private async evaluateNativeApproval(thread: string, rpcId: string | number, method: string, p: Obj, generation: number): Promise<void> {
+    const turn = this.approvalTurns.get(thread);
+    const key = this.key(generation, rpcId);
+    if (!turn || turn.id !== p.turnId || turn.generation !== generation || !this.active.has(thread)
+      || this.evaluatingApprovals.has(key) || this.nativeIndex.has(key) || this.answeredRequests.has(key)) return;
+    const work = { thread };
+    this.evaluatingApprovals.set(key, work);
+    const command = method === 'item/commandExecution/requestApproval';
+    const nativeInfo = this.knownSessions.get(thread);
+    const nativeProject: unknown = nativeInfo?.cwd;
+    const nativePath: unknown = nativeInfo?.path;
+    const project = isString(nativeProject) ? nativeProject : undefined;
+    const cwd = typeof p.cwd === 'string' ? p.cwd : project;
+    const requestedPaths = p.changes === undefined ? undefined : changePaths(p.changes);
+    const observedPaths = isString(p.itemId) ? turn.changes.get(p.itemId) : undefined;
+    const paths = [...new Set([...(requestedPaths?.paths ?? []), ...(observedPaths?.paths ?? [])])];
+    const completePaths = requestedPaths?.complete !== false && observedPaths?.complete !== false && paths.length <= 256;
+    try {
+      let decision = await evaluateCodexApproval(command, p, paths.slice(0,256), {
+        ...this.options.approvalPolicy, ...(project ? { project } : {}), ...(cwd !== undefined ? { cwd } : {}),
+      }, completePaths);
+      if (decision.kind === 'allow_once' && this.options.proveSharedFilesystem
+        && (!await this.options.proveSharedFilesystem(nativePath) || this.knownSessions.get(thread)?.path !== nativePath)) {
+        decision = { kind: 'ask', reason: '无法确认 Codex 线程与服务共享本机文件系统，需人工审批' };
+      }
+      if (!this.transport.connected || this.transport.generation !== generation || !this.active.has(thread)
+        || this.approvalTurns.get(thread) !== turn || this.evaluatingApprovals.get(key) !== work) return;
+      const choices = codexApprovalChoices(p.availableDecisions);
+      const automatic = decision.kind === 'allow_once' ? choices.allow : decision.kind === 'deny' ? choices.deny : undefined;
+      if (automatic) {
+        this.answeredRequests.add(key);
+        this.transport.respond(rpcId, { decision: automatic });
+      } else if (decision.kind === 'ask' || decision.kind === 'deny') {
+        const id = randomUUID();
+        const approvalChoices = { ...choices, allow: decision.kind === 'deny' ? undefined : choices.allow };
+        const allowedDecisions = (['allow', 'deny'] as const).filter(choice => approvalChoices[choice]);
+        const details = paths.length ? { ...p, paths } : p;
+        const blocked = decision.kind === 'deny' ? '\n原端未提供可用的拒绝选项，请在原端处理。' : '';
+        const interaction: Interaction = {
+          interactionId: id, sessionId: thread, turnId: turn.id, nativeRequestId: id, connectionGeneration: generation,
+          revision: 1, status: 'awaiting_answer', expiresAt: null, nativeResult: null, kind: 'approval',
+          tool: command ? 'command' : 'file_change',
+          action: `${decision.reason}${blocked}\n${JSON.stringify(details)}`,
+          scope: 'this_request', toolInputDigest: payloadDigest(details),
+          ...(allowedDecisions.length < 2 ? { allowedDecisions } : {}),
+        };
+        this.requests.set(id, { id: rpcId, generation, interaction, approvalChoices });
+        this.nativeIndex.set(key, id);
+        this.emitInteraction(interaction);
+      }
+    } finally {
+      if (this.evaluatingApprovals.get(key) === work) this.evaluatingApprovals.delete(key);
+    }
+  }
   private receive(m: Obj, generation: number): void {
     const p = m.params as Obj | undefined; if (!p || typeof p !== 'object') return;
     const thread = typeof p.threadId === 'string' ? p.threadId : undefined;
-    if (m.method === 'serverRequest/resolved' && thread && (typeof p.requestId === 'number' || typeof p.requestId === 'string')) {
-      const id = this.nativeIndex.get(this.key(generation, p.requestId)); const req = id && this.requests.get(id);
+    if (!thread || generation !== this.transport.generation) return;
+    if (m.method === 'serverRequest/resolved' && (typeof p.requestId === 'number' || typeof p.requestId === 'string')) {
+      const key = this.key(generation, p.requestId);
+      if (this.evaluatingApprovals.get(key)?.thread === thread) {
+        this.evaluatingApprovals.delete(key);
+        this.answeredRequests.add(key);
+      }
+      const id = this.nativeIndex.get(key); const req = id && this.requests.get(id);
       if (req && req.interaction.sessionId === thread && req.interaction.status !== 'expired') {
         req.interaction = { ...req.interaction, status: 'resolved', revision: req.interaction.revision + 1, nativeResult: { status: 'accepted', source: 'unknown', answer: null } };
-        this.nativeIndex.delete(this.key(generation, p.requestId)); this.emitInteraction(req.interaction);
+        this.nativeIndex.delete(key); this.answeredRequests.add(key); this.emitInteraction(req.interaction);
       } return;
     }
-    if (thread && (typeof m.id === 'string' || typeof m.id === 'number')) {
+    if (typeof m.id === 'string' || typeof m.id === 'number') {
+      if (m.method === 'item/commandExecution/requestApproval' || m.method === 'item/fileChange/requestApproval') {
+        void this.evaluateNativeApproval(thread, m.id, m.method, p, generation).catch(() => {
+          // A closed socket or ambiguous write must never replay a native response.
+        });
+        return;
+      }
+      const key = this.key(generation, m.id);
+      if (this.nativeIndex.has(key) || this.answeredRequests.has(key)) return;
       const id = randomUUID(), base = { interactionId: id, sessionId: thread, turnId: String(p.turnId ?? ''), nativeRequestId: id, connectionGeneration: generation, revision: 1, status: 'awaiting_answer' as const, expiresAt: null, nativeResult: null };
       let interaction: Interaction;
       if (m.method === 'item/tool/requestUserInput' && Array.isArray(p.questions) && p.questions.length > 0 && p.questions.every((q: Obj) => q && !q.isSecret && isString(q.id) && typeof q.question === 'string') && new Set(p.questions.map((q: Obj) => q.id)).size === p.questions.length) {
+        if (!this.active.has(thread)) return;
         interaction = { ...base, kind: 'question_group', toolInputDigest: null, questions: p.questions.map((q: Obj) => ({ id: q.id, prompt: q.question, choices: Array.isArray(q.options) ? q.options.map((o: Obj) => o.label).filter((v: unknown) => typeof v === 'string') : [], multiple: null, allowFreeText: true })) };
-      } else if (m.method === 'item/commandExecution/requestApproval' || m.method === 'item/fileChange/requestApproval') {
-        interaction = { ...base, kind: 'approval', tool: m.method === 'item/commandExecution/requestApproval' ? 'command' : 'file_change', action: JSON.stringify(p), scope: 'this_request', toolInputDigest: payloadDigest(p) };
       } else {
         const now = new Date().toISOString(), sequence = ++this.sequence;
         this.emit({ type: 'event', ref: this.ref(thread), event: { schemaVersion: 1, eventId: randomUUID(), sessionId: thread, objectId: thread, objectRevision: 0, sequence, type: 'interaction.unsupported', occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: { reason: 'unsupported native request' } } });
         return;
       }
-      const req: NativeRequest = { id: m.id, generation, interaction }; this.requests.set(id, req); this.nativeIndex.set(this.key(generation, m.id), id); this.emitInteraction(interaction); return;
+      const req: NativeRequest = { id: m.id, generation, interaction }; this.requests.set(id, req); this.nativeIndex.set(key, id); this.emitInteraction(interaction); return;
     }
-    if (!thread || generation!==this.transport.generation) return;
     const info = this.knownSessions.get(thread);
     if (m.method === 'thread/name/updated' && info) {
       const name = p.threadName ?? p.thread_name ?? p.name;
@@ -113,10 +217,17 @@ export class CodexAdapter implements PlatformPort {
       return;
     }
     if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
-    if(m.method==='turn/started' && isString(p.turn?.id) && this.active.has(thread)) {const key=`${thread}\0${p.turn.id}`;if(this.residualTurns.get(key)?.generation!==generation){if(this.residualTurns.size>=1024) this.residualTurns.delete(this.residualTurns.keys().next().value!);this.residualTurns.set(key,{generation,items:new Set(),version:0,overflow:false});}}
+    if(m.method==='turn/started' && isString(p.turn?.id) && this.active.has(thread)) {this.trackApprovalTurn(thread,p.turn.id,generation);const key=`${thread}\0${p.turn.id}`;if(this.residualTurns.get(key)?.generation!==generation){if(this.residualTurns.size>=1024) this.residualTurns.delete(this.residualTurns.keys().next().value!);this.residualTurns.set(key,{generation,items:new Set(),version:0,overflow:false});}}
+    if (m.method === 'item/started' && p.item?.type === 'fileChange' && isString(p.item.id)) {
+      const turn = this.approvalTurns.get(thread);
+      if (turn && turn.id === p.turnId && turn.generation === generation && turn.changes.size < 1_024) {
+        turn.changes.set(p.item.id, changePaths(p.item.changes));
+      }
+    }
     if((m.method==='item/started' || m.method==='item/completed') && isString(p.turnId) && p.item?.type==='commandExecution' && isString(p.item?.id)) {const tracked=this.residualTurns.get(`${thread}\0${p.turnId}`);if(tracked?.generation===generation && !tracked.items.has(p.item.id)) {if(tracked.items.size>=10000) tracked.overflow=true;else tracked.items.add(p.item.id);tracked.version++;}}
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
       const turn = this.turn(thread,p.turn);
+      if (m.method === 'turn/completed' && this.approvalTurns.get(thread)?.id === turn.turnId) this.approvalTurns.delete(thread);
       if (info) {
         const threadStates = {running: 'active', failed: 'systemError', interrupted: 'interrupted', completed: 'idle', queued: 'idle'};
         info.status = {type: threadStates[turn.status]};
@@ -184,8 +295,11 @@ export class CodexAdapter implements PlatformPort {
   /** Scan default interactive sources by native created_at; second-precision boundary is excluded. */
   async discoverNewer(watermark:number,cursor:string|null,limit:number):Promise<{items:Session[];nextCursor:string|null;partialFailure?:boolean}> {if(!Number.isSafeInteger(watermark) || watermark<0 || !Number.isSafeInteger(limit) || limit<1 || limit>100) throw contractError('invalid_request'); for(const [key,value] of this.recentDiscovery) if(value.expires<Date.now()) this.recentDiscovery.delete(key); let key=cursor,state=key?this.recentDiscovery.get(key):undefined;if(!key){key=randomUUID();state={generation:this.transport.generation,watermark,cursor:null,seenCursors:new Set(),seenIds:new Set(),buffer:[],done:false,expires:Date.now()+600000};if(this.recentDiscovery.size>=4)this.recentDiscovery.delete(this.recentDiscovery.keys().next().value!);this.recentDiscovery.set(key,state);}if(!state || state.watermark!==watermark || !this.transport.connected || state.generation!==this.transport.generation){if(key)this.recentDiscovery.delete(key);throw contractError('snapshot_required');}let partialFailure=false;try {state.expires=Date.now()+600000;if(!state.buffer.length && !state.done){const r=await this.transport.request('thread/list',{cursor:state.cursor,limit:100,sortKey:'created_at',sortDirection:'desc'}) as Obj;if(!this.transport.connected || state.generation!==this.transport.generation || !Array.isArray(r?.data) || !(r.nextCursor==null || isString(r.nextCursor))) return invalidNative();const now=Math.floor(Date.now()/1000);for(const t of r.data){if(!isString(t?.id) || !Number.isSafeInteger(t?.createdAt)){partialFailure=true;continue;}if(state.seenIds.has(t.id))continue;if(state.seenIds.size>=1024)state.seenIds.delete(state.seenIds.values().next().value!);state.seenIds.add(t.id);if(Number.isSafeInteger(t.createdAt) && t.createdAt>watermark && ['cli','vscode','appServer'].includes(t.source) && t.parentThreadId==null) try {state.buffer.push({...this.session(t),discoveryObservedAt:new Date(now*1000).toISOString()});} catch {partialFailure=true;}}const orderedOld=r.data.length>0 && r.data.every((t:Obj,i:number)=>Number.isSafeInteger(t?.createdAt) && t.createdAt<=watermark && (i===0 || r.data[i-1].createdAt>=t.createdAt));const next=orderedOld?null:r.nextCursor??null;if(next!==null){if(state.seenCursors.has(next))throw contractError('snapshot_required');if(state.seenCursors.size>=10000)state.seenCursors.delete(state.seenCursors.values().next().value!);state.seenCursors.add(next);state.cursor=next;}else state.done=true;}const items=state.buffer.splice(0,limit),nextCursor=state.done && !state.buffer.length?null:key;if(nextCursor===null)this.recentDiscovery.delete(key);return {items,nextCursor,...(partialFailure?{partialFailure:true}:{})};}catch(e){this.recentDiscovery.delete(key);throw e;}}
   async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
-    const id = this.check(ref), r = await this.transport.request('thread/read', { threadId: id, includeTurns: true }) as Obj; const session = this.session(r?.thread);
+    const id = this.check(ref), generation = this.transport.generation;
+    const r = await this.transport.request('thread/read', { threadId: id, includeTurns: true }) as Obj; const session = this.session(r?.thread);
     if (session.native.nativeSessionId !== id || !Array.isArray(r.thread.turns)) return invalidNative();
+    const info = this.knownSessions.get(id);
+    if (info && generation === this.transport.generation && Object.hasOwn(r.thread, 'path')) info.path = r.thread.path;
     const messages: Message[] = []; for (const turn of r.thread.turns) if (isString(turn.id) && Array.isArray(turn.items)) for (const item of turn.items) { const prior=this.messages.get(`${id}\0${item.id}`); const final=item.type!=='agentMessage' || turn.status!=='inProgress' || !!prior?.final; const message = this.message(id, turn.id, item, final); if (message) messages.push(message); }
     const turns = r.thread.turns.map((turn: Obj) => this.turn(id,turn));
     return { session, messages, turns, interactions: [...this.requests.values()].map(x => x.interaction).filter(x => x.sessionId === id), connectionGeneration: this.transport.generation };
@@ -196,6 +310,8 @@ export class CodexAdapter implements PlatformPort {
     const r = await this.transport.request('thread/resume', { threadId: id }) as Obj;
     if (!r?.thread || r.thread.id !== id) return invalidNative();
     this.knownSessions.set(id,r.thread); this.owned.add(id); this.active.add(id); this.controlEpoch.set(id,(this.controlEpoch.get(id) ?? 0)+1);
+    const currentTurn = Array.isArray(r.thread.turns) ? r.thread.turns.findLast((turn: Obj) => turn?.status === 'inProgress') : undefined;
+    if (isString(currentTurn?.id)) this.trackApprovalTurn(id, currentTurn.id, this.transport.generation);
     return {...ack(id),connectionGeneration:this.transport.generation};
   }
   async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { const r = await this.transport.request('thread/start', { cwd, model }) as Obj; if (!isString(r?.thread?.id)) return invalidNative(); this.knownSessions.set(r.thread.id,r.thread); this.awaitingFirstInput.add(r.thread); this.owned.add(r.thread.id); this.active.add(r.thread.id); this.controlEpoch.set(r.thread.id,0); return {status:'submitted',nativeReference:r.thread.id,createdSession:this.session(r.thread),connectionGeneration:this.transport.generation}; }
@@ -218,8 +334,13 @@ export class CodexAdapter implements PlatformPort {
     if (guard.expectedConnectionGeneration !== null && guard.expectedConnectionGeneration !== this.transport.generation) throw contractError('control_conflict');
     const info = this.knownSessions.get(id);
     const previousStatus = info?.status;
+    const generation = this.transport.generation;
     guard.assertCurrent(); const response = await this.transport.request(mode === 'new' ? 'turn/start' : 'turn/steer', mode === 'new' ? { threadId: id, input, ...(this.settings.get(id) ?? {}) } : { threadId: id, expectedTurnId: turnId, input });
     const r = response as Obj; const returned=typeof r?.turn?.id === 'string' ? r.turn.id : typeof r?.turnId === 'string' ? r.turnId : null; if(mode==='steer' && returned!==turnId) throw contractError('outcome_unknown','steer acknowledgement did not identify the captured turn');
+    if (mode === 'new' && returned && r.turn?.status === 'inProgress' && info?.status === previousStatus
+      && this.active.has(id) && this.transport.generation === generation && this.knownSessions.get(id) === info) {
+      this.trackApprovalTurn(id, returned, generation);
+    }
     if (mode === 'new' && info && this.awaitingFirstInput.delete(info) && this.active.has(id) && this.knownSessions.get(id) === info) {
       const title = this.session(info).title.trim() ? null : deriveTitleFromInputBlocks(blocks);
       if (title) {
@@ -241,10 +362,17 @@ export class CodexAdapter implements PlatformPort {
     if (interaction.nativeRequestId !== i.nativeRequestId || interaction.connectionGeneration !== i.connectionGeneration || interaction.kind !== i.kind || interaction.toolInputDigest !== i.toolInputDigest || interaction.status !== 'awaiting_answer') throw contractError('stale_revision');
     let result: unknown;
     if (i.kind === 'question_group' && answer.kind === 'question_group' && Object.keys(answer.answers).length === i.questions.length && i.questions.every(q => Array.isArray(answer.answers[q.id]) && answer.answers[q.id]!.length > 0 && answer.answers[q.id]!.every(v => typeof v === 'string' && v.trim()) && new Set(answer.answers[q.id]).size === answer.answers[q.id]!.length)) result = { answers: Object.fromEntries(i.questions.map(q => [q.id, { answers: answer.answers[q.id] }])) };
-    else if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope && ['allow', 'deny'].includes(answer.decision)) result = { decision: answer.decision === 'allow' ? 'accept' : 'decline' };
+    else if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope && ['allow', 'deny'].includes(answer.decision)) {
+      const decision = req.approvalChoices?.[answer.decision];
+      if (!decision) throw contractError('invalid_request', 'native request does not offer this decision');
+      result = { decision };
+    }
     else throw contractError('invalid_request');
     guard.assertCurrent(); req.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 };
-    this.transport.respond(req.id, result); if (req.interaction.status === 'answer_pending_delivery') this.emitInteraction(req.interaction); return ack();
+    this.transport.respond(req.id, result);
+    if (guard.operationId) req.operationId = guard.operationId;
+    if (req.interaction.status === 'answer_pending_delivery') this.emitInteraction(req.interaction);
+    return ack();
   }
   async listArtifacts(_ref: NativeSessionRef): Promise<Artifact[]> { throw contractError('unsupported'); }
   async readArtifact(_ref: NativeSessionRef, _id: string, _version: string): Promise<Uint8Array> { throw contractError('unsupported'); }
@@ -273,6 +401,7 @@ export class CodexAdapter implements PlatformPort {
     if (!this.active.has(id)) throw contractError('control_conflict', 'not subscribed'); guard.assertCurrent();
     const r = await this.transport.request('thread/unsubscribe', {threadId:id}) as Obj;
     if (!['unsubscribed','notSubscribed','notLoaded'].includes(r?.status)) return invalidNative();
+    this.approvalTurns.delete(id);
     this.active.delete(id); for (const entry of this.requests.values()) if (entry.interaction.sessionId === id && entry.interaction.status !== 'resolved' && entry.interaction.status !== 'expired') { entry.interaction = {...entry.interaction,status:'expired',revision:entry.interaction.revision+1}; this.nativeIndex.delete(this.key(entry.generation,entry.id)); this.emitInteraction(entry.interaction); } this.controlEpoch.set(id,(this.controlEpoch.get(id) ?? 0)+1); const info=this.knownSessions.get(id); if (info) this.emit({type:'session',ref,session:this.session(info)}); return ack(r.status);
   }
   async archive(ref: NativeSessionRef, archived: boolean, guard: DispatchGuard): Promise<PlatformAcknowledgement> {

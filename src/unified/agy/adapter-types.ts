@@ -4,6 +4,7 @@ import type {
   PlatformInputBlock,
   PlatformObservation,
 } from '../adapter.js';
+import type { ApprovalScope } from '../approval-policy.js';
 import type {
   AgyCatalog,
   AgyDiscoveredSession,
@@ -17,6 +18,7 @@ import type {
   Message,
   ModelOption,
   NativeSessionRef,
+  ResponseEvidence,
   Session,
   Turn,
 } from '../contracts.js';
@@ -101,17 +103,26 @@ export type ActiveTurnState = {
   assistantFinalized: boolean;
   interrupted: boolean;
   inProgressToolCalls: Set<string>;
+  toolCalls: Map<string, Obj>;
+  fullToolCalls: Set<string>;
+  approvalRequestIds: Map<string, string | null>;
 };
 
 export type PendingAgyRequest = {
   rpcId: string | number;
   generation: number;
+  turnId: string;
   toolCallId: string | null;
   interaction: Interaction;
-  allowOptionId: string;
-  denyOptionId: string;
+  allowOptionId: string | null;
+  denyOptionId: string | null;
   propertyTypes: Record<string, string>;
   answer: Answer | null;
+  operationId: string | null;
+  answerDigest: string | null;
+  submission: 'writing' | 'submitted' | null;
+  executed: boolean;
+  closedSource: string | null;
 };
 
 export type ListSnapshot = {
@@ -136,6 +147,7 @@ export interface AdapterContext {
   readonly catalog: AgyCatalog;
   readonly hostId: string;
   readonly serviceId: string;
+  readonly approvalPolicy?: ApprovalScope;
   readonly active: Set<string>;
   readonly controlEpoch: Map<string, number>;
   readonly knownSessions: Map<string, LiveSessionMeta>;
@@ -151,7 +163,7 @@ export interface AdapterContext {
   ref(id: string): NativeSessionRef;
   check(ref: NativeSessionRef): string;
   emit(observation: PlatformObservation): void;
-  emitInteraction(interaction: Interaction): void;
+  emitInteraction(interaction: Interaction, evidence?: ResponseEvidence): void;
   buildSession(
     id: string,
     summary: AgyDiscoveredSession | null,

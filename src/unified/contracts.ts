@@ -24,9 +24,16 @@ export type OperationResult = {kind:'session'; sessionId:string} | {kind:'artifa
 export interface Operation { operationId: string; idempotencyKey: string; targetId: string; action: string; payloadDigest: string; status: OperationStatus; revision: Revision; error: ContractError | null; result?: OperationResult }
 export type InteractionStatus = 'awaiting_answer' | 'answer_pending_delivery' | 'resolved' | 'expired' | 'cancelled';
 export interface InteractionBase { interactionId: string; sessionId: string; turnId: string; nativeRequestId: string; connectionGeneration: number; revision: Revision; status: InteractionStatus; expiresAt: string | null; toolInputDigest: string | null; nativeResult: NativeResult | null }
-export type Interaction = InteractionBase & ({ kind: 'question'; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean } | { kind: 'approval'; tool: string; action: string; scope: string; toolInputDigest: string } | { kind: 'question_group'; questions: Array<{ id: string; prompt: string; choices: string[]; multiple: boolean | null; allowFreeText: boolean }> });
+export type Interaction = InteractionBase & ({ kind: 'question'; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean } | { kind: 'approval'; tool: string; action: string; scope: string; toolInputDigest: string; allowedDecisions?: readonly ('allow' | 'deny')[] } | { kind: 'question_group'; questions: Array<{ id: string; prompt: string; choices: string[]; multiple: boolean | null; allowFreeText: boolean }> });
 export type NativeResult = { status: 'accepted'; source: string; answer: Answer | null } | { status: 'unknown'; source: string } | { status: 'rejected'; reason: string };
 export type Answer = { kind: 'question'; values: string[] } | { kind: 'approval'; decision: 'allow' | 'deny'; scope: string } | { kind: 'question_group'; answers: Record<string, string[]> };
+export interface ResponseEvidence {
+  operationId: string;
+  interactionId: string;
+  nativeRequestId: string;
+  connectionGeneration: number;
+  answerDigest: string;
+}
 export interface ResolveInteraction { context: WriteContext; interactionId: string; expectedConnectionGeneration: number; answer: Answer; toolInputDigest: string | null }
 export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?:{destination:string;bindingScope:string;ownerSource:string;ownerSubject:string} }
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
@@ -64,6 +71,7 @@ export function validateResolution(x: ResolveInteraction, current: Interaction, 
   if (!x.answer || x.answer.kind !== current.kind) return fail('answer kind mismatch');
   if (current.kind === 'approval') {
     if (x.answer.kind !== 'approval' || !['allow', 'deny'].includes(x.answer.decision) || x.answer.scope !== current.scope || x.toolInputDigest !== current.toolInputDigest) return fail('approval scope or tool input mismatch');
+    if (current.allowedDecisions && !current.allowedDecisions.includes(x.answer.decision)) return fail('native request does not offer this decision');
   } else if (current.kind === 'question_group') {
     if (x.answer.kind !== 'question_group' || !x.answer.answers || Object.keys(x.answer.answers).length !== current.questions.length || new Set(current.questions.map(q => q.id)).size !== current.questions.length || !current.questions.every(q => { const values = x.answer.kind === 'question_group' ? x.answer.answers[q.id] : undefined; return Array.isArray(values) && values.length > 0 && values.every(nonempty) && (q.multiple !== false || values.length === 1) && (q.allowFreeText || values.every(v => q.choices.includes(v))) && new Set(values).size === values.length; })) return fail('invalid grouped question answer');
   } else if (x.answer.kind !== 'question' || !Array.isArray(x.answer.values) || !x.answer.values.length || !x.answer.values.every(nonempty) || (!current.multiple && x.answer.values.length !== 1) || (!current.allowFreeText && !x.answer.values.every(v => current.choices.includes(v))) || new Set(x.answer.values).size !== x.answer.values.length) return fail('invalid question answer');
@@ -82,6 +90,14 @@ export function payloadDigest(value: unknown): string {
     throw new TypeError('payload must be JSON data');
   }
   return createHash('sha256').update(canonical(value)).digest('hex');
+}
+/** Digest the typed answer fields that can actually be delivered to a provider. */
+export function answerDigest(answer: Answer): string {
+  switch (answer.kind) {
+    case 'approval': return payloadDigest({kind: answer.kind, decision: answer.decision, scope: answer.scope});
+    case 'question': return payloadDigest({kind: answer.kind, values: answer.values});
+    case 'question_group': return payloadDigest({kind: answer.kind, answers: answer.answers});
+  }
 }
 export function checkIdempotency(existing: Pick<Operation, 'idempotencyKey' | 'payloadDigest'>, key: string, digest: string): 'same' | 'conflict' | 'different_key' { return existing.idempotencyKey !== key ? 'different_key' : existing.payloadDigest === digest ? 'same' : 'conflict'; }
 const interactionTransitions: Record<InteractionStatus, readonly InteractionStatus[]> = {

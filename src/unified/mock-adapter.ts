@@ -34,6 +34,7 @@ export function createMockAdapter(provider: Provider): UnifiedService & { provid
     async readHistory() { return { items: [], nextCursor: null }; },
     async listInteractions() { return { items: [interaction], nextCursor: null }; },
     async getInteraction() { return interaction; },
+    async getResponseOperation() { return null; },
     async resolveInteraction(request: import('./contracts.js').ResolveInteraction) { return receipt(request.context, 'resolveInteraction', { interactionId: request.interactionId, answer: request.answer }); },
     async getControlState() { return session.control; },
     async requestControl(request: WriteRequest<{ owner: string; strategy: 'wait' | 'interrupt' }>) { return receipt(request.context, 'requestControl', request.payload); },

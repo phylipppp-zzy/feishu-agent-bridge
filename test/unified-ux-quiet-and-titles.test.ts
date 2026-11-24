@@ -97,6 +97,85 @@ test('interactive bind, attach and upgrade only send the finished session panel'
   } finally { x.close(); }
 });
 
+for (const lookup of [undefined, 'not_sent'] as const) test(`a committed upgrade recovers its original-card PATCH after a failed delivery (${lookup ?? 'no lookup'})`, async () => {
+  const x = setup();
+  try {
+    await x.channel.handle(env('open'),{action:'bind',sessionId:session.sessionId,mode:'read_only'});
+    const [before] = x.channel.bindingsForRestore();
+    const sentCount = x.sent.length;
+    const update = x.port.update;
+    x.port.update = async () => { throw new Error('Feishu temporarily unavailable'); };
+    const op = await x.channel.handle(
+      {...env('upgrade-card'),cardMessageId:'source-panel'},
+      {action:'upgrade',bindingId:before!.bindingId},
+    ) as Operation;
+    await assert.rejects(x.channel.advanceOperation(op.operationId),/temporarily unavailable/);
+    const [committed] = x.channel.bindingsForRestore();
+    assert.equal(committed?.accessMode,'interactive');
+    assert.equal(committed?.revision,before!.revision+1);
+
+    const deliveryId = `${op.operationId}:topic-reply`;
+    assert.deepEqual(x.channel.pendingDeliveries().map(row => ({ ...row })), [{ deliveryId, state: 'unknown' }]);
+    const lookedUp: string[] = [];
+    if (lookup) x.port.lookupDelivery = async id => {
+      lookedUp.push(id);
+      return lookup;
+    };
+    x.port.update = update;
+    const recovered = new FeishuChannel(x.service,x.port,x.authorize,x.path);
+    try {
+      await recovered.advanceCompleted();
+      await recovered.advanceCompleted();
+      assert.equal(x.sent.length,sentCount);
+      assert.equal(x.updates.length,1);
+      assert.deepEqual(lookedUp, lookup ? [deliveryId] : []);
+      assert.deepEqual(recovered.pendingDeliveries(), []);
+      assert.equal(x.updates[0]!.id,'source-panel');
+      assert.match(x.updates[0]!.card.text,/✅ 已接入，现在可直接发送消息续聊/);
+      assert.deepEqual(x.updates[0]!.card.actions.map(action=>action.value.action),['history','panel','artifacts']);
+      assert.ok(x.updates[0]!.card.actions.every(action=>action.value.bindingId===committed?.bindingId));
+      assert.deepEqual(recovered.bindingsForRestore(),[committed]);
+    } finally { recovered.close(); }
+  } finally { x.close(); }
+});
+
+test('binding recovery trusts a confirmed PATCH and does not retry an uncertain send', async () => {
+  const x = setup();
+  try {
+    await x.channel.handle(env('open'), { action: 'bind', sessionId: session.sessionId });
+    const [before] = x.channel.bindingsForRestore();
+    const update = x.port.update;
+    x.port.update = async (...args) => {
+      await update(...args);
+      throw new Error('PATCH receipt lost');
+    };
+    const patch = await x.channel.handle(
+      { ...env('upgrade-card'), cardMessageId: 'source-panel' },
+      { action: 'upgrade', bindingId: before!.bindingId },
+    ) as Operation;
+    await assert.rejects(x.channel.advanceOperation(patch.operationId), /PATCH receipt lost/);
+
+    let sendAttempts = 0;
+    x.port.send = async () => {
+      sendAttempts++;
+      throw new Error('send receipt lost');
+    };
+    const send = await x.channel.handle(env('attach', 'another-topic'), {
+      action: 'attach', ...session.native, mode: 'interactive',
+    }) as Operation;
+    await assert.rejects(x.channel.advanceOperation(send.operationId), /send receipt lost/);
+
+    x.port.lookupDelivery = async id => id === `${patch.operationId}:topic-reply` ? 'sent' : 'unknown';
+    await x.channel.advanceCompleted();
+    await x.channel.advanceCompleted();
+    assert.equal(x.updates.length, 1);
+    assert.equal(sendAttempts, 1);
+    assert.deepEqual(x.channel.pendingDeliveries().map(row => ({ ...row })), [
+      { deliveryId: `${send.operationId}:topic-reply`, state: 'unknown' },
+    ]);
+  } finally { x.close(); }
+});
+
 test('settings, cancel, stop and normal attachments are quiet; queued attachments retain the queue link', async () => {
   const x = setup();
   const { channel, sent } = x;

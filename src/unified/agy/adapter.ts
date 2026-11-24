@@ -18,6 +18,7 @@ import type {
   ModelOption,
   NativeSessionRef,
   Page,
+  ResponseEvidence,
   Session,
   SessionSnapshot,
   Turn,
@@ -94,6 +95,7 @@ export class AgyAdapter implements PlatformPort {
     readonly hostId: string,
     readonly serviceId: string,
     readonly quotaClient?: AgyQuotaClient,
+    options: { approvalPolicy?: AdapterContext['approvalPolicy'] } = {},
   ) {
     if (!isString(hostId) || !isString(serviceId)) {
       throw contractError('invalid_request', 'hostId and serviceId are required');
@@ -104,6 +106,7 @@ export class AgyAdapter implements PlatformPort {
       catalog: this.catalog,
       hostId: this.hostId,
       serviceId: this.serviceId,
+      ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
       active: this.active,
       controlEpoch: this.controlEpoch,
       knownSessions: this.knownSessions,
@@ -119,7 +122,7 @@ export class AgyAdapter implements PlatformPort {
       ref: id => this.ref(id),
       check: ref => this.check(ref),
       emit: obs => this.emit(obs),
-      emitInteraction: interaction => this.emitInteraction(interaction),
+      emitInteraction: (interaction, evidence) => this.emitInteraction(interaction, evidence),
       buildSession: (id, summary, liveMeta, createdAtOverride) =>
         this.buildSession(id, summary, liveMeta, createdAtOverride),
       upsertLiveMessage: (sessionId, message) => this.upsertLiveMessage(sessionId, message),
@@ -142,7 +145,7 @@ export class AgyAdapter implements PlatformPort {
       try {
         prevServerRequest(req);
       } catch {}
-      handleAcpServerRequest(this.ctx, req);
+      void handleAcpServerRequest(this.ctx, req).catch(() => {});
     };
 
     transport.onDisconnect = (generation, reason) => {
@@ -223,6 +226,12 @@ export class AgyAdapter implements PlatformPort {
     return ref.nativeSessionId;
   }
 
+  hasActiveNativeSession(ref: NativeSessionRef): boolean {
+    return !this.closed && this.transport.connected &&
+      ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId &&
+      this.active.has(ref.nativeSessionId) && this.knownSessions.has(ref.nativeSessionId);
+  }
+
   private emit(observation: PlatformObservation): void {
     if (this.closed) return;
     for (const listener of this.listeners) {
@@ -230,11 +239,12 @@ export class AgyAdapter implements PlatformPort {
     }
   }
 
-  private emitInteraction(interaction: Interaction): void {
+  private emitInteraction(interaction: Interaction, responseEvidence?: ResponseEvidence): void {
     this.emit({
       type: 'interaction',
       ref: this.ref(interaction.sessionId),
       interaction,
+      ...(responseEvidence ? { responseEvidence } : {}),
     });
   }
 
@@ -458,7 +468,7 @@ export class AgyAdapter implements PlatformPort {
       throw contractError('temporarily_unavailable', 'ACP transport not connected');
     }
 
-    this.catalog.refresh();
+    if (!this.knownSessions.has(id)) await this.catalog.refreshAsync();
     const summary = this.catalog.get(id);
     const liveMeta = this.knownSessions.get(id);
     const cwd = summary?.project || liveMeta?.cwd || '';
@@ -533,6 +543,9 @@ export class AgyAdapter implements PlatformPort {
       assistantFinalized: false,
       interrupted: false,
       inProgressToolCalls: new Set(),
+      toolCalls: new Map(),
+      fullToolCalls: new Set(),
+      approvalRequestIds: new Map(),
     };
     this.activeTurns.set(id, turnState);
 
@@ -816,20 +829,7 @@ export class AgyAdapter implements PlatformPort {
 
     this.active.delete(id);
     this.activeTurns.delete(id);
-    for (const entry of this.requests.values()) {
-      if (
-        entry.interaction.sessionId === id &&
-        entry.interaction.status !== 'resolved' &&
-        entry.interaction.status !== 'expired'
-      ) {
-        entry.interaction = {
-          ...entry.interaction,
-          status: 'expired',
-          revision: entry.interaction.revision + 1,
-        };
-        this.emitInteraction(entry.interaction);
-      }
-    }
+    expireAllPendingRequests(this.ctx, this.transport.connectionGeneration, id);
     this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
     const summary = this.catalog.get(id);
     const meta = this.knownSessions.get(id);

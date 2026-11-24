@@ -11,7 +11,8 @@ import {
   type AgyTranscriptMessage,
   type AgyTranscriptReadResult,
 } from './catalog-types.js';
-import { readAgySummaries } from './catalog-summaries.js';
+import { readAgySummaries, type AgyTitleCacheEntry } from './catalog-summaries.js';
+import { refreshAgyCatalog } from './catalog-refresh.js';
 import { readAgyTranscript } from './catalog-transcript.js';
 import { discoverAgyArtifacts, readAgyArtifact } from './catalog-artifacts.js';
 
@@ -22,22 +23,30 @@ import { discoverAgyArtifacts, readAgyArtifact } from './catalog-artifacts.js';
 export class AgyCatalog {
   private sessions = new Map<string, AgyDiscoveredSession>();
   private orderedIds: string[] = [];
+  private titles = new Map<string, AgyTitleCacheEntry>();
+  private refreshing?: Promise<AgyDiscoveredSession[]>;
+  private version = 0;
 
   constructor(private readonly options: AgyCatalogOptions = {}) {}
 
   refresh(): AgyDiscoveredSession[] {
-    const summaryOpts: Parameters<typeof readAgySummaries>[0] = {};
-    if (this.options.dbPath !== undefined) summaryOpts.dbPath = this.options.dbPath;
-    if (this.options.brainDir !== undefined) summaryOpts.brainDir = this.options.brainDir;
-    if (this.options.allowedProjectRoots !== undefined) {
-      summaryOpts.allowedProjectRoots = this.options.allowedProjectRoots;
-    }
-    if (this.options.includeOutsideRoots !== undefined) {
-      summaryOpts.includeOutsideRoots = this.options.includeOutsideRoots;
-    }
-    if (this.options.maxTitleLength !== undefined) summaryOpts.maxTitleLength = this.options.maxTitleLength;
+    const titles = new Map<string, AgyTitleCacheEntry>();
+    const list = readAgySummaries(this.options, { previous: this.titles, next: titles });
+    this.version++;
+    return this.replace(list, titles);
+  }
 
-    const list = readAgySummaries(summaryOpts);
+  refreshAsync(): Promise<AgyDiscoveredSession[]> {
+    if (this.refreshing) return this.refreshing;
+    const version = this.version;
+    const refresh = refreshAgyCatalog(this.options, this.titles).then(({ list, titles }) =>
+      version === this.version ? this.replace(list, titles) : this.items());
+    this.refreshing = refresh;
+    void refresh.finally(() => { delete this.refreshing; }).catch(() => {});
+    return refresh;
+  }
+
+  private replace(list: AgyDiscoveredSession[], titles: Map<string, AgyTitleCacheEntry>): AgyDiscoveredSession[] {
     const next = new Map<string, AgyDiscoveredSession>();
     const ids: string[] = [];
     for (const s of list) {
@@ -46,6 +55,11 @@ export class AgyCatalog {
     }
     this.sessions = next;
     this.orderedIds = ids;
+    this.titles = titles;
+    return this.items();
+  }
+
+  private items(): AgyDiscoveredSession[] {
     return this.orderedIds.map((id) => structuredClone(this.sessions.get(id)!));
   }
 

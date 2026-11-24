@@ -10,7 +10,7 @@ import type { Session, WriteContext } from '../src/unified/contracts.js';
 // Establish an interactive fixture through the channel's authorized attach/finish path.
 async function interactiveBinding(channel:FeishuChannel, service:UnifiedService, env:{eventId:string;destination:string;identity:{source:string;subject:string}}, sessionId:string) {
  const fake=service as any; const oldAttach=fake.attachSession, oldGet=fake.getOperation; const operations=new Map<string,unknown>();
- fake.attachSession=async ({context}:any)=>{const op={operationId:context.operationId,action:'attachSession',status:'completed',error:null,result:{kind:'session',sessionId}};operations.set(op.operationId,op);return op;};
+ fake.attachSession=async ({context}:any)=>{const op={operationId:context.operationId,targetId:context.targetId,action:'attachSession',status:'completed',error:null,result:{kind:'session',sessionId}};operations.set(op.operationId,op);return op;};
  fake.getOperation=async (id:string)=>operations.get(id);
  try {
   await channel.handle(env,{action:'bind',sessionId,mode:'read_only'});

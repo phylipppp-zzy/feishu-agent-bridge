@@ -12,6 +12,12 @@ export function needsOperationNotice(operation: Operation): boolean {
   return operation.status === 'failed' || operation.status === 'unknown';
 }
 
+export function operationFromReceipt(receipt: unknown): Operation | null {
+  if (!receipt || typeof receipt !== 'object') return null;
+  const op = receipt as Partial<Operation>;
+  return typeof op.operationId === 'string' && typeof op.action === 'string' && typeof op.targetId === 'string' ? op as Operation : null;
+}
+
 export function pendingSessionAuthorization(
   db: DatabaseSync,
   port: FeishuPort,

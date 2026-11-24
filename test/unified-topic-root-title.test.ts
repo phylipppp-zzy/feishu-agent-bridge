@@ -66,8 +66,8 @@ function fixture() {
     getSnapshot: async (id: string) => ({ cursor: 'cursor', value: { session: sessions.get(id), interactions: [], messages: [] } }),
     subscribeEvents: async () => ({ status: 'events', cursor: 'cursor', events: [] }),
     getOperation: async (id: string) => operations.get(id),
-    attachSession: async ({ context }: { context: { operationId: string } }) => {
-      const op = { operationId: context.operationId, status: 'completed', action: 'attachSession', result: { kind: 'session', sessionId: 's' } };
+    attachSession: async ({ context }: { context: { operationId: string; targetId: string } }) => {
+      const op = { operationId: context.operationId, targetId: context.targetId, status: 'completed', action: 'attachSession', result: { kind: 'session', sessionId: 's' } };
       operations.set(op.operationId, op);
       return op;
     },

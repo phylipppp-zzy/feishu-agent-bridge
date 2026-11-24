@@ -1139,6 +1139,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
         toolInputDigest: approvalDigest,
       });
       assert.equal(hubAnswerRes.callbackResult, undefined);
+      await runtime.flushInteractive();
       assert.equal(agy.responds.length, 1);
       assert.equal(runtime.pendingHub!.getRef('interaction:int-e2e-approval')?.card_active, 0);
 
@@ -1181,6 +1182,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
         { q0_choice: '1' },
       );
       assert.equal(hubFormRes.callbackResult, undefined);
+      await runtime.flushInteractive();
       assert.equal(codex.responds.length, 1);
       assert.deepEqual(codex.responds[0]!.answer, { kind: 'question', values: ['全量测试'] });
 

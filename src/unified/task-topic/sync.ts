@@ -22,6 +22,7 @@ export interface TaskSyncDeps {
   port: FeishuPort;
   authorize: TaskAuthorize;
   streamThrottleMs: number;
+  withInteractionLock?: (key: string, run: () => Promise<void>) => Promise<void>;
   renderStreamMessage?: (
     binding: BindingRow,
     target: TargetRow,
@@ -236,6 +237,24 @@ export async function renderTaskInteraction(
   interaction: Interaction,
   controlGeneration: number,
 ): Promise<void> {
+  const render = async () => {
+    const current = await deps.service.getInteraction(interaction.interactionId);
+    if (current.sessionId !== target.session_id) return;
+    await renderCurrentTaskInteraction(deps, binding, target, current, controlGeneration);
+  };
+  if (!deps.withInteractionLock) return render();
+  return deps.withInteractionLock(payloadDigest([
+    binding.task_id, target.target_id, target.target_generation, interaction.interactionId,
+  ]), render);
+}
+
+async function renderCurrentTaskInteraction(
+  deps: TaskSyncDeps,
+  binding: BindingRow,
+  target: TargetRow,
+  interaction: Interaction,
+  controlGeneration: number,
+): Promise<void> {
   const guard = () => verifySyncTarget(deps, binding, target);
   await guard();
 
@@ -263,11 +282,15 @@ export async function renderTaskInteraction(
   }
 
   const latestBinding = getBindingRow(deps.db, binding.task_id) ?? binding;
+  const operation = interaction.status === 'awaiting_answer'
+    ? undefined
+    : await deps.service.getResponseOperation?.(interaction.interactionId);
   const card = taskInteractionCard(
     toBinding(latestBinding),
     toTarget(target),
     interaction,
     controlGeneration,
+    operation,
   );
   const signature = payloadDigest(card);
   if (row && row.revision > interaction.revision) return;

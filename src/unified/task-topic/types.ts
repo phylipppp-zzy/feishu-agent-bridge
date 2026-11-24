@@ -177,6 +177,7 @@ export type TaskChannelAction = (
 
 export interface TaskTopicChannelOptions {
   streamThrottleMs?: number;
+  onInteractionChanged?: (sessionId: string, interactionId: string) => void;
 }
 
 export class TaskChannelError extends Error {

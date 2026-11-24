@@ -1,9 +1,10 @@
 import type { DirectoryListing } from '../claude/deliver.js';
-import type { ModelOption, ConfirmedSettings } from './contracts.js';
+import type { ModelOption, ConfirmedSettings, ResponseEvidence } from './contracts.js';
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
+export type { ResponseEvidence } from './contracts.js';
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
   hasProvider?(provider: Provider): boolean;
@@ -28,6 +29,7 @@ export interface UnifiedService {
   captureSteer?(identity:{source:string;subject:string},sessionId:string):Promise<{turnId:string;connectionGeneration:number;controlGeneration:number}>;
   listInteractions(sessionId: string, query: ListQuery): Promise<Page<Interaction>>;
   getInteraction(interactionId: string): Promise<Interaction>;
+  getResponseOperation?(interactionId: string): Promise<Operation | null>;
   resolveInteraction(request: ResolveInteraction): Promise<Operation>;
   interruptTurn(request: WriteRequest<{ turnId: string }>): Promise<Operation>;
   inspectTurnResidual?(sessionId:string,turnId:string):Promise<TurnResidual>;
@@ -61,12 +63,12 @@ export type PlatformObservation =
   | { type: 'session'; ref: NativeSessionRef; session: Session }
   | { type: 'turn'; ref: NativeSessionRef; turn: Turn; connectionGeneration?:number }
   | { type: 'message'; ref: NativeSessionRef; message: Message; connectionGeneration?: number }
-  | { type: 'interaction'; ref: NativeSessionRef; interaction: Interaction }
+  | { type: 'interaction'; ref: NativeSessionRef; interaction: Interaction; responseEvidence?: ResponseEvidence }
   | { type: 'event'; ref: NativeSessionRef; event: Event; connectionGeneration?:number };
 /** Core holds the session dispatch lock through provider submission. Provider calls
  * assertCurrent immediately before the SDK/socket write; throw aborts submission.
  * External native clients are outside this lock and still require native arbitration. */
-export interface DispatchGuard { expectedControlGeneration: number; expectedConnectionGeneration: number | null; assertCurrent(): void }
+export interface DispatchGuard { operationId?: string; expectedControlGeneration: number; expectedConnectionGeneration: number | null; assertCurrent(): void }
 export type PlatformInputBlock = {type:'text'; text:string} | {type:'artifact'; artifactId:string; contentVersion:string; name:string; mediaType:string; content:Uint8Array};
 export interface PlatformPort {
   readonly provider: Provider;

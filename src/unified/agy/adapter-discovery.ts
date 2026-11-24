@@ -20,8 +20,8 @@ import {
   type AdapterContext,
 } from './adapter-types.js';
 
-export function mergeAllSessions(ctx: AdapterContext): Array<Session & { subagentCount?: number }> {
-  const catalogSessions = ctx.catalog.refresh();
+async function mergeAllSessions(ctx: AdapterContext): Promise<Array<Session & { subagentCount?: number }>> {
+  const catalogSessions = await ctx.catalog.refreshAsync();
   const merged = new Map<string, Session & { subagentCount?: number }>();
 
   for (const s of catalogSessions) {
@@ -51,7 +51,7 @@ export async function listSessions(
   let offset = 0;
 
   if (cursor === null) {
-    items = mergeAllSessions(ctx);
+    items = await mergeAllSessions(ctx);
     snapshotKey = randomUUID();
     if (items.length > limit) {
       while (ctx.listSnapshots.size >= MAX_LIST_SNAPSHOTS) {
@@ -126,8 +126,7 @@ export async function discoverExistingSessions(
   let offset = 0;
 
   if (cursor === null) {
-    const all = ctx.catalog
-      .refresh()
+    const all = (await ctx.catalog.refreshAsync())
       .filter(s => s.isTopLevel && s.projectAllowed && s.project !== '' && (s.stepCount > 0 || s.lastModifiedAt !== null));
     ids = all.map(s => s.conversationId);
     snapshotKey = randomUUID();
@@ -224,7 +223,7 @@ export async function discoverNewerSessions(
   if (cursor === null) {
     const buffer: Session[] = [];
     const observedAt = new Date().toISOString();
-    const summaries = ctx.catalog.refresh();
+    const summaries = await ctx.catalog.refreshAsync();
 
     for (const summary of summaries) {
       if (!summary.isTopLevel || !summary.projectAllowed || !summary.project) continue;
@@ -294,7 +293,7 @@ export async function discoverRunningSessions(
     throw contractError('snapshot_required', 'invalid cursor');
   }
 
-  const summaries = ctx.catalog.refresh();
+  const summaries = await ctx.catalog.refreshAsync();
   const items: Session[] = [];
   for (const s of summaries) {
     if (!s.isTopLevel || !s.projectAllowed || !s.project) continue;
@@ -342,7 +341,7 @@ export async function readAutoActivityForSession(
     return { status: 'unknown' };
   }
 
-  ctx.catalog.refresh();
+  await ctx.catalog.refreshAsync();
   const summary = ctx.catalog.get(id);
   if (!summary || !summary.isTopLevel || !summary.projectAllowed || !summary.project) {
     return { status: 'unknown' };
@@ -440,7 +439,7 @@ export async function readSessionSnapshot(
   ref: NativeSessionRef,
 ): Promise<SessionSnapshot> {
   const id = ctx.check(ref);
-  ctx.catalog.refresh();
+  if (!ctx.knownSessions.has(id)) await ctx.catalog.refreshAsync();
   const summary = ctx.catalog.get(id);
   const liveMeta = ctx.knownSessions.get(id);
   if (!summary && !liveMeta) {

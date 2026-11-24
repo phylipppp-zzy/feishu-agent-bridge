@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from '../adapter.js';
-import type { Identity, Message, NativeSessionRef, Provider } from '../contracts.js';
+import type { Identity, Message, NativeSessionRef, Operation, Provider } from '../contracts.js';
 import type { FeishuPort, TrustedEnvelope } from '../feishu-channel.js';
 import type { TaskTopicToken } from '../task-topic-store.js';
 import { drainTaskEventLocked } from './drain.js';
@@ -47,6 +47,7 @@ export class TaskTopicChannel {
   private readonly db: DatabaseSync;
   private readonly ownsDb: boolean;
   private readonly taskLocks = new Map<string, Promise<void>>();
+  private readonly interactionLocks = new Map<string, Promise<void>>();
   private readonly streamThrottleMs: number;
   private closed = false;
 
@@ -55,7 +56,7 @@ export class TaskTopicChannel {
     private readonly port: FeishuPort,
     private readonly authorize: TaskAuthorize,
     dbOrPath: string | DatabaseSync,
-    options: TaskTopicChannelOptions = {},
+    private readonly options: TaskTopicChannelOptions = {},
   ) {
     this.streamThrottleMs = options.streamThrottleMs ?? 1000;
     if (typeof dbOrPath === 'string') {
@@ -83,21 +84,21 @@ export class TaskTopicChannel {
     return runTransaction(this.db, fn);
   }
 
-  private async withTaskLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.taskLocks.get(taskId) ?? Promise.resolve();
+  private async withLock<T>(locks: Map<string, Promise<void>>, key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = locks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const lock = new Promise<void>((resolve) => {
       release = resolve;
     });
     const tail = previous.then(() => lock);
-    this.taskLocks.set(taskId, tail);
+    locks.set(key, tail);
     await previous;
     try {
       return await fn();
     } finally {
       release();
-      if (this.taskLocks.get(taskId) === tail) {
-        this.taskLocks.delete(taskId);
+      if (locks.get(key) === tail) {
+        locks.delete(key);
       }
     }
   }
@@ -109,6 +110,7 @@ export class TaskTopicChannel {
       port: this.port,
       authorize: this.authorize,
       streamThrottleMs: this.streamThrottleMs,
+      withInteractionLock: (key, run) => this.withLock(this.interactionLocks, key, run),
       renderStreamMessage: (binding, target, scope, message, turnCompleted) =>
         this.renderStreamMessage(binding, target, scope, message, turnCompleted),
     };
@@ -229,6 +231,46 @@ export class TaskTopicChannel {
         .prepare("SELECT event_id FROM task_inbox_scope_v1 WHERE state = 'received' ORDER BY rowid")
         .all() as Array<{ event_id: string }>
     ).map((r) => r.event_id);
+  }
+
+  pendingInboxTasks(): string[] {
+    return (this.db.prepare("SELECT DISTINCT task_id FROM task_inbox_scope_v1 WHERE state='received'")
+      .all() as Array<{ task_id: string }>).map(row => row.task_id);
+  }
+
+  operationForEvent(eventId: string): Operation | null {
+    const result = this.getInboxScope(eventId)?.result;
+    return result && typeof result === 'object' && 'operationId' in result ? result as Operation : null;
+  }
+
+  private sessionTargets(sessionId: string): TargetRow[] {
+    return this.db.prepare(`SELECT t.* FROM task_targets_v1 t JOIN task_bindings_v1 b ON b.task_id=t.task_id
+      WHERE t.session_id=? AND t.state='active' AND b.state='active'`).all(sessionId) as unknown as TargetRow[];
+  }
+
+  tasksForSession(sessionId: string): string[] {
+    return [...new Set(this.sessionTargets(sessionId).map(target => target.task_id))];
+  }
+
+  ownsInteractionCard(destination: string, sessionId: string, interactionId: string, messageId: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM task_interaction_cards_v1 c
+      JOIN task_bindings_v1 b ON b.task_id=c.task_id AND b.destination=c.destination AND b.state='active'
+      JOIN task_targets_v1 t ON t.task_id=c.task_id AND t.target_id=c.target_id AND t.state='active'
+        AND t.target_generation=c.target_generation AND t.session_id=c.session_id
+      WHERE c.destination=? AND c.session_id=? AND c.interaction_id=? AND c.message_id=?`)
+      .get(destination, sessionId, interactionId, messageId);
+  }
+
+  async refreshInteraction(sessionId: string, interactionId: string): Promise<void> {
+    const targets = this.sessionTargets(sessionId);
+    if (!targets.length) return;
+    const interaction = await this.service.getInteraction(interactionId);
+    if (interaction.sessionId !== sessionId) return;
+    const session = await this.service.getSession(sessionId);
+    await Promise.all(targets.map(async target => {
+      const binding = getBindingRow(this.db, target.task_id);
+      if (binding) await renderTaskInteraction(this.syncDeps(), binding, target, interaction, session.control.generation);
+    }));
   }
 
   unknownInbox(taskId?: string): string[] {
@@ -644,7 +686,7 @@ export class TaskTopicChannel {
       .prepare('SELECT task_id FROM task_inbox_scope_v1 WHERE event_id = ?')
       .get(eventId) as { task_id: string } | undefined;
     if (!scope) throw new TaskChannelError('invalid_request', 'task inbox event not found');
-    return this.withTaskLock(scope.task_id, () =>
+    return this.withLock(this.taskLocks, scope.task_id, () =>
       drainTaskEventLocked(
         {
           db: this.db,
@@ -653,6 +695,7 @@ export class TaskTopicChannel {
           authorize: this.authorize,
           listTargets: (taskId, includeRevoked) => this.listTargets(taskId, includeRevoked),
           switchActiveTarget: (input) => this.switchActiveTarget(input),
+          ...(this.options.onInteractionChanged ? { onInteractionChanged: this.options.onInteractionChanged } : {}),
           renderInteraction: (binding, target, interaction, controlGeneration) =>
             renderTaskInteraction(this.syncDeps(), binding, target, interaction, controlGeneration),
         },
