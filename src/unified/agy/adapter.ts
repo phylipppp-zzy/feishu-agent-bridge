@@ -73,6 +73,7 @@ export class AgyAdapter implements PlatformPort {
   readonly provider = 'agy' as const;
 
   private readonly active = new Set<string>();
+  private readonly controlChanges = new Set<string>();
   private readonly controlEpoch = new Map<string, number>();
   private readonly knownSessions = new Map<string, LiveSessionMeta>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
@@ -177,12 +178,8 @@ export class AgyAdapter implements PlatformPort {
       !Number.isSafeInteger(minimum) ||
       minimum < 0 ||
       this.active.has(id) ||
-      [...this.requests.values()].some(
-        r =>
-          r.interaction.sessionId === id &&
-          (r.interaction.status === 'awaiting_answer' ||
-            r.interaction.status === 'answer_pending_delivery'),
-      )
+      this.controlChanges.has(id) ||
+      this.pendingRequests(id).length > 0
     ) {
       throw contractError('busy', 'session has active native state');
     }
@@ -250,6 +247,13 @@ export class AgyAdapter implements PlatformPort {
     });
   }
 
+  private pendingRequests(id: string): PendingAgyRequest[] {
+    return [...this.requests.values()].filter(({ interaction }) =>
+      interaction.sessionId === id &&
+      (interaction.status === 'awaiting_answer' || interaction.status === 'answer_pending_delivery'),
+    );
+  }
+
   private buildSession(
     id: string,
     summary: AgyDiscoveredSession | null,
@@ -257,12 +261,7 @@ export class AgyAdapter implements PlatformPort {
     createdAtOverride?: string,
   ): Session & { subagentCount?: number } {
     const isActive = this.active.has(id) && this.transport.connected;
-    const pending = [...this.requests.values()].filter(
-      r =>
-        r.interaction.sessionId === id &&
-        (r.interaction.status === 'awaiting_answer' ||
-          r.interaction.status === 'answer_pending_delivery'),
-    );
+    const pending = this.pendingRequests(id);
     const activeTurn = this.activeTurns.get(id);
 
     let status: Session['status'] = 'read_only';
@@ -296,7 +295,7 @@ export class AgyAdapter implements PlatformPort {
       title,
       status,
       revision: 0,
-      capabilities: isActive ? liveCaps : readCaps,
+      capabilities: isActive ? liveCaps : this.canReacquire(id) ? { ...readCaps, handoff: liveCaps.handoff } : readCaps,
       control: {
         serviceId: this.serviceId,
         owner: isActive ? this.serviceId : null,
@@ -306,6 +305,10 @@ export class AgyAdapter implements PlatformPort {
         reason: isActive ? null : 'discovered agy session is read-only until attached',
       },
     };
+  }
+
+  private canReacquire(id: string): boolean {
+    return this.transport.connected && this.knownSessions.has(id) && this.controlEpoch.has(id);
   }
 
   private pruneSnapshots(): void {
@@ -465,11 +468,28 @@ export class AgyAdapter implements PlatformPort {
     };
   }
 
-  async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> {
+  resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> {
+    return this.resumeSession(ref);
+  }
+
+  private async resumeSession(ref: NativeSessionRef, guard?: DispatchGuard): Promise<PlatformAcknowledgement> {
     const id = this.check(ref);
+    if (this.controlChanges.has(id) || this.activeTurns.has(id) || this.pendingRequests(id).length > 0) {
+      throw contractError('busy', 'session has an active turn, pending interaction, or control change');
+    }
+    this.controlChanges.add(id);
+    try {
+      return await this.loadSession(ref, id, guard);
+    } finally {
+      this.controlChanges.delete(id);
+    }
+  }
+
+  private async loadSession(ref: NativeSessionRef, id: string, guard?: DispatchGuard): Promise<PlatformAcknowledgement> {
     if (!this.transport.connected) {
       throw contractError('temporarily_unavailable', 'ACP transport not connected');
     }
+    const generation = this.transport.connectionGeneration;
 
     if (!this.knownSessions.has(id)) await this.catalog.refreshAsync();
     const summary = this.catalog.get(id);
@@ -477,6 +497,9 @@ export class AgyAdapter implements PlatformPort {
     const cwd = summary?.project || liveMeta?.cwd || '';
     if (!cwd) {
       throw contractError('invalid_request', 'session working directory unavailable');
+    }
+    if (guard && cwd !== liveMeta?.cwd) {
+      throw contractError('control_conflict', 'session working directory changed');
     }
 
     if (!this.preLiveTranscriptIds.has(id) && !this.liveMessages.has(id)) {
@@ -488,6 +511,8 @@ export class AgyAdapter implements PlatformPort {
       }
     }
 
+    this.assertConnection(generation);
+    guard?.assertCurrent();
     const res = (await this.transport.request('session/load', {
       sessionId: id,
       cwd,
@@ -497,16 +522,22 @@ export class AgyAdapter implements PlatformPort {
       throw contractError('outcome_unknown', 'ACP session/load returned mismatched sessionId');
     }
 
+    this.assertConnection(generation);
     this.captureServerSessionMeta(id, cwd, res);
     this.active.add(id);
     this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
-    const generation = this.transport.connectionGeneration;
     this.emit({ type: 'connection', ref, connectionGeneration: generation });
 
     return {
       ...ack(id),
       connectionGeneration: generation,
     };
+  }
+
+  private assertConnection(generation: number): void {
+    if (this.closed || !this.transport.connected || generation !== this.transport.connectionGeneration) {
+      throw contractError('control_conflict', 'connection generation changed');
+    }
   }
 
   async input(
@@ -519,7 +550,7 @@ export class AgyAdapter implements PlatformPort {
     if (mode !== 'new') {
       throw contractError('unsupported', 'steer is available only for Codex');
     }
-    if (!this.active.has(id) || !this.transport.connected) {
+    if (!this.active.has(id) || this.controlChanges.has(id) || !this.transport.connected) {
       throw contractError('control_conflict', 'session is not subscribed');
     }
     if (!blocks.length) {
@@ -720,13 +751,14 @@ export class AgyAdapter implements PlatformPort {
     guard: DispatchGuard,
   ): Promise<PlatformAcknowledgement> {
     const id = this.check(ref);
-    if (!this.active.has(id) || !this.transport.connected) {
+    if (!this.active.has(id) || this.controlChanges.has(id) || !this.transport.connected) {
       throw contractError('control_conflict', 'session is not connected');
     }
     if (Object.keys(settings.preferences).some(k => k !== 'reasoningEffort')) {
       throw contractError('unsupported', 'unsupported preference');
     }
 
+    const controlGeneration = this.controlEpoch.get(id);
     let baseModel: string | null = null;
     let extractedEffort: AgyEffortLevel | null = null;
 
@@ -754,6 +786,9 @@ export class AgyAdapter implements PlatformPort {
     }
     const effort = rawEffort as AgyEffortLevel | undefined;
 
+    if (this.controlChanges.has(id) || !this.active.has(id) || controlGeneration !== this.controlEpoch.get(id)) {
+      throw contractError('control_conflict', 'session control changed');
+    }
     if (
       guard.expectedConnectionGeneration !== null &&
       guard.expectedConnectionGeneration !== this.transport.connectionGeneration
@@ -773,8 +808,8 @@ export class AgyAdapter implements PlatformPort {
       }
 
       if (effort !== undefined) {
-        if (!this.active.has(id) || !this.transport.connected) {
-          throw contractError('control_conflict', 'session disconnected during settings update');
+        if (!this.active.has(id) || this.controlChanges.has(id) || !this.transport.connected || controlGeneration !== this.controlEpoch.get(id)) {
+          throw contractError('control_conflict', 'session control changed during settings update');
         }
         if (
           guard.expectedConnectionGeneration !== null &&
@@ -820,29 +855,35 @@ export class AgyAdapter implements PlatformPort {
       if (this.active.has(id)) {
         throw contractError('busy', 'already subscribed');
       }
-      guard.assertCurrent();
-      return await this.resume(ref);
+      if (!this.canReacquire(id)) throw contractError('unsupported', 'session has no previous interactive attachment');
+      const receipt = await this.resumeSession(ref, guard);
+      this.emitSession(ref, id);
+      return receipt;
     }
 
-    if (!this.active.has(id)) {
+    if (!this.active.has(id) || !this.transport.connected) {
       throw contractError('control_conflict', 'not subscribed');
+    }
+    if (this.controlChanges.has(id) || this.activeTurns.has(id) || this.pendingRequests(id).length > 0) {
+      throw contractError('busy', 'session has an active turn, pending interaction, or control change');
     }
     guard.assertCurrent();
 
-    if (this.transport.connected) {
-      try {
-        await this.transport.request('session/close', { sessionId: id });
-      } catch (error) {
-        if (!(isRecord(error) && error.code === 'unsupported')) {
-          // Best-effort local teardown if server already closed or unsupported.
-        }
+    this.controlChanges.add(id);
+    try {
+      // Some ACP versions omit session/close. Local release still fences bridge writes.
+      await this.transport.request('session/close', { sessionId: id }).catch(() => {});
+      if (this.active.delete(id)) {
+        this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
+        this.emitSession(ref, id);
       }
+    } finally {
+      this.controlChanges.delete(id);
     }
+    return ack('unsubscribed');
+  }
 
-    this.active.delete(id);
-    this.activeTurns.delete(id);
-    expireAllPendingRequests(this.ctx, this.transport.connectionGeneration, id);
-    this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
+  private emitSession(ref: NativeSessionRef, id: string): void {
     const summary = this.catalog.get(id);
     const meta = this.knownSessions.get(id);
     if (summary || meta) {
@@ -853,6 +894,5 @@ export class AgyAdapter implements PlatformPort {
       });
     }
 
-    return ack('unsubscribed');
   }
 }

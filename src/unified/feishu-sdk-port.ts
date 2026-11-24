@@ -146,7 +146,7 @@ export function parseSdkCardCallback<T extends RuntimeTrustedAction = ChannelAct
   if (a.openId !== owner) throw new Error('unauthorized');
   return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseFeishuAction<T>(a.value,a.formValues)};
 }
-const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target', 'cancel', 'archive', 'notice_settings']);
+const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target', 'cancel', 'archive', 'notice_settings', 'control']);
 function isAlreadyHandledCardError(error: unknown): boolean {
   const obj = typeof error === 'object' && error !== null ? (error as { code?: unknown; detail?: unknown }) : null;
   const code = obj && 'code' in obj ? String(obj.code ?? '') : '';

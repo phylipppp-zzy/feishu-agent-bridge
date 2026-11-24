@@ -1,21 +1,33 @@
 import { test } from 'node:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { ClaudeAdapter } from '../src/unified/claude-adapter.js';
-import type { Interaction } from '../src/unified/contracts.js';
+import type { Interaction, WriteContext } from '../src/unified/contracts.js';
+import { createIntegratedRuntime } from '../src/unified/runtime.js';
 import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type ApprovalRequest, type ApprovalScope, type GateDecision } from '../src/unified/approval-policy.js';
 
 const tick = () => new Promise(r => setImmediate(r));
 function fixture(approvalPolicy?: ApprovalScope) {
-  let options: any, prompt: any, end!: () => void; const events: any[] = [], writes: any[] = [];
-  const queue: any[] = []; let wake: (() => void) | undefined; let closed = false;
-  const q: any = { async *[Symbol.asyncIterator]() { while (!closed || queue.length) { if (queue.length) yield queue.shift(); else await new Promise<void>(r => { wake = r; }); } }, interrupt: async () => { writes.push('interrupt'); }, setModel: async (x: unknown) => { writes.push(x); }, supportedModels: async () => [{ value: 'm', displayName: 'Model' }] };
-  end = () => { closed = true; wake?.(); };
-  const sdk: any = { query: (p: any) => { options = p.options; prompt = p.prompt; return q; }, listSessions: async () => [], getSessionMessages: async () => [] };
+  let options: any, prompt: any, end!: () => void, push!: (m: any) => void;
+  const events: any[] = [], writes: any[] = [];
+  const sdk: any = { query: (p: any) => {
+    options = p.options; prompt = p.prompt;
+    const queue: any[] = []; let wake: (() => void) | undefined; let closed = false;
+    const finish = () => { closed = true; wake?.(); };
+    end = finish;
+    push = (m: any) => { queue.push(m); wake?.(); };
+    return {
+      async *[Symbol.asyncIterator]() { while (!closed || queue.length) { if (queue.length) yield queue.shift(); else await new Promise<void>(r => { wake = r; }); } },
+      close() { writes.push('close'); finish(); },
+      interrupt: async () => { writes.push('interrupt'); },
+      setModel: async (x: unknown) => { writes.push(x); },
+      supportedModels: async () => [{ value: 'm', displayName: 'Model' }],
+    };
+  }, listSessions: async () => [], getSessionMessages: async () => [] };
   const adapter = new ClaudeAdapter('host', 'service', mkdtempSync(join(tmpdir(), 'claude-port-')), sdk, undefined, approvalPolicy ? { approvalPolicy } : {});
   adapter.onObservation(x => events.push(x));
   const nextInteraction = () => new Promise<Interaction>(resolve => {
@@ -26,8 +38,8 @@ function fixture(approvalPolicy?: ApprovalScope) {
     });
   });
   const guard: any = { expectedConnectionGeneration: null, expectedControlGeneration: 1, assertCurrent() {} };
-  const push = (m: any) => { queue.push(m); wake?.(); };
-  return { adapter, guard, events, writes, get options() { return options; }, get prompt() { return prompt; }, push, end, nextInteraction };
+  return { adapter, guard, events, writes, get options() { return options; }, get prompt() { return prompt; },
+    push: (m: any) => push(m), end: () => end(), nextInteraction };
 }
 
 test('SDK input guarded; tool approval denial and native result are separately observed', async () => {
@@ -51,7 +63,7 @@ test('SDK input guarded; tool approval denial and native result are separately o
   f.push({ type: 'result', subtype: 'success', is_error: false }); await tick(); assert.equal(f.events.at(-1).turn.status, 'completed'); f.end();
 });
 
-test('multi-question free text, expiration, and external sessions remain read-only', async () => {
+test('multi-question free text, expiration, and unknown sessions cannot be resumed', async () => {
   const f = fixture(); const id = (await f.adapter.create('/tmp', 'm')).nativeReference!; const ref = { provider: 'claude' as const, hostId: 'host', serviceId: 'service', nativeSessionId: id };
   const ac = new AbortController(); const decision = f.options.canUseTool('AskUserQuestion', { questions: [{ question: 'First?', options: [{ label: 'A' }], multiSelect: false }, { question: 'Second?', options: [], multiSelect: true }] }, { signal: ac.signal, toolUseID: 'q' });
   const i: Interaction = f.events.at(-1).interaction; assert.equal(i.kind, 'question_group');
@@ -59,7 +71,7 @@ test('multi-question free text, expiration, and external sessions remain read-on
   assert.deepEqual((await decision).updatedInput.answers, { 'First?': 'custom', 'Second?': 'x, y' });
   const observed = f.nextInteraction();
   const ac2 = new AbortController(); const decision2 = f.options.canUseTool('Bash', { command: 'sudo true' }, { signal: ac2.signal, toolUseID: 'other' }); const j = await observed; ac2.abort(); assert.equal((await decision2).behavior, 'deny'); await assert.rejects(f.adapter.respond(ref, j, { kind: 'approval', decision: 'allow', scope: 'this_request' }, { ...f.guard, expectedConnectionGeneration: j.connectionGeneration }));
-  await assert.rejects(f.adapter.resume({ ...ref, nativeSessionId: 'external' }), (e: any) => e.code === 'unsupported'); f.end();
+  await assert.rejects(f.adapter.resume({ ...ref, nativeSessionId: 'unknown' }), (e: any) => e.code === 'temporarily_unavailable'); f.end();
 });
 
 test('image bytes are verified and connection closure expires outstanding requests', async () => {
@@ -74,11 +86,30 @@ test('image bytes are verified and connection closure expires outstanding reques
   await assert.rejects(f.adapter.respond(ref, i, { kind: 'approval', decision: 'allow', scope: 'this_request' }, { ...f.guard, expectedConnectionGeneration: i.connectionGeneration }));
 });
 
-test('owned registry survives adapter restart and increments generation', async () => {
+test('owned and explicitly resumed external sessions preserve their origin across adapter restarts', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'claude-owned-')); const queries: any[] = []; let sessionId = '';
-  const sdk: any = { listSessions: async () => sessionId ? [{ sessionId, cwd: '/tmp', summary: '', lastModified: 1 }] : [], getSessionMessages: async () => [], query: (arg: any) => { queries.push(arg); return { async *[Symbol.asyncIterator]() { await new Promise(() => {}); }, close() {} }; } };
+  const externalId = '12345678-1234-1234-1234-123456789abc';
+  const closed: string[] = [];
+  let failInitialization = false;
+  const sdk: any = {
+    listSessions: async () => [sessionId, externalId].filter(Boolean).map(id => ({ sessionId: id, cwd: '/tmp', summary: '', lastModified: 1 })),
+    getSessionMessages: async () => [],
+    query: (arg: any) => {
+      queries.push(arg);
+      let finish!: () => void;
+      const finished = new Promise<void>(resolve => { finish = resolve; });
+      return {
+        async *[Symbol.asyncIterator]() { await finished; },
+        async initializationResult() { if (failInitialization) throw Error('startup failed'); },
+        close() { closed.push(arg.options.resume ?? arg.options.sessionId); finish(); },
+      };
+    },
+  };
   const first = new ClaudeAdapter('h', 's', dir, sdk); sessionId = (await first.create('/tmp', null)).nativeReference!;
+  await first.close();
   const second = new ClaudeAdapter('h', 's', dir, sdk); const ref = { provider: 'claude' as const, hostId: 'h', serviceId: 's', nativeSessionId: sessionId };
+  const external = { ...ref, nativeSessionId: externalId };
+  const registry = () => JSON.parse(readFileSync(join(dir, 'claude-owned.json'), 'utf8'));
   assert.equal((await second.resume(ref)).nativeReference, sessionId); assert.equal(queries[1].options.resume, sessionId);
   const ac = new AbortController();
   const observed = new Promise<Interaction>(resolve => {
@@ -90,17 +121,141 @@ test('owned registry survives adapter restart and increments generation', async 
   });
   const pending = queries[1].options.canUseTool('Bash', { command: 'sudo true' }, { signal: ac.signal, toolUseID: 'p' });
   assert.equal((await observed).connectionGeneration, 2); ac.abort(); await pending;
-  await assert.rejects(second.resume({ ...ref, nativeSessionId: 'unknown' }), (e: any) => e.code === 'unsupported');
+  assert.equal((await second.read(external)).session.status, 'read_only');
+  assert.equal((await second.read(external)).session.capabilities.handoff.status, 'unsupported');
+  assert.equal(queries.length, 2);
+  assert.equal(Object.hasOwn(registry().sessions, externalId), false);
+  failInitialization = true;
+  await assert.rejects(second.resume(external), /startup failed/);
+  assert.equal(closed.at(-1), externalId);
+  assert.equal((await queries[2].prompt[Symbol.asyncIterator]().next()).done, true);
+  assert.equal(Object.hasOwn(registry().sessions, externalId), false);
+  assert.equal(second.hasActiveNativeSession(external), false);
+  failInitialization = false;
+  const externalReceipt = await second.resume(external);
+  assert.equal(externalReceipt.nativeReference, externalId);
+  assert.equal((await second.read(external)).session.control.owner, 's');
+  assert.deepEqual(registry().sessions, { [sessionId]: { origin: 'bridge_sdk' }, [externalId]: { origin: 'external_resume' } });
+  await second.close();
+  const third = new ClaudeAdapter('h', 's', dir, sdk);
+  assert.ok((await third.resume(external)).connectionGeneration! > externalReceipt.connectionGeneration!);
+  await third.close();
+  const invalid = registry();
+  invalid.sessions[externalId].origin = 'external';
+  writeFileSync(join(dir, 'claude-owned.json'), JSON.stringify(invalid));
+  assert.throws(() => new ClaudeAdapter('h', 's', dir, sdk), (e: any) => e.code === 'temporarily_unavailable');
 });
 
 
-test('handoff is unsupported and duplicate questions are denied without an answer', async () => {
-  const f = fixture(); const id = (await f.adapter.create('/tmp', null)).nativeReference!; const ref = { provider: 'claude' as const, hostId: 'host', serviceId: 'service', nativeSessionId: id };
-  assert.equal((await f.adapter.list(null, 10)).items[0]!.capabilities.handoff.status, 'unsupported');
-  for (const action of ['acquire', 'release'] as const) await assert.rejects(f.adapter.control(ref, action, f.guard), (e: any) => e.code === 'unsupported');
+test('idle handoff closes the SDK connection and duplicate questions are denied without an answer', async () => {
+  const f = fixture(); const created = await f.adapter.create('/tmp', null); const ref = created.createdSession!.native;
+  assert.equal(created.createdSession!.control.owner, ref.serviceId);
+  assert.equal((await f.adapter.list(null, 10)).items[0]!.capabilities.handoff.status, 'available');
+  await assert.rejects(f.adapter.control(ref, 'acquire', f.guard), (e: any) => e.code === 'busy');
   const ac = new AbortController(); const decision = await f.options.canUseTool('AskUserQuestion', { questions: [{ question: 'Same?', options: [{ label: 'A' }] }, { question: 'Same?', options: [{ label: 'B' }] }] }, { signal: ac.signal, toolUseID: 'dup' });
   assert.equal(decision.behavior, 'deny'); assert.match(decision.message, /Unsupported question group/); assert.equal(decision.updatedInput, undefined);
-  const o = f.events.at(-1); assert.equal(o.type, 'event'); assert.equal(o.event.type, 'interaction.unsupported'); assert.match(o.event.data.reason, /duplicate/); f.end();
+  const o = f.events.at(-1); assert.equal(o.type, 'event'); assert.equal(o.event.type, 'interaction.unsupported'); assert.match(o.event.data.reason, /duplicate/);
+  const guard = { ...f.guard, expectedConnectionGeneration: created.connectionGeneration! };
+  const ask = f.options.canUseTool('AskUserQuestion', { question: 'Continue?' }, { signal: ac.signal, toolUseID: 'pending' });
+  await assert.rejects(f.adapter.control(ref, 'release', guard), (e: any) => e.code === 'busy');
+  const interaction = f.events.at(-1).interaction;
+  await f.adapter.respond(ref, interaction, { kind: 'question_group', answers: { '0': ['Yes'] } }, guard);
+  await ask;
+  await assert.rejects(f.adapter.control(ref, 'release', guard), (e: any) => e.code === 'busy');
+  f.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'pending' }] } });
+  await tick();
+  await f.adapter.input(ref, 'new', [{ type: 'text', text: 'handoff test' }], guard);
+  await assert.rejects(f.adapter.control(ref, 'release', guard), (e: any) => e.code === 'busy');
+  const inputIterator = f.prompt[Symbol.asyncIterator]();
+  await inputIterator.next();
+  f.push({ type: 'result', subtype: 'success', is_error: false });
+  await tick();
+  await assert.rejects(f.adapter.control(ref, 'release', { ...guard, expectedConnectionGeneration: created.connectionGeneration! + 1 }),
+    (e: any) => e.code === 'control_conflict');
+  await assert.rejects(f.adapter.control(ref, 'release', { ...guard, assertCurrent() { throw Error('stale'); } }), /stale/);
+  assert.equal(f.writes.includes('close'), false);
+  assert.equal((await f.adapter.control(ref, 'release', guard)).nativeReference, 'unsubscribed');
+  assert.deepEqual(f.writes, ['close']);
+  assert.equal((await inputIterator.next()).done, true);
+  assert.equal(f.adapter.hasActiveNativeSession(ref), false);
+  const released = f.events.at(-1);
+  assert.equal(released.type, 'session');
+  assert.equal(released.session.status, 'read_only');
+  assert.equal(released.session.control.owner, null);
+  assert.equal(released.session.control.input, 'unavailable');
+  assert.equal(released.session.capabilities.handoff.status, 'available');
+  assert.equal((await f.adapter.read(ref)).session.title, 'handoff test');
+  const acquired = await f.adapter.control(ref, 'acquire', guard);
+  assert.equal(acquired.nativeReference, ref.nativeSessionId);
+  assert.ok(acquired.connectionGeneration! > created.connectionGeneration!);
+  assert.equal(f.options.resume, ref.nativeSessionId);
+  const active = f.events.at(-1).session;
+  assert.equal(active.control.owner, ref.serviceId);
+  assert.ok(active.control.generation > released.session.control.generation);
+  await f.adapter.close();
+});
+
+test('scoped runtime attaches and hands back the same external Claude session', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'claude-runtime-handoff-'));
+  const project = join(dir,'project'), logs = join(dir,'logs');
+  mkdirSync(project); mkdirSync(logs);
+  const nativeSessionId = '11111111-2222-4333-8444-555555555555';
+  const ref = {provider:'claude',hostId:'h',serviceId:'c',nativeSessionId} as const;
+  const resumed: string[] = [];
+  let closes = 0;
+  const sdk: any = {
+    listSessions: async () => [{sessionId:nativeSessionId,cwd:project,summary:'Desktop session',lastModified:1}],
+    getSessionMessages: async () => [],
+    query: ({options}: any) => {
+      resumed.push(options.resume);
+      let end!: () => void;
+      const closed = new Promise<void>(resolve => { end = resolve; });
+      return {async *[Symbol.asyncIterator]() { await closed; }, close() { closes++; end(); }};
+    },
+  };
+  const adapter = new ClaudeAdapter('h','c',dir,sdk);
+  const config = {
+    coreDb:join(dir,'core.db'),channelDb:join(dir,'channel.db'),artifactStatePath:join(dir,'artifact.json'),
+    ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',claudeServiceId:'c',codexServiceId:'x',
+    claudeStateDir:dir,codexEndpoint:'codex-proxy://default',intervalMs:100,
+    catalogSources:[{...ref,directory:logs}],allowedProjectRoots:[project],outputRoots:[project],
+  };
+  const bot = {send:async () => 'message',update:async () => {},sendFile:async () => {}};
+  let runtime = await createIntegratedRuntime(config,bot,[adapter]);
+  const context = (operationId: string, sessionId = 'new'): WriteContext => {
+    const session = runtime.store.findSession(ref);
+    return {operationId,idempotencyKey:operationId,targetId:sessionId,identity:{source:'feishu',subject:'owner'},
+      expectedRevision:session?.revision ?? 0,controlGeneration:session?.control.generation ?? 0};
+  };
+  try {
+    const binding = await runtime.core.attachSession({context:context('read'),payload:{...ref,mode:'read_only'}});
+    assert.equal(binding.result?.kind,'session');
+    const sessionId = binding.result.sessionId;
+    assert.deepEqual(resumed,[]);
+    await runtime.core.attachSession({context:context('upgrade'),payload:{...ref,mode:'interactive'}});
+    const generation = runtime.store.connectionGeneration(sessionId);
+    assert.deepEqual(resumed,[nativeSessionId]);
+    assert.equal(runtime.store.getSession(sessionId).control.owner,'c');
+    await runtime.core.releaseControl({context:context('release',sessionId),payload:{owner:'c'}});
+    assert.equal((await runtime.core.dispatch('release')).status,'completed');
+    assert.equal(closes,1);
+    assert.equal(runtime.store.getSession(sessionId).status,'read_only');
+    assert.equal(runtime.store.hasInteractiveIntent(sessionId),false);
+    await runtime.core.requestControl({context:context('acquire',sessionId),payload:{owner:'c',strategy:'wait'}});
+    assert.equal((await runtime.core.dispatch('acquire')).status,'completed');
+    assert.equal(runtime.store.getSession(sessionId).control.input,'available');
+    assert.ok(runtime.store.connectionGeneration(sessionId) > generation);
+    assert.deepEqual(resumed,[nativeSessionId,nativeSessionId]);
+    await runtime.close();
+    runtime = await createIntegratedRuntime(config,bot,[new ClaudeAdapter('h','c',dir,sdk)]);
+    assert.equal(runtime.store.getSession(sessionId).control.input,'unavailable');
+    await runtime.core.attachSession({context:context('attach-after-restart'),payload:{...ref,mode:'interactive'}});
+    assert.equal(runtime.store.getSession(sessionId).control.input,'available');
+    assert.deepEqual(resumed,[nativeSessionId,nativeSessionId,nativeSessionId]);
+  } finally {
+    await runtime.close();
+    rmSync(dir,{recursive:true,force:true});
+  }
 });
 
 test('native tool error does not assert that the approval was rejected', async () => {

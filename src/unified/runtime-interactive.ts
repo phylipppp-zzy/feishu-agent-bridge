@@ -80,7 +80,7 @@ export class RuntimeInteractive {
           else throw error;
         } finally {
           if (answer) this.notifyInteraction(answer.context.targetId, answer.interactionId);
-          if (out.kind === 'archiveSession' || out.kind === 'updateSessionSettings' ||
+          if (out.kind === 'archiveSession' || out.kind === 'updateSessionSettings' || out.kind === 'requestControl' || out.kind === 'releaseControl' ||
               out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'steer') {
             this.notifyImmediateProgress(out.context.targetId);
           }

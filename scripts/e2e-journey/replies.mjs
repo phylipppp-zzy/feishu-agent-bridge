@@ -26,6 +26,67 @@ async function waitForPatchWindow(ctx, topic) {
   await ctx.tick();
 }
 
+function assertResumeCommand(message, command) {
+  assert.ok(message.card.bodyText.includes(`\`${command}\``), `卡片缺少电脑端续聊命令 ${command}`);
+}
+
+async function verifyControlHandoff(ctx) {
+  const { trace, topics, providers, runtime, wire } = ctx;
+  for (const [name, provider, prefix] of [
+    ['Codex', 'codex', 'codex resume'],
+    ['Antigravity', 'agy', 'agy --conversation'],
+    ['Claude', 'claude', 'claude --resume'],
+  ]) {
+    const topic = topics[provider];
+    const adapter = providers[provider];
+    const command = `${prefix} ${topic.ref.nativeSessionId}`;
+    let panel;
+    await trace.step(`11.6 查看 ${name} 会话卡片并发送 /status`, async () => {
+      const session = ctx.cards(topic).find(({ card }) => card.bodyText.includes('✅ 已接入，现在可直接发送消息续聊'));
+      assert.ok(session, `未收到 ${name} 会话卡片`);
+      await ctx.send(topic, '/status');
+      await ctx.settle();
+      panel = completionCard(ctx, topic, /^会话控制$/);
+      trace.check(`会话卡片和控制面板显示同一条电脑端续聊命令 ${command}`, () => {
+        assertResumeCommand(session, command);
+        assertResumeCommand(panel, command);
+      });
+    });
+    await trace.step(`11.6 在 ${name} 控制面板点击「释放控制」`, async () => {
+      const before = adapter.controls.length;
+      const callback = await ctx.click(panel, '释放控制');
+      await ctx.settle();
+      trace.check('收到「已确认」，原面板显示重新接入和电脑端续聊命令', () => {
+        assert.deepEqual(callback.result, { toast: { type: 'success', content: '已确认' } });
+        assert.deepEqual(adapter.controls.slice(before), [{ ref: topic.ref, action: 'release' }]);
+        assert.equal(runtime.store.getSession(topic.sessionId).control.input, 'unavailable');
+        assert.equal(runtime.store.hasInteractiveIntent(topic.sessionId), false);
+        const patches = ctx.writes(topic).filter(({ card }) => card.title === '会话控制');
+        assert.deepEqual(patches.map(({ id, method }) => ({ id, method })), [{ id: panel.id, method: 'im.message.patch' }]);
+        const [patched] = patches;
+        assertResumeCommand(patched, command);
+        assert.ok(patched.card.buttons.some(({ label }) => label === '重新接入'));
+        assert.ok(patched.card.buttons.every(({ label }) => label !== '释放控制'));
+      });
+    });
+    await trace.step(`11.6 在 ${name} 原面板点击「重新接入」并续聊`, async () => {
+      const before = adapter.resumes.length;
+      await ctx.click(wire.messages.get(panel.id), '重新接入');
+      await ctx.settle();
+      const turn = await ctx.start(topic, '接着刚才的会话继续');
+      await ctx.finish(topic, '已在原会话继续。');
+      trace.check('在原话题恢复交互，使用原生会话接收下一条输入', () => {
+        assert.deepEqual(adapter.resumes.slice(before), [topic.ref]);
+        assert.equal(runtime.channel.accessMode(topic.destination), 'interactive');
+        assert.equal(runtime.store.getSession(topic.sessionId).control.input, 'available');
+        assert.equal(runtime.store.hasInteractiveIntent(topic.sessionId), true);
+        assert.match(wire.messages.get(panel.id).card.bodyText, /已接入，现在可直接发送消息续聊/);
+        assert.equal(turn.sessionId, topic.ref.nativeSessionId);
+      });
+    });
+  }
+}
+
 function reportFixture(file) {
   const head = `# 核心结论\n[评估报告](${pathToFileURL(file).href}) [来源会话](conversation://journey/10)\n\n`;
   const tail = '\n\nFINAL_TAIL_MARKER_99';
@@ -226,7 +287,7 @@ async function longReplies(ctx) {
 
 async function isolatedSessions(ctx) {
   const { trace, topics: { codex, agy }, providers, runtime, wire } = ctx;
-  await trace.stage(11, '会话隔离、筛选搜索、一键接入电脑会话、归档解绑与异常通知', async () => {
+  await trace.stage(11, '会话隔离、筛选搜索、电脑与飞书之间切换、归档解绑与异常通知', async () => {
     await trace.step('11.1 在 Codex 与 Antigravity 两个话题同时发起任务', async () => {
       await Promise.all([
         ctx.send(codex, '请整理独立的代码结论'),
@@ -306,8 +367,17 @@ async function isolatedSessions(ctx) {
         assert.ok(ctx.cards(null).some(message => message.card.buttons.some(button => button.url)));
       });
     });
-    await trace.step('11.3 在只读桌面话题点击「接入并续聊」一次', async () => {
-      await ctx.click(upgradeCard, button => button.value?.action === 'upgrade');
+    await trace.step('11.3 在只读桌面话题打开 /status', async () => {
+      await ctx.send(desktopTopic, '/status');
+      await ctx.settle();
+      upgradeCard = completionCard(ctx, desktopTopic, /^只读会话$/);
+      trace.check('只读面板提供电脑端续聊命令和一键接入按钮', () => {
+        assertResumeCommand(upgradeCard, 'codex resume desktop-grpo-reward');
+        assert.ok(upgradeCard.card.buttons.some(({ label }) => label === '一键接入并续聊'));
+      });
+    });
+    await trace.step('11.3 在只读桌面话题点击「一键接入并续聊」一次', async () => {
+      await ctx.click(upgradeCard, '一键接入并续聊');
       await ctx.tick();
       trace.check('更新原卡片，写明可续聊，没有重复发送控制卡', () => {
         assert.equal(runtime.channel.accessMode(desktopTopic.destination), 'interactive');
@@ -372,7 +442,7 @@ async function isolatedSessions(ctx) {
       archivePanel = completionCard(ctx, desktopTopic, /^会话控制$/);
       trace.check('未归档的面板只提供归档按钮，并且只显示一种控制交接操作', () => {
         assert.deepEqual(archivePanel.card.buttons.filter(button => button.value?.action === 'archive').map(button => button.label), ['归档']);
-        assert.deepEqual(archivePanel.card.buttons.filter(button => button.value?.action === 'control').map(button => button.label), ['切换到飞书']);
+        assert.deepEqual(archivePanel.card.buttons.filter(button => button.value?.action === 'control').map(button => button.label), ['释放控制']);
       });
     });
     await trace.step('11.5 点击「归档」', async () => {
@@ -425,6 +495,7 @@ async function isolatedSessions(ctx) {
         assert.deepEqual(runtime.channel.unknownInbox(), beforeUnknown);
       });
     });
+    await verifyControlHandoff(ctx);
   });
 }
 

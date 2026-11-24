@@ -23,11 +23,12 @@ export function hasTerminalInputTurn(operation: Operation): boolean {
 }
 
 type FeedbackOrigin = {envelope: TrustedEnvelope} &
-  ({action: 'archive'; archived: boolean} | {action: 'settings'} | {action: 'steer'; text: string});
+  ({action: 'archive'; archived: boolean} | {action: 'settings'} | {action: 'control'} | {action: 'steer'; text: string});
 
 function operationFeedbackOrigin(db: DatabaseSync, operation: Operation, destination: string, scope: string): FeedbackOrigin | undefined {
   const action = operation.action === 'archiveSession' && ['accepted','completed'].includes(operation.status) ? 'archive'
     : operation.action === 'updateSessionSettings' && operation.status === 'completed' ? 'settings'
+    : ['requestControl','releaseControl'].includes(operation.action) && operation.status === 'completed' ? 'control'
     : operation.action === 'submitInput' && operation.status === 'completed' && !operation.result ? 'steer' : null;
   if (!action) return;
   if (action === 'steer') {
@@ -45,7 +46,7 @@ function operationFeedbackOrigin(db: DatabaseSync, operation: Operation, destina
   `).get(action,scope,operation.operationId,destination) as {envelope:string; archived:number | null} | undefined;
   if (!row) return;
   const envelope = JSON.parse(row.envelope) as TrustedEnvelope;
-  if (action === 'settings') return envelope.cardMessageId ? {envelope,action} : undefined;
+  if (action === 'settings' || action === 'control') return envelope.cardMessageId ? {envelope,action} : undefined;
   return {envelope,action,archived:!!row.archived};
 }
 
@@ -70,6 +71,8 @@ export async function publishOperationFeedback(
   } else if (action === 'settings') {
     const {card} = await sessionModelPage(service,await service.getSession(sessionId));
     await reply(envelope,card,'model-confirmed',guard);
+  } else if (action === 'control') {
+    await reply(envelope,await panel(await service.getSession(sessionId)),'reply',guard);
   } else {
     const title = origin.archived ? '会话已归档' : '会话已恢复归档';
     const card = envelope.cardMessageId ? await panel(await service.getSession(sessionId)) : undefined;

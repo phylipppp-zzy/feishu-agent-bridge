@@ -78,6 +78,8 @@ export interface DispatchGuard { operationId?: string; expectedControlGeneration
 export type PlatformInputBlock = {type:'text'; text:string} | {type:'artifact'; artifactId:string; contentVersion:string; name:string; mediaType:string; content:Uint8Array};
 export interface PlatformPort {
   readonly provider: Provider;
+  /** Whether persisted control needs to be re-established with this adapter. */
+  requiresControlRecovery?(ref: NativeSessionRef): boolean;
   candidateGeneration?():number|null;
   listCandidateIds?(cursor:string|null,limit:number):Promise<{items:string[];nextCursor:string|null;partial?:boolean}>;
   readCandidateMetadata?(id:string):Promise<CandidateMetadata>;

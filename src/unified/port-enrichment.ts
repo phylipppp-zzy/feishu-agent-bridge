@@ -125,6 +125,7 @@ export class EnrichedPort implements PlatformPort {
   }
   seedConnectionGeneration(minimum:number) { this.base.seedConnectionGeneration?.(minimum); }
   seedControlGeneration(ref:NativeSessionRef, minimum:number) { this.base.seedControlGeneration?.(ref,minimum); }
+  requiresControlRecovery(ref:NativeSessionRef): boolean { return this.base.requiresControlRecovery?.(ref) === true; }
   async resume(ref:NativeSessionRef) { await this.writable(ref); return this.base.resume(ref); }
   create(...args:Parameters<PlatformPort['create']>) { return this.base.create(...args); }
   async input(...args:Parameters<PlatformPort['input']>) { await this.writable(args[0]); return this.base.input(...args); }

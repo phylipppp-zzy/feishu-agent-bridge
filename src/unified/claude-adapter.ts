@@ -18,12 +18,14 @@ type Pending = { interaction: Interaction; input: Record<string, unknown>; toolI
 type Live = { title?: string; completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
+const startupTimeoutMs = 15_000;
 const safeNumber = (n: unknown): number | null => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
 const ack = (nativeReference: string | null = null): PlatformAcknowledgement => ({ status: 'submitted', nativeReference });
 const available = { status: 'available' as const };
 const unsupported = { status: 'unsupported' as const, reason: 'Claude SDK port does not support this capability' };
-const liveCaps: Capabilities = { view: available, send: available, queue: unsupported, steer: unsupported, answer: available, approve: available, interrupt: available, handoff: unsupported, files: unsupported, config: available };
+const liveCaps: Capabilities = { view: available, send: available, queue: unsupported, steer: unsupported, answer: available, approve: available, interrupt: available, handoff: available, files: unsupported, config: available };
 const readCaps: Capabilities = { ...liveCaps, send: unsupported, answer: unsupported, approve: unsupported, interrupt: unsupported, handoff: unsupported, config: unsupported };
+const releasedCaps: Capabilities = { ...readCaps, handoff: available };
 
 const readTools = new Set(['Read', 'Glob', 'Grep', 'LS']);
 const claudeToolFields: Record<string, readonly string[]> = {
@@ -63,10 +65,12 @@ async function evaluateClaudeApproval(request: ClaudeApprovalRequest, context: A
   return decision.kind === 'allow_once' && request.incomplete ? { kind: 'ask' as const, reason: unknownApprovalScope } : decision;
 }
 
-/** SDK sessions created by this instance are interactive; discovered external sessions are read-only. */
+/** External sessions are read-only until an explicit resume opens a live SDK query. */
 export class ClaudeAdapter implements PlatformPort {
   readonly provider = 'claude' as const;
   private readonly lives = new Map<string, Live>();
+  private readonly opening = new Map<string, Live | null>();
+  private readonly controlGeneration = new Map<string, number>();
   private readonly known = new Map<string, SDKSessionInfo>();
   private readonly owned: ClaudeState;
   private readonly listeners = new Set<(o: PlatformObservation) => void>();
@@ -91,17 +95,36 @@ export class ClaudeAdapter implements PlatformPort {
   }
   private ref(id: string): NativeSessionRef { return { provider: 'claude', hostId: this.hostId, serviceId: this.serviceId, nativeSessionId: id }; }
   private check(ref: NativeSessionRef): string { if (ref.provider !== 'claude' || ref.hostId !== this.hostId || ref.serviceId !== this.serviceId || !ref.nativeSessionId) throw contractError('invalid_request'); return ref.nativeSessionId; }
+  seedControlGeneration(ref: NativeSessionRef, minimum: number): void {
+    const id = this.check(ref);
+    if (!Number.isSafeInteger(minimum) || minimum < 0) throw contractError('invalid_request');
+    if (this.lives.has(id) || this.opening.has(id)) throw contractError('busy', 'session has active SDK state');
+    this.controlGeneration.set(id, Math.max(minimum, this.controlGeneration.get(id) ?? 0));
+  }
   hasActiveNativeSession(ref: NativeSessionRef): boolean {
     return !this.closed && ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
       && this.lives.has(ref.nativeSessionId) && !!this.owned.get(ref.nativeSessionId);
   }
+  requiresControlRecovery(ref: NativeSessionRef): boolean { return !this.hasActiveNativeSession(ref); }
   private emit(o: PlatformObservation): void { for (const f of this.listeners) f(o); }
   onObservation(f: (o: PlatformObservation) => void): () => void { this.listeners.add(f); return () => this.listeners.delete(f); }
   private session(info: SDKSessionInfo): Session {
     const live = this.lives.get(info.sessionId); const pending = live && [...live.pending.values()].some(p => p.interaction.status === 'awaiting_answer');
     const timestamp = info.lastModified; const updatedAt = typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8.64e15 ? new Date(timestamp).toISOString() : undefined;
     const createdAt=Number.isSafeInteger(info.createdAt) && info.createdAt!>0 && info.createdAt!<=8.64e15 ? new Date(info.createdAt!).toISOString() : undefined;
-    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: info.sessionId, native: this.ref(info.sessionId), project: info.cwd ?? '', title: info.customTitle?.trim() || info.summary?.trim() || live?.title || '', status: live ? pending ? 'waiting_approval' : live.turn ? 'running' : 'idle' : 'read_only', revision: 0, capabilities: live ? liveCaps : readCaps, control: { serviceId: this.serviceId, owner: null, input: live ? 'available' : 'unavailable', generation: 0, operationId: null, reason: live ? null : 'external native session is read-only' } };
+    const owned = this.owned.get(info.sessionId);
+    return {
+      ...(createdAt ? { createdAt } : {}), ...(updatedAt ? { updatedAt } : {}),
+      sessionId: info.sessionId, native: this.ref(info.sessionId), project: info.cwd ?? '',
+      title: info.customTitle?.trim() || info.summary?.trim() || live?.title || '',
+      status: live ? pending ? 'waiting_approval' : live.turn ? 'running' : 'idle' : 'read_only',
+      revision: 0, capabilities: live ? liveCaps : owned ? releasedCaps : readCaps,
+      control: {
+        serviceId: this.serviceId, owner: live ? this.serviceId : null, input: live ? 'available' : 'unavailable',
+        generation: this.controlGeneration.get(info.sessionId) ?? 0, operationId: null,
+        reason: live ? null : owned ? 'interactive SDK session is not connected' : 'external native session is read-only',
+      },
+    };
   }
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
     const offset = cursor === null ? 0 : Number(cursor); if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request');
@@ -132,7 +155,7 @@ export class ClaudeAdapter implements PlatformPort {
     if (!text) return null; return { messageId: m.uuid, sessionId: id, turnId: m.uuid, role: m.type, blocks: [{ type: 'text', text }], sequence: seq, revision: 1, final: true, source: 'claude' };
   }
   async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
-    const id = this.check(ref), info = await this.find(id), live = this.lives.get(id);
+    const id = this.check(ref), info = await this.find(id);
     const history = await this.boundedMetadata(`read:${id}`, () =>
       this.sdk.getSessionMessages(id, info.cwd ? { dir: info.cwd } : undefined));
     const messages: Message[] = [];
@@ -151,6 +174,7 @@ export class ClaudeAdapter implements PlatformPort {
         if (link.turnId) old.turnId = link.turnId;
       } else messages.push(message);
     }
+    const live = this.lives.get(id);
     const liveIds = new Set(live?.messages.map(m => m.messageId));
     return {
       session: this.session(info),
@@ -159,9 +183,80 @@ export class ClaudeAdapter implements PlatformPort {
       ...(live ? { connectionGeneration: live.generation } : {}),
     };
   }
-  async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { if (!cwd) throw contractError('invalid_request'); const id = randomUUID(); this.start(id, cwd, model, false); try { this.owned.put(id, { origin: 'bridge_sdk' }); } catch (e) { const live = this.lives.get(id); live?.queue.close(); live?.query.close(); throw e; } const live = this.lives.get(id)!; return {status:'submitted',nativeReference:id,createdSession:this.session({sessionId:id,cwd,summary:'',lastModified:0}),connectionGeneration:live.generation}; }
-  async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> { const id = this.check(ref); if (this.lives.has(id)) { const generation = this.lives.get(id)!.generation; this.emit({type:'connection',ref,connectionGeneration:generation}); return {...ack(id),connectionGeneration:generation}; } const owned = this.owned.get(id); if (!owned) throw contractError('unsupported', 'external native sessions are read-only'); const info = await this.find(id); if (!info.cwd) throw contractError('temporarily_unavailable', 'session working directory unavailable'); this.start(id, info.cwd, null, true); const generation = this.lives.get(id)!.generation; this.emit({type:'connection',ref,connectionGeneration:generation}); return {...ack(id),connectionGeneration:generation}; }
-  private start(id: string, cwd: string, model: string | null, resume: boolean): void {
+  async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> {
+    if (!cwd) throw contractError('invalid_request');
+    const id = randomUUID();
+    const live = this.start(id, cwd, model, false);
+    try {
+      this.owned.put(id, { origin: 'bridge_sdk' });
+    } catch (error) {
+      this.discard(live);
+      throw error;
+    }
+    this.activate(live);
+    return { ...ack(id), createdSession: this.session({ sessionId: id, cwd, summary: '', lastModified: 0 }), connectionGeneration: live.generation };
+  }
+  async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> {
+    return this.open(ref);
+  }
+  private async open(ref: NativeSessionRef, guard?: DispatchGuard): Promise<PlatformAcknowledgement> {
+    const id = this.check(ref);
+    const current = this.lives.get(id);
+    if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
+    if (current) {
+      if (guard) throw contractError('busy', 'session is already connected');
+      this.emit({ type: 'connection', ref, connectionGeneration: current.generation });
+      return { ...ack(id), connectionGeneration: current.generation };
+    }
+    if (this.opening.has(id)) throw contractError('busy', 'session is already opening');
+    this.opening.set(id, null);
+    let live: Live | undefined;
+    let info: SDKSessionInfo;
+    try {
+      info = await this.find(id);
+      if (typeof info.cwd !== 'string' || !info.cwd.trim()) {
+        throw contractError('temporarily_unavailable', 'session working directory unavailable');
+      }
+      guard?.assertCurrent();
+      live = this.start(id, info.cwd, null, true);
+      this.opening.set(id, live);
+      await this.awaitInitialization(live.query);
+      if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
+      guard?.assertCurrent();
+      if (!this.owned.get(id)) this.owned.put(id, { origin: 'external_resume' });
+    } catch (error) {
+      if (live && !this.closed) this.discard(live);
+      throw error;
+    } finally {
+      this.opening.delete(id);
+    }
+    this.controlGeneration.set(id, (this.controlGeneration.get(id) ?? 0) + 1);
+    this.activate(live);
+    this.emit({ type: 'connection', ref, connectionGeneration: live.generation });
+    if (guard) this.emit({ type: 'session', ref, session: this.session(info) });
+    return { ...ack(id), connectionGeneration: live.generation };
+  }
+  private async awaitInitialization(query: Query): Promise<void> {
+    const ready = query.initializationResult?.();
+    if (!ready) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([ready, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(contractError('temporarily_unavailable', 'Claude SDK initialization timed out')), startupTimeoutMs);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  private discard(live: Live): void {
+    live.queue.close();
+    try { live.query.close(); } catch { /* Preserve the startup error. */ }
+  }
+  private activate(live: Live): void {
+    this.lives.set(live.id, live);
+    live.completion = this.consume(live);
+  }
+  private start(id: string, cwd: string, model: string | null, resume: boolean): Live {
     if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
     const queue = new InputQueue<SDKUserMessage>(); const generation = this.owned.nextGeneration();
     const hookCwds = new Map<string, string>();
@@ -228,7 +323,13 @@ export class ClaudeAdapter implements PlatformPort {
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: decision.kind, permissionDecisionReason: decision.reason } };
     }] }] };
     const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool, hooks };
-    const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream:null, residual:new ClaudeResidualObservation(id) }; this.lives.set(id, live); live.completion = this.consume(live);
+    try {
+      const q = this.sdk.query({ prompt: queue, options });
+      return { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream: null, residual: new ClaudeResidualObservation(id) };
+    } catch (error) {
+      queue.close();
+      throw error;
+    }
   }
   private async consume(live: Live): Promise<void> {
     const ref = this.ref(live.id);
@@ -236,6 +337,7 @@ export class ClaudeAdapter implements PlatformPort {
     let toolTurn: string | null = null;
     let streamFailure: {kind:string; exitCode:number|null} | null = null;
     try { for await (const raw of live.query) {
+      if (this.closed || this.lives.get(live.id) !== live) break;
       const m = raw as any;
       if(!this.closed && this.lives.get(live.id)===live)live.residual.observe(m);
       if (live.turn && !this.closed && this.lives.get(live.id) === live && !m.parent_tool_use_id && !m.parent_agent_id) {
@@ -302,6 +404,7 @@ export class ClaudeAdapter implements PlatformPort {
   /** Stop owned SDK queries and settle outstanding requests before detaching observers. */
   async close(): Promise<void> {
     if (this.closed) return; this.closed = true;
+    for (const live of this.opening.values()) if (live) this.discard(live);
     const lives = [...this.lives.values()];
     for (const live of lives) {
       for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') {
@@ -367,5 +470,32 @@ export class ClaudeAdapter implements PlatformPort {
       throw contractError('outcome_unknown', 'Claude session settings may have partially changed');
     }
   }
-  async control(ref: NativeSessionRef, _action: 'acquire' | 'release', _guard: DispatchGuard): Promise<PlatformAcknowledgement> { this.check(ref); throw contractError('unsupported', 'Claude SDK does not provide observable native control handoff'); }
+  async control(ref: NativeSessionRef, action: 'acquire' | 'release', guard: DispatchGuard): Promise<PlatformAcknowledgement> {
+    const id = this.check(ref);
+    if (!this.owned.get(id)) throw contractError('unsupported', 'session ownership has not been established');
+    if (action === 'acquire') return this.open(ref, guard);
+
+    const live = this.lives.get(id);
+    if (this.closed || !live || (guard.expectedConnectionGeneration !== null && guard.expectedConnectionGeneration !== live.generation)) {
+      throw contractError('control_conflict', 'session is not connected at the expected generation');
+    }
+    if (live.turn || [...live.pending.values()].some(({ interaction }) =>
+      interaction.status === 'awaiting_answer' || interaction.status === 'answer_pending_delivery')) {
+      throw contractError('busy', 'session has a running turn or a pending interaction');
+    }
+    const known = this.known.get(id);
+    const info = { ...known, sessionId: id, cwd: live.cwd, summary: known?.summary || live.title || '', lastModified: known?.lastModified ?? 0 };
+    guard.assertCurrent();
+    try {
+      live.query.close();
+    } catch {
+      throw contractError('outcome_unknown', 'Claude SDK query close could not be confirmed');
+    }
+    live.queue.close();
+    this.lives.delete(id);
+    this.known.set(id, info);
+    this.controlGeneration.set(id, (this.controlGeneration.get(id) ?? 0) + 1);
+    this.emit({ type: 'session', ref, session: this.session(info) });
+    return ack('unsubscribed');
+  }
 }

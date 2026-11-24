@@ -707,7 +707,7 @@ export class FeishuChannel {
       else await this.refreshInteraction(e.destination,bound,a.interactionId);
       return op;
     }
-    if (a.action === 'cancel' && e.cardMessageId && op.status === 'completed') {
+    if ((a.action === 'cancel' || a.action === 'control') && e.cardMessageId && op.status === 'completed') {
       const currentSession = await this.service.getSession(bound);
       await updateReply(buildSessionPanel(currentSession,this.noticePanel(e.destination,bound,executionScope,currentSession),await this.service.getWorkState(bound)));
     } else if (a.action === 'input' && (op.status === 'queued' || a.mode === 'queue' && op.status === 'received')) {

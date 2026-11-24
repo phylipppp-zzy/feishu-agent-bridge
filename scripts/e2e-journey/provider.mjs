@@ -20,6 +20,8 @@ export class JourneyProvider {
   responses = [];
   settings = [];
   archives = [];
+  resumes = [];
+  controls = [];
   sequence = 0;
   generation = 1;
 
@@ -37,7 +39,7 @@ export class JourneyProvider {
       sessionId: id, project, title, createdAt: now(), updatedAt: now(), revision: 0,
       status: active ? 'idle' : 'read_only',
       capabilities,
-      control: { serviceId: this.serviceId, owner: null, input: active ? 'available' : 'unavailable',
+      control: { serviceId: this.serviceId, owner: active ? this.serviceId : null, input: active ? 'available' : 'unavailable',
         generation: 1, operationId: null, reason: null },
     };
     this.sessions.set(id, { session, messages: new Map(messages.map(m => [m.messageId, m])),
@@ -76,8 +78,10 @@ export class JourneyProvider {
   async resume(ref) {
     const state = this.state(ref);
     const { session } = state;
+    this.resumes.push(ref);
     state.session = { ...session, status: 'idle', revision: session.revision + 1,
-      control: { ...session.control, input: 'available', generation: session.control.generation + 1 } };
+      control: { ...session.control, owner: this.serviceId, input: 'available',
+        generation: session.control.generation + 1, reason: null } };
     return { ...nativeAck(ref.nativeSessionId), createdSession: structuredClone(state.session),
       connectionGeneration: this.generation };
   }
@@ -209,9 +213,19 @@ export class JourneyProvider {
     return { ...nativeAck(null), settingsApplied: true };
   }
 
-  async control(_ref, _action, guard) {
+  async control(ref, action, guard) {
     guard.assertCurrent();
-    return nativeAck(null);
+    this.controls.push({ ref, action });
+    if (action === 'acquire') {
+      const receipt = await this.resume(ref);
+      this.emit({ type: 'session', ref, session: receipt.createdSession });
+      return receipt;
+    }
+    const { session } = this.state(ref);
+    this.emit({ type: 'session', ref, session: { ...session, status: 'read_only', revision: session.revision + 1,
+      control: { ...session.control, owner: null, input: 'unavailable',
+        generation: session.control.generation + 1, reason: 'subscription released' } } });
+    return nativeAck('unsubscribed');
   }
 
   async archive(ref, archived, guard) {

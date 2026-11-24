@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { contractError } from './errors.js';
 
-type Entry = { origin: 'bridge_sdk' };
+type Entry = { origin: 'bridge_sdk' | 'external_resume' };
 type MessageLink = { id: string; generation: number; turnId?: string };
 interface State { version: 1; hostId: string; serviceId: string; generation: number; sessions: Record<string, Entry> }
 function validMessageLink(entry: unknown): entry is MessageLink {
@@ -20,7 +20,17 @@ export class ClaudeState {
   private state: State;
   constructor(dir: string, hostId: string, serviceId: string) {
     if (!dir) throw contractError('invalid_request', 'Claude state directory required'); mkdirSync(dir, { recursive: true, mode: 0o700 }); this.path = join(dir, 'claude-owned.json'); this.aliasPath=join(dir,'claude-message-aliases-v1.json'); this.hostId=hostId; this.serviceId=serviceId;
-    try { const value = JSON.parse(readFileSync(this.path, 'utf8')) as State; if (value.version !== 1 || value.hostId !== hostId || value.serviceId !== serviceId || !Number.isSafeInteger(value.generation) || value.generation < 0 || !value.sessions || typeof value.sessions !== 'object' || Array.isArray(value.sessions) || Object.values(value.sessions).some(entry => !entry || entry.origin !== 'bridge_sdk')) throw Error('invalid state'); this.state = value; }
+    try {
+      const value = JSON.parse(readFileSync(this.path, 'utf8')) as State;
+      if (value.version !== 1 || value.hostId !== hostId || value.serviceId !== serviceId ||
+          !Number.isSafeInteger(value.generation) || value.generation < 0 ||
+          !value.sessions || typeof value.sessions !== 'object' || Array.isArray(value.sessions) ||
+          Object.entries(value.sessions).some(([id, entry]) => !id || !entry || typeof entry !== 'object' ||
+            Array.isArray(entry) || (entry.origin !== 'bridge_sdk' && entry.origin !== 'external_resume'))) {
+        throw Error('invalid state');
+      }
+      this.state = value;
+    }
     catch (e: any) { if (e?.code !== 'ENOENT') throw contractError('temporarily_unavailable', 'Claude ownership registry invalid or inaccessible'); this.state = { version: 1, hostId, serviceId, generation: 0, sessions: {} }; }
     try {
       const value = JSON.parse(readFileSync(this.aliasPath, 'utf8'));

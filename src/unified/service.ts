@@ -56,6 +56,10 @@ function page<T>(items: T[], q: ListQuery) {
   return { items: items.slice(start, start + q.limit), nextCursor: start + q.limit < items.length ? String(start + q.limit) : null };
 }
 const pendingProviderLists=new WeakMap<PlatformPort,{cursor:string|null;work:ReturnType<PlatformPort['list']>}>();
+type ControlObservations = {
+  connection?: Extract<PlatformObservation,{type:'connection'}>;
+  session?: Extract<PlatformObservation,{type:'session'}>;
+};
 async function boundedProviderList(port:PlatformPort,cursor:string|null):ReturnType<PlatformPort['list']> {const prior=pendingProviderLists.get(port);if(prior && prior.cursor!==cursor) throw contractError('temporarily_unavailable','provider list already pending'); let timer:ReturnType<typeof setTimeout>|undefined;const work=prior?.work ?? Promise.resolve().then(()=>port.list(cursor,100));if(!prior){pendingProviderLists.set(port,{cursor,work});void work.finally(()=>{if(pendingProviderLists.get(port)?.work===work)pendingProviderLists.delete(port);}).catch(()=>{});}try {return await Promise.race([work,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(contractError('temporarily_unavailable','provider list timed out')),2000);})]);} finally {if(timer)clearTimeout(timer);}}
 /** Normalized core. Native transports and credentials are injected through PlatformPort. */
 export class UnifiedCore implements UnifiedService {
@@ -64,6 +68,7 @@ export class UnifiedCore implements UnifiedService {
   setProviderAvailable(provider:Provider,available:boolean):void {if(available){if(this.unavailableProviders.has(provider)){const port=this.providers.get(provider);if(port)pendingProviderLists.delete(port);}this.unavailableProviders.delete(provider);}else this.unavailableProviders.add(provider);}
   private readonly providers = new Map<Provider, PlatformPort>();
   private readonly tails = new Map<string, Promise<unknown>>();
+  private readonly controlObservations = new Map<string, ControlObservations>();
   private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
   private closed=false;
@@ -81,8 +86,10 @@ export class UnifiedCore implements UnifiedService {
       if (this.providers.has(port.provider)) throw new Error('duplicate provider');
       port.seedConnectionGeneration?.(store.maxConnectionGeneration());
       // Persisted control is not proof that this fresh provider connection holds a subscription.
-      if ((port.provider === 'codex' || port.provider === 'agy') && port.seedConnectionGeneration) for (const current of store.listSessions()) {
+      const reconnects = (port.provider === 'codex' || port.provider === 'agy') && !!port.seedConnectionGeneration;
+      if (reconnects || port.requiresControlRecovery) for (const current of store.listSessions()) {
         if (current.native.provider !== port.provider || current.control.input !== 'available') continue;
+        if (!reconnects && !port.requiresControlRecovery?.(current.native)) continue;
         const capabilities=Object.fromEntries(Object.entries(current.capabilities).map(([key,value])=>[key,key==='view' ? value : {status:'temporarily_unavailable',reason:'explicit resume required after provider restart'}])) as Session['capabilities'];
         store.updateSession({...current,status:'read_only',revision:current.revision+1,capabilities,control:{...current.control,owner:null,input:'unavailable',generation:current.control.generation+1,reason:'explicit resume required after provider restart'}},current.revision,current.control.generation);
       }
@@ -278,7 +285,7 @@ export class UnifiedCore implements UnifiedService {
     if ((this.canDiscover && !this.canDiscover(candidate)) || !this.authorize(request.context.identity,candidate,'attachSession')) return fail('unauthorized');
     let resumed = false; let attached = false;
     try {
-    if (request.payload.mode === 'interactive' && (provider === 'codex' || provider === 'agy')) {
+    if (request.payload.mode === 'interactive' && (provider !== 'claude' || observed.session.control.input !== 'available')) {
       if (existing) port.seedControlGeneration?.(ref,existing.control.generation);
       const receipt = await port.resume(ref);
       resumed = true;
@@ -455,7 +462,9 @@ export class UnifiedCore implements UnifiedService {
         if (out.kind === 'submitInput') { const input = out.payload as SubmitInput; const setting = input.mode==='steer'?null:this.store.confirmedSettings(session.sessionId); if(setting){const restored=await port.updateSettings(session.native,{model:setting.model,preferences:setting.preferences},guard);if(restored.settingsApplied!==true) return this.store.markDeliveryUnknown(id);} const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; }); nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard,input.requiredTurnId)).nativeReference; }
         else if (out.kind === 'archiveSession') { if (!port.archive) return this.store.reconcileOperation(id,'failed',contractError('unsupported')); await port.archive(session.native,(out.payload as {archived:boolean}).archived,guard); }
         else if (out.kind === 'updateSessionSettings') { const settings=out.payload as {model:string|null;preferences:Record<string,string>}; const receipt=await port.updateSettings(session.native,settings,guard); if (guarded && receipt.settingsApplied === true && this.store.getOutbox(id).state === 'in_flight') return this.store.confirmSettings(id,settings); }
-        else if (out.kind === 'requestControl' || out.kind === 'releaseControl') { await port.control(session.native, out.kind === 'requestControl' ? 'acquire' : 'release', guard); }
+        else if (out.kind === 'requestControl' || out.kind === 'releaseControl') {
+          return await this.dispatchControl(port,session,out.kind === 'requestControl',guard,() => guarded,id);
+        }
         else if (out.kind === 'interruptTurn') { await port.interrupt(session.native, (out.payload as { turnId: string }).turnId, guard); }
         else return this.store.reconcileOperation(id, 'failed', contractError('unsupported'));
         // A provider that omits its mandatory fence cannot establish a reliable acknowledgement.
@@ -465,6 +474,10 @@ export class UnifiedCore implements UnifiedService {
         if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {if(nativeReference!==(out.payload as SubmitInput).requiredTurnId)return this.store.markDeliveryUnknown(id);return this.store.completeSteer(id);}
         return this.store.acceptSubmission(id,nativeReference);
       } catch (error) {
+        if (!guarded && (out.kind === 'requestControl' || out.kind === 'releaseControl')) {
+          const rejected = responsePrewriteError(error);
+          if (rejected) return this.store.reconcileOperation(id,'failed',rejected);
+        }
         const input = out.kind === 'submitInput' ? out.payload as SubmitInput : null;
         if (!guarded && error instanceof StoreError && (input?.mode === 'steer' || (input?.mode === 'new' && input.channelScope)) &&
             ['busy','control_conflict','interaction_expired','unauthorized'].includes(error.detail.code)) return this.store.reconcileOperation(id,'failed',error.detail);
@@ -474,6 +487,35 @@ export class UnifiedCore implements UnifiedService {
       }
       } finally { this.store.releaseDispatchLease(pending.context.targetId,owner,generation); }
     });
+  }
+  private async dispatchControl(port: PlatformPort, session: Session, acquire: boolean,
+    guard: DispatchGuard, guarded: () => boolean, id: string): Promise<Operation> {
+    const observed: ControlObservations = {};
+    const controlGuard: DispatchGuard = {...guard,assertCurrent: () => {
+      guard.assertCurrent();
+      this.controlObservations.set(session.sessionId,observed);
+    }};
+    let persisted = false;
+    try {
+      if (acquire) port.seedControlGeneration?.(session.native,session.control.generation);
+      const receipt = await port.control(session.native,acquire ? 'acquire' : 'release',controlGuard);
+      const control = observed.session?.session.control;
+      if (!guarded() || receipt.status !== 'submitted' || !observed.session || !control ||
+          control.generation <= session.control.generation ||
+          (acquire ? control.input !== 'available' || !control.owner : control.input !== 'unavailable' || control.owner !== null)) {
+        return this.store.markDeliveryUnknown(id);
+      }
+      const connection = observed.connection?.connectionGeneration ?? receipt.connectionGeneration;
+      const op = this.store.completeControl(id,{...observed.session.session,sessionId:session.sessionId},connection);
+      persisted = true;
+      if (observed.connection && connection !== guard.expectedConnectionGeneration) this.onAcceptedObservation?.(observed.connection);
+      return op;
+    } finally {
+      this.controlObservations.delete(session.sessionId);
+      if (!persisted) for (const observation of [observed.connection,observed.session]) if (observation) {
+        void this.observe(observation).catch(() => { this.observationFailure = 'normalized observation could not be persisted; replay required'; });
+      }
+    }
   }
   private async dispatchResponse(id: string, out: ReturnType<UnifiedStore['getOutbox']>, request: ResolveInteraction): Promise<Operation> {
     const key = responseLeaseKey(request.interactionId);
@@ -559,6 +601,13 @@ export class UnifiedCore implements UnifiedService {
       const object = observation.type === 'session' ? observation.session : observation.type === 'turn' ? observation.turn : observation.type === 'message' ? observation.message : observation.type === 'interaction' ? observation.interaction : observation.event;
       if (object.sessionId !== observation.ref.nativeSessionId && object.sessionId !== mapped.sessionId) return fail('invalid_request','observation session mismatch');
       if (observation.type === 'session' && (payloadDigest(observation.session.native)!==payloadDigest(observation.ref) || observation.session.project!==mapped.project)) return fail('invalid_request','observation native reference mismatch');
+    }
+    // A control acknowledgement and its state change must commit before that change can invalidate outbox writes.
+    const control = this.controlObservations.get(mapped.sessionId);
+    if (control && (observation.type === 'connection' || observation.type === 'session')) {
+      if (observation.type === 'connection') control.connection = observation;
+      else control.session = observation;
+      return;
     }
     if (observation.type === 'connection') {
       const previous = this.store.connectionGeneration(mapped.sessionId);

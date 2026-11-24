@@ -7,6 +7,7 @@ import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js
 import type { UnifiedService } from '../src/unified/adapter.js';
 import type { Interaction, Session, WriteContext } from '../src/unified/contracts.js';
 import { interactionCard, type ChannelCard } from '../src/unified/feishu-cards.js';
+import { formatResumeCommand } from '../src/unified/card-formatters.js';
 
 // Establish an interactive fixture through the channel's authorized attach/finish path.
 async function interactiveBinding(channel:FeishuChannel, service:UnifiedService, env:{eventId:string;destination:string;identity:{source:string;subject:string}}, sessionId:string) {
@@ -126,30 +127,52 @@ test('expired cursor recovers new finals without exporting initial history', asy
  try {await channel.handle({eventId:'b',destination:'t',identity:{source:'v',subject:'u'}},{action:'bind',sessionId:'s'});await channel.sync('t');assert.ok(!texts.includes('old'));generation=1;await channel.sync('t');assert.ok(texts.includes('new'));assert.ok(!texts.includes('old'));} finally {channel.close();rmSync(dir,{recursive:true,force:true});}
 });
 
-for (const provider of ['claude','codex'] as const) test(`${provider}: generated controls round trip and owner management`, async () => {
+test('Linux resume commands accept only the native ID allowlist', () => {
+ const native = {provider:'codex',hostId:'h',serviceId:'svc',nativeSessionId:'Abc9-_.:0'} as const;
+ assert.equal(formatResumeCommand(native),'codex resume Abc9-_.:0');
+ assert.equal(formatResumeCommand({...native,nativeSessionId:'a'.repeat(128)}),`codex resume ${'a'.repeat(128)}`);
+ for (const id of ['', 'a'.repeat(129), 'id with space', 'id\n', 'id\r', 'id\t', 'id;echo', '$(id)', '`id`', 'id/other']) {
+  assert.equal(formatResumeCommand({...native,nativeSessionId:id}),null,JSON.stringify(id));
+ }
+});
+
+for (const [provider,command] of [['claude','claude --resume native'],['codex','codex resume native'],['agy','agy --conversation native']] as const) test(`${provider}: generated controls round trip and owner management`, async () => {
  const {parseFeishuAction,parseFeishuText,toFeishuCard}=await import('../src/unified/feishu-codec.js');
- const dir=mkdtempSync(join(tmpdir(),'channel-controls-')); const cards:import('../src/unified/feishu-cards.js').ChannelCard[]=[]; const calls:string[]=[];
- const session={sessionId:'s',native:{provider},title:'t',project:'p',status:'idle',revision:1,capabilities:{interrupt:{status:'available'},queue:{status:'available'},handoff:{status:'available'}},control:{input:'available',generation:1}} as unknown as Session;
+ const dir=mkdtempSync(join(tmpdir(),'channel-controls-')); const cards:ChannelCard[]=[]; const calls:string[]=[];
+ const patched = new Map<string,ChannelCard>();
+ const session={sessionId:'s',native:{provider,nativeSessionId:'native'},title:'t',project:'p',status:'idle',revision:1,capabilities:{interrupt:{status:'available'},queue:{status:'available'},handoff:{status:'available'}},control:{input:'available',owner:null,serviceId:'svc',generation:1}} as unknown as Session;
  const makeOp=(name:string)=>(request:{context:WriteContext})=>{calls.push(name);return Promise.resolve({...request.context,action:name,status:'completed',revision:1,error:null,payloadDigest:'d'});};
- const service={getSession:async()=>session,eventWatermark:()=>0,getWorkState:async()=>({runningTurns:[{turnId:'turn'}],queuedInputs:[{inputId:'queue'}],canArchive:true}),interruptTurn:makeOp('stop'),cancelQueuedInput:makeOp('cancel'),requestControl:makeOp('control'),releaseControl:makeOp('release'),archiveSession:makeOp('archive'),updateSessionSettings:makeOp('settings'),attachSession:makeOp('attach'),listModels:async()=>({items:[{id:'m',label:'Model'}],nextCursor:null})} as unknown as UnifiedService;
- const port:FeishuPort={send:async(_d,c)=>{cards.push(c);return 'id';},update:async()=>{},sendFile:async()=>{}};
+ const releaseControl = (request:{context:WriteContext;payload:{owner:string}}) => {
+  assert.equal(request.payload.owner,session.control.serviceId);
+  session.archived=false; session.status='read_only';
+  session.control={...session.control,owner:null,input:'unavailable',generation:2};
+  return makeOp('release')(request);
+ };
+ const service={getSession:async()=>session,eventWatermark:()=>0,getWorkState:async()=>({runningTurns:[{turnId:'turn'}],queuedInputs:[{inputId:'queue'}],canArchive:true}),interruptTurn:makeOp('stop'),cancelQueuedInput:makeOp('cancel'),requestControl:makeOp('control'),releaseControl,archiveSession:makeOp('archive'),updateSessionSettings:makeOp('settings'),attachSession:makeOp('attach'),listModels:async()=>({items:[{id:'m',label:'Model'}],nextCursor:null})} as unknown as UnifiedService;
+ const port:FeishuPort={send:async(_d,c)=>{cards.push(c);return 'id';},update:async(_d,id,c)=>{patched.set(id,c);},sendFile:async()=>{}};
  const channel=new FeishuChannel(service,port,async()=>true,join(dir,'db')); const env=(eventId:string,subject='owner')=>({eventId,destination:'d',identity:{source:'v',subject}});
  try {
   await interactiveBinding(channel,service,env('b'),'s');
   await channel.handle(env('p'),parseFeishuText('/panel turn queue'));
   const panel=cards.at(-1)!;
+  assert.ok(panel.text.split('\n').includes(`电脑端接回：\`${command}\``));
   assert.match(panel.text,/通知：开启（完成：开 · 等待：开 · 失败：开）/);
   assert.doesNotMatch(panel.text,/当前不支持|旧版/);
   const json=toFeishuCard(panel) as {elements:Array<{actions?:Array<{value:unknown}>}>};
   for (const [i,button] of json.elements[1]!.actions!.entries()) await channel.handle(env(`a${i}`),parseFeishuAction(button.value));
   assert.deepEqual(calls,['stop','cancel','archive','control']);
-  session.control.owner='feishu';
+  session.control.owner=session.control.serviceId;
   session.archived=true;
   await channel.handle(env('owned-panel'),{action:'panel'});
   const ownedPanel=cards.at(-1)!;
   assert.deepEqual(ownedPanel.actions.filter(button=>button.value.action==='control' || button.value.action==='archive').map(button=>button.label),
     ['恢复归档','释放控制']);
   await channel.handle(env('models'),{action:'models'}); const model=toFeishuCard(cards.at(-1)!) as {elements:Array<{actions?:Array<{value:unknown}>}>}; await channel.handle(env('model-choice'),parseFeishuAction(model.elements[1]!.actions![0]!.value));
+  await channel.handle({...env('release'),cardMessageId:'existing-panel'},parseFeishuAction(ownedPanel.actions.find(button=>button.label==='释放控制')!.value));
+  const released=patched.get('existing-panel')!;
+  assert.match(released.text,/状态：连接不可用/);
+  assert.ok(released.text.split('\n').includes(`电脑端接回：\`${command}\``));
+  assert.ok(released.actions.some(button=>button.label==='重新接入'));
   await assert.rejects(channel.handle(env('attach'),parseFeishuText(`/attach ${provider} host service native interactive`)),/use upgrade/); assert.ok(calls.includes('settings'));
   await assert.rejects(channel.handle(env('other','other'),{action:'unbind'}),/binding management unauthorized/);
   await assert.rejects(channel.handle(env('other2','other'),{action:'bind',sessionId:'s'}),/binding management unauthorized/);

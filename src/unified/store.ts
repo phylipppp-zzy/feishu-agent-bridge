@@ -235,6 +235,20 @@ export class UnifiedStore {
     this.eventFor(op.targetId, op.operationId, next.revision, `operation.${status}`, op.operationId, next);
     return next;
   }
+  completeControl(id: string, observed: Session, connectionGeneration?: number): Operation { return this.transaction(() => {
+    const op = this.getOperation(id), out = this.getOutbox(id), current = this.session(op.targetId);
+    if (out.state !== 'in_flight' || !['requestControl','releaseControl'].includes(out.kind) ||
+        current.control.generation !== out.context.controlGeneration || this.connectionGeneration(current.sessionId) !== out.connectionGeneration) return fail('control_conflict');
+    const done = this.updateOperationInTransaction(this.updateOperationInTransaction(op,'accepted'),'completed');
+    this.run("UPDATE outbox SET state='done' WHERE operation_id=?",id);
+    if (out.kind === 'releaseControl') this.run('DELETE FROM interactive_intent WHERE session_id=?',current.sessionId);
+    else this.run('INSERT OR IGNORE INTO interactive_intent(session_id) VALUES(?)',current.sessionId);
+    if (connectionGeneration !== undefined && connectionGeneration !== out.connectionGeneration) {
+      this.setConnectionGenerationInTransaction(current.sessionId,out.connectionGeneration,connectionGeneration);
+    }
+    this.updateSessionInTransaction({...observed,revision:current.revision+1},current);
+    return done;
+  }); }
   private putTurnInTransaction(turn: Turn, observedAt?: number): boolean {
     this.session(turn.sessionId);
     const old = this.row('SELECT value FROM turns WHERE id=?',turn.turnId);
@@ -465,13 +479,16 @@ export class UnifiedStore {
     }
     return true;
   }); }
-  setConnectionGeneration(sessionId: string, expected: number, next: number): void { this.transaction(() => {
+  setConnectionGeneration(sessionId: string, expected: number, next: number): void {
+    this.transaction(() => this.setConnectionGenerationInTransaction(sessionId,expected,next));
+  }
+  private setConnectionGenerationInTransaction(sessionId: string, expected: number, next: number): void {
     const row = this.row('SELECT connection_generation FROM sessions WHERE id=?', sessionId);
     if (!row || Number(row.connection_generation) !== expected) return fail('stale_revision', 'connection generation changed');
     if (!Number.isSafeInteger(next) || next <= expected) return fail('invalid_request', 'connection generation must increase');
     this.invalidateDeliveries(sessionId, true);
     this.run('UPDATE sessions SET connection_generation=? WHERE id=?', next, sessionId);
-  }); }
+  }
   insertInteraction(value: Interaction, native: Interaction = value): void { this.transaction(() => {
     if (native.interactionId !== value.interactionId || native.nativeRequestId !== value.nativeRequestId || native.connectionGeneration !== value.connectionGeneration || native.status !== 'awaiting_answer' || value.status !== 'awaiting_answer') return fail('invalid_request','invalid native interaction snapshot');
     const row = this.row('SELECT connection_generation FROM sessions WHERE id=?', value.sessionId);

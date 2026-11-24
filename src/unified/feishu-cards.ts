@@ -1,6 +1,6 @@
 import type { QuestionForm } from './feishu-question-forms.js';
 import type { Interaction, Operation, Provider, Session } from './contracts.js';
-import { formatApprovalAction, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 
 export function providerDisplayLabel(provider: Provider): string {
@@ -40,7 +40,8 @@ export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only
     : accessMode === 'read_only' ? '\n只读接入，可直接查看历史与文件。' : '';
   const template = accessMode === 'interactive' ? connected ? 'green' : 'orange'
     : accessMode === 'read_only' ? 'grey' : sessionStatusTemplate(session.status);
-  return { title:session.title, ...(template ? { template } : {}), text:`${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${statusLabel}${access}`, actions:[
+  const command = accessMode === 'unbound' ? null : formatResumeCommand(session.native);
+  return { title:session.title, ...(template ? { template } : {}), text:`${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${statusLabel}${access}${command ? `\n电脑端接回：\`${command}\`` : ''}`, actions:[
     { label:'查看历史', value:{action:'history'} },
     ...(accessMode === 'interactive' && connected ? [{ label:'切换模型', value:{action:'models'} }] : []),
     ...controls,

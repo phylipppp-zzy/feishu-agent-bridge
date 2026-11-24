@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import type { ChannelCard } from './feishu-cards.js';
-import type { RunStatus, TurnResidual } from './contracts.js';
+import type { RunStatus, Session, TurnResidual } from './contracts.js';
 import { escapeCardMarkdown, stripCardMentions } from './feishu-card-wire.js';
 
 type DisplayStatus = RunStatus | 'completed';
@@ -32,6 +32,17 @@ export function sessionStatusLabel(status: DisplayStatus): string {
 
 export function sessionStatusTemplate(status: DisplayStatus): ChannelCard['template'] {
   return templates[status];
+}
+
+export function formatResumeCommand(native: Session['native']): string | null {
+  const id = native.nativeSessionId;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(id)) return null;
+  switch (native.provider) {
+    case 'codex': return `codex resume ${id}`;
+    case 'agy': return `agy --conversation ${id}`;
+    case 'claude': return `claude --resume ${id}`;
+    default: return null;
+  }
 }
 
 export function shortenHomePath(path: string): string {

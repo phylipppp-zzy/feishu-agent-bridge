@@ -863,6 +863,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(roSession.capabilities.send.status, 'unsupported');
     assert.equal(roSession.capabilities.answer.status, 'unsupported');
     assert.equal(roSession.capabilities.approve.status, 'unsupported');
+    assert.equal(roSession.capabilities.handoff.status, 'unsupported');
     assert.equal((adapter as PlatformPort).archive, undefined);
 
     const newer = await adapter.discoverNewer(Date.parse('2026-11-22T09:00:00Z'), null, 10);
@@ -898,6 +899,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(createdAck.nativeReference, 'agy-live-1');
     const liveRef = createdAck.createdSession!.native;
     const session = createdAck.createdSession!;
+    assert.equal(session.capabilities.handoff.status, 'available');
     store.insertSession(session);
     store.setConnectionGeneration(session.sessionId, 0, gen1);
     assert.equal(adapter.hasActiveNativeSession(liveRef), true);
@@ -1193,6 +1195,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const turnCancelIdx = observed.length;
     const cancelAck = await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-cancel' }], makeGuard(gen1));
     const cancelTurnId = cancelAck.nativeReference!;
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen1)), { code: 'busy' });
     await waitFor(
       () => observed.slice(turnCancelIdx).some((o) => o.type === 'turn' && o.turn.status === 'running'),
       2000,
@@ -1220,6 +1223,8 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       .slice(turnDropIdx)
       .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
 
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen1)), { code: 'busy' });
+
     // Wait for child process unexpected crash & reconnect
     await waitFor(() => !transport.connected, 3000, 'expected transport disconnect after crash');
     assert.equal(adapter.hasActiveNativeSession(liveRef), false);
@@ -1236,11 +1241,61 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(resumedAck.nativeReference, 'agy-live-1', 'resume must load original ID without forking');
     assert.equal(resumedAck.connectionGeneration, gen2);
 
+    // 9. Release an idle session and recover the same native ID through core control.
+    const beforeRelease = (await adapter.read(liveRef)).session;
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen1)), { code: 'control_conflict' });
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen2, false)), /stale control guard/);
+    assert.equal(adapter.hasActiveNativeSession(liveRef), true);
+    const releasing = adapter.control(liveRef, 'release', makeGuard(gen2));
+    await assert.rejects(adapter.input(liveRef, 'new', [{ type: 'text', text: 'blocked' }], makeGuard(gen2)), { code: 'control_conflict' });
+    await assert.rejects(adapter.resume(liveRef), { code: 'busy' });
+    assert.equal((await releasing).nativeReference, 'unsubscribed');
+    assert.equal(adapter.hasActiveNativeSession(liveRef), false);
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen2)), { code: 'control_conflict' });
+    await waitFor(() => store.getSession(session.sessionId).control.generation === beforeRelease.control.generation + 1, 3000);
+    const released = store.getSession(session.sessionId);
+    assert.equal(released.status, 'read_only');
+    assert.equal(released.control.input, 'unavailable');
+    assert.equal(released.control.owner, null);
+    assert.equal(released.control.generation, beforeRelease.control.generation + 1);
+    assert.equal(released.capabilities.send.status, 'unsupported');
+    assert.equal(released.capabilities.handoff.status, 'available');
+
+    const controlContext = (operationId: string, current: Session) => ({
+      operationId, idempotencyKey: operationId, targetId: session.sessionId,
+      expectedRevision: current.revision, controlGeneration: current.control.generation,
+      identity: { source: 'feishu', subject: 'ou_owner' },
+    });
+    await core.requestControl({
+      context: controlContext('reacquire', released),
+      payload: { owner: 'agy-svc-1', strategy: 'wait' },
+    });
+    assert.equal((await core.dispatch('reacquire')).status, 'completed');
+    assert.equal(adapter.hasActiveNativeSession(liveRef), true);
+    const reacquired = store.getSession(session.sessionId);
+    assert.equal(reacquired.control.input, 'available');
+    assert.equal(reacquired.control.generation, released.control.generation + 1);
+
+    await core.releaseControl({
+      context: controlContext('release', reacquired),
+      payload: { owner: 'agy-svc-1' },
+    });
+    assert.equal((await core.dispatch('release')).status, 'completed');
+    assert.equal(store.getSession(session.sessionId).control.input, 'unavailable');
+
     // Verify RPC log stripped effort suffix and sent expected payloads
     const rpcEntries = (await readFile(rpcLogPath, 'utf8'))
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(rpcEntries.filter(e => e.method === 'session/close'), [
+      { method: 'session/close', params: { sessionId: liveRef.nativeSessionId } },
+      { method: 'session/close', params: { sessionId: liveRef.nativeSessionId } },
+    ]);
+    assert.deepEqual(rpcEntries.filter(e => e.method === 'session/load').map(e => e.params), [
+      { sessionId: liveRef.nativeSessionId, cwd: projectDir, mcpServers: [] },
+      { sessionId: liveRef.nativeSessionId, cwd: projectDir, mcpServers: [] },
+    ]);
     const setModelCalls = rpcEntries.filter((e) => e.method === 'session/set_model');
     assert.ok(setModelCalls.length >= 2);
     for (const call of setModelCalls) {

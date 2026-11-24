@@ -61,7 +61,7 @@ export const readCaps: Capabilities = {
   answer: unsupported('discovered agy session is read-only until attached'),
   approve: unsupported('discovered agy session is read-only until attached'),
   interrupt: unsupported('discovered agy session is read-only until attached'),
-  handoff: unsupported('agy ACP does not support live terminal handoff'),
+  handoff: unsupported('discovered agy session is read-only until attached'),
   files: available,
   config: unsupported('discovered agy session is read-only until attached'),
 };
@@ -74,7 +74,7 @@ export const liveCaps: Capabilities = {
   answer: available,
   approve: available,
   interrupt: available,
-  handoff: unsupported('agy ACP does not support live terminal handoff'),
+  handoff: available,
   files: available,
   config: available,
 };

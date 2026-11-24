@@ -1,5 +1,5 @@
 import type { UnifiedService } from './adapter.js';
-import { sessionStatusLabel, sessionStatusTemplate } from './card-formatters.js';
+import { formatResumeCommand, sessionStatusLabel, sessionStatusTemplate } from './card-formatters.js';
 import type { Session } from './contracts.js';
 import type { ChannelCard } from './feishu-cards.js';
 
@@ -25,8 +25,10 @@ export function noticePanel(session: Session, settings: NoticeSettings, legacy?:
 }
 
 export function buildSessionPanel(session: Session, notice: Panel, work: Awaited<ReturnType<UnifiedService['getWorkState']>> | null): ChannelCard {
+  const command = formatResumeCommand(session.native);
+  const details = [...(command ? [`电脑端接回：\`${command}\``] : []), notice.text];
   if (!work) return {
-    title:'只读会话', template:'grey', text:`状态：只读\n${notice.text}`,
+    title:'只读会话', template:'grey', text:['状态：只读', ...details].join('\n'),
     actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},...notice.actions],
   };
 
@@ -48,12 +50,13 @@ export function buildSessionPanel(session: Session, notice: Panel, work: Awaited
     label:archived ? '恢复归档' : '归档',value:{action:'archive',archived:!archived,...base},
   });
   if (session.capabilities?.handoff?.status === 'available') {
-    const ownsControl = session.control.owner === 'feishu';
+    const { owner, serviceId } = session.control;
+    const ownsControl = !!owner && (owner === 'feishu' || owner === serviceId);
     actions.push({label:ownsControl ? '释放控制' : '切换到飞书',
-      value:{action:'control',owner:'feishu',strategy:'wait',...(ownsControl ? {release:true} : {}),...base}});
+      value:{action:'control',owner:ownsControl ? owner : serviceId || 'feishu',strategy:'wait',...(ownsControl ? {release:true} : {}),...base}});
   }
   const status = archived ? '已归档' : available ? sessionStatusLabel(session.status) : '连接不可用';
-  const text = [`状态：${status}`, notice.text, ...(queued.length ? [`排队中：${queued.length} 条`] : [])].join('\n');
+  const text = [`状态：${status}`, ...details, ...(queued.length ? [`排队中：${queued.length} 条`] : [])].join('\n');
   const template = archived ? 'grey' : available ? sessionStatusTemplate(session.status) : 'orange';
   return {title:'会话控制',text,actions,...(template ? {template} : {})};
 }
