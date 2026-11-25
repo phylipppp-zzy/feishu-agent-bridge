@@ -58,23 +58,27 @@ function isSessionLocked(ctx: AdapterContext, sessionId: string, generation: num
   return Boolean(lock && lock.generation === generation);
 }
 
-function pruneResidualToolCall(
+function matchResidualToolCall(
   ctx: AdapterContext,
   sessionId: string,
   generation: number,
   toolCallId: string,
+  isTerminal: boolean,
 ): boolean {
   if (!ctx.turnResiduals) return false;
   const prefix = `${sessionId}:`;
-  let pruned = false;
+  let matched = false;
   for (const [key, snap] of ctx.turnResiduals) {
     if (!key.startsWith(prefix) || snap.generation !== generation) continue;
-    if (snap.inProgressToolCallIds.delete(toolCallId)) {
-      snap.observedAt = new Date().toISOString();
-      pruned = true;
+    if (snap.inProgressToolCallIds.has(toolCallId)) {
+      matched = true;
+      if (isTerminal) {
+        snap.inProgressToolCallIds.delete(toolCallId);
+        snap.observedAt = new Date().toISOString();
+      }
     }
   }
-  return pruned;
+  return matched;
 }
 
 function hasPendingTurnInteraction(ctx: AdapterContext, sessionId: string, turnId: string): boolean {
@@ -299,9 +303,11 @@ export function cancelPendingTurnServerRequests(
     if (!ctx.isClosed() && ctx.transport.connected && generation === ctx.transport.connectionGeneration) {
       const cancelPayload =
         entry.interaction.kind === 'approval' ? agyPermissionOutcome(null) : { action: 'cancel' };
-      void ctx.transport
-        .respondServerRequest(entry.generation, entry.rpcId, cancelPayload)
-        .catch(() => {});
+      try {
+        void ctx.transport
+          .respondServerRequest(entry.generation, entry.rpcId, cancelPayload)
+          .catch(() => {});
+      } catch {}
     }
   }
   expireAllPendingRequests(ctx, generation, sessionId, turnId, source);
@@ -620,18 +626,26 @@ export function handleAcpNotification(
   }
 
   if (kind !== 'tool_call' && kind !== 'tool_call_update' && kind !== 'agent_message_chunk') {
+    const existingWakeup = ctx.activeTurns.get(sessionId);
+    if (existingWakeup?.isWakeup && existingWakeup.generation === notification.generation) {
+      existingWakeup.lastActivityAt = Date.now();
+      scheduleWakeupFinalize(ctx, sessionId, existingWakeup);
+    }
     return;
   }
 
   if (
-    (kind === 'tool_call' || kind === 'tool_call_update') &&
-    isString(update.toolCallId) &&
-    isString(update.status) &&
-    terminalToolStatuses.has(update.status)
+    kind === 'tool_call_update' &&
+    isString(update.toolCallId)
   ) {
-    const prunedResidual = pruneResidualToolCall(ctx, sessionId, notification.generation, update.toolCallId);
+    const isTerminal = isString(update.status) && terminalToolStatuses.has(update.status);
     const currentTurn = ctx.activeTurns.get(sessionId);
-    if (prunedResidual && (!currentTurn || !currentTurn.toolCalls.has(update.toolCallId))) {
+    const canConsumeResidual =
+      !currentTurn || (!currentTurn.toolCalls.has(update.toolCallId) && (isTerminal || update.status !== 'pending'));
+    if (
+      canConsumeResidual &&
+      matchResidualToolCall(ctx, sessionId, notification.generation, update.toolCallId, isTerminal)
+    ) {
       return;
     }
   }
