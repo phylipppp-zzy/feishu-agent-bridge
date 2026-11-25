@@ -3,7 +3,8 @@ import { QUESTION_INPUT_MAX_LENGTH } from './feishu-card-wire.js';
 
 /** Card JSON 2.0 form uses only components supported inside a form container. */
 export { QUESTION_INPUT_MAX_LENGTH, renderQuestionForm } from './feishu-card-wire.js';
-type Question = { id: string; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean };
+export const DECLINED_ANSWER_MARKER = '[已跳过/取消]';
+type Question = { id: string; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean; required?: boolean };
 export interface QuestionForm {
   interactionId: string;
   revision: number;
@@ -18,6 +19,7 @@ export interface QuestionForm {
 export interface FormAnswerAction {
   action: 'answer'; bindingId: string; interactionId: string; revision: number;
   connectionGeneration: number; answer: Extract<Answer, {kind:'question' | 'question_group'}>; toolInputDigest: null;
+  declined?: boolean;
 }
 const record = (v:unknown): v is Record<string,unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const available = (i:Interaction, readOnly:boolean, now:number): boolean => !readOnly && i.status === 'awaiting_answer' && (i.expiresAt === null || (Number.isFinite(Date.parse(i.expiresAt)) && Date.parse(i.expiresAt) > now));
@@ -31,7 +33,23 @@ export function questionForm(
   submitValueFields?: Record<string, unknown>,
 ): QuestionForm {
   if (!bindingId || !Number.isFinite(now) || interaction.kind === 'approval') throw new Error('invalid question form');
-  const questions:Question[] = interaction.kind === 'question' ? [{id:'question',prompt:interaction.prompt,choices:[...interaction.choices],multiple:interaction.multiple,allowFreeText:interaction.allowFreeText}] : interaction.questions.map(q=>({id:q.id,prompt:q.prompt,choices:[...q.choices],multiple:q.multiple !== false,allowFreeText:q.allowFreeText}));
+  const questions:Question[] = interaction.kind === 'question'
+    ? [{
+        id:'question',
+        prompt:interaction.prompt,
+        choices:[...interaction.choices],
+        multiple:interaction.multiple,
+        allowFreeText:interaction.allowFreeText,
+        ...((interaction as { required?: boolean }).required === false ? { required: false } : {}),
+      }]
+    : interaction.questions.map(q=>({
+        id:q.id,
+        prompt:q.prompt,
+        choices:[...q.choices],
+        multiple:q.multiple !== false,
+        allowFreeText:q.allowFreeText,
+        ...((q as { required?: boolean }).required === false ? { required: false } : {}),
+      }));
   if (!questions.length || new Set(questions.map(q=>q.id)).size !== questions.length || questions.some(q=>!q.id || new Set(q.choices).size !== q.choices.length || q.choices.some(c=>!c.trim()) || (!q.choices.length && !q.allowFreeText))) throw new Error('invalid authoritative question');
   return {interactionId:interaction.interactionId,revision:interaction.revision,connectionGeneration:interaction.connectionGeneration,bindingId,kind:interaction.kind,questions,submittable:available(interaction,readOnly,now),...(submitValueFields ? {submitValueFields:{...submitValueFields}} : {})};
 }
@@ -66,7 +84,23 @@ function multipleChoices(fields: Record<string, unknown>, keys: Set<string>, ind
 /** Decode only form fields; metadata is compared with server-side current state and binding. */
 export function decodeQuestionForm(value:unknown, fields:unknown, current:Interaction, bindingId:string, readOnly = false, now = Date.now()): FormAnswerAction {
   const form=questionForm(current,bindingId,readOnly,now);
-  if (!form.submittable || !record(value) || value.action !== 'answer_form' || value.bindingId !== form.bindingId || value.interactionId !== form.interactionId || value.revision !== form.revision || value.connectionGeneration !== form.connectionGeneration || !record(fields)) throw new Error('expired or invalid form');
+  if (!form.submittable || !record(value) || value.action !== 'answer_form' || value.bindingId !== form.bindingId || value.interactionId !== form.interactionId || value.revision !== form.revision || value.connectionGeneration !== form.connectionGeneration) throw new Error('expired or invalid form');
+  if (value.decline === true) {
+    const declinedAnswer: FormAnswerAction['answer'] = form.kind === 'question'
+      ? { kind: 'question', values: [DECLINED_ANSWER_MARKER] }
+      : { kind: 'question_group', answers: Object.fromEntries(form.questions.map(q => [q.id, [DECLINED_ANSWER_MARKER]])) };
+    return {
+      action: 'answer',
+      bindingId: form.bindingId,
+      interactionId: form.interactionId,
+      revision: form.revision,
+      connectionGeneration: form.connectionGeneration,
+      answer: declinedAnswer,
+      toolInputDigest: null,
+      declined: true,
+    };
+  }
+  if (!record(fields)) throw new Error('expired or invalid form');
   const keys=new Set<string>(); const answers:Record<string,string[]> = Object.create(null) as Record<string,string[]>;
   for (const [i,q] of form.questions.entries()) {
     const selected:string[]=[];
@@ -76,8 +110,28 @@ export function decodeQuestionForm(value:unknown, fields:unknown, current:Intera
       const key=`q${i}_choice`;keys.add(key);const v=fields[key];
       if (v !== undefined && v !== null && v !== '') selected.push(q.choices[choiceIndex(v, q.choices.length)]!);
     }
-    if (q.allowFreeText) { const key=`q${i}_text`; keys.add(key); const v=fields[key]; if (v !== undefined && v !== null && typeof v !== 'string') throw new Error('invalid text'); if (typeof v === 'string' && [...v].length > QUESTION_INPUT_MAX_LENGTH) throw new Error('text too long'); if (typeof v === 'string' && v.trim()) selected.push(v); }
-    if (!selected.length || (!q.multiple && selected.length !== 1) || new Set(selected).size !== selected.length) throw new Error('invalid answer');
+    if (q.allowFreeText) {
+      const key=`q${i}_text`; keys.add(key); const v=fields[key];
+      if (v !== undefined && v !== null && typeof v !== 'string') throw new Error('invalid text');
+      if (typeof v === 'string' && [...v].length > QUESTION_INPUT_MAX_LENGTH) throw new Error('text too long');
+      if (typeof v === 'string' && v.trim()) {
+        if (!q.multiple) {
+          // For single-choice questions with both dropdown and free-text filled, free-text overrides the dropdown selection.
+          selected.length = 0;
+          selected.push(v);
+        } else if (!selected.includes(v)) {
+          selected.push(v);
+        }
+      }
+    }
+    if (!selected.length) {
+      if (q.required === false) {
+        answers[q.id] = [];
+        continue;
+      }
+      throw new Error('invalid answer');
+    }
+    if ((!q.multiple && selected.length !== 1) || new Set(selected).size !== selected.length) throw new Error('invalid answer');
     answers[q.id]=selected;
   }
   if (Object.keys(fields).some(k=>!keys.has(k))) throw new Error('unexpected form field');

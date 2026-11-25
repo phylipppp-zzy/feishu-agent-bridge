@@ -313,9 +313,9 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       .run(eventId);
     if (!claim.changes) return { status: 'unknown' };
     const text = {
-      unsupported: '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。',
-      size: '文本附件为空或超过 1 MiB，未提交。',
-      encoding: '文本附件不是有效 UTF-8 或包含 NUL，未提交。',
+      unsupported: '仅支持图片（PNG/JPG/GIF/WebP）、PDF 文档，以及常见 UTF-8 文本/代码文件（.txt/.md/.json/.yaml/.log/.py/.ts 等）。',
+      size: '附件为空或超过大小限制（文本/代码文件上限 1 MiB，图片/PDF 上限 20 MiB），未提交。',
+      encoding: '文本/代码附件不是有效 UTF-8 或包含 NUL 字节，未提交。',
     }[a.reason];
     await deliverTaskCard(
       deps,
@@ -405,14 +405,21 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
   try {
     let result: unknown;
     if (a.action === 'input') {
+      const effectiveMode =
+        a.mode === 'new' &&
+        session.status === 'running' &&
+        session.capabilities?.steer?.status !== 'available' &&
+        session.capabilities?.queue?.status === 'available'
+          ? 'queue'
+          : a.mode;
       const op = await deps.service.submitInput({
         context: makeContext(
           session.revision,
-          a.mode === 'steer' ? payload.steer_control_generation! : session.control.generation,
+          effectiveMode === 'steer' ? payload.steer_control_generation! : session.control.generation,
         ),
-        mode: a.mode,
+        mode: effectiveMode,
         blocks: [{ type: 'text', text: a.text }],
-        ...(a.mode === 'steer'
+        ...(effectiveMode === 'steer'
           ? {
               requiredTurnId: payload.steer_turn_id!,
               expectedConnectionGeneration: payload.steer_connection_generation!,
@@ -437,17 +444,30 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       });
       result = op;
     } else if (a.action === 'answer_form') {
-      const op = await deps.service.resolveInteraction({
-        context: makeContext(
-          resolvedFormAnswer!.revision,
-          a.controlGeneration ?? session.control.generation,
-        ),
-        interactionId: resolvedFormAnswer!.interactionId,
-        expectedConnectionGeneration: resolvedFormAnswer!.connectionGeneration,
-        answer: resolvedFormAnswer!.answer,
-        toolInputDigest: null,
-      });
-      result = op;
+      try {
+        const op = await deps.service.resolveInteraction({
+          context: makeContext(
+            resolvedFormAnswer!.revision,
+            a.controlGeneration ?? session.control.generation,
+          ),
+          interactionId: resolvedFormAnswer!.interactionId,
+          expectedConnectionGeneration: resolvedFormAnswer!.connectionGeneration,
+          answer: resolvedFormAnswer!.answer,
+          toolInputDigest: null,
+        });
+        result = op;
+      } catch (error) {
+        if (!resolvedFormAnswer?.declined) throw error;
+        await deliverTaskCard(
+          deps,
+          e.destination,
+          row.task_id,
+          row.target_id,
+          { title: '已跳过/取消', template: 'grey', text: '已跳过或取消本次问题答复。', actions: [] },
+          `${eventId}:declined`,
+        );
+        result = { status: 'declined' };
+      }
     } else if (a.action === 'stop') {
       const op = await deps.service.interruptTurn({
         context: makeContext(a.revision, a.controlGeneration),

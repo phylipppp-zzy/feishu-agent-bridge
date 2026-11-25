@@ -1,6 +1,9 @@
 import { verifiedMessageAppLink } from './feishu-message-link.js';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseIncoming, parseCardAction } from '../feishu.js';
 import { parseFeishuAction, parseFeishuText } from './feishu-codec.js';
@@ -84,6 +87,42 @@ class ClosedKnownTestCreation extends Error { readonly deliveryKind='known_close
 class PendingKnownTestCreation extends Error { readonly deliveryKind='known_pending'; }
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
 const IMAGE_SIGNATURE_BYTES = 12; // The longest signature checked by imageMediaType is WebP.
+const TEXT_CODE_EXTENSION_RE = /\.(?:txt|md|markdown|json|jsonl|yaml|yml|log|csv|tsv|xml|toml|ini|cfg|conf|py|ts|tsx|js|jsx|mjs|cjs|sh|bash|zsh|c|h|cpp|hpp|cc|rs|go|java|kt|rb|php|sql|r|tex|bib|css|scss|html|htm|diff|patch)$/i;
+const TEXT_CODE_MIMES = new Set([
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'text/tab-separated-values',
+  'text/xml',
+  'text/html',
+  'text/css',
+  'text/javascript',
+  'application/json',
+  'application/x-yaml',
+  'application/yaml',
+  'application/xml',
+  'application/javascript',
+  'application/typescript',
+  'application/x-sh',
+]);
+const PDF_EXTENSION_RE = /\.pdf$/i;
+const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp)$/i;
+const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function isPdfBytes(bytes: Buffer): boolean {
+  return bytes.length >= 5 && bytes.subarray(0, 5).toString('ascii') === '%PDF-';
+}
+
+function stageInboundLocalFile(eventId: string, displayName: string, content: Buffer): string {
+  const dir = join(tmpdir(), 'feishu-bridge-inbound');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const digest = createHash('sha256').update(eventId).update(':').update(content).digest('hex').slice(0, 16);
+  const safeName = displayName.replace(/[^A-Za-z0-9._\-\u4e00-\u9fff]/g, '_').slice(0, 80) || 'attachment';
+  const filePath = join(dir, `${digest}-${safeName}`);
+  writeFileSync(filePath, content, { mode: 0o600 });
+  return filePath;
+}
+
 type ResourceMetadata={name?:string;mime?:string};
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
@@ -91,16 +130,29 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
   const m=parseIncoming(data,botId,true); if (!m) return;
   const threadId=(data.message as unknown as {thread_id?:string}).thread_id;
   const inTopic=Boolean(m.rootId || m.parentId || threadId);
+  const msgType = data.message.message_type;
   if (m.mentionedBot) {
     if (m.senderOpenId !== owner || !destinations.has(m.chatId)) throw new Error('unauthorized');
   } else {
     if (m.senderOpenId !== owner || !destinations.has(m.chatId)) return;
-    const isMainSlash=!inTopic && data.message.message_type === 'text' && Boolean(m.text?.trim().startsWith('/'));
+    const isMainSlash=!inTopic && (msgType === 'text' || msgType === 'post') && Boolean(m.text?.trim().startsWith('/'));
     if (!inTopic && !isMainSlash) return;
   }
   let textAction:ChannelAction | undefined;
   const hasText = m.text.trim().length > 0;
-  if (data.message.message_type === 'text' && hasText) { try { textAction=parseFeishuText(m.text); } catch (error) { if (!m.text.trimStart().startsWith('/')) throw error; textAction={action:'help'}; } }
+  if ((msgType === 'text' || msgType === 'post') && hasText) {
+    try {
+      textAction = parseFeishuText(m.text, { passthroughUnknownSlash: inTopic });
+    } catch (error) {
+      if (!m.text.trimStart().startsWith('/')) throw error;
+      if (inTopic) {
+        const command = m.text.trimStart().split(/\s+/)[0] ?? '/';
+        textAction = { action: 'command_error', command, rawText: m.text.trim() };
+      } else {
+        textAction = { action: 'help' };
+      }
+    }
+  }
   let destination:string;
   try {
     destination=resolveDestination ? resolveDestination(m.chatId,m.rootId,m.parentId,threadId) : m.chatId;
@@ -109,19 +161,43 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
     throw error;
   }
   const envelope={eventId:`message:${m.messageId}`,destination,identity:{source:'feishu',subject:m.senderOpenId}};
+  if (msgType === 'post') {
+    if (textAction) await handle(envelope, textAction);
+    if (m.imageKeys.length > 0) {
+      for (const [idx, imageKey] of m.imageKeys.entries()) {
+        const imgEnvelope = !textAction && m.imageKeys.length === 1
+          ? envelope
+          : { ...envelope, eventId: `${envelope.eventId}:img:${idx}` };
+        if (queueResource) await queueResource(imgEnvelope, m.messageId, imageKey, 'image');
+        else await downloadAndIntake(imgEnvelope, m.messageId, imageKey, 'image', download, handle);
+      }
+    }
+    return;
+  }
   if (textAction) { await handle(envelope,textAction); return; }
-  if (!m.mentionedBot && data.message.message_type === 'text' && !hasText) return;
-  if (data.message.message_type !== 'image' && data.message.message_type !== 'file') throw new Error('unsupported inbound message type');
+  if (!m.mentionedBot && msgType === 'text' && !hasText) return;
+  if (msgType !== 'image' && msgType !== 'file') throw new Error('unsupported inbound message type');
   let body:unknown; try { body=JSON.parse(data.message.content); } catch { throw new Error('invalid resource message'); }
   if (!body || typeof body !== 'object') throw new Error('invalid resource message');
-  const resourceType=data.message.message_type; const key=(body as Record<string,unknown>)[resourceType === 'image' ? 'image_key' : 'file_key'];
+  const resourceType=msgType; const key=(body as Record<string,unknown>)[resourceType === 'image' ? 'image_key' : 'file_key'];
   if (typeof key !== 'string' || !key || !m.messageId) throw new Error('invalid resource key');
   const obj=body as Record<string,unknown>;if((typeof obj.file_name==='string'&&Buffer.byteLength(obj.file_name)>1024)||(typeof obj.mime_type==='string'&&Buffer.byteLength(obj.mime_type)>128))throw new Error('invalid resource metadata');const metadata:ResourceMetadata={...(typeof obj.file_name==='string'?{name:obj.file_name}:{}),...(typeof obj.mime_type==='string'?{mime:obj.mime_type}:{})};
   if (queueResource) { await queueResource(envelope,m.messageId,key,resourceType,metadata); return; }
   await downloadAndIntake(envelope,m.messageId,key,resourceType,download,handle,undefined,metadata);
 }
 async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:string,resourceType:'image'|'file',download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>,handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>,scope?:string,metadata?:ResourceMetadata):Promise<void> {
-  const rawName=metadata?.name, mime=metadata?.mime?.toLowerCase();const textHint=resourceType==='file' && (typeof rawName==='string'&&/\.txt$/i.test(rawName)||mime==='text/plain');const stream=await download(messageId,key,resourceType); const chunks:Buffer[]=[]; let length=0;
+  const rawName=metadata?.name, mime=metadata?.mime?.toLowerCase();
+  const isTxt = typeof rawName === 'string' && /\.txt$/i.test(rawName);
+  const isTextCodeName = typeof rawName === 'string' && TEXT_CODE_EXTENSION_RE.test(rawName);
+  const isTextCodeMime = !!mime && (TEXT_CODE_MIMES.has(mime) || mime.startsWith('text/'));
+  const isPdfName = typeof rawName === 'string' && PDF_EXTENSION_RE.test(rawName);
+  const isPdfMime = mime === 'application/pdf';
+  const isImageName = typeof rawName === 'string' && IMAGE_EXTENSION_RE.test(rawName);
+  const isImageMime = !!mime && IMAGE_MIMES.has(mime);
+  const pdfHint = resourceType === 'file' && (isPdfName || isPdfMime);
+  const textHint = resourceType === 'file' && !pdfHint && (isTextCodeName || isTextCodeMime);
+  const maxBytes = textHint ? MAX_TEXT_ATTACHMENT_BYTES : MAX_INBOUND_BYTES;
+  const stream=await download(messageId,key,resourceType); const chunks:Buffer[]=[]; let length=0;
   try {
     for await (const part of stream) {
       const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
@@ -130,11 +206,32 @@ async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:s
         if (!imageMediaType(signature)) throw new UnsupportedInboundFile();
       }
       length += chunk.length;
-      if (length > (textHint ? MAX_TEXT_ATTACHMENT_BYTES : MAX_INBOUND_BYTES)) throw new ResourceRejected(textHint ? 'size' : 'inbound resource exceeds limit');
+      if (length > maxBytes) throw new ResourceRejected(textHint ? 'size' : 'inbound resource exceeds limit');
       chunks.push(chunk);
     }
   } finally { if (!stream.destroyed) stream.destroy(); }
-  const content=Buffer.concat(chunks); const mediaType=imageMediaType(content);if(resourceType==='file'&&!textHint&&((rawName&&!/\.(png|jpe?g|gif|webp)$/i.test(rawName))||(mime&&!['image/png','image/jpeg','image/gif','image/webp'].includes(mime))||(mime&&mediaType&&mime!==mediaType)))throw new ResourceRejected('unsupported');if(textHint){if(mediaType || (mime&&mime!=='text/plain') || (rawName&&!/\.txt$/i.test(rawName)))throw new ResourceRejected('unsupported');try{decodeTextAttachment(content)}catch(error){throw new ResourceRejected(content.length===0||content.length>MAX_TEXT_ATTACHMENT_BYTES?'size':'encoding')}await handle(envelope,{action:'attachment',name:attachmentDisplayName(rawName??'attachment.txt'),mediaType:'text/plain',content,mode:'new'},scope);return;}
+  const content=Buffer.concat(chunks);
+  const mediaType=imageMediaType(content);
+  if (pdfHint) {
+    if ((rawName && !isPdfName) || (mime && !isPdfMime)) throw new ResourceRejected('unsupported');
+    if (content.length === 0 || content.length > MAX_INBOUND_BYTES) throw new ResourceRejected('size');
+    if (!isPdfBytes(content)) throw new ResourceRejected('unsupported');
+    const displayName = attachmentDisplayName(rawName ?? 'document.pdf');
+    const localPath = stageInboundLocalFile(envelope.eventId, displayName, content);
+    await handle(envelope, { action: 'attachment', name: displayName, mediaType: 'application/pdf', content, mode: 'new', localPath }, scope);
+    return;
+  }
+  if (resourceType === 'file' && !textHint && ((rawName && !isImageName) || (mime && !isImageMime) || (mime && mediaType && mime !== mediaType))) {
+    throw new ResourceRejected('unsupported');
+  }
+  if (textHint) {
+    if (mediaType || (mime && !isTextCodeMime) || (rawName && !isTextCodeName)) throw new ResourceRejected('unsupported');
+    try { decodeTextAttachment(content); } catch { throw new ResourceRejected(content.length === 0 || content.length > MAX_TEXT_ATTACHMENT_BYTES ? 'size' : 'encoding'); }
+    const displayName = attachmentDisplayName(rawName ?? 'attachment.txt');
+    const localPath = !isTxt ? stageInboundLocalFile(envelope.eventId, displayName, content) : undefined;
+    await handle(envelope, { action: 'attachment', name: displayName, mediaType: 'text/plain', content, mode: 'new', ...(localPath ? { localPath } : {}) }, scope);
+    return;
+  }
   if (!mediaType) throw resourceType === 'file' ? new UnsupportedInboundFile() : new ResourceRejected('unsupported resource type');
   const ext={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp'}[mediaType];
   await handle(envelope,{action:'attachment',name:rawName?attachmentDisplayName(rawName):`image.${ext}`,mediaType,content,mode:'new'},scope);
@@ -586,14 +683,14 @@ export class FeishuSdkPort implements FeishuPort {
     if(!m.mentionedBot&&!inTopic&&!isMainSlash)return null;
     return {m,thread,inTopic,isMainSlash};
   }
-  private rootlessTaskWritePending(data:MessageEvent,botId:string):boolean {const info=this.parseEligibleMessage(data,botId);if(!info||info.inTopic)return false;if(data.message.message_type==='text'&&['/help','/health','/sessions'].includes(info.m.text))return false;return !!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(info.m.chatId);}
+  private rootlessTaskWritePending(data:MessageEvent,botId:string):boolean {const info=this.parseEligibleMessage(data,botId);if(!info||info.inTopic)return false;if(data.message.message_type==='text'&&['/help','/health','/sessions','/quota'].includes(info.m.text))return false;return !!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(info.m.chatId);}
   /** Block only ambiguous writes while a task root creation has no resolved route. */
   private async guideTaskPending(data:MessageEvent,botId:string,unknownRoot=false):Promise<boolean> {
     const info=this.parseEligibleMessage(data,botId);if(!info)return false;
     const {m,thread}=info;
     if(!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId))return false;
     const ids=[m.rootId,m.parentId,thread].filter((v):v is string=>!!v),hasRoot=ids.length>0;if(hasRoot&&!unknownRoot)return false;if(hasRoot&&ids.some(id=>!!this.db.prepare('SELECT 1 FROM sdk_topic_routes r LEFT JOIN sdk_message_routes m ON m.destination=r.destination WHERE r.chat_id=? AND (r.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1').get(m.chatId,id,id,id)))return false;
-    if(!hasRoot&&data.message.message_type==='text'&&['/help','/health','/sessions'].includes(m.text))return false;
+    if(!hasRoot&&data.message.message_type==='text'&&['/help','/health','/sessions','/quota'].includes(m.text))return false;
     const id=`task-pending-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes)return true;if(this.closing)throw new Error('SDK port closing');
     if(!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId))return true;
     const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务提示',text:'任务话题待核查，写入暂不可用。',actions:[]},'1.0'))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(id,response.data.message_id,m.chatId,'1.0');return true;

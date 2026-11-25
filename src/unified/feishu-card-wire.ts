@@ -3,7 +3,19 @@ import type { QuestionForm } from './feishu-question-forms.js';
 
 export const QUESTION_INPUT_MAX_LENGTH = 1000;
 export type CardSchema = NonNullable<ChannelCard['schema']>;
-export const cardSchema = (card: ChannelCard): CardSchema => card.schema ?? (card.form ? '2.0' : '1.0');
+
+const GFM_TABLE_RE = /^\|.+\|\s*\r?\n\|[\s:|-]+\|/m;
+const DETAILS_BLOCK_RE = /<details\b[^>]*>([\s\S]*?)<\/details>/giu;
+const SUMMARY_TAG_RE = /<summary\b[^>]*>([\s\S]*?)<\/summary>/iu;
+
+function hasRichMarkdownV2(card: ChannelCard): boolean {
+  if (card.format === 'plain' || card.table) return false;
+  if (card.executionLog) return true;
+  return GFM_TABLE_RE.test(card.text) || /<details\b[^>]*>[\s\S]*?<\/details>/iu.test(card.text);
+}
+
+export const cardSchema = (card: ChannelCard): CardSchema =>
+  card.schema ?? (card.form || hasRichMarkdownV2(card) ? '2.0' : '1.0');
 
 const plain = (content: string) => ({ tag: 'plain_text', content });
 const markdown = (content: string) => ({ tag: 'markdown', content: stripCardMentions(content) });
@@ -29,10 +41,42 @@ function header(card: ChannelCard) {
   };
 }
 
-function cardElements(card: ChannelCard, omitEmpty = false): unknown[] {
+function markdownElementsV2(text: string): unknown[] {
+  const cleaned = stripCardMentions(text);
+  const elements: unknown[] = [];
+  let lastIndex = 0;
+  let panelIndex = 0;
+  DETAILS_BLOCK_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = DETAILS_BLOCK_RE.exec(cleaned)) !== null) {
+    const before = cleaned.slice(lastIndex, match.index).trim();
+    if (before) elements.push(markdown(before));
+    const inner = match[1] ?? '';
+    const summaryMatch = SUMMARY_TAG_RE.exec(inner);
+    const title = summaryMatch?.[1]?.trim() || '展开详情';
+    const body = (summaryMatch
+      ? inner.slice(0, summaryMatch.index) + inner.slice(summaryMatch.index + summaryMatch[0].length)
+      : inner).trim();
+    elements.push({
+      tag: 'collapsible_panel',
+      element_id: `details_${panelIndex++}`,
+      expanded: false,
+      header: { title: markdown(title) },
+      elements: body ? [markdown(body)] : [],
+    });
+    lastIndex = match.index + match[0].length;
+  }
+  const after = cleaned.slice(lastIndex);
+  if (panelIndex === 0) return [markdown(cleaned)];
+  if (after.trim()) elements.push(markdown(after.trim()));
+  return elements;
+}
+
+function cardElements(card: ChannelCard, omitEmpty = false, schema: CardSchema = '1.0'): unknown[] {
   if (!card.table) {
     if (omitEmpty && !card.text.trim()) return [];
-    return [card.format === 'plain' ? { tag: 'div', text: plain(card.text) } : markdown(card.text)];
+    if (card.format === 'plain') return [{ tag: 'div', text: plain(card.text) }];
+    return schema === '2.0' ? markdownElementsV2(card.text) : [markdown(card.text)];
   }
   const table = card.table;
   const renderColumns = (cells: string[], bold: boolean) => table.columns.map((col, idx) => ({
@@ -76,6 +120,7 @@ function executionElements(log: ChannelCard['executionLog'], schema: CardSchema)
 function questionElements(form: QuestionForm): unknown[] {
   const elements: Record<string, unknown>[] = [];
   for (const [i, q] of form.questions.entries()) {
+    const optionalSuffix = q.required === false ? '（可选）' : '';
     elements.push(markdown(q.prompt));
     if (!form.submittable) continue;
     if (q.choices.length) {
@@ -84,7 +129,7 @@ function questionElements(form: QuestionForm): unknown[] {
         tag: q.multiple ? 'multi_select_static' : 'select_static',
         name,
         element_id: name,
-        placeholder: plain(q.multiple ? '可多选' : '选择一个选项'),
+        placeholder: plain(`${q.multiple ? '可多选' : '选择一个选项'}${optionalSuffix}`),
         required: false,
         options: q.choices.map((content, j) => ({ text: plain(content), value: String(j) })),
       });
@@ -92,7 +137,7 @@ function questionElements(form: QuestionForm): unknown[] {
     if (q.allowFreeText) {
       const name = `q${i}_text`;
       elements.push({
-        tag: 'input', name, element_id: name, required: false, placeholder: plain('输入文字答复'),
+        tag: 'input', name, element_id: name, required: false, placeholder: plain(`输入文字答复${optionalSuffix}`),
         max_length: QUESTION_INPUT_MAX_LENGTH, input_type: 'multiline_text', rows: 4, auto_resize: true, max_rows: 8,
       });
     }
@@ -110,6 +155,10 @@ function questionElements(form: QuestionForm): unknown[] {
   elements.push({
     tag: 'button', name: 'submit_question', element_id: 'submit_question', text: plain('提交答复'),
     type: 'primary', form_action_type: 'submit', behaviors: [{ type: 'callback', value }],
+  });
+  elements.push({
+    tag: 'button', name: 'decline_question', element_id: 'decline_question', text: plain('跳过/取消'),
+    type: 'default', behaviors: [{ type: 'callback', value: { ...value, decline: true } }],
   });
   return [{ tag: 'form', name: 'question_form', element_id: 'question_form', direction: 'vertical', vertical_spacing: '8px', elements }];
 }
@@ -136,7 +185,7 @@ function encodeV2(card: ChannelCard, form?: QuestionForm): Record<string, unknow
     header: header(card),
     body: {
       elements: [
-        ...cardElements(card, !!form),
+        ...cardElements(card, !!form, '2.0'),
         ...(form ? questionElements(form) : []),
         ...executionElements(card.executionLog, '2.0'),
         ...actionsV2(card.actions),

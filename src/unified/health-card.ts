@@ -1,4 +1,5 @@
 import type { UnifiedService } from './adapter.js';
+import type { AgyQuotaSnapshot, AgyQuotaWindow } from './agy-quota.js';
 import type { ChannelCard } from './feishu-cards.js';
 
 export type HealthEntry = Awaited<ReturnType<UnifiedService['health']>>[number];
@@ -63,29 +64,122 @@ function healthLabelOf(component: string): string {
   return HEALTH_LABELS[component] ?? component;
 }
 
-export function buildHealthCard(health: readonly HealthEntry[]): ChannelCard {
+function formatQuotaPercent(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '未知';
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
+}
+
+function formatQuotaWindow(window: AgyQuotaWindow | null | undefined, label: string): string {
+  if (!window) return `${label}：未知（未采样）`;
+  const remaining = formatQuotaPercent(window.remainingPercent);
+  const reset = formatBeijingTime(window.resetsAt);
+  const resetText = reset ? `，重置 ${reset} 北京` : '，重置时间未知';
+  const staleText = window.stale ? '（缓存已过期）' : '';
+  return `${label}：剩余 ${remaining}${resetText}${staleText}`;
+}
+
+export function formatQuotaSummary(quota: AgyQuotaSnapshot | null | undefined): string[] {
+  if (!quota) {
+    return ['5h 额度：未知（未采样）', '周额度：未知（未采样）'];
+  }
+  if (quota.apiKeyMode) {
+    return ['额度模式：API Key（无订阅周期额度限制）'];
+  }
+  if (!quota.short && !quota.weekly && (!quota.windows || quota.windows.length === 0)) {
+    const reason = quota.error ? `（${quota.error}）` : '（未采样）';
+    return [`5h 额度：未知${reason}`, `周额度：未知${reason}`];
+  }
+  const lines = [
+    formatQuotaWindow(quota.short, '5h 额度'),
+    formatQuotaWindow(quota.weekly, '周额度'),
+  ];
+  const sampledAt = formatBeijingTime(quota.lastSnapshotAt ?? quota.observedAt);
+  if (sampledAt) {
+    const sourceLabel = quota.source === 'live' ? '实时' : quota.source === 'cache' ? '缓存' : '未采样';
+    lines.push(`采样：${sampledAt} 北京（${sourceLabel}${quota.stale ? ' · 已过期' : ''}）`);
+  }
+  return lines;
+}
+
+export function buildQuotaCard(quota: AgyQuotaSnapshot | null, health?: readonly HealthEntry[]): ChannelCard {
+  const lines = formatQuotaSummary(quota);
+  if (quota && quota.windows.length > 0) {
+    const extra = quota.windows.filter(w => w !== quota.short && w !== quota.weekly);
+    for (const w of extra) {
+      const reset = formatBeijingTime(w.resetsAt);
+      lines.push(`${w.label || w.name}：剩余 ${formatQuotaPercent(w.remainingPercent)}${reset ? `，重置 ${reset} 北京` : ''}`);
+    }
+  }
+  const agyHealth = health?.find(h => h.component === 'agy_quota');
+  if (agyHealth && agyHealth.status !== 'healthy' && agyHealth.reason) {
+    lines.push(`状态说明：${translateHealthReason(agyHealth.reason)}`);
+  }
+  const hasData = !!quota && (quota.apiKeyMode || !!quota.short || !!quota.weekly || quota.windows.length > 0);
+  const lowQuota = hasData && !quota.apiKeyMode && [quota.short, quota.weekly].some(w => w && w.remainingPercent < 15);
+  const template: ChannelCard['template'] = !hasData ? 'grey' : lowQuota ? 'orange' : 'green';
+  return {
+    title: 'Antigravity 额度',
+    template,
+    text: lines.join('\n'),
+    actions: [],
+  };
+}
+
+export function buildHealthCard(health: readonly HealthEntry[], quota?: AgyQuotaSnapshot | null): ChannelCard {
   const attention: string[] = [];
   const normal: string[] = [];
   const unverified: string[] = [];
   const attentionRows: string[][] = [];
   const normalRows: string[][] = [];
+  let sawAgyQuota = false;
+
+  const quotaInlineDetail = (q: AgyQuotaSnapshot | null | undefined): string => {
+    if (!q) return '5h/周额度未知（未采样）';
+    if (q.apiKeyMode) return 'API Key 模式';
+    if (!q.short && !q.weekly) return '5h/周额度未知（未采样）';
+    const parts: string[] = [];
+    if (q.short) {
+      const r = formatBeijingTime(q.short.resetsAt);
+      parts.push(`5h 剩余 ${formatQuotaPercent(q.short.remainingPercent)}${r ? `（重置 ${r}）` : ''}`);
+    } else {
+      parts.push('5h 未知');
+    }
+    if (q.weekly) {
+      const r = formatBeijingTime(q.weekly.resetsAt);
+      parts.push(`周剩余 ${formatQuotaPercent(q.weekly.remainingPercent)}${r ? `（重置 ${r}）` : ''}`);
+    } else {
+      parts.push('周未知');
+    }
+    return parts.join(' · ');
+  };
 
   for (const h of health) {
     const label = healthLabelOf(h.component);
+    const isAgyQuota = h.component === 'agy_quota';
+    if (isAgyQuota) sawAgyQuota = true;
+    const quotaText = isAgyQuota && quota !== undefined ? quotaInlineDetail(quota) : null;
     if (h.status === 'healthy') {
       const success = formatBeijingTime(h.lastSuccessAt);
       const observed = formatBeijingTime(h.lastObservedAt);
       const timeText = success ? `（最近成功 ${success}）` : observed ? `（最近观测 ${observed}）` : '';
-      normal.push(`- ${label}：正常${timeText}`);
-      const detailText = success ? `最近成功 ${success}` : observed ? `最近观测 ${observed}` : '—';
+      normal.push(`- ${label}：正常${timeText}${quotaText ? `；${quotaText}` : ''}`);
+      const baseDetail = success ? `最近成功 ${success}` : observed ? `最近观测 ${observed}` : '—';
+      const detailText = quotaText ? (baseDetail === '—' ? quotaText : `${quotaText}；${baseDetail}`) : baseDetail;
       normalRows.push([label, `✅ ${HEALTH_STATES.healthy}`, detailText]);
     } else if (h.status === 'unverified') {
-      unverified.push(label);
+      if (isAgyQuota && quota !== undefined) {
+        normal.push(`- ${label}：${quotaText}`);
+        normalRows.push([label, `⚪ ${HEALTH_STATES.unverified}`, quotaText!]);
+      } else {
+        unverified.push(label);
+      }
     } else {
       const state = HEALTH_STATES[h.status] ?? h.status;
       const icon = h.status === 'unreachable' ? '❌' : '⚠️';
       const reason = translateHealthReason(h.reason ?? h.lastFailureReason);
       const details: string[] = [];
+      if (quotaText) details.push(quotaText);
       const success = formatBeijingTime(h.lastSuccessAt);
       const failure = formatBeijingTime(h.lastFailureAt);
       if (success) details.push(`最近成功 ${success}`);
@@ -96,6 +190,13 @@ export function buildHealthCard(health: readonly HealthEntry[]): ChannelCard {
       const rowDetails = [...(reason ? [reason] : []), ...details];
       attentionRows.push([label, `${icon} ${state}`, rowDetails.length ? rowDetails.join('；') : '—']);
     }
+  }
+
+  if (quota !== undefined && !sawAgyQuota) {
+    const qDetail = quotaInlineDetail(quota);
+    const hasData = !!quota && (quota.apiKeyMode || !!quota.short || !!quota.weekly);
+    normal.push(`- ${healthLabelOf('agy_quota')}：${qDetail}`);
+    normalRows.push([healthLabelOf('agy_quota'), hasData ? `✅ ${HEALTH_STATES.healthy}` : `⚪ ${HEALTH_STATES.unverified}`, qDetail]);
   }
 
   const sections: string[] = [];
