@@ -20,19 +20,6 @@ export async function sessionModelPage(service: UnifiedService, session: Session
   return {card, page};
 }
 
-function matchesSessionSearch(session: Session, keyword: string): boolean {
-  const needle = keyword.trim().toLowerCase();
-  if (!needle) return true;
-  const haystacks = [
-    session.title,
-    session.project,
-    session.sessionId,
-    session.native.provider,
-    session.native.nativeSessionId,
-  ];
-  return haystacks.some(value => typeof value === 'string' && value.toLowerCase().includes(needle));
-}
-
 export async function showSessionList(
   service: UnifiedService,
   port: FeishuPort,
@@ -52,7 +39,6 @@ export async function showSessionList(
   const {identity,destination} = envelope;
   const sessions = [];
   for (const session of page.items) {
-    if (trimmedSearch && !matchesSessionSearch(session, trimmedSearch)) continue;
     if (await authorize(identity,destination,session.sessionId)) sessions.push(session);
   }
   const links = await Promise.all(sessions.map(async session => {

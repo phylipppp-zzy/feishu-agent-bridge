@@ -402,11 +402,11 @@ export class FeishuSessionBinding {
     if (needsOperationNotice(result) || result.status === 'queued') {
       const card = operationCard(result);
       if (result.status === 'queued') {
+        card.actions.push({label:'查看排队',value:{action:'panel'}});
         card.actions.push({
           label: '撤回排队',
           value: { action: 'cancel', inputId: result.operationId, revision: session.revision, controlGeneration: session.control.generation },
         });
-        card.actions.push({label:'查看排队',value:{action:'panel'}});
       }
       await reply(card);
     }

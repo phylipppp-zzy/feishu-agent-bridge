@@ -236,8 +236,8 @@ function parseAction(value: unknown): RuntimeTrustedAction {
 }
 /** Callback buttons must carry the binding epoch stamped by the channel. */
 export function parseFeishuAction<T extends RuntimeTrustedAction = ChannelAction>(value: unknown, formValues?: unknown): T {
-  if (object(value) && value.action === 'answer_form') {
-    const isDecline = value.decline === true;
+  if (object(value) && (value.action === 'answer_form' || value.action === 'decline_form')) {
+    const isDecline = value.action === 'decline_form' || value.decline === true;
     if (value.decline !== undefined && typeof value.decline !== 'boolean') throw new Error('invalid question form callback');
     if (!isDecline && object(formValues) && Object.hasOwn(formValues, '__decline')) {
       throw new Error('invalid question form callback');

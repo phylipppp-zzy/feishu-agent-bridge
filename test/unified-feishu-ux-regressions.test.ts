@@ -535,7 +535,14 @@ test('/sessions keyword filter, /quota command, health-card and panel quota disp
 
   // Channel /quota and /sessions <关键词>
   const service: any = {
-    listSessions: async () => ({ items: [agySession, otherSession], nextCursor: null }),
+    listSessions: async (q?: { search?: string }) => {
+      const all = [agySession, otherSession];
+      const needle = q?.search?.trim().toLowerCase();
+      const items = needle
+        ? all.filter(s => `${s.title} ${s.project} ${s.native.provider}`.toLowerCase().includes(needle))
+        : all;
+      return { items, nextCursor: null };
+    },
     health: async () => [quotaSnapshot.health],
   };
   const port: FeishuPort = {

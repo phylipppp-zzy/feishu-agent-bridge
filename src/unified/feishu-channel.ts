@@ -523,7 +523,7 @@ export class FeishuChannel {
       return this.deliverOrUpdate(e,card,suffix,current,fallback);
     };
     const updateReply = (card:ChannelCard) => replyOrUpdate(card,'reply',undefined,false);
-    if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片（PNG/JPG/GIF/WebP）、PDF 文档，以及常见 UTF-8 文本/代码文件（.txt/.md/.json/.yaml/.log/.py/.ts 等）。',size:'附件为空或超过大小限制（文本/代码文件上限 1 MiB，图片/PDF 上限 20 MiB），未提交。',encoding:'文本/代码附件不是有效 UTF-8 或包含 NUL 字节，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
+    if(a.action==='resource_rejected'){const text={unsupported:'仅支持图片（PNG/JPG/GIF/WebP）、PDF 文档，以及常见 UTF-8 文本/代码文件（.txt/.md/.json/.yaml/.log/.py/.ts 等）。',size:'文本附件为空或超过 1 MiB（图片/PDF 上限 20 MiB），未提交。',encoding:'文本/代码附件不是有效 UTF-8 或包含 NUL 字节，未提交。'}[a.reason];await reply({title:'附件未提交',text,actions:[]});return {status:'rejected',reason:a.reason};}
     if (a.action === 'command_error') {
       await reply({
         title: '命令参数有误',

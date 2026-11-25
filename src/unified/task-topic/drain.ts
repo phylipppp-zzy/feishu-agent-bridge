@@ -336,7 +336,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
     if (!claim.changes) return { status: 'unknown' };
     const text = {
       unsupported: '仅支持图片（PNG/JPG/GIF/WebP）、PDF 文档，以及常见 UTF-8 文本/代码文件（.txt/.md/.json/.yaml/.log/.py/.ts 等）。',
-      size: '附件为空或超过大小限制（文本/代码文件上限 1 MiB，图片/PDF 上限 20 MiB），未提交。',
+      size: '文本附件为空或超过 1 MiB（图片/PDF 上限 20 MiB），未提交。',
       encoding: '文本/代码附件不是有效 UTF-8 或包含 NUL 字节，未提交。',
     }[a.reason];
     await deliverTaskCard(

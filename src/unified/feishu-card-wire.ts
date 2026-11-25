@@ -229,7 +229,7 @@ function questionElements(form: QuestionForm): unknown[] {
   });
   elements.push({
     tag: 'button', name: 'decline_question', element_id: 'decline_question', text: plain('跳过/取消'),
-    type: 'default', behaviors: [{ type: 'callback', value: { ...value, decline: true } }],
+    type: 'default', behaviors: [{ type: 'callback', value: { ...value, action: 'decline_form', decline: true } }],
   });
   return [{ tag: 'form', name: 'question_form', element_id: 'question_form', direction: 'vertical', vertical_spacing: '8px', elements }];
 }
