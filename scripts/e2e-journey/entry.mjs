@@ -98,11 +98,11 @@ async function blankSession(ctx) {
       await ctx.send(null, '/new');
       await ctx.settle();
       draft = lastCard(ctx, null);
-      trace.check('蓝色新建卡列出三个后端与 Top-5 项目', () => {
+      trace.check('蓝色新建卡列出三个后端与项目候选', () => {
         assert.equal(draft.card.title, '新建会话');
         assert.equal(draft.card.template, 'blue');
         assert.deepEqual(labels(draft).slice(0, 3).map(label => label.replace(/^✓ /, '')), ['Antigravity', 'Codex', 'Claude']);
-        assert.equal(draft.card.buttons.filter(button => button.value?.action === 'new_pick').length, 5);
+        assert.equal(draft.card.buttons.filter(button => button.value?.action === 'new_pick').length, 6);
         assert.ok(labels(draft).includes('feishu-agent-bridge'));
         assert.ok(labels(draft).includes('gui-rl'));
         assert.doesNotMatch(draft.card.bodyText, /首句任务/);

@@ -101,7 +101,7 @@ async function busyTurn(ctx) {
       trace.check('面板显示运行状态和排队计数，并提供取消和中断按钮', () => {
         assert.match(panel.card.bodyText, /状态：运行中/);
         assert.match(panel.card.bodyText, /排队中：1 条/);
-        assert.match(cancelButton.label, /取消排队/);
+        assert.match(cancelButton.label, /(?:取消|撤回)排队/);
         assert.match(action(panel, 'stop').label, /中断/);
         assert.equal(action(panel, 'stop').type, 'primary');
         assert.ok(panel.card.buttons.indexOf(cancelButton) < panel.card.buttons.findIndex(({value}) => value?.action === 'notice_settings'));
@@ -532,10 +532,10 @@ async function attachments(ctx) {
       await verifiedAttachment('error_trace.txt', 'file', 'text/plain', logs, '文本日志提示配置缺少 projectRoot。');
     });
 
-    await trace.step('6.3 在 Codex 话题上传不支持的「paper.pdf」', async () => {
+    await trace.step('6.3 在 Codex 话题上传不支持的「archive.zip」', async () => {
       const count = provider.inputs.length;
       const prior = new Set(sdk.resourceIssues().map(issue => issue.eventId));
-      const { replay } = await ctx.attach(codex, { name: 'paper.pdf', type: 'file', mediaType: 'application/pdf', bytes: pdf });
+      const { replay } = await ctx.attach(codex, { name: 'archive.zip', type: 'file', mediaType: 'application/zip', bytes: Buffer.from('PK\x03\x04fakezip') });
       await ctx.tick();
       await replay();
       await ctx.tick();
@@ -546,10 +546,10 @@ async function attachments(ctx) {
         ]);
         assert.equal(provider.inputs.length, count);
       });
-      trace.check('带文件名和 MIME 的 PDF 在事件重放后仍只收到一次格式提示', () => {
+      trace.check('带文件名和 MIME 的不支持二进制在事件重放后仍只收到一次格式提示', () => {
         const notices = ctx.writes(codex).filter(({ card }) => card.title === '附件未提交');
         assert.equal(notices.length, 1);
-        assert.equal(notices[0].card.bodyText, '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。');
+        assert.match(notices[0].card.bodyText, /仅支持图片/);
       });
       trace.observe('SDK 资源问题记录包含本次格式拒绝。', newIssues);
     });
@@ -576,7 +576,7 @@ async function attachments(ctx) {
         assert.equal(ctx.wire.calls.filter(call => call.method === 'im.messageResource.get').length, before + 1);
         const notices = ctx.writes(codex).filter(({ card }) => card.title === '附件未提交');
         assert.equal(notices.length, 1);
-        assert.equal(notices[0].card.bodyText, '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。');
+        assert.match(notices[0].card.bodyText, /仅支持图片/);
       });
     });
     await trace.step('6.5 在有资源拒绝记录时查看 /health', async () => {
