@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import {
   AgyQuotaClient,
+  formatAgyQuotaSummary,
   parseAgyUsageJson,
   queryAgyQuota,
   resolveAgyBinary,
@@ -297,6 +298,91 @@ setInterval(() => {}, 1000);
     await writeFile(futureCache, JSON.stringify({ snapshot_ts: (nowMs + 60_000) / 1000, windows: [] }));
     const futureSnap = await queryAgyQuota({ offline: true, cachePath: futureCache, nowMs });
     assert.equal(futureSnap.state, 'offline_empty');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('parseAgyUsageJson and AgyQuotaClient reject out-of-range remaining_fraction, classify partial/expired states, and expose structured snapshot', async () => {
+  const nowMs = Date.parse('2026-11-22T12:00:00Z');
+
+  // Out-of-range 1.4 + bad bucket must be rejected as invalid (never clamped to 100%).
+  const allInvalidPayload = {
+    status: 'SUCCESS',
+    command: {
+      data: {
+        groups: [
+          {
+            name: 'Gemini Models',
+            buckets: [
+              { id: 'over', window: '5h', remaining_fraction: 1.4 },
+              { id: 'neg', window: 'weekly', remaining_fraction: -0.2 },
+            ],
+          },
+        ],
+      },
+    },
+  };
+  const invalidParsed = parseAgyUsageJson(JSON.stringify(allInvalidPayload), nowMs);
+  assert.equal(invalidParsed.windows, null);
+  assert.equal(invalidParsed.validity, 'invalid');
+  assert.equal(invalidParsed.invalidBuckets, 2);
+  assert.ok(invalidParsed.error?.includes('1.4'));
+
+  // Partial valid payload: valid 0.75 + invalid 1.4 -> partial validity, invalid bucket dropped, degraded health.
+  const partialPayload = {
+    status: 'SUCCESS',
+    command: {
+      data: {
+        groups: [
+          {
+            name: 'Gemini Models',
+            buckets: [
+              { id: 'g-5h', window: '5h', remaining_fraction: 0.75 },
+              { id: 'g-bad', window: 'weekly', remaining_fraction: 1.4 },
+            ],
+          },
+        ],
+      },
+    },
+  };
+  const partialParsed = parseAgyUsageJson(JSON.stringify(partialPayload), nowMs);
+  assert.equal(partialParsed.validity, 'partial');
+  assert.equal(partialParsed.invalidBuckets, 1);
+  assert.equal(partialParsed.windows?.length, 1);
+  assert.equal(partialParsed.windows?.[0]!.remainingPercent, 75);
+
+  const dir = await mkdtemp(join(tmpdir(), 'agy-quota-strict-'));
+  try {
+    const cachePath = join(dir, 'quota-cache.json');
+    const fakePartial = await makeFakeAgy(
+      dir,
+      'fake-partial',
+      `process.stdout.write(${JSON.stringify(JSON.stringify(partialPayload))} + "\\n");`,
+    );
+    const client = new AgyQuotaClient({ agyBin: fakePartial, cachePath });
+    assert.equal(client.snapshot(), null);
+
+    const snap = await client.query({ nowMs });
+    assert.equal(snap.validity, 'partial');
+    assert.equal(snap.invalidBuckets, 1);
+    assert.equal(snap.health.status, 'degraded');
+    assert.deepEqual(client.snapshot()?.windows.length, 1);
+
+    const summary = formatAgyQuotaSummary(client.snapshot());
+    assert.match(summary, /部分有效/);
+    assert.match(summary, /剩余 75%/);
+
+    // Offline read after window expiry reports cacheExpired=true and validity='expired'.
+    const expiredSnap = await queryAgyQuota({
+      offline: true,
+      cachePath,
+      nowMs: nowMs + 301 * 60_000,
+    });
+    assert.equal(expiredSnap.state, 'offline_empty');
+    assert.equal(expiredSnap.cacheExpired, true);
+    assert.equal(expiredSnap.validity, 'expired');
+    assert.match(formatAgyQuotaSummary(expiredSnap), /缓存已过期/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

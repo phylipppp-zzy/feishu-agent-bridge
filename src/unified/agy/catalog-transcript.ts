@@ -1,18 +1,18 @@
 import { constants, existsSync } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import {
   assertValidConversationId,
+  CREATED_AT_HEADER_READ_BYTES,
   decodeCursor,
-  DEFAULT_AGY_BRAIN_DIR,
   DEFAULT_MAX_TRANSCRIPT_BYTES,
   encodeCursor,
-  expandHomePath,
   extractAgyUserInput,
   isInside,
   isPlainRecord,
   parseAgyTimestamp,
   parseTimestampMs,
+  resolveAgyBrainDirs,
   sha256,
   TERMINAL_STEP_STATUSES,
   type AgyMediaSummary,
@@ -23,6 +23,17 @@ import {
   type AgyTranscriptReadResult,
   type AgyTranscriptStep,
 } from './catalog-types.js';
+
+class FileExceedsMaxBytesError extends Error {
+  constructor(
+    readonly filePath: string,
+    readonly fileSize: number,
+    readonly maxBytes: number,
+  ) {
+    super(`file exceeds max bytes (${fileSize} > ${maxBytes}): ${filePath}`);
+    this.name = 'FileExceedsMaxBytesError';
+  }
+}
 
 /** Deterministic message ID for restart deduplication across incremental reads. */
 export function stableAgyMessageId(
@@ -40,22 +51,39 @@ function nonNegIntOrNull(value: unknown): number | null {
   return value;
 }
 
-function extractTokenUsage(row: Record<string, unknown>): AgyTokenUsage | null {
-  const hasAny =
-    Object.prototype.hasOwnProperty.call(row, 'input_tokens') ||
-    Object.prototype.hasOwnProperty.call(row, 'cache_read_tokens') ||
-    Object.prototype.hasOwnProperty.call(row, 'output_tokens');
-  if (!hasAny) return null;
-  const inputTokens = nonNegIntOrNull(row.input_tokens ?? 0);
-  const cacheReadTokens = nonNegIntOrNull(row.cache_read_tokens ?? 0);
-  const outputTokens = nonNegIntOrNull(row.output_tokens ?? 0);
-  if (inputTokens === null || cacheReadTokens === null || outputTokens === null) return null;
-  return {
-    inputTokens,
-    cacheReadTokens,
-    outputTokens,
-    totalTokens: inputTokens + cacheReadTokens + outputTokens,
-  };
+export function extractTokenUsage(row: Record<string, unknown>): AgyTokenUsage | null {
+  const fields: Array<[string, keyof AgyTokenUsage]> = [
+    ['input_tokens', 'inputTokens'],
+    ['cache_read_tokens', 'cacheReadTokens'],
+    ['output_tokens', 'outputTokens'],
+    ['total_tokens', 'totalTokens'],
+  ];
+
+  const usage: AgyTokenUsage = {};
+  let validCount = 0;
+
+  for (const [rawKey, outKey] of fields) {
+    if (!Object.prototype.hasOwnProperty.call(row, rawKey)) continue;
+    const rawVal = row[rawKey];
+    if (rawVal === undefined || rawVal === null) continue;
+    const parsed = nonNegIntOrNull(rawVal);
+    if (parsed === null) return null;
+    usage[outKey] = parsed;
+    validCount += 1;
+  }
+
+  if (validCount === 0) return null;
+
+  if (
+    usage.totalTokens === undefined &&
+    usage.inputTokens !== undefined &&
+    usage.cacheReadTokens !== undefined &&
+    usage.outputTokens !== undefined
+  ) {
+    usage.totalTokens = usage.inputTokens + usage.cacheReadTokens + usage.outputTokens;
+  }
+
+  return usage;
 }
 
 function extractToolCalls(value: unknown): AgyToolCallSummary[] {
@@ -102,13 +130,16 @@ async function readRegularFileWithinRoot(
     throw new Error(`file escapes allowed root: ${filePath}`);
   }
   if (info.size > maxBytes) {
-    throw new Error(`file exceeds max bytes (${info.size} > ${maxBytes}): ${filePath}`);
+    throw new FileExceedsMaxBytesError(filePath, info.size, maxBytes);
   }
   const handle = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > maxBytes) {
-      throw new Error(`file invalid or exceeds max bytes: ${filePath}`);
+    if (!stat.isFile()) {
+      throw new Error(`file invalid: ${filePath}`);
+    }
+    if (stat.size > maxBytes) {
+      throw new FileExceedsMaxBytesError(filePath, stat.size, maxBytes);
     }
     const buf = Buffer.alloc(stat.size);
     let offset = 0;
@@ -121,6 +152,129 @@ async function readRegularFileWithinRoot(
   } finally {
     await handle.close();
   }
+}
+
+async function resolveTranscriptSessionDir(
+  conversationId: string,
+  options: { brainDir?: string; brainDirs?: readonly string[]; appDataDir?: string },
+): Promise<string | null> {
+  const brainDirs = resolveAgyBrainDirs(options);
+  for (const brainDir of brainDirs) {
+    if (!existsSync(brainDir)) continue;
+    const canonicalBrainDir = await realpath(brainDir);
+    const sessionDir = join(canonicalBrainDir, conversationId);
+    if (!existsSync(sessionDir)) continue;
+    const sessionInfo = await lstat(sessionDir);
+    if (sessionInfo.isSymbolicLink() || !sessionInfo.isDirectory()) {
+      throw new Error(`refusing non-directory or symlinked session brain dir: ${sessionDir}`);
+    }
+    const canonicalSessionDir = await realpath(sessionDir);
+    if (!isInside(canonicalSessionDir, canonicalBrainDir)) {
+      throw new Error(`session brain dir escapes brainDir: ${sessionDir}`);
+    }
+    return canonicalSessionDir;
+  }
+  return null;
+}
+
+async function readFileHeaderWithinRoot(
+  filePath: string,
+  canonicalRoot: string,
+  maxHeaderBytes: number,
+): Promise<Buffer | null> {
+  let info;
+  try {
+    info = await lstat(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`refusing non-regular or symlinked file: ${filePath}`);
+  }
+  const canonicalPath = await realpath(filePath);
+  if (!isInside(canonicalPath, canonicalRoot)) {
+    throw new Error(`file escapes allowed root: ${filePath}`);
+  }
+  const handle = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    const toRead = Math.min(stat.size, maxHeaderBytes);
+    if (toRead <= 0) return Buffer.alloc(0);
+    const buf = Buffer.allocUnsafe(toRead);
+    let offset = 0;
+    while (offset < toRead) {
+      const { bytesRead } = await handle.read(buf, offset, toRead - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    return buf.subarray(0, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read only the first 8 KiB header of `transcript.jsonl` (or `transcript_full.jsonl`)
+ * to extract the initial `created_at` timestamp without loading the whole file.
+ */
+export async function readAgyTranscriptCreatedAt(
+  conversationId: string,
+  options: {
+    brainDir?: string;
+    brainDirs?: readonly string[];
+    appDataDir?: string;
+    maxHeaderBytes?: number;
+  } = {},
+): Promise<string | null> {
+  assertValidConversationId(conversationId);
+  const maxHeaderBytes = options.maxHeaderBytes ?? CREATED_AT_HEADER_READ_BYTES;
+  const canonicalSessionDir = await resolveTranscriptSessionDir(conversationId, options);
+  if (!canonicalSessionDir) return null;
+
+  const candidates = [
+    join(canonicalSessionDir, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(canonicalSessionDir, '.system_generated', 'logs', 'transcript_full.jsonl'),
+  ];
+
+  for (const filePath of candidates) {
+    let buf: Buffer | null;
+    try {
+      buf = await readFileHeaderWithinRoot(filePath, canonicalSessionDir, maxHeaderBytes);
+    } catch {
+      continue;
+    }
+    if (!buf || buf.length === 0) continue;
+    const headerText = buf.toString('utf8');
+    const lines = headerText.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (isPlainRecord(parsed)) {
+          const ts = parseAgyTimestamp(parsed.created_at);
+          if (ts) return ts;
+        }
+      } catch {
+        // First line may exceed maxHeaderBytes: fall back to regex extraction of created_at.
+        const strMatch = /"created_at"\s*:\s*"([^"]+)"/.exec(trimmed);
+        if (strMatch?.[1]) {
+          const ts = parseAgyTimestamp(strMatch[1]);
+          if (ts) return ts;
+        }
+        const numMatch = /"created_at"\s*:\s*(\d+(?:\.\d+)?)/.exec(trimmed);
+        if (numMatch?.[1]) {
+          const ts = parseAgyTimestamp(Number(numMatch[1]));
+          if (ts) return ts;
+        }
+      }
+      // Only inspect the first non-empty line for session creation time.
+      break;
+    }
+  }
+  return null;
 }
 
 function splitCompleteJsonlLines(text: string): { lines: string[]; truncatedTrailingLine: boolean } {
@@ -188,7 +342,6 @@ export async function readAgyTranscript(
   options: AgyReadTranscriptOptions = {},
 ): Promise<AgyTranscriptReadResult> {
   assertValidConversationId(conversationId);
-  const brainDir = resolve(expandHomePath(options.brainDir ?? DEFAULT_AGY_BRAIN_DIR));
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_TRANSCRIPT_BYTES;
 
   let startLine = options.afterLine ?? 0;
@@ -230,11 +383,16 @@ export async function readAgyTranscript(
     throw new Error('invalid afterLine');
   }
 
+  const warnings: string[] = [];
+  let fullTranscriptSkippedReason: string | null = null;
+
   const emptyResult = (transcriptPath: string | null, fullPath: string | null, usedFullFallback: boolean): AgyTranscriptReadResult => ({
     conversationId,
     transcriptPath,
     fullTranscriptPath: fullPath,
     usedFullFallback,
+    fullTranscriptSkippedReason,
+    warnings: [...warnings],
     steps: [],
     messages: [],
     nextLine: 0,
@@ -251,24 +409,10 @@ export async function readAgyTranscript(
     truncatedTrailingLine: false,
   });
 
-  if (!existsSync(brainDir)) {
+  const canonicalSessionDir = await resolveTranscriptSessionDir(conversationId, options);
+  if (!canonicalSessionDir) {
     if (expectedPrefixDigest !== null && startLine > 0) throw new Error('stale or invalid cursor');
     return emptyResult(null, null, false);
-  }
-
-  const canonicalBrainDir = await realpath(brainDir);
-  const sessionDir = join(canonicalBrainDir, conversationId);
-  if (!existsSync(sessionDir)) {
-    if (expectedPrefixDigest !== null && startLine > 0) throw new Error('stale or invalid cursor');
-    return emptyResult(null, null, false);
-  }
-  const sessionInfo = await lstat(sessionDir);
-  if (sessionInfo.isSymbolicLink() || !sessionInfo.isDirectory()) {
-    throw new Error(`refusing non-directory or symlinked session brain dir: ${sessionDir}`);
-  }
-  const canonicalSessionDir = await realpath(sessionDir);
-  if (!isInside(canonicalSessionDir, canonicalBrainDir)) {
-    throw new Error(`session brain dir escapes brainDir: ${sessionDir}`);
   }
 
   const compactPath = join(canonicalSessionDir, '.system_generated', 'logs', 'transcript.jsonl');
@@ -317,7 +461,20 @@ export async function readAgyTranscript(
       return null;
     }
     if (fullBufCache === undefined) {
-      fullBufCache = await readRegularFileWithinRoot(fullPath, canonicalSessionDir, maxBytes);
+      try {
+        fullBufCache = await readRegularFileWithinRoot(fullPath, canonicalSessionDir, maxBytes);
+      } catch (err) {
+        if (err instanceof FileExceedsMaxBytesError) {
+          fullTranscriptSkippedReason = 'full_transcript_exceeds_max_bytes';
+          warnings.push(
+            `transcript_full.jsonl exceeds max bytes (${err.fileSize} > ${err.maxBytes}); degraded to compact transcript.jsonl`,
+          );
+          fullBufCache = null;
+          fullIndex = null;
+          return null;
+        }
+        throw err;
+      }
     }
     fullIndex = fullBufCache ? buildFullTranscriptIndex(fullBufCache.toString('utf8')) : null;
     return fullIndex;
@@ -477,6 +634,13 @@ export async function readAgyTranscript(
     }
   }
 
+  if (parseErrors > 0) {
+    warnings.push(`transcript contains ${parseErrors} malformed JSONL line(s)`);
+  }
+  if (truncatedTrailingLine) {
+    warnings.push('transcript has an incomplete trailing JSONL line');
+  }
+
   const nextLine = lines.length;
   const cursor = encodeCursor({
     conversationId,
@@ -491,6 +655,8 @@ export async function readAgyTranscript(
     transcriptPath: compactBuf ? compactPath : null,
     fullTranscriptPath: usedFullFallback || fullBufCache ? fullPath : null,
     usedFullFallback,
+    fullTranscriptSkippedReason,
+    warnings,
     steps,
     messages,
     nextLine,

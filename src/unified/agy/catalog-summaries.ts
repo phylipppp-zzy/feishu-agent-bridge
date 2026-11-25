@@ -7,7 +7,6 @@ import {
   ALL_CONTROL_CHARS_RE,
   canonicalizePath,
   CONVERSATION_ID_RE,
-  DEFAULT_AGY_BRAIN_DIR,
   DEFAULT_AGY_SUMMARIES_DB_PATH,
   DEFAULT_MAX_TITLE_LENGTH,
   expandHomePath,
@@ -16,6 +15,7 @@ import {
   isPlainRecord,
   isTruthyFlag,
   parseAgyTimestamp,
+  resolveAgyBrainDirs,
   stripHostInjectionBlocks,
   TITLE_TRANSCRIPT_READ_BYTES,
   type AgyConversationSummaryRow,
@@ -294,6 +294,7 @@ export function readAgySummaries(
   options: {
     dbPath?: string;
     brainDir?: string;
+    brainDirs?: readonly string[];
     allowedProjectRoots?: readonly string[];
     includeOutsideRoots?: boolean;
     maxTitleLength?: number;
@@ -301,13 +302,30 @@ export function readAgySummaries(
   titleCache?: AgyTitleCache,
 ): AgyDiscoveredSession[] {
   const dbPath = resolve(expandHomePath(options.dbPath ?? DEFAULT_AGY_SUMMARIES_DB_PATH));
-  const brainDir = resolve(expandHomePath(options.brainDir ?? DEFAULT_AGY_BRAIN_DIR));
-  let canonicalBrainDir: string | null = null;
-  try {
-    if (existsSync(brainDir)) canonicalBrainDir = realpathSync(brainDir);
-  } catch {
-    canonicalBrainDir = null;
-  }
+  const canonicalBrainDirCache = new Map<string, string | null>();
+  const resolveCanonicalBrain = (dir: string): string | null => {
+    if (canonicalBrainDirCache.has(dir)) return canonicalBrainDirCache.get(dir)!;
+    let canonical: string | null = null;
+    try {
+      if (existsSync(dir)) canonical = realpathSync(dir);
+    } catch {
+      canonical = null;
+    }
+    canonicalBrainDirCache.set(dir, canonical);
+    return canonical;
+  };
+  const readTitleFromBrains = (conversationId: string, appDataDir: string, maxLen: number): string | null => {
+    const dirs = resolveAgyBrainDirs({
+      ...(options.brainDir !== undefined ? { brainDir: options.brainDir } : {}),
+      ...(options.brainDirs !== undefined ? { brainDirs: options.brainDirs } : {}),
+      ...(appDataDir ? { appDataDir } : {}),
+    });
+    for (const dir of dirs) {
+      const title = readTranscriptTitleFromBrain(conversationId, resolveCanonicalBrain(dir), maxLen, titleCache);
+      if (title) return title;
+    }
+    return null;
+  };
   if (!existsSync(dbPath)) return [];
   const st = lstatSync(dbPath);
   if (st.isSymbolicLink() || !st.isFile()) {
@@ -403,9 +421,10 @@ export function readAgySummaries(
     const rawTitle = typeof row.title === 'string' ? row.title : '';
     const preview = typeof row.preview === 'string' ? row.preview : '';
     const rawStatus = typeof row.status === 'string' ? row.status : '';
+    const appDataDir = typeof row.app_data_dir === 'string' ? row.app_data_dir : '';
     const derivedTitle =
       derivePresentAgyTitle(rawTitle, preview, maxTitleLength) ??
-      readTranscriptTitleFromBrain(row.conversation_id, canonicalBrainDir, maxTitleLength, titleCache) ??
+      readTitleFromBrains(row.conversation_id, appDataDir, maxTitleLength) ??
       deriveAgySessionTitle(row.conversation_id, '', '', maxTitleLength);
     sessions.push({
       conversationId: row.conversation_id,
@@ -415,12 +434,15 @@ export function readAgySummaries(
       project: projectInfo.project,
       workspacePaths: projectInfo.workspacePaths,
       projectAllowed: projectInfo.allowed,
-      stepCount: Number.isFinite(row.step_count) ? Number(row.step_count) : 0,
+      stepCount:
+        typeof row.step_count === 'number' && Number.isSafeInteger(row.step_count) && row.step_count >= 0
+          ? row.step_count
+          : 0,
       status: mapCascadeStatus(rawStatus),
       rawStatus,
       source: typeof row.source === 'string' ? row.source : '',
       projectId: typeof row.project_id === 'string' ? row.project_id : '',
-      appDataDir: typeof row.app_data_dir === 'string' ? row.app_data_dir : '',
+      appDataDir,
       groupId: typeof row.group_id === 'string' ? row.group_id : '',
       lastModifiedAt: parseAgyTimestamp(row.last_modified_time),
       lastUserInputAt: parseAgyTimestamp(row.last_user_input_time),

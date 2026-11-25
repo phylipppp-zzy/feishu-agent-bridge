@@ -23,7 +23,7 @@ import {
   type LiveSessionMeta,
 } from './adapter-types.js';
 import { isPlaceholderAgyTitle } from './catalog-summaries.js';
-import { ALL_CONTROL_CHARS_RE } from './catalog-types.js';
+import { ALL_CONTROL_CHARS_RE, type AgyCreatedAtInfo } from './catalog-types.js';
 import { agyPromptText, reconcileAgyReply } from './transcript-reconciliation.js';
 
 const ACP_TITLES_TTL_MS = 15_000;
@@ -153,19 +153,27 @@ export async function listSessions(
   };
 }
 
+export async function resolveCreatedAtInfo(
+  ctx: AdapterContext,
+  summary: AgyDiscoveredSession,
+): Promise<AgyCreatedAtInfo> {
+  try {
+    const createdAt = await ctx.catalog.readTranscriptCreatedAt(summary.conversationId, summary.appDataDir);
+    if (createdAt) {
+      return { createdAt, source: 'transcript' };
+    }
+  } catch {
+    // Transcript unavailable or unreadable; keep source as unknown.
+  }
+  return { createdAt: null, source: 'unknown' };
+}
+
 export async function resolveCreatedAtIso(
   ctx: AdapterContext,
   summary: AgyDiscoveredSession,
 ): Promise<string | undefined> {
-  try {
-    const transcript = await ctx.catalog.readTranscript(summary.conversationId);
-    for (const step of transcript.steps) {
-      if (step.createdAt) return step.createdAt;
-    }
-  } catch {
-    // Fallback to DB timestamps when transcript is unavailable.
-  }
-  return summary.lastUserInputAt ?? summary.lastModifiedAt ?? undefined;
+  const info = await resolveCreatedAtInfo(ctx, summary);
+  return info.source === 'transcript' && info.createdAt ? info.createdAt : undefined;
 }
 
 export async function discoverExistingSessions(
@@ -229,7 +237,8 @@ export async function discoverExistingSessions(
       partialFailure = true;
       continue;
     }
-    const createdAt = await resolveCreatedAtIso(ctx, summary);
+    const createdInfo = await resolveCreatedAtInfo(ctx, summary);
+    const createdAt = createdInfo.createdAt ?? summary.lastUserInputAt ?? summary.lastModifiedAt ?? undefined;
     if (!createdAt) continue;
     items.push({
       ...ctx.buildSession(id, summary, undefined, createdAt),
@@ -291,8 +300,10 @@ export async function discoverNewerSessions(
       const latestMs = Number.isFinite(modMs) ? modMs : inputMs;
       if (!Number.isFinite(latestMs) || latestMs <= watermark) continue;
 
-      const createdAt = await resolveCreatedAtIso(ctx, summary);
-      if (!createdAt) continue;
+      const createdInfo = await resolveCreatedAtInfo(ctx, summary);
+      // Unknown creation time must never serve as proof of post-watermark creation.
+      if (createdInfo.source !== 'transcript' || !createdInfo.createdAt) continue;
+      const createdAt = createdInfo.createdAt;
       const createdMs = Date.parse(createdAt);
       if (!Number.isFinite(createdMs) || createdMs <= watermark) continue;
 
@@ -567,6 +578,31 @@ export async function readSessionSnapshot(
       normalizeTranscriptMessage(id, m, i + 1),
     );
     createdAt = transcript.steps.find(s => s.createdAt)?.createdAt ?? undefined;
+    if (transcript.warnings?.length) {
+      ctx.emit({
+        type: 'event',
+        ref: ctx.ref(id),
+        event: {
+          schemaVersion: 1,
+          eventId: `agy-transcript-warn:${id}:${transcript.nextLine}:${transcript.warnings.length}`,
+          sessionId: id,
+          objectId: id,
+          objectRevision: 0,
+          sequence: ctx.nextSequence(),
+          type: 'transcript.warning',
+          occurredAt: new Date().toISOString(),
+          receivedAt: new Date().toISOString(),
+          operationId: null,
+          cursor: `warn:${id}:${transcript.nextLine}`,
+          data: {
+            warnings: transcript.warnings,
+            parseErrors: transcript.parseErrors,
+            truncatedTrailingLine: transcript.truncatedTrailingLine,
+            fullTranscriptSkippedReason: transcript.fullTranscriptSkippedReason ?? null,
+          },
+        },
+      });
+    }
   } catch {
     // Fresh ACP session may not yet have a transcript directory on disk.
   }
