@@ -1,5 +1,6 @@
 import { realpathSync, statSync } from 'node:fs';
-import { basename, isAbsolute, relative, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
 import type { Provider, WriteContext } from './contracts.js';
 import type { ChannelCard } from './feishu-cards.js';
@@ -9,8 +10,10 @@ import type { FeishuSessionBinding } from './feishu-session-binding.js';
 import type { NewSessionDraft, NewSessionDrafts } from './new-session-drafts.js';
 import { BindingExpired } from './topic-title-sync.js';
 
+export const MAX_NEW_SESSION_PROJECTS = 20;
+
 export type NewSessionAction =
-  | { action: 'new_help'; provider?: Provider; initialPrompt?: string }
+  | { action: 'new_help'; provider?: Provider; project?: string; initialPrompt?: string }
   | { action: 'new_provider'; t: string; r: number; p: Provider }
   | { action: 'new_pick'; t: string; r: number; i: number };
 
@@ -32,10 +35,17 @@ type Execution = {
 const providerOrder: Provider[] = ['agy', 'codex', 'claude'];
 const providerNames: Record<Provider, string> = { agy: 'Antigravity', codex: 'Codex', claude: 'Claude' };
 
+function expandHomePath(path: string): string {
+  if (path === '~') return homedir();
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
+  return path;
+}
+
 function realDirectory(path: string): string | undefined {
-  if (!isAbsolute(path)) return;
+  const expanded = expandHomePath(path);
+  if (!isAbsolute(expanded)) return;
   try {
-    const real = realpathSync(path);
+    const real = realpathSync(expanded);
     if (statSync(real).isDirectory()) return real;
   } catch { /* stale directory */ }
 }
@@ -62,14 +72,16 @@ function button(label: string, value: NewSessionAction): ChannelCard['actions'][
   return { label, value };
 }
 
-function draftCard(draft: NewSessionDraft, providers: Provider[]): ChannelCard {
+function draftCard(draft: NewSessionDraft, providers: Provider[], explicitProject?: string): ChannelCard {
   const preview = [...stripCardMentions(draft.initial_prompt ?? '')];
+  const labels = labelsFor(draft.projects);
   return {
     title: '新建会话',
     template: 'blue',
     format: 'plain',
     text: [
       `当前后端：${providerNames[draft.provider]}`,
+      explicitProject ? `指定目录：${explicitProject}` : '',
       preview.length ? `首句任务：${preview.slice(0, 180).join('')}${preview.length > 180 ? '…' : ''}` : '',
       '选择一个目录即可创建新会话。',
     ].filter(Boolean).join('\n'),
@@ -78,7 +90,10 @@ function draftCard(draft: NewSessionDraft, providers: Provider[]): ChannelCard {
         ...button(`${p === draft.provider ? '✓ ' : ''}${providerNames[p]}`, { action: 'new_provider', t: draft.token, r: draft.revision, p }),
         type: p === draft.provider ? 'primary' as const : 'default' as const,
       })),
-      ...labelsFor(draft.projects).map((label, i) => button(label, { action: 'new_pick', t: draft.token, r: draft.revision, i })),
+      ...labels.map((label, i) => ({
+        ...button(label, { action: 'new_pick', t: draft.token, r: draft.revision, i }),
+        ...(explicitProject && draft.projects[i] === explicitProject ? { type: 'primary' as const } : {}),
+      })),
     ],
   };
 }
@@ -123,21 +138,35 @@ export class NewSessionFlow {
       await x.reply({ title: '后端不可用', text: `当前可用后端：${providers.map(p => providerNames[p]).join('、')}。请重新发送 /new。`, actions: [] });
       return { status: 'unavailable' };
     }
-    const sessions = await this.service.listSessions({limit:20}).then(page => page.items, () => []);
+    let explicitProject: string | undefined;
+    if (a.project) {
+      const resolved = realDirectory(a.project);
+      if (!resolved || !roots.some(root => within(resolved, root))) {
+        await x.reply({
+          title: '目录不可用',
+          template: 'orange',
+          text: `目录 ${a.project} 不存在或不在允许的项目根目录内。`,
+          actions: [],
+        });
+        return { status: 'unavailable' };
+      }
+      explicitProject = resolved;
+    }
+    const sessions = await this.service.listSessions({limit:50}).then(page => page.items, () => []);
     const visible: string[] = [];
     for (const session of sessions) {
       if (await this.authorize(e.identity, e.destination, session.sessionId)) visible.push(session.project);
     }
-    const candidates = [this.options.defaultCreateProject, ...visible, ...roots];
+    const candidates = [explicitProject, this.options.defaultCreateProject, ...visible, ...roots];
     const projects = new Set<string>();
     for (const candidate of candidates) {
       const real = candidate && realDirectory(candidate);
       if (real && roots.some(root => within(real, root))) projects.add(real);
-      if (projects.size === 5) break;
+      if (projects.size >= MAX_NEW_SESSION_PROJECTS) break;
     }
     await x.guard();
     const draft = this.drafts.open(e, x.scope, a.provider ?? providers[0]!, [...projects], a.initialPrompt);
-    const messageId = await x.reply(draftCard(draft, providers), 'new-draft');
+    const messageId = await x.reply(draftCard(draft, providers, explicitProject), 'new-draft');
     if (messageId) this.drafts.setCardMessage(draft.token, messageId);
     return { status: 'draft' };
   }

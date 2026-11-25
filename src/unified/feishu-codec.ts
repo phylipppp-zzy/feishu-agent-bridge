@@ -236,8 +236,14 @@ function parseAction(value: unknown): RuntimeTrustedAction {
 }
 /** Callback buttons must carry the binding epoch stamped by the channel. */
 export function parseFeishuAction<T extends RuntimeTrustedAction = ChannelAction>(value: unknown, formValues?: unknown): T {
-  if (object(value) && value.action === 'answer_form') {
-    if (!str(value.interactionId) || !counter(value.revision) || !counter(value.connectionGeneration) || !object(formValues) || JSON.stringify(formValues).length > 100_000) {
+  if (object(value) && (value.action === 'answer_form' || value.action === 'decline_form')) {
+    const isDecline = value.action === 'decline_form' || value.decline === true;
+    if (value.decline !== undefined && typeof value.decline !== 'boolean') throw new Error('invalid question form callback');
+    if (!isDecline && object(formValues) && Object.hasOwn(formValues, '__decline')) {
+      throw new Error('invalid question form callback');
+    }
+    const normalizedForm = isDecline ? { __decline: true } : formValues;
+    if (!str(value.interactionId) || !counter(value.revision) || !counter(value.connectionGeneration) || !object(normalizedForm) || JSON.stringify(normalizedForm).length > 100_000) {
       throw new Error('invalid question form callback');
     }
     const pendingMeta = parsePendingMeta(value);
@@ -250,10 +256,11 @@ export function parseFeishuAction<T extends RuntimeTrustedAction = ChannelAction
       ...(str(value.bindingId) ? { bindingId: value.bindingId } : {}),
       ...(pendingMeta ?? {}),
       ...(taskScope ?? {}),
+      ...(isDecline ? { decline: true } : {}),
       interactionId: value.interactionId,
       revision: value.revision,
       connectionGeneration: value.connectionGeneration,
-      fields: formValues,
+      fields: normalizedForm,
     } as T;
   }
   const action = parseAction(value);
@@ -270,11 +277,108 @@ export function parseFeishuAction<T extends RuntimeTrustedAction = ChannelAction
       : {};
   return { ...action, ...attachBindingId } as T;
 }
+
+export const KNOWN_BRIDGE_COMMANDS: ReadonlySet<string> = new Set([
+  '/help', '/swarm', '/new', '/sessions', '/candidates', '/model', '/list', '/bind',
+  '/attach', '/stop', '/cancel', '/control', '/settings', '/notifications', '/archive',
+  '/create', '/answer', '/queue', '/steer', '/', '/status', '/menu', '/panel', '/ls',
+  '/deliver', '/export', '/history', '/file', '/files', '/models', '/pending', '/ops',
+  '/health', '/quota', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
+]);
+
+export function isBridgeCommand(command: string): boolean {
+  return KNOWN_BRIDGE_COMMANDS.has(command);
+}
+
+function tokenizeShellArgs(raw: string): string[] | null {
+  const args: string[] = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  let hasToken = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      else current += ch;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < raw.length) {
+        current += raw[++i]!;
+      } else if (ch === '"') {
+        inDouble = false;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '\\' && i + 1 < raw.length) {
+      hasToken = true;
+      current += raw[++i]!;
+    } else if (ch === "'") {
+      hasToken = true;
+      inSingle = true;
+    } else if (ch === '"') {
+      hasToken = true;
+      inDouble = true;
+    } else if (/\s/.test(ch)) {
+      if (hasToken) {
+        args.push(current);
+        current = '';
+        hasToken = false;
+      }
+    } else {
+      hasToken = true;
+      current += ch;
+    }
+  }
+  if (inSingle || inDouble) return null;
+  if (hasToken) args.push(current);
+  return args;
+}
+
+function parseLeadingPathToken(tail: string): { path: string; rest: string } | null {
+  if (!tail) return null;
+  const quote = tail[0];
+  if (quote === '"' || quote === "'") {
+    let value = '';
+    let i = 1;
+    while (i < tail.length) {
+      const ch = tail[i]!;
+      if (quote === '"' && ch === '\\' && i + 1 < tail.length) {
+        value += tail[++i]!;
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        const after = tail.slice(i + 1);
+        if (after.length > 0 && !/^\s/.test(after)) return null;
+        if (!value || (!value.startsWith('/') && !value.startsWith('~/'))) return null;
+        return { path: value, rest: after.trimStart() };
+      }
+      value += ch;
+      i++;
+    }
+    return null;
+  }
+  const match = /^(\S+)/.exec(tail);
+  if (!match) return null;
+  const token = match[1]!;
+  if (!token.startsWith('/') && !token.startsWith('~/')) return null;
+  return { path: token, rest: tail.slice(token.length).trimStart() };
+}
+
 /** Commands work identically for either provider; text without a slash is an input. */
-export function parseFeishuText(text: string): ChannelAction {
+export function parseFeishuText(text: string, options?: { passthroughUnknownSlash?: boolean }): ChannelAction {
   const input = text.trim(); if (!input) throw new Error('empty message');
   if (!input.startsWith('/')) return {action:'input',text:input,mode:'new'};
-  const [command, ...parts] = input.split(/\s+/); const rest = parts.join(' ');
+  const trimmedStart = text.trimStart();
+  const cmdMatch = /^(\S+)/.exec(trimmedStart);
+  const command = cmdMatch![1]!;
+  const rawTail = trimmedStart.slice(command.length);
+  const parts = input.split(/\s+/).slice(1);
+  const rest = parts.join(' ');
   switch (command) {
     case '/help': {
       if (parts.length === 0) return {action:'help'};
@@ -282,18 +386,31 @@ export function parseFeishuText(text: string): ChannelAction {
       break;
     }
     case '/swarm': {
-      const prompt = input.slice(command!.length).trim();
+      const prompt = input.slice(command.length).trim();
       return {action:'swarm',prompt,rawText:input};
     }
     case '/new': {
-      const tail = text.trimStart().slice(command.length).trimStart();
-      const provider = isProvider(parts[0]) ? parts[0] : undefined;
-      const prompt = provider ? tail.slice(provider.length).trimStart() : tail;
-      return {action:'new_help',...(provider ? {provider} : {}),...(prompt.trim() ? {initialPrompt:prompt} : {})};
+      let tail = rawTail.trimStart();
+      const firstToken = /^(\S+)/.exec(tail)?.[1];
+      const provider = firstToken && isProvider(firstToken) ? firstToken : undefined;
+      if (provider) tail = tail.slice(provider.length).trimStart();
+      const leadingPath = parseLeadingPathToken(tail);
+      const project = leadingPath?.path;
+      if (leadingPath) tail = leadingPath.rest;
+      return {
+        action: 'new_help',
+        ...(provider ? { provider } : {}),
+        ...(project ? { project } : {}),
+        ...(tail.trim() ? { initialPrompt: tail } : {}),
+      };
     }
     case '/sessions': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/candidates': if(parts.length===1||parts.length===2)return {action:'inspect_unknown',operationId:parts[0]!,...(parts[1]?{nativeId:parts[1]}:{})};break;
-    case '/model': return parts.length === 0 ? {action:'legacy_model'} : parts.length === 2 ? {action:'legacy_model',model:parts[0]!,effort:parts[1]!} : {action:'legacy_model',invalid:true};
+    case '/model':
+      if (parts.length === 0) return {action:'legacy_model'};
+      if (parts.length === 1) return {action:'legacy_model',model:parts[0]!};
+      if (parts.length === 2) return {action:'legacy_model',model:parts[0]!,effort:parts[1]!};
+      return {action:'legacy_model',invalid:true};
     case '/list': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/bind': if (parts[0] && (!parts[1] || parts[1] === 'read_only' || parts[1] === 'interactive')) return {action:'bind',sessionId:parts[0],...(parts[1] ? {mode:parts[1] as 'read_only'|'interactive'} : {})}; break;
     case '/attach': { const [provider,hostId,serviceId,nativeSessionId,mode] = parts; return parseAction({action:'attach',provider,hostId,serviceId,nativeSessionId,mode}) as ChannelAction; }
@@ -303,19 +420,33 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/settings': { const [model,r,g]=parts; return parseAction({action:'settings',model:model === '-' ? null : model,preferences:{},revision:Number(r),controlGeneration:Number(g)}) as ChannelAction; }
     case '/notifications': { const [enabled,r,g,...eventTypes]=parts; if (enabled !== 'on' && enabled !== 'off') break; return parseAction({action:'notifications',enabled:enabled === 'on',eventTypes,revision:Number(r),controlGeneration:Number(g)}) as ChannelAction; }
     case '/archive': { const [mode,r,g]=parts; if (mode !== 'on' && mode !== 'off') break; return parseAction({action:'archive',archived:mode === 'on',revision:Number(r),controlGeneration:Number(g)}) as ChannelAction; }
-    case '/create': if ((parts[0] === 'claude' || parts[0] === 'codex' || parts[0] === 'agy') && parts[1]) return {action:'create',provider:parts[0],project:parts[1],model:parts[2] ?? null}; break;
+    case '/create': {
+      const tokens = tokenizeShellArgs(rawTail.trim());
+      if (tokens && tokens.length >= 2 && tokens.length <= 3 && (tokens[0] === 'claude' || tokens[0] === 'codex' || tokens[0] === 'agy') && tokens[1]) {
+        return {action:'create',provider:tokens[0],project:tokens[1],model:tokens[2] ?? null};
+      }
+      break;
+    }
     case '/answer': {
       const [interactionId, revision, generation, ...values] = parts;
       const r = Number(revision), g = Number(generation);
       if (interactionId && revision !== undefined && generation !== undefined && counter(r) && counter(g) && values.length) return {action:'answer',interactionId,revision:r,connectionGeneration:g,answer:{kind:'question',values},toolInputDigest:null};
       break;
     }
-    case '/queue': if (rest) return {action:'input',text:rest,mode:'queue'}; break;
-    case '/steer': if (rest) return {action:'input',text:rest,mode:'steer'}; break;
+    case '/queue': {
+      const body = rawTail.replace(/^(?:[ \t]+|\r?\n)/, '').trimEnd();
+      if (body.trim()) return {action:'input',text:body,mode:'queue'};
+      break;
+    }
+    case '/steer': {
+      const body = rawTail.replace(/^(?:[ \t]+|\r?\n)/, '').trimEnd();
+      if (body.trim()) return {action:'input',text:body,mode:'steer'};
+      break;
+    }
     case '/': case '/status': case '/menu': return {action:'panel'};
     case '/panel': return {action:'panel',...(parts[0] && parts[0] !== '-' ? {turnId:parts[0]} : {}),...(parts[1] && parts[1] !== '-' ? {inputId:parts[1]} : {})};
     case '/ls': { const args=parts.filter(x=>x!=='-a'); if(args.length>1) break; return {action:'project_files',directory:args[0] ?? '.',showHidden:parts.includes('-a')}; }
-    case '/deliver': if (rest) return {action:'deliver_files',args:input.slice(command!.length).trim()}; break;
+    case '/deliver': if (rest) return {action:'deliver_files',args:input.slice(command.length).trim()}; break;
     case '/export': if (!rest) return {action:'export'}; break;
     case '/history': return {action:'history',...(rest ? {cursor:rest}:{})};
     case '/file':
@@ -324,6 +455,7 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/pending': if (!parts.length) return {action:'pending_open'}; break;
     case '/ops': if (!parts.length) return {action:'pending'}; break;
     case '/health': return {action:'health'};
+    case '/quota': if (!parts.length) return {action:'quota'}; break;
     case '/upgrade': return {action:'upgrade'};
     case '/unbind': return {action:'unbind'};
     case '/task': {
@@ -339,6 +471,12 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/handoff': if (parts.length === 1 && parts[0]) return {action:'handoff_preview',targetId:parts[0]}; break;
     case '/finish': if (rest) return {action:'finish',operationId:rest}; break;
     case '/reconcile': if (rest) return {action:'reconcile',operationId:rest}; break;
+    default: {
+      if (options?.passthroughUnknownSlash) {
+        return {action:'input',text:input,mode:'new'};
+      }
+      break;
+    }
   }
   throw new Error('invalid or unsupported command');
 }

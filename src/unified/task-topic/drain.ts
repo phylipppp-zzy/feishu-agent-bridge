@@ -144,7 +144,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       return { ok: false, status: 'expired', reason: 'task_binding_changed' };
     }
 
-    if ((a.action === 'panel' || a.action === 'help') && row.target_id === '') {
+    if ((a.action === 'panel' || a.action === 'help' || (a as { action: string }).action === 'command_error') && row.target_id === '') {
       const allowed = await deps.authorize(e.identity, e.destination, null);
       if (!allowed) return { ok: false, status: 'rejected', reason: 'unauthorized' };
       return { ok: true, binding, target: null };
@@ -269,6 +269,28 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
     return finalize('completed', { status: 'guidance' });
   }
 
+  if ((a as { action: string }).action === 'command_error') {
+    const claim = deps.db
+      .prepare("UPDATE task_inbox_scope_v1 SET state = 'unknown' WHERE event_id = ? AND state = 'received'")
+      .run(eventId);
+    if (!claim.changes) return { status: 'unknown' };
+    const cmd = (a as unknown as { command?: string }).command ?? '/';
+    await deliverTaskCard(
+      deps,
+      e.destination,
+      row.task_id,
+      check.target?.target_id ?? null,
+      {
+        title: '命令参数有误',
+        template: 'orange',
+        text: `命令 \`${escapeCardMarkdown(cmd)}\` 参数格式不正确，请检查后重试，或发送 /help 查看用法。`,
+        actions: [],
+      },
+      `${eventId}:command-error`,
+    );
+    return finalize('rejected', { status: 'rejected', reason: 'invalid_command' });
+  }
+
   if (a.action === 'swarm') {
     const swarmTarget = check.target!;
     if (swarmTarget.provider !== 'agy') {
@@ -313,9 +335,9 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       .run(eventId);
     if (!claim.changes) return { status: 'unknown' };
     const text = {
-      unsupported: '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。',
-      size: '文本附件为空或超过 1 MiB，未提交。',
-      encoding: '文本附件不是有效 UTF-8 或包含 NUL，未提交。',
+      unsupported: '仅支持图片（PNG/JPG/GIF/WebP）、PDF 文档，以及常见 UTF-8 文本/代码文件（.txt/.md/.json/.yaml/.log/.py/.ts 等）。',
+      size: '文本附件为空或超过 1 MiB（图片/PDF 上限 20 MiB），未提交。',
+      encoding: '文本/代码附件不是有效 UTF-8 或包含 NUL 字节，未提交。',
     }[a.reason];
     await deliverTaskCard(
       deps,
@@ -405,14 +427,21 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
   try {
     let result: unknown;
     if (a.action === 'input') {
+      const effectiveMode =
+        a.mode === 'new' &&
+        session.status === 'running' &&
+        session.capabilities?.steer?.status !== 'available' &&
+        session.capabilities?.queue?.status === 'available'
+          ? 'queue'
+          : a.mode;
       const op = await deps.service.submitInput({
         context: makeContext(
           session.revision,
-          a.mode === 'steer' ? payload.steer_control_generation! : session.control.generation,
+          effectiveMode === 'steer' ? payload.steer_control_generation! : session.control.generation,
         ),
-        mode: a.mode,
+        mode: effectiveMode,
         blocks: [{ type: 'text', text: a.text }],
-        ...(a.mode === 'steer'
+        ...(effectiveMode === 'steer'
           ? {
               requiredTurnId: payload.steer_turn_id!,
               expectedConnectionGeneration: payload.steer_connection_generation!,
@@ -467,40 +496,58 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       });
       result = op;
     } else if (a.action === 'attachment') {
-      const digest = createHash('sha256').update(a.content).digest('hex');
-      const stageOp = await deps.service.stageInputArtifact({
-        context: makeContext(session.revision, session.control.generation),
-        payload: {
-          name: a.name,
-          mediaType: a.mediaType,
-          size: a.content.byteLength,
-          contentDigest: digest,
-          content: a.content,
-        },
-      });
-      if (stageOp.result?.kind === 'artifact') {
-        const refreshed = await deps.service.getSession(row.session_id);
-        const submitId = `task-attach:${eventId}`;
+      const att = a as Extract<TaskChannelAction, { action: 'attachment' }> & { localPath?: string; size?: number };
+      const effectiveMode =
+        att.mode === 'new' &&
+        session.status === 'running' &&
+        session.capabilities?.steer?.status !== 'available' &&
+        session.capabilities?.queue?.status === 'available'
+          ? 'queue'
+          : att.mode;
+      if (att.mediaType === 'application/pdf' && att.localPath) {
+        const byteSize = att.size ?? att.content.byteLength;
+        const promptText = `用户上传了 PDF 附件：${att.name}（${byteSize} 字节）\n本地路径：${att.localPath}\n请使用 read_file 读取该文件。`;
         result = await deps.service.submitInput({
-          context: {
-            operationId: submitId,
-            idempotencyKey: submitId,
-            targetId: row.session_id,
-            expectedRevision: refreshed.revision,
-            controlGeneration: refreshed.control.generation,
-            identity: e.identity,
-          },
-          mode: a.mode,
-          blocks: [
-            {
-              type: 'artifact',
-              artifactId: stageOp.result.artifactId,
-              contentVersion: stageOp.result.contentVersion,
-            },
-          ],
+          context: makeContext(session.revision, session.control.generation),
+          mode: effectiveMode,
+          blocks: [{ type: 'text', text: promptText }],
         });
       } else {
-        result = stageOp;
+        const digest = createHash('sha256').update(att.content).digest('hex');
+        const stageOp = await deps.service.stageInputArtifact({
+          context: makeContext(session.revision, session.control.generation),
+          payload: {
+            name: att.name,
+            mediaType: att.mediaType,
+            size: att.content.byteLength,
+            contentDigest: digest,
+            content: att.content,
+          },
+        });
+        if (stageOp.result?.kind === 'artifact') {
+          const refreshed = await deps.service.getSession(row.session_id);
+          const submitId = `task-attach:${eventId}`;
+          result = await deps.service.submitInput({
+            context: {
+              operationId: submitId,
+              idempotencyKey: submitId,
+              targetId: row.session_id,
+              expectedRevision: refreshed.revision,
+              controlGeneration: refreshed.control.generation,
+              identity: e.identity,
+            },
+            mode: effectiveMode,
+            blocks: [
+              {
+                type: 'artifact',
+                artifactId: stageOp.result.artifactId,
+                contentVersion: stageOp.result.contentVersion,
+              },
+            ],
+          });
+        } else {
+          result = stageOp;
+        }
       }
     } else if (a.action === 'history') {
       const page = await deps.service.readHistory(row.session_id, {

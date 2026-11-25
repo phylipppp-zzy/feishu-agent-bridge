@@ -3,7 +3,91 @@ import type { QuestionForm } from './feishu-question-forms.js';
 
 export const QUESTION_INPUT_MAX_LENGTH = 1000;
 export type CardSchema = NonNullable<ChannelCard['schema']>;
-export const cardSchema = (card: ChannelCard): CardSchema => card.schema ?? (card.form ? '2.0' : '1.0');
+
+const GFM_TABLE_RE = /^\|.+\|\s*\r?\n\|[\s:|-]+\|/m;
+const DETAILS_OPEN_RE = /<details\b[^>]*>/iu;
+const DETAILS_CLOSE_RE = /<\/details>/iu;
+const SUMMARY_TAG_RE = /<summary\b[^>]*>([\s\S]*?)<\/summary>/iu;
+
+interface DetailsRange {
+  start: number;
+  end: number;
+  inner: string;
+}
+
+/** Find <details>...</details> ranges strictly outside fenced Markdown code blocks. */
+function findDetailsOutsideFences(text: string): DetailsRange[] {
+  const ranges: DetailsRange[] = [];
+  const fencedIntervals: Array<[number, number]> = [];
+  let pos = 0;
+  let fenceChar: '`' | '~' | null = null;
+  let fenceLen = 0;
+  let fenceStart = 0;
+
+  while (pos < text.length) {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? text.length : nl + 1;
+    const line = text.slice(pos, nl === -1 ? text.length : nl).replace(/\r$/, '');
+    const m = /^[ ]{0,3}(`{3,}|~{3,})/.exec(line);
+    if (m) {
+      const run = m[1]!;
+      const ch = run[0] as '`' | '~';
+      if (!fenceChar) {
+        fenceChar = ch;
+        fenceLen = run.length;
+        fenceStart = pos;
+      } else if (ch === fenceChar && run.length >= fenceLen && line.trim() === run) {
+        fencedIntervals.push([fenceStart, lineEnd]);
+        fenceChar = null;
+        fenceLen = 0;
+      }
+    }
+    pos = lineEnd;
+  }
+  if (fenceChar) fencedIntervals.push([fenceStart, text.length]);
+
+  const inFence = (index: number): boolean =>
+    fencedIntervals.some(([s, e]) => index >= s && index < e);
+
+  let cursor = 0;
+  while (cursor < text.length) {
+    const slice = text.slice(cursor);
+    const openMatch = DETAILS_OPEN_RE.exec(slice);
+    if (!openMatch) break;
+    const openStart = cursor + openMatch.index;
+    const openEnd = openStart + openMatch[0].length;
+    if (inFence(openStart)) {
+      cursor = openEnd;
+      continue;
+    }
+    let searchClose = openEnd;
+    let foundClose: { start: number; end: number } | null = null;
+    while (searchClose < text.length) {
+      const closeMatch = DETAILS_CLOSE_RE.exec(text.slice(searchClose));
+      if (!closeMatch) break;
+      const closeStart = searchClose + closeMatch.index;
+      const closeEnd = closeStart + closeMatch[0].length;
+      if (!inFence(closeStart)) {
+        foundClose = { start: closeStart, end: closeEnd };
+        break;
+      }
+      searchClose = closeEnd;
+    }
+    if (!foundClose) break;
+    ranges.push({ start: openStart, end: foundClose.end, inner: text.slice(openEnd, foundClose.start) });
+    cursor = foundClose.end;
+  }
+  return ranges;
+}
+
+function hasRichMarkdownV2(card: ChannelCard): boolean {
+  if (card.format === 'plain' || card.table) return false;
+  if (card.executionLog) return true;
+  return GFM_TABLE_RE.test(card.text) || findDetailsOutsideFences(card.text).length > 0;
+}
+
+export const cardSchema = (card: ChannelCard): CardSchema =>
+  card.schema ?? (card.form || hasRichMarkdownV2(card) ? '2.0' : '1.0');
 
 const plain = (content: string) => ({ tag: 'plain_text', content });
 const markdown = (content: string) => ({ tag: 'markdown', content: stripCardMentions(content) });
@@ -29,10 +113,41 @@ function header(card: ChannelCard) {
   };
 }
 
-function cardElements(card: ChannelCard, omitEmpty = false): unknown[] {
+function markdownElementsV2(text: string): unknown[] {
+  const cleaned = stripCardMentions(text);
+  const ranges = findDetailsOutsideFences(cleaned);
+  if (!ranges.length) return [markdown(cleaned)];
+  const elements: unknown[] = [];
+  let lastIndex = 0;
+  let panelIndex = 0;
+  for (const range of ranges) {
+    const before = cleaned.slice(lastIndex, range.start).trim();
+    if (before) elements.push(markdown(before));
+    const inner = range.inner;
+    const summaryMatch = SUMMARY_TAG_RE.exec(inner);
+    const title = summaryMatch?.[1]?.trim() || '展开详情';
+    const body = (summaryMatch
+      ? inner.slice(0, summaryMatch.index) + inner.slice(summaryMatch.index + summaryMatch[0].length)
+      : inner).trim();
+    elements.push({
+      tag: 'collapsible_panel',
+      element_id: `details_${panelIndex++}`,
+      expanded: false,
+      header: { title: markdown(title) },
+      elements: body ? [markdown(body)] : [],
+    });
+    lastIndex = range.end;
+  }
+  const after = cleaned.slice(lastIndex);
+  if (after.trim()) elements.push(markdown(after.trim()));
+  return elements;
+}
+
+function cardElements(card: ChannelCard, omitEmpty = false, schema: CardSchema = '1.0'): unknown[] {
   if (!card.table) {
     if (omitEmpty && !card.text.trim()) return [];
-    return [card.format === 'plain' ? { tag: 'div', text: plain(card.text) } : markdown(card.text)];
+    if (card.format === 'plain') return [{ tag: 'div', text: plain(card.text) }];
+    return schema === '2.0' ? markdownElementsV2(card.text) : [markdown(card.text)];
   }
   const table = card.table;
   const renderColumns = (cells: string[], bold: boolean) => table.columns.map((col, idx) => ({
@@ -76,6 +191,7 @@ function executionElements(log: ChannelCard['executionLog'], schema: CardSchema)
 function questionElements(form: QuestionForm): unknown[] {
   const elements: Record<string, unknown>[] = [];
   for (const [i, q] of form.questions.entries()) {
+    const optionalSuffix = q.required === false ? '（可选）' : '';
     elements.push(markdown(q.prompt));
     if (!form.submittable) continue;
     if (q.choices.length) {
@@ -84,7 +200,7 @@ function questionElements(form: QuestionForm): unknown[] {
         tag: q.multiple ? 'multi_select_static' : 'select_static',
         name,
         element_id: name,
-        placeholder: plain(q.multiple ? '可多选' : '选择一个选项'),
+        placeholder: plain(`${q.multiple ? '可多选' : '选择一个选项'}${optionalSuffix}`),
         required: false,
         options: q.choices.map((content, j) => ({ text: plain(content), value: String(j) })),
       });
@@ -92,7 +208,7 @@ function questionElements(form: QuestionForm): unknown[] {
     if (q.allowFreeText) {
       const name = `q${i}_text`;
       elements.push({
-        tag: 'input', name, element_id: name, required: false, placeholder: plain('输入文字答复'),
+        tag: 'input', name, element_id: name, required: false, placeholder: plain(`输入文字答复${optionalSuffix}`),
         max_length: QUESTION_INPUT_MAX_LENGTH, input_type: 'multiline_text', rows: 4, auto_resize: true, max_rows: 8,
       });
     }
@@ -110,6 +226,10 @@ function questionElements(form: QuestionForm): unknown[] {
   elements.push({
     tag: 'button', name: 'submit_question', element_id: 'submit_question', text: plain('提交答复'),
     type: 'primary', form_action_type: 'submit', behaviors: [{ type: 'callback', value }],
+  });
+  elements.push({
+    tag: 'button', name: 'decline_question', element_id: 'decline_question', text: plain('跳过/取消'),
+    type: 'default', behaviors: [{ type: 'callback', value: { ...value, action: 'decline_form', decline: true } }],
   });
   return [{ tag: 'form', name: 'question_form', element_id: 'question_form', direction: 'vertical', vertical_spacing: '8px', elements }];
 }
@@ -136,7 +256,7 @@ function encodeV2(card: ChannelCard, form?: QuestionForm): Record<string, unknow
     header: header(card),
     body: {
       elements: [
-        ...cardElements(card, !!form),
+        ...cardElements(card, !!form, '2.0'),
         ...(form ? questionElements(form) : []),
         ...executionElements(card.executionLog, '2.0'),
         ...actionsV2(card.actions),
