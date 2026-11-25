@@ -35,7 +35,14 @@ const transcriptRow = (message: Message): boolean => message.source === 'agy' &&
 function replyMatches(counterpart: Message, nativeReply: readonly Message[]): boolean {
   const streamed = rawMessageText(counterpart).trim();
   const steps = nativeReply.map(rawMessageText).filter(Boolean);
-  return !streamed || steps.join('\n\n').includes(streamed) || steps.every(step => streamed.includes(step.trim()));
+  if (!streamed || steps.join('\n\n').includes(streamed) || steps.every(step => streamed.includes(step.trim()))) {
+    return true;
+  }
+  const streamedParagraphs = streamed.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  return steps.some(step => {
+    const trimmed = step.trim();
+    return Boolean(trimmed) && streamedParagraphs.includes(trimmed);
+  });
 }
 
 type History = Pick<SessionSnapshot, 'messages' | 'turns'>;
@@ -110,9 +117,29 @@ export function reconcilePersistedAgyHistory<T extends History>(observed: T, per
       (!finalized || replyMatches(assistants.get(prompt.message.turnId)!, reply))) : -1;
 
     if (match < 0) {
-      // Check if there is a same-prompt live record whose reply diverges from the finalized native reply.
+      // Check if there is a same-prompt live record whose reply diverges from the finalized native reply,
+      // unless a later unconsumed native turn already matches that live record cleanly (making this an external CLI turn).
       const divergentIdx = text && finalized ? prompts.findIndex(samePrompt) : -1;
-      if (divergentIdx >= 0) {
+      const hasLaterMatchingNativeTurn = (liveTurnId: string): boolean => {
+        const liveAssistant = assistants.get(liveTurnId);
+        if (!liveAssistant) return false;
+        let scan = index;
+        while (scan < rows.length) {
+          const cand = rows[scan++]!;
+          if (!transcriptRow(cand) || cand.role !== 'user' || persisted.has(cand.messageId)) continue;
+          const candGroup: Message[] = [];
+          while (scan < rows.length && transcriptRow(rows[scan]!) && rows[scan]!.role !== 'user') {
+            candGroup.push(rows[scan++]!);
+          }
+          if (agyPromptText(cand) !== text) continue;
+          const candReply = candGroup.filter(step => step.role === 'assistant');
+          if (candReply.length > 0 && candReply.every(step => step.final) && replyMatches(liveAssistant, candReply)) {
+            return true;
+          }
+        }
+        return false;
+      };
+      if (divergentIdx >= 0 && !hasLaterMatchingNativeTurn(prompts[divergentIdx]!.message.turnId)) {
         const livePrompt = prompts[divergentIdx]!;
         const liveAssistant = assistants.get(livePrompt.message.turnId)!;
         conflicts.push({
