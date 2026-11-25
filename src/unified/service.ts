@@ -256,7 +256,9 @@ export class UnifiedCore implements UnifiedService {
     if (this.unavailableProviders.has(current.native.provider)) return false;
     if (typeof this.port(current).read !== 'function') return false;
     if (this.store.hasActiveBridgeTurn(id)) return false;
-    if (this.store.hasOpenInteraction(id) || this.store.pendingOutbox(id, 'submitInput').length > 0 || this.store.hasUnsettledInput(id, '')) return false;
+    const hasNonQueuePending = this.store.pendingOutbox(id, 'submitInput')
+      .some(opId => (this.store.getOutbox(opId).payload as { mode?: string }).mode !== 'queue');
+    if (this.store.hasOpenInteraction(id) || hasNonQueuePending || this.store.hasUnsettledInput(id, '')) return false;
     return this.refreshHistory(id, true, undefined, true);
   }
   private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot, bestEffort = false):Promise<boolean> {

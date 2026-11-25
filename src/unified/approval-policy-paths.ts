@@ -180,7 +180,9 @@ export async function makePolicy(context: ApprovalContext, checks: Check[] = [])
     const proof = await provePath(root);
     if (proof && !proof.unresolvedLink && (await stat(proof.path).catch(() => null))?.isDirectory()) return proof;
   };
-  const isBroadRoot = (root: string): boolean => root === '/' || root === home || under(home, root);
+  const homeProof = await provePath(home);
+  const homeRoots = homeProof && homeProof.path !== home ? [home, homeProof.path] : [home];
+  const isBroadRoot = (root: string): boolean => root === '/' || homeRoots.some(h => root === h || under(h, root));
   const rawProject = context.project;
   const project = rawProject ? await proveDirectory(rawProject) : undefined;
   const sessionRoots = rawProject && project && project.path !== '/' ? [rawProject] : [];

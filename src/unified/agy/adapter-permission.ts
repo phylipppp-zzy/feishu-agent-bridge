@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { evaluateApproval, resolveApprovalFacts, type ApprovalRequest, type ApprovalScope, type GateDecision } from '../approval-policy.js';
-import { provePath, under } from '../approval-policy-paths.js';
+import { under } from '../approval-policy-paths.js';
 import { payloadDigest } from '../contracts.js';
 import { isRecord, isString, type Obj } from './adapter-types.js';
 
@@ -195,53 +195,53 @@ function approvalRequest(toolCall: MergedToolCall, types: string[]): { request: 
 
 function matchTrustedReadOnlyTool(rawName: string, serverName?: string): string | null {
   const lower = rawName.trim().toLowerCase();
+  const normalizedServer = serverName?.trim().toLowerCase();
   if (!lower) return null;
-  if (builtinAutoAllowTools.has(lower)) return serverName ? null : lower;
+  if (lower === 'search_web' || lower === 'default_api:search_web') {
+    return normalizedServer ? null : 'search_web';
+  }
+  if (builtinAutoAllowTools.has(lower)) {
+    if (normalizedServer && !trustedCodexServers.has(normalizedServer)) return null;
+    return lower;
+  }
   if (lower.startsWith('default_api:')) {
     const leaf = lower.slice('default_api:'.length);
-    if (builtinAutoAllowTools.has(leaf) || codexReadOnlyMcpTools.has(leaf)) return leaf;
+    if (builtinAutoAllowTools.has(leaf) || codexReadOnlyMcpTools.has(leaf)) {
+      if (normalizedServer && !trustedCodexServers.has(normalizedServer)) return null;
+      return leaf;
+    }
     return null;
   }
   if (codexReadOnlyMcpTools.has(lower)) {
-    if (serverName && !trustedCodexServers.has(serverName.trim().toLowerCase())) return null;
+    if (normalizedServer && !trustedCodexServers.has(normalizedServer)) return null;
     return lower;
   }
   const mcpDouble = /^mcp__([a-z0-9_-]+)__([a-z0-9_-]+)$/.exec(lower);
   if (mcpDouble && trustedCodexServers.has(mcpDouble[1]!) && codexReadOnlyMcpTools.has(mcpDouble[2]!)) {
+    if (normalizedServer && normalizedServer !== mcpDouble[1]) return null;
     return mcpDouble[2]!;
   }
   const mcpColon = /^(?:mcp:)?([a-z0-9_-]+):([a-z0-9_-]+)$/.exec(lower);
   if (mcpColon && trustedCodexServers.has(mcpColon[1]!) && codexReadOnlyMcpTools.has(mcpColon[2]!)) {
+    if (normalizedServer && normalizedServer !== mcpColon[1]) return null;
     return mcpColon[2]!;
   }
   return null;
 }
 
-async function hasSensitiveResourceUri(toolCall: MergedToolCall, homeDir: string): Promise<boolean> {
+function extractFileResourcePaths(toolCall: MergedToolCall): { ok: true; paths: string[] } | { ok: false } {
   const groups = [toolCall, ...inputGroups.map(key => toolCall[key]).filter(isRecord)];
   const uris = groups.flatMap(group => ['Uri', 'uri'].map(key => group[key]).filter(isString));
-  const sensitiveLogical = [join(homeDir, 'reviews'), join(homeDir, '.ssh')];
-  const sensitiveRoots = new Set<string>(sensitiveLogical);
-  for (const p of sensitiveLogical) {
-    const proof = await provePath(p);
-    if (proof) sensitiveRoots.add(proof.path);
-  }
+  const paths: string[] = [];
   for (const uri of uris) {
     if (!/^file:/i.test(uri.trim())) continue;
-    let filePath: string;
     try {
-      filePath = fileURLToPath(uri.trim());
+      paths.push(fileURLToPath(uri.trim()));
     } catch {
-      return true;
-    }
-    const logical = resolve(filePath);
-    const proof = await provePath(logical);
-    const candidates = [logical, ...(proof ? [proof.path] : [])];
-    if (!proof || proof.unresolvedLink || candidates.some(c => [...sensitiveRoots].some(root => under(c, root)))) {
-      return true;
+      return { ok: false };
     }
   }
-  return false;
+  return { ok: true, paths };
 }
 
 function resolveTrustedReadOnlyTool(toolCall: MergedToolCall): string | null {
@@ -259,18 +259,19 @@ function resolveTrustedReadOnlyTool(toolCall: MergedToolCall): string | null {
   if (groups.some(group => Object.keys(group).some(k => forbiddenMcpCommandKeys.has(k)))) {
     return null;
   }
-  const direct = matchTrustedReadOnlyTool(toolName);
+  const servers = groups.flatMap(group =>
+    ['ServerName', 'serverName', 'server_name'].map(key => group[key]).filter(isString).map(v => v.trim().toLowerCase()),
+  );
+  if (new Set(servers).size > 1) return null;
+  const serverName = servers[0];
+  const direct = matchTrustedReadOnlyTool(toolName, serverName);
   if (direct) return direct;
   if (mcpWrapperTools.has(toolName)) {
     const mcpNames = groups.flatMap(group =>
       ['ToolName', 'toolName', 'tool_name'].map(key => group[key]).filter(isString).map(v => v.trim().toLowerCase()),
     );
     if (!mcpNames.length || new Set(mcpNames).size !== 1) return null;
-    const servers = groups.flatMap(group =>
-      ['ServerName', 'serverName', 'server_name'].map(key => group[key]).filter(isString).map(v => v.trim().toLowerCase()),
-    );
-    if (new Set(servers).size > 1) return null;
-    return matchTrustedReadOnlyTool(mcpNames[0]!, servers[0]);
+    return matchTrustedReadOnlyTool(mcpNames[0]!, serverName);
   }
   return null;
 }
@@ -302,17 +303,27 @@ export async function classifyAgyPermission(
   }
   const homeDir = resolve(approvalPolicy?.homeDir ?? homedir());
   const readOnlyTool = resolveTrustedReadOnlyTool(toolCall);
+  let forcedRequest: { request: ApprovalRequest; cwd?: string } | null = null;
   if (readOnlyTool) {
     if (hasAgyToolCallConflicts(toolCall)) {
       return { kind: 'ask', reason: '工具调用参数存在冲突，请确认最新参数。' };
     }
-    if (readOnlyTool === 'read_resource' && await hasSensitiveResourceUri(toolCall, homeDir)) {
-      return { kind: 'ask', reason: '敏感本地资源路径需人工审批' };
+    if (readOnlyTool === 'read_resource') {
+      const extracted = extractFileResourcePaths(toolCall);
+      if (!extracted.ok) {
+        return { kind: 'ask', reason: '无法解析本地资源路径，需人工审批' };
+      }
+      if (extracted.paths.length > 0) {
+        forcedRequest = { request: { kind: 'read', paths: extracted.paths } };
+      } else {
+        return { kind: 'allow_once' };
+      }
+    } else {
+      return { kind: 'allow_once' };
     }
-    return { kind: 'allow_once' };
   }
   const types = identityKeys.map(key => toolCall[key]).filter(isString).map(value => value.toLowerCase());
-  const { request, cwd } = approvalRequest(toolCall, types);
+  const { request, cwd } = forcedRequest ?? approvalRequest(toolCall, types);
   const workingDirectory = cwd ? (isAbsolute(cwd) ? cwd : `${project}/${cwd}`) : project;
   const sessionBrainRoots: string[] = [];
   if (sessionId) {

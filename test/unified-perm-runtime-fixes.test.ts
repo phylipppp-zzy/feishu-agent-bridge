@@ -232,6 +232,21 @@ test('approval policy: homeDir in allowedProjectRoots is not a cross-project rea
     );
     assert.equal(viaSymlinkRead.kind, 'ask', 'symlinked homeDir must not allow cross-project auto-reads');
 
+    // Symlinked homeDir itself + physical target in allowedRoots must also be filtered out by broad-root check.
+    const physicalHome = fakeHome;
+    const symlinkHome = join(dir, 'symlinked-home-dir');
+    symlinkSync(physicalHome, symlinkHome);
+    const physicalInAllowed = runtimeApprovalScope(makeRuntimeConfig(dir, {
+      allowedProjectRoots: [physicalHome],
+      outputRoots: [],
+      approvalPolicy: { enabled: true, homeDir: symlinkHome },
+    }));
+    assert.equal(
+      evaluateApproval(await resolveApprovalFacts({ kind: 'read', paths: [join(projectB, 'b.ts')] }, { ...physicalInAllowed, project: projectA })).kind,
+      'ask',
+      'physical target of symlinked homeDir must not allow cross-project auto-reads',
+    );
+
     // Reading inside current projectA is allowed.
     const inProjRead = evaluateApproval(
       await resolveApprovalFacts({ kind: 'read', paths: [join(projectA, 'a.ts')] }, { ...scope, project: projectA }),
@@ -341,17 +356,33 @@ test('adapter-permission: ArtifactMetadata, read-only MCP/search_web, brain/<ses
       assert.equal((await classifyAgyPermission(tool, project, { enabled: false })).kind, 'ask', JSON.stringify(tool));
     }
 
-    // 1a: Untrusted MCP namespace, mixed execute+call_mcp_tool, CommandLine smuggling, and sensitive file:// URI must ask.
+    // 1a: Untrusted MCP namespace, conflicting ServerName, mixed execute+call_mcp_tool, CommandLine smuggling, and cross-project/sensitive file:// URI must ask.
     const fakeHome = join(dir, 'fake-home');
+    const otherProject = join(dir, 'other-project');
     mkdirSync(join(fakeHome, 'reviews'), { recursive: true });
+    mkdirSync(otherProject, { recursive: true });
     writeFileSync(join(fakeHome, 'reviews', 'secret.pdf'), 'confidential');
+    writeFileSync(join(otherProject, 'secret.ts'), 'export const s = 1;');
+    writeFileSync(join(project, 'allowed.ts'), 'export const ok = 1;');
+    assert.equal(
+      (await classifyAgyPermission(
+        { kind: 'read', name: 'read_resource', rawInput: { ServerName: 'codex', Uri: `file://${join(project, 'allowed.ts')}` } },
+        project,
+        { ...scope, homeDir: fakeHome },
+      )).kind,
+      'allow_once',
+      'in-project file:// URI for trusted read_resource should allow',
+    );
     for (const bypassAttempt of [
       { name: 'mcp__untrusted__list_resources', rawInput: {} },
       { name: 'mcp__untrusted__read_resource', rawInput: { Uri: 'x://y' } },
+      { name: 'list_resources', rawInput: { ServerName: 'untrusted-mcp' } },
+      { name: 'mcp__codex__codex_lookup', rawInput: { ServerName: 'evil' } },
       { name: 'call_mcp_tool', rawInput: { ServerName: 'untrusted', ToolName: 'codex_status' } },
       { kind: 'execute', name: 'call_mcp_tool', rawInput: { CommandLine: 'rm -rf /', ToolName: 'codex_status' } },
       { kind: 'other', name: 'call_mcp_tool', rawInput: { ToolName: 'codex_status', CommandLine: 'echo pwn' } },
       { kind: 'read', name: 'read_resource', rawInput: { Uri: `file://${join(fakeHome, 'reviews', 'secret.pdf')}` } },
+      { kind: 'read', name: 'read_resource', rawInput: { Uri: `file://${join(otherProject, 'secret.ts')}` } },
       { name: 'call_mcp_tool', rawInput: { ToolName: 'codex_engineer' } },
     ]) {
       assert.equal(
@@ -690,7 +721,19 @@ test('runtime: disconnect/reconnect restores channel + taskTopic targets, wires 
       makeActive: true,
     });
 
-    // Idle interactive session can incrementally pick up new terminal messages.
+    // Idle interactive session can incrementally pick up new terminal messages even while a queued input waits.
+    await runtime.core.submitInput({
+      context: {
+        operationId: 'q-wait-1',
+        idempotencyKey: 'q-wait-1',
+        targetId: chanSid,
+        expectedRevision: runtime.store.getSession(chanSid).revision,
+        controlGeneration: runtime.store.getSession(chanSid).control.generation,
+        identity: OWNER,
+      },
+      mode: 'queue',
+      blocks: [{ type: 'text', text: 'queued behind external turn' }],
+    });
     extraMessages.set('chan-1', [{ id: 'term-msg-1', text: 'terminal reply' }]);
     const caughtUp = await runtime.core.refreshIdleInteractiveSession(chanSid);
     assert.equal(caughtUp, true);
@@ -778,6 +821,15 @@ test('runtime: disconnect/reconnect restores channel + taskTopic targets, wires 
         lastDeliveryAt: null,
       },
     };
+    // Stale/cached low-quota snapshot must NOT trigger a false alert before a fresh ok sample arrives.
+    runtime.reportQuotaSnapshot('agy', { ...lowQuota, state: 'cached', stale: true }, 15);
+    await runtime.tick();
+    assert.equal(
+      runtime.watchHub!.listOutbox().filter((r) => r.objectId === 'provider:agy:quota').length,
+      0,
+      'stale cached quota snapshot must not emit low-quota alert',
+    );
+
     runtime.reportQuotaSnapshot('agy', lowQuota, 15);
     // Stale/failed quota sample must NOT clear lowQuotaActive latch.
     runtime.reportQuotaSnapshot('agy', { ...lowQuota, state: 'timeout', short: null, stale: true }, 15);

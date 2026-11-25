@@ -159,7 +159,7 @@ export class UnifiedRuntime {
   get decisionSync():DecisionSyncStore|undefined { return this._decisionSync; }
   get taskChannel():TaskTopicChannel|undefined { return this._taskChannel; }
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
-  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
+  private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly inFlightUnknownOpAlerts=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
   constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
     const channelPath=resolve(config.channelDb); const canonical=existsSync(channelPath) ? realpathSync(channelPath) : join(realpathSync(dirname(channelPath)),basename(channelPath));
@@ -496,8 +496,13 @@ export class UnifiedRuntime {
     summary: string;
     sourceRef?: WatchSourceRef;
     eventId?: string;
+    onIngested?: () => void;
+    onSettled?: () => void;
   }): void {
-    if (!this._watchHub || this.closing || this.closed) return;
+    if (!this._watchHub || this.closing || this.closed) {
+      input.onSettled?.();
+      return;
+    }
     const task = this._watchHub.ingest({
       eventId: input.eventId ?? `rt:${randomUUID()}`,
       source: input.source,
@@ -508,7 +513,7 @@ export class UnifiedRuntime {
       title: input.title,
       summary: input.summary,
       ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
-    }).then(() => { this.wake(); }).catch(() => {});
+    }).then(() => { input.onIngested?.(); this.wake(); }).catch(() => {}).finally(() => { input.onSettled?.(); });
     this.hubTasks.add(task);
     void task.finally(() => this.hubTasks.delete(task));
   }
@@ -519,7 +524,8 @@ export class UnifiedRuntime {
     const inbox = this.channel.unknownInbox().length;
     const prev = this.lastUnknownDeliverySnapshot;
     if (deliveries !== prev.deliveries || inbox !== prev.inbox) {
-      this.lastUnknownDeliverySnapshot = { deliveries, inbox };
+      const nextSnapshot = { deliveries, inbox };
+      this.lastUnknownDeliverySnapshot = nextSnapshot;
       if (deliveries > 0 || inbox > 0) {
         this.emitWatchEvent({
           source: 'watch',
@@ -542,8 +548,8 @@ export class UnifiedRuntime {
     }
     const currentUnknownOps = new Set(this.store.unknownOperationIds());
     for (const opId of currentUnknownOps) {
-      if (this.alertedUnknownOperations.has(opId)) continue;
-      this.alertedUnknownOperations.add(opId);
+      if (this.alertedUnknownOperations.has(opId) || this.inFlightUnknownOpAlerts.has(`alert:${opId}`)) continue;
+      this.inFlightUnknownOpAlerts.add(`alert:${opId}`);
       this.emitWatchEvent({
         source: 'watch',
         objectId: `operation.unknown:${opId}`,
@@ -551,11 +557,13 @@ export class UnifiedRuntime {
         severity: 'high',
         title: '操作投递结果未知',
         summary: `操作 ${opId} 处于未知交付状态（outcome_unknown），请先核对原端状态再决定是否重试。`,
+        onIngested: () => { this.alertedUnknownOperations.add(opId); },
+        onSettled: () => { this.inFlightUnknownOpAlerts.delete(`alert:${opId}`); },
       });
     }
     for (const opId of [...this.alertedUnknownOperations]) {
-      if (currentUnknownOps.has(opId)) continue;
-      this.alertedUnknownOperations.delete(opId);
+      if (currentUnknownOps.has(opId) || this.inFlightUnknownOpAlerts.has(`recover:${opId}`)) continue;
+      this.inFlightUnknownOpAlerts.add(`recover:${opId}`);
       this.emitWatchEvent({
         source: 'watch',
         objectId: `operation.unknown:${opId}`,
@@ -563,11 +571,14 @@ export class UnifiedRuntime {
         severity: 'low',
         title: '未知交付操作已收敛',
         summary: `操作 ${opId} 已离开未知交付状态。`,
+        onIngested: () => { this.alertedUnknownOperations.delete(opId); },
+        onSettled: () => { this.inFlightUnknownOpAlerts.delete(`recover:${opId}`); },
       });
     }
   }
 
   reportQuotaSnapshot(provider: Provider, snapshot: AgyQuotaSnapshot, thresholdPercent = 15): void {
+    if (snapshot.state !== 'ok' || snapshot.stale) return;
     const lowWindows = [snapshot.short, snapshot.weekly]
       .filter((w): w is NonNullable<AgyQuotaSnapshot['short']> => Boolean(w) && Number.isFinite(w!.remainingPercent) && w!.remainingPercent < thresholdPercent);
     const source: WatchSource = provider === 'agy' ? 'agy_status' : provider === 'codex' ? 'codex_status' : 'watch';
@@ -582,7 +593,7 @@ export class UnifiedRuntime {
         title: `${providerTitlePrefix(provider)} 配额低于 ${thresholdPercent}%`,
         summary: detail,
       });
-    } else if (snapshot.state === 'ok' && !snapshot.stale && (snapshot.short || snapshot.weekly) && this.lowQuotaActive.delete(provider)) {
+    } else if ((snapshot.short || snapshot.weekly) && this.lowQuotaActive.delete(provider)) {
       const detail = [snapshot.short, snapshot.weekly]
         .filter((w): w is NonNullable<AgyQuotaSnapshot['short']> => Boolean(w))
         .map(w => `${w.label} 剩余 ${Math.round(w.remainingPercent)}%`).join('；');
