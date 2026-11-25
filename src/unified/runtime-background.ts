@@ -40,6 +40,18 @@ export async function runBackgroundWork(
   for (const binding of runtime.taskChannel?.listActiveBindings() ?? []) {
     await isolate(() => interactive.syncTask(binding.taskId));
   }
+  const unknownDeliveries = runtime.channel.pendingDeliveries().length;
+  const unknownInbox = runtime.channel.unknownInbox().length;
+  if (unknownDeliveries > 0 || unknownInbox > 0) {
+    runtime.emitWatchEvent({
+      source: 'watch',
+      objectId: 'runtime:unknown-deliveries',
+      state: 'alert',
+      severity: 'low',
+      title: '存在未确认投递或入站记录',
+      summary: `当前存在 ${unknownDeliveries} 条未确认投递、${unknownInbox} 条未知入站记录，请核对。`,
+    });
+  }
   if (runtime.watchHub?.listOutbox().some(row => row.state === 'pending')) {
     await isolate(async () => { await runtime.watchHub?.flush(); });
   }

@@ -1,4 +1,5 @@
-import { isAbsolute } from 'node:path';
+import { homedir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { evaluateApproval, resolveApprovalFacts, type ApprovalRequest, type ApprovalScope, type GateDecision } from '../approval-policy.js';
 import { payloadDigest } from '../contracts.js';
@@ -6,11 +7,21 @@ import { isRecord, isString, type Obj } from './adapter-types.js';
 
 const commandTools = new Set(['execute', 'run_command']);
 const readTools = new Set(['read', 'read_file', 'view_file', 'list_directory', 'list_dir', 'search', 'grep_search']);
+const autoAllowReadOnlyTools = new Set([
+  'search_web',
+  'list_resources',
+  'read_resource',
+  'codex_lookup',
+  'codex_status',
+  'codex_job',
+]);
+const mcpWrapperTools = new Set(['call_mcp_tool', 'mcp_call', 'use_mcp_tool']);
 const destructiveTools = new Set(['delete', 'delete_file', 'move', 'move_file', 'rename', 'rename_file']);
 const writeTools = new Set([
   'edit', 'write_file', 'edit_file', 'replace_file_content', 'multi_replace_file_content', 'write_to_file',
   ...destructiveTools,
 ]);
+const SAFE_SESSION_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 const pathKeys = [
   'Path', 'path', 'TargetFile', 'targetFile', 'FilePath', 'filePath', 'AbsolutePath', 'absolutePath',
   'SourcePath', 'sourcePath', 'DestinationPath', 'destinationPath', 'TargetDirectory', 'targetDirectory',
@@ -52,13 +63,45 @@ export function mergeAgyToolCall(previous: MergedToolCall | undefined, update: O
   return merged;
 }
 
+function uniqueOptionId(raw: Obj[], option: Obj | undefined): string | null {
+  const id = option?.optionId;
+  return isString(id) && raw.filter(row => row.optionId === id).length === 1 ? id : null;
+}
+
 export function agyOnceOption(options: unknown, kind: 'allow_once' | 'reject_once'): string | null {
+  const raw = Array.isArray(options) ? options.filter(isRecord) : [];
+  const exact = raw.find(row => row.kind === kind && isString(row.optionId) &&
+      (!reservedOptions.has(row.optionId) || row.optionId === kind))
+    ?? raw.find(row => row.kind === undefined && row.optionId === kind);
+  const exactId = uniqueOptionId(raw, exact);
+  if (exactId) return exactId;
+  const fallbackKinds = kind === 'allow_once' ? ['allow'] : ['reject', 'deny'];
+  const fallback = raw.find(row => isString(row.kind) && fallbackKinds.includes(row.kind) &&
+      isString(row.optionId) && !reservedOptions.has(row.optionId))
+    ?? raw.find(row => row.kind === undefined && isString(row.optionId) && fallbackKinds.includes(row.optionId));
+  return uniqueOptionId(raw, fallback);
+}
+
+export function agyAlwaysOption(options: unknown, kind: 'allow_always' | 'reject_always' = 'allow_always'): string | null {
   const raw = Array.isArray(options) ? options.filter(isRecord) : [];
   const option = raw.find(row => row.kind === kind && isString(row.optionId) &&
       (!reservedOptions.has(row.optionId) || row.optionId === kind))
     ?? raw.find(row => row.kind === undefined && row.optionId === kind);
-  const id = option?.optionId;
-  return isString(id) && raw.filter(row => row.optionId === id).length === 1 ? id : null;
+  return uniqueOptionId(raw, option);
+}
+
+export function agyPermissionOptions(options: unknown): {
+  allowOnce: string | null;
+  allowAlways: string | null;
+  rejectOnce: string | null;
+  rejectAlways: string | null;
+} {
+  return {
+    allowOnce: agyOnceOption(options, 'allow_once'),
+    allowAlways: agyAlwaysOption(options, 'allow_always'),
+    rejectOnce: agyOnceOption(options, 'reject_once'),
+    rejectAlways: agyAlwaysOption(options, 'reject_always'),
+  };
 }
 
 export function agyPermissionOutcome(optionId: string | null) {
@@ -84,7 +127,14 @@ function validInputField(key: string, value: unknown, kind: 'command' | 'read' |
       if (['Content', 'Target', 'Replacement', 'TargetContent', 'ReplacementContent', 'CodeContent'].includes(key)) {
         return typeof value === 'string';
       }
-      if (key === 'Overwrite' || key === 'Append') return typeof value === 'boolean';
+      if (key === 'Overwrite' || key === 'Append' || key === 'EmptyFile') return typeof value === 'boolean';
+      if (key === 'ArtifactMetadata') {
+        return isRecord(value) && Object.entries(value).every(([metaKey, metaValue]) => {
+          if (metaKey === 'Summary' || metaKey === 'ArtifactType') return typeof metaValue === 'string';
+          if (metaKey === 'UserFacing' || metaKey === 'RequestFeedback') return typeof metaValue === 'boolean';
+          return false;
+        });
+      }
     }
   }
   return key === 'toolSummary' && typeof value === 'string';
@@ -143,16 +193,59 @@ function approvalRequest(toolCall: MergedToolCall, types: string[]): { request: 
   return { request: { kind, command }, ...(workingDirectory ? { cwd: workingDirectory } : {}) };
 }
 
+function normalizeToolLeaf(value: string): string {
+  const lower = value.trim().toLowerCase();
+  const byDoubleUnderscore = lower.includes('__') ? lower.slice(lower.lastIndexOf('__') + 2) : lower;
+  const byColon = byDoubleUnderscore.includes(':') ? byDoubleUnderscore.slice(byDoubleUnderscore.lastIndexOf(':') + 1) : byDoubleUnderscore;
+  return byColon.includes('/') ? byColon.slice(byColon.lastIndexOf('/') + 1) : byColon;
+}
+
+function isAutoAllowReadOnlyTool(toolCall: MergedToolCall, types: string[]): boolean {
+  if (!types.length || identityKeys.some(key => Object.hasOwn(toolCall, key) && !isString(toolCall[key]))) {
+    return false;
+  }
+  const leaves = types.map(normalizeToolLeaf);
+  if (leaves.every(leaf => autoAllowReadOnlyTools.has(leaf))) return true;
+  if (leaves.some(leaf => mcpWrapperTools.has(leaf))) {
+    const groups = [toolCall, ...inputGroups.map(key => toolCall[key]).filter(isRecord)];
+    const mcpNames = groups.flatMap(group =>
+      ['ToolName', 'toolName', 'tool_name'].map(key => group[key]).filter(isString).map(normalizeToolLeaf),
+    );
+    return mcpNames.length > 0 && mcpNames.every(name => autoAllowReadOnlyTools.has(name));
+  }
+  return false;
+}
+
 export async function classifyAgyPermission(
   toolCall: MergedToolCall,
   project: string,
   approvalPolicy?: ApprovalScope,
+  sessionId?: string,
 ): Promise<GateDecision> {
+  if (approvalPolicy?.enabled === false) {
+    return { kind: 'ask', reason: '部署配置已停用自动审批，需人工审批' };
+  }
   const types = identityKeys.map(key => toolCall[key]).filter(isString).map(value => value.toLowerCase());
+  if (isAutoAllowReadOnlyTool(toolCall, types)) {
+    if (hasAgyToolCallConflicts(toolCall)) {
+      return { kind: 'ask', reason: '工具调用参数存在冲突，请确认最新参数。' };
+    }
+    return { kind: 'allow_once' };
+  }
   const { request, cwd } = approvalRequest(toolCall, types);
   const workingDirectory = cwd ? (isAbsolute(cwd) ? cwd : `${project}/${cwd}`) : project;
+  const effectiveSessionId = sessionId ?? (isString(toolCall.sessionId) ? toolCall.sessionId : undefined);
+  const sessionBrainRoots: string[] = [];
+  if (effectiveSessionId && SAFE_SESSION_ID_RE.test(effectiveSessionId) && !effectiveSessionId.includes('..')) {
+    const brainRoot = resolve(approvalPolicy?.brainDir ?? join(approvalPolicy?.homeDir ?? homedir(), '.gemini', 'antigravity-cli', 'brain'));
+    sessionBrainRoots.push(join(brainRoot, effectiveSessionId));
+  }
+  const mergedWriteRoots = [...new Set([...(approvalPolicy?.writeRoots ?? []), ...sessionBrainRoots])];
+  const mergedReadRoots = [...new Set([...(approvalPolicy?.readRoots ?? []), ...mergedWriteRoots])];
   const decision = evaluateApproval(await resolveApprovalFacts(request, {
     ...approvalPolicy,
+    ...(mergedReadRoots.length ? { readRoots: mergedReadRoots } : {}),
+    ...(mergedWriteRoots.length ? { writeRoots: mergedWriteRoots } : {}),
     cwd: workingDirectory,
     project,
   }));

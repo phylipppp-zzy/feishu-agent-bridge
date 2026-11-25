@@ -423,10 +423,20 @@ export class UnifiedStore {
     return Math.max(0, Number(row?.sequence ?? 0)) + 1;
   }
   putMessage(value: Message, expectedRevision: number | null): void { this.transaction(() => this.putMessageInTransaction(value,expectedRevision)); }
+  private pruneSupersededStreamingEvents(sessionId: string, messageId: string): void {
+    const stale = this.db.prepare(
+      "SELECT event_id FROM events WHERE session_id=? AND json_extract(value,'$.type')='message.updated' AND json_extract(value,'$.objectId')=? AND json_extract(value,'$.data.final')=0"
+    ).all(sessionId, messageId) as Array<{ event_id: string }>;
+    for (const entry of stale) {
+      this.run('DELETE FROM events WHERE event_id=?', entry.event_id);
+      this.run('DELETE FROM event_keys WHERE event_id=?', entry.event_id);
+    }
+  }
   private putMessageInTransaction(value: Message, expectedRevision: number | null): void {
     this.session(value.sessionId); const row = this.row('SELECT value FROM messages WHERE id=?', value.messageId);
     if (row) { const old = parse<Message>(row.value); if (old.sessionId !== value.sessionId || old.revision !== expectedRevision || value.revision !== old.revision + 1) return fail('stale_revision');
       this.run('UPDATE messages SET value=? WHERE id=?', JSON.stringify(value), value.messageId);
+      this.pruneSupersededStreamingEvents(value.sessionId, value.messageId);
     } else { if (expectedRevision !== null) return fail('stale_revision'); this.run('INSERT INTO messages(id,session_id,value) VALUES(?,?,?)', value.messageId, value.sessionId, JSON.stringify(value)); }
     this.eventFor(value.sessionId, value.messageId, value.revision, 'message.updated', null, value);
   }
@@ -771,5 +781,24 @@ export class UnifiedStore {
     });
   }
   /** Retain a watermark even when old events are removed. */
-  compactEvents(sessionId: string, throughCursor: string): void { this.transaction(() => { const sequence = readCursor(throughCursor, sessionId); const row = this.row('SELECT event_floor,event_seq FROM sessions WHERE id=?', sessionId); if (!row || sequence < Number(row.event_floor) || sequence > Number(row.event_seq)) return fail('invalid_request', 'invalid compaction watermark'); this.run('DELETE FROM events WHERE session_id=? AND seq<=?', sessionId, sequence); this.run('UPDATE sessions SET event_floor=? WHERE id=?', sequence, sessionId); }); }
+  compactEvents(sessionId: string, throughCursor: string): void {
+    this.transaction(() => {
+      const sequence = readCursor(throughCursor, sessionId);
+      const row = this.row('SELECT event_floor,event_seq FROM sessions WHERE id=?', sessionId);
+      if (!row || sequence < Number(row.event_floor) || sequence > Number(row.event_seq)) return fail('invalid_request', 'invalid compaction watermark');
+      const staleStreaming = this.db.prepare(
+        "SELECT event_id FROM events WHERE session_id=? AND seq<=? AND json_extract(value,'$.type')='message.updated' AND json_extract(value,'$.data.final')=0"
+      ).all(sessionId, sequence) as Array<{ event_id: string }>;
+      for (const entry of staleStreaming) {
+        this.run('DELETE FROM event_keys WHERE event_id=?', entry.event_id);
+      }
+      this.run('DELETE FROM events WHERE session_id=? AND seq<=?', sessionId, sequence);
+      this.run('UPDATE sessions SET event_floor=? WHERE id=?', sequence, sessionId);
+    });
+  }
+  eventFloor(sessionId: string): number {
+    const row = this.row('SELECT event_floor FROM sessions WHERE id=?', sessionId);
+    if (!row) return fail('invalid_request', 'unknown session');
+    return Number(row.event_floor);
+  }
 }

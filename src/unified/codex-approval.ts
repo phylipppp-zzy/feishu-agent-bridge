@@ -1,5 +1,6 @@
 import { realpath, stat } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { homedir } from 'node:os';
+import { isAbsolute, resolve } from 'node:path';
 import { unwrapShellCommand } from '../execution-policy.js';
 import { parseShellCommands } from './approval-policy-shell.js';
 import {
@@ -50,11 +51,28 @@ export function codexApprovalChoices(value: unknown) {
 
 export function runtimeApprovalScope(config: RuntimeConfig) {
   const policy = config.approvalPolicy;
+  const home = resolve(policy?.homeDir ?? homedir());
+  const isBroadRoot = (root: string): boolean => {
+    const resolved = resolve(root);
+    return resolved === '/' || resolved === home || under(home, resolved);
+  };
+  const projectReadRoots = (config.allowedProjectRoots ?? []).filter(root => !isBroadRoot(root));
+  const writeRoots = [...new Set([
+    ...(policy?.extraWriteRoots ?? []),
+    ...(config.agy?.extraWriteRoots ?? []),
+  ])];
+  const readRoots = [...new Set([
+    ...projectReadRoots,
+    ...(config.outputRoots ?? []),
+    ...(policy?.extraTrustedRoots ?? []),
+    ...writeRoots,
+  ])];
   return {
     enabled: policy?.enabled !== false,
-    readRoots: [...(config.allowedProjectRoots ?? []), ...(config.outputRoots ?? []), ...(policy?.extraTrustedRoots ?? [])],
-    writeRoots: policy?.extraWriteRoots ?? [],
+    readRoots,
+    writeRoots,
     ...(policy?.homeDir !== undefined ? { homeDir: policy.homeDir } : {}),
+    ...(config.agy?.brainDir !== undefined ? { brainDir: config.agy.brainDir } : {}),
   };
 }
 

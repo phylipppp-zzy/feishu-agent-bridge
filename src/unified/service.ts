@@ -65,7 +65,30 @@ async function boundedProviderList(port:PlatformPort,cursor:string|null):ReturnT
 export class UnifiedCore implements UnifiedService {
   private readonly quarantinedHere = new Set<string>();
   private readonly unavailableProviders=new Set<Provider>();
-  setProviderAvailable(provider:Provider,available:boolean):void {if(available){if(this.unavailableProviders.has(provider)){const port=this.providers.get(provider);if(port)pendingProviderLists.delete(port);}this.unavailableProviders.delete(provider);}else this.unavailableProviders.add(provider);}
+  private readonly syncedSettings = new Map<string, { connectionGeneration: number; revision: number; digest: string }>();
+  setProviderAvailable(provider:Provider,available:boolean):void {
+    if(available){if(this.unavailableProviders.has(provider)){const port=this.providers.get(provider);if(port)pendingProviderLists.delete(port);}this.unavailableProviders.delete(provider);}
+    else {
+      this.unavailableProviders.add(provider);
+      for (const s of this.store.listSessions()) {
+        if (s.native.provider === provider) this.syncedSettings.delete(s.sessionId);
+      }
+    }
+  }
+  private settingsSyncMatches(sessionId: string, connectionGeneration: number, setting: { model: string | null; preferences: Record<string, string>; revision: number }): boolean {
+    const synced = this.syncedSettings.get(sessionId);
+    if (!synced) return false;
+    return synced.connectionGeneration === connectionGeneration &&
+      synced.revision === setting.revision &&
+      synced.digest === payloadDigest({ model: setting.model, preferences: setting.preferences });
+  }
+  private markSettingsSynced(sessionId: string, connectionGeneration: number, setting: { model: string | null; preferences: Record<string, string>; revision: number }): void {
+    this.syncedSettings.set(sessionId, {
+      connectionGeneration,
+      revision: setting.revision,
+      digest: payloadDigest({ model: setting.model, preferences: setting.preferences }),
+    });
+  }
   private readonly providers = new Map<Provider, PlatformPort>();
   private readonly tails = new Map<string, Promise<unknown>>();
   private readonly controlObservations = new Map<string, ControlObservations>();
@@ -225,7 +248,18 @@ export class UnifiedCore implements UnifiedService {
   async refreshReadOnlySession(id: string, observed?:SessionSnapshot): Promise<boolean> { return this.refreshHistory(id,false,observed); }
   /** Initial history baseline is read-only even when another binding has interactive control. */
   async hydrateSessionHistory(id:string):Promise<boolean> { return this.refreshHistory(id,true); }
-  private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot):Promise<boolean> {
+  /** Best-effort read-only incremental catch-up for idle interactive sessions (e.g. terminal turns). */
+  async refreshIdleInteractiveSession(id: string): Promise<boolean> {
+    const current = this.store.getSession(id);
+    if (current.control.input !== 'available' || current.status !== 'idle') return false;
+    if (this.store.isDetached(id) || this.store.recoveryQuarantined(id)) return false;
+    if (this.unavailableProviders.has(current.native.provider)) return false;
+    if (typeof this.port(current).read !== 'function') return false;
+    if (this.store.listTurns(id).some(t => t.status === 'running' || t.status === 'queued')) return false;
+    if (this.store.hasOpenInteraction(id) || this.store.pendingOutbox(id, 'submitInput').length > 0 || this.store.hasUnsettledInput(id, '')) return false;
+    return this.refreshHistory(id, true, undefined, true);
+  }
+  private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot, bestEffort = false):Promise<boolean> {
     let current:Session|undefined;
     try {
       current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
@@ -239,6 +273,7 @@ export class UnifiedCore implements UnifiedService {
       if(committed && this.observationFailure==='read-only refresh failed') this.observationFailure=null;
       return committed;
     } catch (error) {
+      if (bestEffort) return false;
       const suppress=!!current && current.status==='read_only' && current.control.input!=='available' && (isMissingNativeSessionError(error) || this.unavailableProviders.has(current.native.provider));
       if(!suppress) this.observationFailure='read-only refresh failed';
       throw error;
@@ -299,7 +334,7 @@ export class UnifiedCore implements UnifiedService {
     if (request.payload.mode === 'interactive' && observed.session.control.input !== 'available') return fail('control_conflict');
     if (request.payload.mode === 'interactive' && (!Number.isSafeInteger(observed.connectionGeneration) || observed.connectionGeneration! < 0)) return fail('temporarily_unavailable','connection generation unavailable');
     if ((observed.turns ?? []).some(t=>t.sessionId!==ref.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
-    const result=this.store.attachSession(request.context,session,request.payload,request.payload.mode === 'read_only' ? null : observed.connectionGeneration ?? null,request.payload.mode === 'read_only' ? {...observed,interactions:[]} : observed); attached=true; if(quarantined) this.store.clearRecoveryQuarantine(candidate.sessionId); return result;
+    const result=this.store.attachSession(request.context,session,request.payload,request.payload.mode === 'read_only' ? null : observed.connectionGeneration ?? null,request.payload.mode === 'read_only' ? {...observed,interactions:[]} : observed); attached=true; this.syncedSettings.delete(candidate.sessionId); if(quarantined) this.store.clearRecoveryQuarantine(candidate.sessionId); return result;
     } finally {
       if (resumed && !attached) { try { await port.control(ref,'release',{expectedControlGeneration:0,expectedConnectionGeneration:observed.connectionGeneration ?? null,assertCurrent() {}}); } catch { return fail('outcome_unknown','attach failed and subscription release could not be confirmed'); } }
     }
@@ -314,8 +349,14 @@ export class UnifiedCore implements UnifiedService {
       if (!this.authorize(identity,current,'attachSession') || (this.canDiscover && !this.canDiscover(current))) return;
       const before=await this.port(current).read(current.native);
       if (payloadDigest(before.session.native)!==payloadDigest(current.native) || before.session.project!==current.project || !await stillAuthorized()) return fail('unauthorized','restore authorization changed');
+      let target = current;
+      if (current.control.input === 'available' && (before.session.control.input !== 'available' || (before.connectionGeneration !== undefined && before.connectionGeneration !== this.store.connectionGeneration(id)))) {
+        const capabilities=Object.fromEntries(Object.entries(current.capabilities).map(([key,value])=>[key,key==='view' ? value : {status:'temporarily_unavailable',reason:'explicit resume required after provider disconnect'}])) as Session['capabilities'];
+        target = {...current,status:'read_only',revision:current.revision+1,capabilities,control:{...current.control,owner:null,input:'unavailable',generation:current.control.generation+1,reason:'explicit resume required after provider disconnect'}};
+        this.store.updateSession(target,current.revision,current.control.generation);
+      }
       const token=randomUUID();
-      attempted=true; await this.attachSession({context:{operationId:`restore:${token}`,idempotencyKey:`restore:${token}`,targetId:id,expectedRevision:current.revision,controlGeneration:current.control.generation,identity},payload:{...current.native,mode:'interactive'}});
+      attempted=true; await this.attachSession({context:{operationId:`restore:${token}`,idempotencyKey:`restore:${token}`,targetId:id,expectedRevision:target.revision,controlGeneration:target.control.generation,identity},payload:{...target.native,mode:'interactive'}});
       if (!await stillAuthorized()) return fail('unauthorized','restore authorization changed');
       // Re-read trusted provider output after the new generation is established.
       const restored=this.store.getSession(id), generation=this.store.connectionGeneration(id);
@@ -459,9 +500,28 @@ export class UnifiedCore implements UnifiedService {
       };
       try {
         const port = this.port(session); let nativeReference: string | null = null;
-        if (out.kind === 'submitInput') { const input = out.payload as SubmitInput; const setting = input.mode==='steer'?null:this.store.confirmedSettings(session.sessionId); if(setting){const restored=await port.updateSettings(session.native,{model:setting.model,preferences:setting.preferences},guard);if(restored.settingsApplied!==true) return this.store.markDeliveryUnknown(id);} const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; }); nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard,input.requiredTurnId)).nativeReference; }
+        if (out.kind === 'submitInput') {
+          const input = out.payload as SubmitInput;
+          const setting = input.mode === 'steer' ? null : this.store.confirmedSettings(session.sessionId);
+          if (setting && !this.settingsSyncMatches(session.sessionId, out.connectionGeneration, setting)) {
+            const restored = await port.updateSettings(session.native, { model: setting.model, preferences: setting.preferences }, guard);
+            if (restored.settingsApplied !== true) return this.store.markDeliveryUnknown(id);
+            this.markSettingsSynced(session.sessionId, out.connectionGeneration, setting);
+          }
+          const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; });
+          nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard, input.requiredTurnId)).nativeReference;
+        }
         else if (out.kind === 'archiveSession') { if (!port.archive) return this.store.reconcileOperation(id,'failed',contractError('unsupported')); await port.archive(session.native,(out.payload as {archived:boolean}).archived,guard); }
-        else if (out.kind === 'updateSessionSettings') { const settings=out.payload as {model:string|null;preferences:Record<string,string>}; const receipt=await port.updateSettings(session.native,settings,guard); if (guarded && receipt.settingsApplied === true && this.store.getOutbox(id).state === 'in_flight') return this.store.confirmSettings(id,settings); }
+        else if (out.kind === 'updateSessionSettings') {
+          const settings = out.payload as { model: string | null; preferences: Record<string, string> };
+          const receipt = await port.updateSettings(session.native, settings, guard);
+          if (guarded && receipt.settingsApplied === true && this.store.getOutbox(id).state === 'in_flight') {
+            const op = this.store.confirmSettings(id, settings);
+            const confirmed = this.store.confirmedSettings(session.sessionId);
+            if (confirmed) this.markSettingsSynced(session.sessionId, out.connectionGeneration, confirmed);
+            return op;
+          }
+        }
         else if (out.kind === 'requestControl' || out.kind === 'releaseControl') {
           return await this.dispatchControl(port,session,out.kind === 'requestControl',guard,() => guarded,id);
         }
@@ -479,9 +539,23 @@ export class UnifiedCore implements UnifiedService {
           if (rejected) return this.store.reconcileOperation(id,'failed',rejected);
         }
         const input = out.kind === 'submitInput' ? out.payload as SubmitInput : null;
-        if (!guarded && error instanceof StoreError && (input?.mode === 'steer' || (input?.mode === 'new' && input.channelScope)) &&
-            ['busy','control_conflict','interaction_expired','unauthorized'].includes(error.detail.code)) return this.store.reconcileOperation(id,'failed',error.detail);
-        if (!guarded && error && typeof error === 'object' && 'code' in error) { const code=(error as {code:unknown}).code; if (code === 'unsupported' || code === 'invalid_request' || (out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer' && (code==='busy'||code==='control_conflict'||code==='interaction_expired'||code==='unauthorized'))) return this.store.reconcileOperation(id,'failed',contractError(code)); }
+        if (!guarded && error instanceof StoreError && (
+            error.detail.code === 'busy' ||
+            ((input?.mode === 'steer' || (input?.mode === 'new' && input.channelScope)) &&
+              ['control_conflict','interaction_expired','unauthorized'].includes(error.detail.code))
+        )) return this.store.reconcileOperation(id,'failed',error.detail);
+        if (!guarded && error && typeof error === 'object' && 'code' in error) {
+          const code = (error as { code: unknown }).code;
+          const message = 'message' in error && typeof (error as { message?: unknown }).message === 'string'
+            ? (error as { message: string }).message : undefined;
+          if (
+            code === 'unsupported' ||
+            code === 'invalid_request' ||
+            code === 'busy' ||
+            (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'steer' &&
+              (code === 'control_conflict' || code === 'interaction_expired' || code === 'unauthorized'))
+          ) return this.store.reconcileOperation(id, 'failed', contractError(code, message));
+        }
         // The transport may have written before losing its acknowledgement.
         return this.store.markDeliveryUnknown(id);
       }
@@ -507,6 +581,7 @@ export class UnifiedCore implements UnifiedService {
       }
       const connection = observed.connection?.connectionGeneration ?? receipt.connectionGeneration;
       const op = this.store.completeControl(id,{...observed.session.session,sessionId:session.sessionId},connection);
+      this.syncedSettings.delete(session.sessionId);
       persisted = true;
       if (observed.connection && connection !== guard.expectedConnectionGeneration) this.onAcceptedObservation?.(observed.connection);
       return op;
@@ -614,6 +689,7 @@ export class UnifiedCore implements UnifiedService {
       if (!Number.isSafeInteger(observation.connectionGeneration) || observation.connectionGeneration < previous) return fail('control_conflict');
       if (observation.connectionGeneration > previous) {
         this.store.setConnectionGeneration(mapped.sessionId,previous,observation.connectionGeneration);
+        this.syncedSettings.delete(mapped.sessionId);
         this.onAcceptedObservation?.(observation);
       }
       return;

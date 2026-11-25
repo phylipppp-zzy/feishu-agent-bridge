@@ -9,6 +9,7 @@ export type ApprovalContext = {
   readRoots?: readonly string[];
   writeRoots?: readonly string[];
   homeDir?: string;
+  brainDir?: string;
   enabled?: boolean;
 };
 export type ApprovalScope = Omit<ApprovalContext, 'project' | 'cwd'>;
@@ -178,20 +179,25 @@ export async function makePolicy(context: ApprovalContext, checks: Check[] = [])
     const proof = await provePath(root);
     if (proof && !proof.unresolvedLink && (await stat(proof.path).catch(() => null))?.isDirectory()) return proof;
   };
+  const isBroadRoot = (root: string): boolean => root === '/' || root === home || under(home, root);
   const rawProject = context.project;
   const project = rawProject ? await proveDirectory(rawProject) : undefined;
   const sessionRoots = rawProject && project && project.path !== '/' ? [rawProject] : [];
-  const proveRoots = async (roots: readonly string[]) => (await Promise.all([...new Set([...sessionRoots, ...roots])].map(async root => {
-    const proof = root === rawProject ? project : await proveDirectory(root);
+  const proveRoots = async (roots: readonly string[], filterBroad = false) => (await Promise.all([...new Set([...sessionRoots, ...roots])].map(async root => {
+    const isSessionRoot = root === rawProject;
+    const proof = isSessionRoot ? project : await proveDirectory(root);
     if (!proof) return [];
     const logical = resolve(root);
+    if (filterBroad && !isSessionRoot && (isBroadRoot(logical) || isBroadRoot(proof.path))) return [];
     if (logical === proof.path || root !== logical && (await provePath(logical))?.path !== proof.path) return [proof.path];
     return [logical, proof.path];
   }))).flat();
-  const [readRoots, writeRoots] = await Promise.all([
-    proveRoots([...(context.allowedRoots ?? []), ...(context.readRoots ?? [])]),
-    proveRoots(context.writeRoots ?? []),
+  const [allowedReadRoots, explicitReadRoots, writeRoots] = await Promise.all([
+    proveRoots(context.allowedRoots ?? [], true),
+    proveRoots(context.readRoots ?? [], false),
+    proveRoots(context.writeRoots ?? [], false),
   ]);
+  const readRoots = [...new Set([...allowedReadRoots, ...explicitReadRoots])];
   const script = await provePath(pmCheckPath);
   const pmCheck = script && !script.unresolvedLink && (await stat(script.path).catch(() => null))?.isFile() ? script.path : undefined;
   return { home, project, readRoots, writeRoots, checks, protections, ...(pmCheck ? { pmCheck } : {}) };
@@ -206,9 +212,13 @@ export async function inspectPath(policy: PolicyPaths, path: string, cwd: string
   const proof = await provePath(path, cwd);
   const targets = new Set([lexical, ...(proof ? [proof.path] : [])]);
   const roots = write ? policy.writeRoots : policy.readRoots;
+  const sensitiveReadRoots = [join(policy.home, 'reviews'), join(policy.home, '.ssh')];
   for (const target of targets) {
     const check = write ? protectedPath(policy, target, gitMetadata) : null;
     if (check) policy.checks.push(check);
+    else if (!write && sensitiveReadRoots.some(root => under(target, root) && (!policy.project || !under(policy.project.path, root)))) {
+      ask(policy, outside);
+    }
     else if (!roots.some(root => under(target, root))) ask(policy, outside);
     if (remove && (
       target === join(policy.home, 'projects')
