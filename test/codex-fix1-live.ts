@@ -1,8 +1,11 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { CodexTransport } from '../src/unified/codex-transport.js';
 import { CodexAdapter } from '../src/unified/codex-adapter.js';
 import { UnifiedStore } from '../src/unified/store.js';
 import { UnifiedCore } from '../src/unified/service.js';
-const transport=new CodexTransport('ws://127.0.0.1:19431',undefined,10000);await transport.connect();const adapter=new CodexAdapter(transport,'fixture-host','fixture-service');const store=new UnifiedStore('/home/zhangzy/tmp/codex-features-fix1/state.db');const core=new UnifiedCore(store,[adapter],i=>i.subject==='fixture',()=>false,()=>false,s=>s.project==='/home/zhangzy/tmp/codex-features-fix1/project');
+const fix1Root=process.env.FIX1_ROOT || join(homedir(),'tmp/codex-features-fix1');
+const transport=new CodexTransport('ws://127.0.0.1:19431',undefined,10000);await transport.connect();const adapter=new CodexAdapter(transport,'fixture-host','fixture-service');const store=new UnifiedStore(join(fix1Root,'state.db'));const core=new UnifiedCore(store,[adapter],i=>i.subject==='fixture',()=>false,()=>false,s=>s.project===join(fix1Root,'project'));
 const ctx=(id:string,targetId:string,rev=0,gen=0)=>({operationId:id,idempotencyKey:id,targetId,expectedRevision:rev,controlGeneration:gen,identity:{subject:'fixture',source:'local-test'}});
 try {
  const page=await adapter.list(null,100); if(page.items.length!==1)throw Error(`expected exactly 1 isolated TUI thread, found ${page.items.length}`); const found=page.items[0]!;

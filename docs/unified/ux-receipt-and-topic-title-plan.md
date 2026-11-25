@@ -1,7 +1,7 @@
 # 飞书统一桥接器 UX 收口方案：消除冗余「操作回执」与话题根卡片真实命名同步
 
-- **适用仓库工作树**：`/home/zhangzy/tmp/feishu-unified-v2`（分支 `codex/feishu-unified-v2-agy`，基线提交 `16c64dc`）
-- **禁止触碰**：`/home/zhangzy/workspace/feishu-agent-bridge`（主工作树）、线上 `~/.config/feishu-unified-bridge/config.json` 与 `feishu-unified-production.service`（代码改完并经测试验证后由运维/用户确认切换）
+- **适用仓库工作树**：`$HOME/tmp/feishu-unified-v2`（分支 `codex/feishu-unified-v2-agy`，基线提交 `16c64dc`）
+- **禁止触碰**：`$HOME/workspace/feishu-agent-bridge`（主工作树）、线上 `~/.config/feishu-unified-bridge/config.json` 与 `feishu-unified-production.service`（代码改完并经测试验证后由运维/用户确认切换）
 - **硬性约束**：`src/unified/` 下任意 `.ts` 文件必须严格保持 `< 900` 行；所有相对 ESM 导入带 `.js` 尾缀；改动后运行 `npm run check && npm run build && npm test` 必须 0 失败。
 
 ---
@@ -93,4 +93,4 @@
 2. 校验命令：
    - `find src/unified -name '*.ts' -exec wc -l {} + | sort -rn | head -n 10`（全部 `< 900` 行）
    - `npm run check && npm run build && npm test`（0 失败）
-   - 核对 `/home/zhangzy/workspace/feishu-agent-bridge` 未被改动（`git status` 干净）。
+   - 核对 `$HOME/workspace/feishu-agent-bridge` 未被改动（`git status` 干净）。

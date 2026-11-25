@@ -212,7 +212,7 @@ node --import tsx --test \
   test/unified-task-handoff-t2.test.ts
 
 # 3. 带 0090d1a 回滚守卫的离线全套（需本地存在 sealed 0090d1a 目录）
-TASK_GUARD_RELEASE=/home/zhangzy/tmp/feishu-0090d1a-verify \
+TASK_GUARD_RELEASE="$HOME/tmp/feishu-0090d1a-verify" \
   node --import tsx --test \
   test/unified-ssteer-channel.test.ts \
   test/unified-file-fixture-versions.test.ts \

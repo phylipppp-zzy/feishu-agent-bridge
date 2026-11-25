@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {existsSync,mkdtempSync,rmSync} from 'node:fs';
 import {fileURLToPath,pathToFileURL} from 'node:url';
-import {tmpdir} from 'node:os';
+import {homedir,tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {connect} from 'node:net';
@@ -15,7 +15,7 @@ import {TestLaneRuntime} from '../src/unified/test-lane.js';
 import {parseFeishuAction} from '../src/unified/feishu-codec.js';
 
 const execFileAsync=promisify(execFile);
-const oldReleaseDir=process.env.SSTEER_OLD_RELEASE || process.env.R12_OLD_RELEASE || process.env.TASK_GUARD_RELEASE || '/home/zhangzy/.local/share/feishu-unified-bridge/releases/0090d1a';
+const oldReleaseDir=process.env.SSTEER_OLD_RELEASE || process.env.R12_OLD_RELEASE || process.env.TASK_GUARD_RELEASE || join(homedir(),'.local/share/feishu-unified-bridge/releases/0090d1a');
 
 test('fixed file versions survive trigger replay and channel restart with SDK delivery ledger isolation',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'fixture-versions-'));let seq=0,uploads=0;const chats=new Map<string,string>();const contents:Buffer[]=[];

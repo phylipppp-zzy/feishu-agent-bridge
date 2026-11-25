@@ -414,7 +414,7 @@ rl.on('line', async (line) => {
       } else if (text === 'flow-auto-deny') {
         toolCall = {
           toolCallId, title: 'Edit project file', kind: 'edit',
-          rawInput: { TargetFile: '/home/zhangzy/projects/projtool/src/index.ts' },
+          rawInput: { TargetFile: (process.env.HOME || '/tmp') + '/projects/projtool/src/index.ts' },
         };
         options = [{ optionId: 'allow_always', kind: 'allow_always' }, { optionId: 'reject_always', kind: 'reject_always' }];
       }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   AgyAcpTransport,
@@ -416,7 +416,7 @@ rl.on('close', async () => {
 }
 
 test('CLI arg builders enforce P0-2 ACP and stream-json flag contracts', () => {
-  assert.equal(DEFAULT_AGY_BIN, '/home/zhangzy/.gemini/bin/agy');
+  assert.equal(DEFAULT_AGY_BIN, join(homedir(), '.gemini', 'bin', 'agy'));
 
   const acpArgs = buildAgyAcpArgs({
     geminiDir: '/tmp/gem',
