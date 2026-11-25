@@ -23,6 +23,7 @@ function readCursor(value: string, sessionId: string): number {
 export class UnifiedStore {
   private db: DatabaseSync;
   private readonly turnProgress: TurnProgressStore;
+  private readonly streamingEventIds = new Map<string, string>();
   private migrationLocked=false;
   constructor(path: string) {
     this.db = new DatabaseSync(path);
@@ -277,6 +278,16 @@ export class UnifiedStore {
   baselineReadonlyTurns(sessionId:string,turns:Turn[]):void { this.transaction(()=>{const current=this.session(sessionId);if(current.status!=='read_only'||current.control.input==='available')return fail('busy');for(const turn of turns){if(turn.sessionId!==sessionId||!['completed','failed','interrupted'].includes(turn.status))return fail('invalid_request');const row=this.row('SELECT value FROM turns WHERE id=?',turn.turnId);if(row){const prior=parse<Turn>(row.value);if(prior.sessionId!==sessionId)return fail('invalid_request');if(['completed','failed','interrupted'].includes(prior.status))continue;this.run('UPDATE turns SET value=? WHERE id=?',JSON.stringify(turn),turn.turnId);}else this.run('INSERT INTO turns(id,session_id,value) VALUES(?,?,?)',turn.turnId,sessionId,JSON.stringify(turn));}}); }
 
   operationTurn(id:string): {sessionId:string;turnId:string} | null { const row=this.row('SELECT session_id,turn_id FROM operation_turns WHERE operation_id=?',id); return row ? {sessionId:String(row.session_id),turnId:String(row.turn_id)} : null; }
+  hasActiveBridgeTurn(sessionId: string): boolean {
+    return !!this.row(
+      "SELECT 1 FROM operation_turns ot JOIN turns t ON t.id = ot.turn_id AND t.session_id = ot.session_id WHERE ot.session_id=? AND json_extract(t.value,'$.status') IN ('running','queued') LIMIT 1",
+      sessionId,
+    );
+  }
+  unknownOperationIds(): string[] {
+    const rows = this.db.prepare("SELECT id FROM operations WHERE json_extract(value,'$.status')='unknown' ORDER BY rowid").all() as Array<{ id: string }>;
+    return rows.map(r => String(r.id));
+  }
   /** Apply live turn evidence and its session status atomically; stale terminals never clear newer work. */
   observeTurn(turn: Turn, observedAt = Date.now()): boolean {
     return this.transaction(() => this.applyCurrentTurnInTransaction(turn, observedAt));
@@ -423,22 +434,22 @@ export class UnifiedStore {
     return Math.max(0, Number(row?.sequence ?? 0)) + 1;
   }
   putMessage(value: Message, expectedRevision: number | null): void { this.transaction(() => this.putMessageInTransaction(value,expectedRevision)); }
-  private pruneSupersededStreamingEvents(sessionId: string, messageId: string): void {
-    const stale = this.db.prepare(
-      "SELECT event_id FROM events WHERE session_id=? AND json_extract(value,'$.type')='message.updated' AND json_extract(value,'$.objectId')=? AND json_extract(value,'$.data.final')=0"
-    ).all(sessionId, messageId) as Array<{ event_id: string }>;
-    for (const entry of stale) {
-      this.run('DELETE FROM events WHERE event_id=?', entry.event_id);
-      this.run('DELETE FROM event_keys WHERE event_id=?', entry.event_id);
-    }
-  }
   private putMessageInTransaction(value: Message, expectedRevision: number | null): void {
     this.session(value.sessionId); const row = this.row('SELECT value FROM messages WHERE id=?', value.messageId);
     if (row) { const old = parse<Message>(row.value); if (old.sessionId !== value.sessionId || old.revision !== expectedRevision || value.revision !== old.revision + 1) return fail('stale_revision');
       this.run('UPDATE messages SET value=? WHERE id=?', JSON.stringify(value), value.messageId);
-      this.pruneSupersededStreamingEvents(value.sessionId, value.messageId);
     } else { if (expectedRevision !== null) return fail('stale_revision'); this.run('INSERT INTO messages(id,session_id,value) VALUES(?,?,?)', value.messageId, value.sessionId, JSON.stringify(value)); }
-    this.eventFor(value.sessionId, value.messageId, value.revision, 'message.updated', null, value);
+    const streamKey = `${value.sessionId}:${value.messageId}`;
+    const prevEventId = this.streamingEventIds.get(streamKey);
+    if (prevEventId) {
+      this.run('DELETE FROM events WHERE event_id=?', prevEventId);
+      this.run('DELETE FROM event_keys WHERE event_id=?', prevEventId);
+      this.streamingEventIds.delete(streamKey);
+    }
+    const event = this.eventFor(value.sessionId, value.messageId, value.revision, 'message.updated', null, value);
+    if (!value.final) {
+      this.streamingEventIds.set(streamKey, event.eventId);
+    }
   }
   private messageMap(sessionId: string): Map<string,Message> {
     return new Map(this.db.prepare('SELECT value FROM messages WHERE session_id=? ORDER BY rowid').all(sessionId).map(row => {
@@ -592,7 +603,17 @@ export class UnifiedStore {
     const interaction = this.getInteraction(request.interactionId);
     const connection = this.row('SELECT connection_generation FROM sessions WHERE id=?', context.targetId);
     if (!connection || Number(connection.connection_generation) !== request.expectedConnectionGeneration) return fail('interaction_expired');
-    const valid = validateResolution(request, interaction, now); if (!valid.ok) throw new StoreError(valid.error);
+    const interactionWithMeta = interaction as Interaction & { allowAlways?: boolean; allowedScopes?: readonly string[] };
+    const sessionScopePermitted =
+      interaction.kind === 'approval' &&
+      request.answer.kind === 'approval' &&
+      request.answer.decision === 'allow' &&
+      (request.answer.scope === 'session' || request.answer.scope === 'allow_always') &&
+      (interactionWithMeta.allowAlways === true || interactionWithMeta.allowedScopes?.includes(request.answer.scope) === true);
+    const validationTarget: ResolveInteraction = sessionScopePermitted && request.answer.kind === 'approval'
+      ? { ...request, answer: { ...request.answer, scope: interaction.scope } }
+      : request;
+    const valid = validateResolution(validationTarget, interaction, now); if (!valid.ok) throw new StoreError(valid.error);
     const updated: Interaction = { ...interaction, status: 'answer_pending_delivery', revision: interaction.revision + 1 };
     this.run('UPDATE interactions SET value=? WHERE id=?', JSON.stringify(updated), updated.interactionId);
     this.eventFor(updated.sessionId, updated.interactionId, updated.revision, 'interaction.answer_pending_delivery', context.operationId, updated);
@@ -786,12 +807,6 @@ export class UnifiedStore {
       const sequence = readCursor(throughCursor, sessionId);
       const row = this.row('SELECT event_floor,event_seq FROM sessions WHERE id=?', sessionId);
       if (!row || sequence < Number(row.event_floor) || sequence > Number(row.event_seq)) return fail('invalid_request', 'invalid compaction watermark');
-      const staleStreaming = this.db.prepare(
-        "SELECT event_id FROM events WHERE session_id=? AND seq<=? AND json_extract(value,'$.type')='message.updated' AND json_extract(value,'$.data.final')=0"
-      ).all(sessionId, sequence) as Array<{ event_id: string }>;
-      for (const entry of staleStreaming) {
-        this.run('DELETE FROM event_keys WHERE event_id=?', entry.event_id);
-      }
       this.run('DELETE FROM events WHERE session_id=? AND seq<=?', sessionId, sequence);
       this.run('UPDATE sessions SET event_floor=? WHERE id=?', sequence, sessionId);
     });

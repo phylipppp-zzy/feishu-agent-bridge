@@ -255,7 +255,7 @@ export class UnifiedCore implements UnifiedService {
     if (this.store.isDetached(id) || this.store.recoveryQuarantined(id)) return false;
     if (this.unavailableProviders.has(current.native.provider)) return false;
     if (typeof this.port(current).read !== 'function') return false;
-    if (this.store.listTurns(id).some(t => t.status === 'running' || t.status === 'queued')) return false;
+    if (this.store.hasActiveBridgeTurn(id)) return false;
     if (this.store.hasOpenInteraction(id) || this.store.pendingOutbox(id, 'submitInput').length > 0 || this.store.hasUnsettledInput(id, '')) return false;
     return this.refreshHistory(id, true, undefined, true);
   }
@@ -342,11 +342,14 @@ export class UnifiedCore implements UnifiedService {
   }
   /** The caller revalidates persisted channel authorization for this exact session across native reads. */
   async restoreInteractive(id:string, identity:WriteContext['identity'], stillAuthorized:()=>Promise<boolean>):Promise<void> {
+    await this.restoreInteractiveWithOutcome(id, identity, stillAuthorized);
+  }
+  async restoreInteractiveWithOutcome(id:string, identity:WriteContext['identity'], stillAuthorized:()=>Promise<boolean>):Promise<'restored'|'skipped'> {
     let attempted=false;
     try {
-      if (!this.store.hasInteractiveIntent(id) || this.store.isDetached(id) || this.store.recoveryQuarantined(id) || !await stillAuthorized()) return;
+      if (!this.store.hasInteractiveIntent(id) || this.store.isDetached(id) || this.store.recoveryQuarantined(id) || !await stillAuthorized()) return 'skipped';
       const current=this.store.getSession(id);
-      if (!this.authorize(identity,current,'attachSession') || (this.canDiscover && !this.canDiscover(current))) return;
+      if (!this.authorize(identity,current,'attachSession') || (this.canDiscover && !this.canDiscover(current))) return 'skipped';
       const before=await this.port(current).read(current.native);
       if (payloadDigest(before.session.native)!==payloadDigest(current.native) || before.session.project!==current.project || !await stillAuthorized()) return fail('unauthorized','restore authorization changed');
       let target = current;
@@ -364,6 +367,7 @@ export class UnifiedCore implements UnifiedService {
       if (payloadDigest(snapshot.session.native)!==payloadDigest(restored.native) || snapshot.session.project!==current.project || snapshot.connectionGeneration!==generation || this.store.connectionGeneration(id)!==generation || !await stillAuthorized()) return fail('unauthorized','restore metadata changed');
       if ((snapshot.turns ?? []).some(t=>t.sessionId!==restored.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
       this.store.applyHistoryRefresh(restored,generation,snapshot);
+      return 'restored';
     } catch(error) {
       if(attempted) {
         // Fence observations before awaiting the release: native events have no trusted generation tag.
@@ -507,6 +511,8 @@ export class UnifiedCore implements UnifiedService {
             const restored = await port.updateSettings(session.native, { model: setting.model, preferences: setting.preferences }, guard);
             if (restored.settingsApplied !== true) return this.store.markDeliveryUnknown(id);
             this.markSettingsSynced(session.sessionId, out.connectionGeneration, setting);
+            // Reset guard so port.input() is fenced independently from the preceding settings sync.
+            guarded = false;
           }
           const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; });
           nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard, input.requiredTurnId)).nativeReference;

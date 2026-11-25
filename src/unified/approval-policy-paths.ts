@@ -23,6 +23,7 @@ export interface PolicyPaths {
   writeRoots: string[];
   checks: Check[];
   protections: Protection[];
+  sensitiveReadRoots: string[];
   pmCheck?: string;
 }
 
@@ -198,9 +199,14 @@ export async function makePolicy(context: ApprovalContext, checks: Check[] = [])
     proveRoots(context.writeRoots ?? [], false),
   ]);
   const readRoots = [...new Set([...allowedReadRoots, ...explicitReadRoots])];
+  const sensitiveReadLogical = [join(home, 'reviews'), join(home, '.ssh')];
+  const sensitiveReadRoots = [...new Set((await Promise.all(sensitiveReadLogical.map(async entry => {
+    const proof = await provePath(entry);
+    return proof && proof.path !== entry ? [entry, proof.path] : [entry];
+  }))).flat())];
   const script = await provePath(pmCheckPath);
   const pmCheck = script && !script.unresolvedLink && (await stat(script.path).catch(() => null))?.isFile() ? script.path : undefined;
-  return { home, project, readRoots, writeRoots, checks, protections, ...(pmCheck ? { pmCheck } : {}) };
+  return { home, project, readRoots, writeRoots, checks, protections, sensitiveReadRoots, ...(pmCheck ? { pmCheck } : {}) };
 }
 
 export async function inspectPath(policy: PolicyPaths, path: string, cwd: string | undefined, write: boolean, remove = false, gitMetadata = false): Promise<string | undefined> {
@@ -212,11 +218,10 @@ export async function inspectPath(policy: PolicyPaths, path: string, cwd: string
   const proof = await provePath(path, cwd);
   const targets = new Set([lexical, ...(proof ? [proof.path] : [])]);
   const roots = write ? policy.writeRoots : policy.readRoots;
-  const sensitiveReadRoots = [join(policy.home, 'reviews'), join(policy.home, '.ssh')];
   for (const target of targets) {
     const check = write ? protectedPath(policy, target, gitMetadata) : null;
     if (check) policy.checks.push(check);
-    else if (!write && sensitiveReadRoots.some(root => under(target, root) && (!policy.project || !under(policy.project.path, root)))) {
+    else if (!write && policy.sensitiveReadRoots.some(root => under(target, root) && (!policy.project || !under(policy.project.path, root)))) {
       ask(policy, outside);
     }
     else if (!roots.some(root => under(target, root))) ask(policy, outside);

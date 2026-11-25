@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -164,9 +164,18 @@ test('service: pre-write busy error converges to failed (never unknown) and upda
     assert.equal(inputCalls, 3);
     assert.equal(updateSettingsCalls, 1, 'no redundant updateSettings RPCs across turns');
 
-    // 3. Connection generation advances -> next submitInput re-syncs settings once, then skips again.
+    // 3. Connection generation advances -> next submitInput re-syncs settings once; if port.input throws pre-write busy,
+    // guarded must have been reset after updateSettings so it converges to failed (never unknown).
     await core.observe({ type: 'connection', ref, connectionGeneration: 2 });
     assert.ok(obsListener !== undefined);
+    busy = true;
+    await core.submitInput({ context: ctx('op-in-4-busy'), mode: 'new', blocks: [{ type: 'text', text: 'busy-after-settings' }] });
+    const busyAfterSettings = await core.dispatch('op-in-4-busy');
+    assert.equal(busyAfterSettings.status, 'failed');
+    assert.equal(busyAfterSettings.error?.code, 'busy');
+    assert.equal(updateSettingsCalls, 2);
+
+    busy = false;
     await core.submitInput({ context: ctx('op-in-4'), mode: 'new', blocks: [{ type: 'text', text: 'after-reconn' }] });
     assert.equal((await core.dispatch('op-in-4')).status, 'accepted');
     assert.equal(updateSettingsCalls, 2);
@@ -204,9 +213,24 @@ test('approval policy: homeDir in allowedProjectRoots is not a cross-project rea
       allowedProjectRoots: [fakeHome],
       outputRoots: [],
       approvalPolicy: { enabled: true, homeDir: fakeHome, extraWriteRoots: [extraWrite] },
+      agy: { enabled: true, serviceId: 'agy-svc', extraWriteRoots: [join(dir, 'agy-only-write')] },
     });
     const scope = runtimeApprovalScope(cfg);
     assert.ok(!scope.readRoots.includes(fakeHome), 'homeDir must not be blindly added to readRoots');
+    assert.ok(!scope.writeRoots.includes(join(dir, 'agy-only-write')), 'agy.extraWriteRoots must not pollute shared Claude/Codex scope');
+
+    // Symlink pointing to homeDir in allowedProjectRoots must also be filtered out by physical broad-root check.
+    const homeSymlink = join(dir, 'home-link');
+    symlinkSync(fakeHome, homeSymlink);
+    const symlinkScope = runtimeApprovalScope(makeRuntimeConfig(dir, {
+      allowedProjectRoots: [homeSymlink],
+      outputRoots: [],
+      approvalPolicy: { enabled: true, homeDir: fakeHome },
+    }));
+    const viaSymlinkRead = evaluateApproval(
+      await resolveApprovalFacts({ kind: 'read', paths: [join(projectB, 'b.ts')] }, { ...symlinkScope, project: projectA }),
+    );
+    assert.equal(viaSymlinkRead.kind, 'ask', 'symlinked homeDir must not allow cross-project auto-reads');
 
     // Reading inside current projectA is allowed.
     const inProjRead = evaluateApproval(
@@ -281,6 +305,22 @@ test('adapter-permission: ArtifactMetadata, read-only MCP/search_web, brain/<ses
     };
     assert.equal((await classifyAgyPermission(otherBrainWrite, project, scope, 'sess-abc-123')).kind, 'ask');
 
+    // 1b: '.' sessionId, untrusted toolCall.sessionId, and symlinked brain/<sessionId> must all be rejected (-> ask).
+    assert.equal((await classifyAgyPermission(artifactWrite, project, scope, '.')).kind, 'ask');
+    assert.equal((await classifyAgyPermission({ ...artifactWrite, sessionId: 'sess-abc-123' }, project, scope)).kind, 'ask');
+    const escapedTarget = join(dir, 'escaped-brain');
+    mkdirSync(escapedTarget, { recursive: true });
+    symlinkSync(escapedTarget, join(brainDir, 'sess-symlink'));
+    assert.equal(
+      (await classifyAgyPermission(
+        { ...artifactWrite, rawInput: { ...artifactWrite.rawInput, Path: join(brainDir, 'sess-symlink', 'pwn.md') } },
+        project,
+        scope,
+        'sess-symlink',
+      )).kind,
+      'ask',
+    );
+
     // Writing to extraWriteRoots -> allow_once.
     const extraWriteCall = {
       name: 'write_file',
@@ -288,24 +328,38 @@ test('adapter-permission: ArtifactMetadata, read-only MCP/search_web, brain/<ses
     };
     assert.equal((await classifyAgyPermission(extraWriteCall, project, scope, 'sess-abc-123')).kind, 'allow_once');
 
-    // 2. Read-only MCP tools & search_web auto-allow (and respect enabled: false).
+    // 2. Read-only MCP tools & search_web auto-allow (including real ACP kind='fetch'/'search'), and respect enabled: false.
     for (const tool of [
-      { name: 'search_web', rawInput: { query: 'test' } },
-      { name: 'list_resources', rawInput: { ServerName: 'codex' } },
-      { name: 'read_resource', rawInput: { ServerName: 'codex', Uri: 'codex://x' } },
-      { name: 'codex_lookup', rawInput: { prompt: 'check' } },
-      { name: 'mcp__codex-bridge__codex_status', rawInput: {} },
-      { name: 'call_mcp_tool', rawInput: { ToolName: 'codex_job', jobId: '123' } },
+      { kind: 'fetch', name: 'search_web', rawInput: { query: 'test' } },
+      { kind: 'read', name: 'list_resources', rawInput: { ServerName: 'codex' } },
+      { kind: 'read', name: 'read_resource', rawInput: { ServerName: 'codex', Uri: 'codex://x' } },
+      { kind: 'search', name: 'codex_lookup', rawInput: { prompt: 'check' } },
+      { kind: 'other', name: 'mcp__codex-bridge__codex_status', rawInput: {} },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge', ToolName: 'codex_job', jobId: '123' } },
     ]) {
       assert.equal((await classifyAgyPermission(tool, project, scope)).kind, 'allow_once', JSON.stringify(tool));
       assert.equal((await classifyAgyPermission(tool, project, { enabled: false })).kind, 'ask', JSON.stringify(tool));
     }
 
-    // Mutating MCP tool stays ask.
-    assert.equal(
-      (await classifyAgyPermission({ name: 'call_mcp_tool', rawInput: { ToolName: 'codex_engineer' } }, project, scope)).kind,
-      'ask',
-    );
+    // 1a: Untrusted MCP namespace, mixed execute+call_mcp_tool, CommandLine smuggling, and sensitive file:// URI must ask.
+    const fakeHome = join(dir, 'fake-home');
+    mkdirSync(join(fakeHome, 'reviews'), { recursive: true });
+    writeFileSync(join(fakeHome, 'reviews', 'secret.pdf'), 'confidential');
+    for (const bypassAttempt of [
+      { name: 'mcp__untrusted__list_resources', rawInput: {} },
+      { name: 'mcp__untrusted__read_resource', rawInput: { Uri: 'x://y' } },
+      { name: 'call_mcp_tool', rawInput: { ServerName: 'untrusted', ToolName: 'codex_status' } },
+      { kind: 'execute', name: 'call_mcp_tool', rawInput: { CommandLine: 'rm -rf /', ToolName: 'codex_status' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ToolName: 'codex_status', CommandLine: 'echo pwn' } },
+      { kind: 'read', name: 'read_resource', rawInput: { Uri: `file://${join(fakeHome, 'reviews', 'secret.pdf')}` } },
+      { name: 'call_mcp_tool', rawInput: { ToolName: 'codex_engineer' } },
+    ]) {
+      assert.equal(
+        (await classifyAgyPermission(bypassAttempt, project, { ...scope, homeDir: fakeHome })).kind,
+        'ask',
+        `bypass attempt must ask: ${JSON.stringify(bypassAttempt)}`,
+      );
+    }
 
     // 3. Option extraction: allow_always + safe fallback when provider only offers `allow`.
     const onlyAllowOpts = [
@@ -334,39 +388,91 @@ test('adapter-permission: ArtifactMetadata, read-only MCP/search_web, brain/<ses
   }
 });
 
-test('cards & formatters: session allow button and expanded >400 char command/path display', () => {
+test('cards & formatters: session allow button end-to-end (card -> resolveInteraction -> dispatch -> respond) and >400 char display', async () => {
   const longCmd = `python3 scripts/run_eval.py --config ${'a'.repeat(500)}/exp.yaml --seed 42`;
   const formatted = formatApprovalAction('run_command', JSON.stringify({ CommandLine: longCmd, Cwd: '/work/proj' }), 'this_request');
   assert.ok(formatted.text.includes('--seed 42'), 'command over 400 chars should not be prematurely truncated');
   assert.ok(formatted.text.includes('/work/proj'), 'working directory should be displayed');
 
-  const baseApproval: Interaction = {
-    interactionId: 'int-1',
+  const dir = mkdtempSync(join(tmpdir(), 'perm-rt-allow-always-'));
+  const store = new UnifiedStore(join(dir, 'core.sqlite'));
+  const ref = { provider: 'agy' as const, hostId: 'h', serviceId: 's', nativeSessionId: 'agy-1' };
+  const session: Session = {
     sessionId: 'sess-1',
-    turnId: 'turn-1',
-    nativeRequestId: 'rpc-1',
-    connectionGeneration: 1,
-    revision: 1,
-    status: 'awaiting_answer',
-    expiresAt: null,
-    toolInputDigest: 'digest-1',
-    nativeResult: null,
-    kind: 'approval',
-    tool: 'run_command',
-    action: JSON.stringify({ CommandLine: longCmd }),
-    scope: 'this_request',
+    native: ref,
+    title: 'agy',
+    project: dir,
+    status: 'waiting_approval',
+    revision: 0,
+    capabilities: ALL_CAPS,
+    control: { serviceId: 's', owner: 'o', input: 'available', generation: 1, operationId: null, reason: null },
   };
-  const cardWithAlways = interactionCard({ ...baseApproval, allowAlways: true });
-  assert.deepEqual(
-    cardWithAlways.actions.map((a) => a.label),
-    ['允许本次', '本会话允许', '拒绝'],
-  );
-  const sessionBtn = cardWithAlways.actions.find((a) => a.label === '本会话允许')!;
-  assert.deepEqual((sessionBtn.value as { answer: unknown }).answer, {
-    kind: 'approval',
-    decision: 'allow',
-    scope: 'session',
-  });
+  let deliveredAnswer: unknown = null;
+  const port = {
+    provider: 'agy' as const,
+    onObservation: () => () => {},
+    respond: async (_r: unknown, _i: unknown, answer: unknown, guard: DispatchGuard) => {
+      guard.assertCurrent();
+      deliveredAnswer = answer;
+      return { status: 'submitted' as const, nativeReference: 'rpc-1' };
+    },
+  } as unknown as PlatformPort;
+  const core = new UnifiedCore(store, [port], () => true);
+
+  try {
+    store.insertSession(session);
+    store.setConnectionGeneration('sess-1', 0, 1);
+    const approvalWithAlways: Interaction & { allowAlways?: boolean } = {
+      interactionId: 'int-1',
+      sessionId: 'sess-1',
+      turnId: 'turn-1',
+      nativeRequestId: 'rpc-1',
+      connectionGeneration: 1,
+      revision: 1,
+      status: 'awaiting_answer',
+      expiresAt: null,
+      toolInputDigest: 'digest-1',
+      nativeResult: null,
+      kind: 'approval',
+      tool: 'run_command',
+      action: JSON.stringify({ CommandLine: longCmd }),
+      scope: 'this_request',
+      allowAlways: true,
+    };
+    store.insertInteraction(approvalWithAlways);
+
+    const cardWithAlways = interactionCard(approvalWithAlways);
+    assert.deepEqual(
+      cardWithAlways.actions.map((a) => a.label),
+      ['允许本次', '本会话允许', '拒绝'],
+    );
+    const sessionBtn = cardWithAlways.actions.find((a) => a.label === '本会话允许')!;
+    const btnAnswer = (sessionBtn.value as { answer: { kind: 'approval'; decision: 'allow'; scope: string } }).answer;
+    assert.deepEqual(btnAnswer, { kind: 'approval', decision: 'allow', scope: 'session' });
+
+    const op = await core.resolveInteraction({
+      context: {
+        operationId: 'res-session-1',
+        idempotencyKey: 'res-session-1',
+        targetId: 'sess-1',
+        expectedRevision: 1,
+        controlGeneration: 1,
+        identity: OWNER,
+      },
+      interactionId: 'int-1',
+      expectedConnectionGeneration: 1,
+      answer: btnAnswer,
+      toolInputDigest: 'digest-1',
+    });
+    assert.equal(op.status, 'received');
+    const dispatched = await core.dispatch('res-session-1');
+    assert.equal(dispatched.status, 'accepted');
+    assert.deepEqual(deliveredAnswer, { kind: 'approval', decision: 'allow', scope: 'session' });
+  } finally {
+    core.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('store: streaming chunk updates avoid O(N^2) event growth and compactEvents preserves idempotency', () => {
@@ -590,7 +696,13 @@ test('runtime: disconnect/reconnect restores channel + taskTopic targets, wires 
     assert.equal(caughtUp, true);
     assert.ok((await runtime.core.getSnapshot(chanSid)).value.messages.some((m) => m.messageId === 'term-msg-1'));
 
-    // Runtime disconnect -> reconnect restores BOTH regular channel and taskTopic targets + emits WatchHub events.
+    // Pre-connect setProviderReady('agy', false) must NOT emit a false runtime disconnect alert.
+    runtime.setProviderReady('agy', false);
+    await runtime.tick();
+    assert.ok(!runtime.watchHub!.listOutbox().some((r) => r.objectId === 'provider:agy:connection'));
+
+    // Mark provider connected, then disconnect -> reconnect restores BOTH regular channel and taskTopic targets + emits WatchHub events.
+    runtime.setProviderReady('agy', true);
     resumeCalls = [];
     runtime.setProviderReady('agy', false);
     connGen = 2;
@@ -667,12 +779,25 @@ test('runtime: disconnect/reconnect restores channel + taskTopic targets, wires 
       },
     };
     runtime.reportQuotaSnapshot('agy', lowQuota, 15);
+    // Stale/failed quota sample must NOT clear lowQuotaActive latch.
+    runtime.reportQuotaSnapshot('agy', { ...lowQuota, state: 'timeout', short: null, stale: true }, 15);
     await runtime.tick();
 
     const outbox = runtime.watchHub!.listOutbox();
     assert.ok(outbox.some((r) => r.objectId === 'provider:agy:connection'), 'ACP disconnect/reconnect in WatchHub');
     assert.ok(outbox.some((r) => r.objectId.startsWith('turn.timeout:')), 'turn timeout in WatchHub');
     assert.ok(outbox.some((r) => r.objectId === 'provider:agy:quota'), 'low quota alert in WatchHub');
+    assert.equal(
+      outbox.filter((r) => r.objectId === 'provider:agy:quota' && r.currentState === 'recovered').length,
+      0,
+      'stale/timeout quota sample must not clear low-quota latch',
+    );
+    runtime.reportQuotaSnapshot('agy', { ...lowQuota, state: 'ok', stale: false, short: { ...lowQuota.short!, remainingPercent: 80 } }, 15);
+    await runtime.tick();
+    assert.ok(
+      runtime.watchHub!.listOutbox().some((r) => r.objectId === 'provider:agy:quota' && r.currentState === 'recovered'),
+      'fresh ok quota sample emits recovered',
+    );
     assert.ok(obsListener !== undefined);
   } finally {
     await runtime.close();
