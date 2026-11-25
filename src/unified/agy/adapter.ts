@@ -35,6 +35,7 @@ import {
   DEFAULT_WAKEUP_IDLE_MS,
   extractServerCurrentSettings,
   findEffortConfigId,
+  findModeConfigId,
   isGenericAgyTitle,
   isRecord,
   isString,
@@ -54,6 +55,7 @@ import {
   type SessionLockState,
   type TurnResidualSnapshot,
 } from './adapter-types.js';
+import { agyPermissionOutcome } from './adapter-permission.js';
 import {
   discoverExistingSessions,
   discoverNewerSessions,
@@ -130,7 +132,9 @@ export class AgyAdapter implements PlatformPort {
       serviceId: this.serviceId,
       ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
       wakeupIdleMs: this.wakeupIdleMs,
+      promptIdleTimeoutMs: this.promptIdleTimeoutMs,
       active: this.active,
+      controlChanges: this.controlChanges,
       controlEpoch: this.controlEpoch,
       knownSessions: this.knownSessions,
       activeTurns: this.activeTurns,
@@ -150,6 +154,7 @@ export class AgyAdapter implements PlatformPort {
       check: ref => this.check(ref),
       emit: obs => this.emit(obs),
       emitInteraction: (interaction, evidence) => this.emitInteraction(interaction, evidence),
+      emitSession: (ref, id) => this.emitSession(ref, id),
       buildSession: (id, summary, liveMeta, createdAtOverride) =>
         this.buildSession(id, summary, liveMeta, createdAtOverride),
       upsertLiveMessage: (sessionId, message) => this.upsertLiveMessage(sessionId, message),
@@ -300,12 +305,16 @@ export class AgyAdapter implements PlatformPort {
     createdAtOverride?: string,
   ): Session & { subagentCount?: number } {
     const isActive = this.active.has(id) && this.transport.connected;
+    const isLocked =
+      isActive && this.lockedSessions.get(id)?.generation === this.transport.connectionGeneration;
     const pending = this.pendingRequests(id);
     const activeTurn = this.activeTurns.get(id);
 
     let status: Session['status'] = 'read_only';
     if (isActive) {
-      if (pending.some(p => p.interaction.kind === 'approval')) {
+      if (isLocked) {
+        status = 'failed';
+      } else if (pending.some(p => p.interaction.kind === 'approval')) {
         status = 'waiting_approval';
       } else if (pending.length > 0) {
         status = 'waiting_question';
@@ -322,6 +331,20 @@ export class AgyAdapter implements PlatformPort {
     const updatedAt = summary?.lastModifiedAt ?? liveMeta?.updatedAt ?? undefined;
     const createdAt = createdAtOverride ?? liveMeta?.createdAt ?? undefined;
 
+    const capabilities = isLocked
+      ? {
+          ...liveCaps,
+          send: {
+            status: 'temporarily_unavailable' as const,
+            reason: '会话因上游响应超时处于锁定态，请先释放控制或重连',
+          },
+        }
+      : isActive
+        ? liveCaps
+        : this.canReacquire(id)
+          ? { ...readCaps, handoff: liveCaps.handoff }
+          : readCaps;
+
     return {
       ...(createdAt ? { createdAt } : {}),
       ...(updatedAt ? { updatedAt } : {}),
@@ -332,14 +355,18 @@ export class AgyAdapter implements PlatformPort {
       title,
       status,
       revision: 0,
-      capabilities: isActive ? liveCaps : this.canReacquire(id) ? { ...readCaps, handoff: liveCaps.handoff } : readCaps,
+      capabilities,
       control: {
         serviceId: this.serviceId,
         owner: isActive ? this.serviceId : null,
-        input: isActive ? 'available' : 'unavailable',
+        input: isActive && !isLocked ? 'available' : 'unavailable',
         generation: this.controlEpoch.get(id) ?? 0,
         operationId: null,
-        reason: isActive ? null : 'discovered agy session is read-only until attached',
+        reason: isLocked
+          ? '会话因上游响应超时处于锁定态，请先释放控制或重连后再继续'
+          : isActive
+            ? null
+            : 'discovered agy session is read-only until attached',
       },
     };
   }
@@ -387,13 +414,30 @@ export class AgyAdapter implements PlatformPort {
     this.turnResiduals.set(key, {
       turnId: turnState.turnId,
       generation: turnState.generation,
-      inProgressToolCalls: turnState.inProgressToolCalls.size,
+      inProgressToolCallIds: new Set(turnState.inProgressToolCalls),
       observedAt: new Date().toISOString(),
     });
     while (this.turnResiduals.size > MAX_TURN_RESIDUAL_SNAPSHOTS) {
       const oldest = this.turnResiduals.keys().next().value;
       if (oldest === undefined) break;
       this.turnResiduals.delete(oldest);
+    }
+  }
+
+  private async applyDefaultModeBestEffort(sessionId: string, res: unknown): Promise<void> {
+    const mode = this.transport.defaultMode;
+    if (!mode || !this.transport.connected || !isRecord(res)) return;
+    if (isRecord(res.modes)) {
+      await this.transport.request('session/set_mode', { sessionId, modeId: mode }).catch(() => {});
+      return;
+    }
+    if (Array.isArray(res.configOptions)) {
+      const modeConfigId = findModeConfigId(res.configOptions);
+      if (modeConfigId) {
+        await this.transport
+          .request('session/set_config_option', { sessionId, configId: modeConfigId, value: mode })
+          .catch(() => {});
+      }
     }
   }
 
@@ -506,6 +550,8 @@ export class AgyAdapter implements PlatformPort {
     this.lockedSessions.delete(sessionId);
     const generation = this.transport.connectionGeneration;
 
+    await this.applyDefaultModeBestEffort(sessionId, res);
+
     let settingsApplied: true | undefined;
     if (model !== null && model.trim() !== '') {
       const { baseModel, extractedEffort } = stripAgyModelEffortSuffix(model);
@@ -600,9 +646,13 @@ export class AgyAdapter implements PlatformPort {
 
     this.assertConnection(generation);
     this.captureServerSessionMeta(id, cwd, res);
-    this.lockedSessions.delete(id);
+    const existingLock = this.lockedSessions.get(id);
+    if (existingLock && existingLock.generation !== generation) {
+      this.lockedSessions.delete(id);
+    }
     this.active.add(id);
     this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
+    await this.applyDefaultModeBestEffort(id, res);
     this.emit({ type: 'connection', ref, connectionGeneration: generation });
 
     return {
@@ -738,13 +788,17 @@ export class AgyAdapter implements PlatformPort {
           this.pendingRequests(id).some(
             p => p.interaction.status === 'awaiting_answer' || p.submission === 'writing',
           ),
+        onSettled: outcome => {
+          if (outcome.ok) {
+            handlePromptCompleted(this.ctx, id, turnState, outcome.result);
+          } else {
+            handlePromptFailed(this.ctx, id, turnState, outcome.error);
+          }
+        },
       },
     );
 
-    void promptPromise.then(
-      rawResult => handlePromptCompleted(this.ctx, id, turnState, rawResult),
-      error => handlePromptFailed(this.ctx, id, turnState, error),
-    );
+    void promptPromise.catch(() => {});
 
     return ack(turnId);
   }
@@ -776,6 +830,24 @@ export class AgyAdapter implements PlatformPort {
     this.transport.notify('session/cancel', { sessionId: id });
     activeTurn.cancelRequested = true;
     activeTurn.cancelRequestedAt = new Date().toISOString();
+
+    for (const entry of this.requests.values()) {
+      if (
+        entry.interaction.sessionId !== id ||
+        entry.turnId !== turnId ||
+        entry.generation !== activeTurn.generation ||
+        entry.interaction.status !== 'awaiting_answer' ||
+        entry.submission !== null
+      ) {
+        continue;
+      }
+      const cancelPayload =
+        entry.interaction.kind === 'approval' ? agyPermissionOutcome(null) : { action: 'cancel' };
+      void this.transport
+        .respondServerRequest(entry.generation, entry.rpcId, cancelPayload)
+        .catch(() => {});
+    }
+    expireAllPendingRequests(this.ctx, activeTurn.generation, id, turnId, 'turn_cancelled');
     return ack(turnId);
   }
 
@@ -804,10 +876,10 @@ export class AgyAdapter implements PlatformPort {
       snap.generation === this.transport.connectionGeneration &&
       this.transport.connected
     ) {
-      if (snap.inProgressToolCalls > 0) {
+      if (snap.inProgressToolCallIds.size > 0) {
         return {
           status: 'running',
-          count: snap.inProgressToolCalls,
+          count: snap.inProgressToolCallIds.size,
           observedAt: snap.observedAt,
           complete: false,
           reason: '轮次终结时存在未完成工具调用；Antigravity ACP 未提供完整后台子进程清单',
@@ -989,8 +1061,15 @@ export class AgyAdapter implements PlatformPort {
 
     this.controlChanges.add(id);
     try {
-      // Some ACP versions omit session/close. Local release still fences bridge writes.
-      await this.transport.request('session/close', { sessionId: id }).catch(() => {});
+      // Some ACP versions omit session/close. Only clear timeout lock if session/close is confirmed.
+      let closeConfirmed = false;
+      try {
+        await this.transport.request('session/close', { sessionId: id });
+        closeConfirmed = true;
+      } catch {}
+      if (closeConfirmed) {
+        this.lockedSessions.delete(id);
+      }
       if (this.active.delete(id)) {
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
         this.emitSession(ref, id);

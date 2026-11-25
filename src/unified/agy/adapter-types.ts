@@ -49,6 +49,7 @@ export const DEFAULT_PROMPT_IDLE_TIMEOUT_MS = 10 * 60_000;
 export const DEFAULT_PROMPT_TIMEOUT_MS = DEFAULT_PROMPT_MAX_TIMEOUT_MS;
 export const DEFAULT_WAKEUP_IDLE_MS = 1_500;
 export const MAX_TURN_RESIDUAL_SNAPSHOTS = 64;
+export const ELICITATION_SKIP_SENTINEL = '[已跳过/取消]';
 export const LIST_SNAPSHOT_TTL_MS = 120_000;
 export const MAX_LIST_SNAPSHOTS = 8;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -100,7 +101,7 @@ export type AgyElicitationAction = 'accept' | 'decline' | 'cancel';
 export type TurnResidualSnapshot = {
   turnId: string;
   generation: number;
-  inProgressToolCalls: number;
+  inProgressToolCallIds: Set<string>;
   observedAt: string;
 };
 
@@ -128,6 +129,8 @@ export type ActiveTurnState = {
   cancelRequestedAt?: string;
   isWakeup?: boolean;
   wakeupTimer?: ReturnType<typeof setTimeout>;
+  lastActivityAt?: number;
+  inFlightServerRequests?: number;
   inProgressToolCalls: Set<string>;
   toolCalls: Map<string, Obj>;
   fullToolCalls: Set<string>;
@@ -143,6 +146,7 @@ export type PendingAgyRequest = {
   allowOptionId: string | null;
   denyOptionId: string | null;
   propertyTypes: Record<string, string>;
+  requiredFields?: Record<string, boolean>;
   answer: Answer | null;
   operationId: string | null;
   answerDigest: string | null;
@@ -174,13 +178,15 @@ export interface AdapterContext {
   readonly hostId: string;
   readonly serviceId: string;
   readonly approvalPolicy?: ApprovalScope;
-  readonly wakeupIdleMs: number;
+  readonly wakeupIdleMs?: number;
+  readonly promptIdleTimeoutMs?: number;
   readonly active: Set<string>;
+  readonly controlChanges?: Set<string>;
   readonly controlEpoch: Map<string, number>;
   readonly knownSessions: Map<string, LiveSessionMeta>;
   readonly activeTurns: Map<string, ActiveTurnState>;
-  readonly lockedSessions: Map<string, SessionLockState>;
-  readonly turnResiduals: Map<string, TurnResidualSnapshot>;
+  readonly lockedSessions?: Map<string, SessionLockState>;
+  readonly turnResiduals?: Map<string, TurnResidualSnapshot>;
   readonly sessionTurns: Map<string, Map<string, Turn>>;
   readonly liveMessages: Map<string, Message[]>;
   readonly preLiveTranscriptIds: Map<string, Set<string>>;
@@ -197,6 +203,7 @@ export interface AdapterContext {
   check(ref: NativeSessionRef): string;
   emit(observation: PlatformObservation): void;
   emitInteraction(interaction: Interaction, evidence?: ResponseEvidence): void;
+  emitSession?(ref: NativeSessionRef, id: string): void;
   buildSession(
     id: string,
     summary: AgyDiscoveredSession | null,
@@ -205,8 +212,8 @@ export interface AdapterContext {
   ): Session & { subagentCount?: number };
   upsertLiveMessage(sessionId: string, message: Message): void;
   putSessionTurn(sessionId: string, turn: Turn): void;
-  getSessionModel(sessionId: string): string | null;
-  recordTurnResidual(sessionId: string, turnState: ActiveTurnState): void;
+  getSessionModel?(sessionId: string): string | null;
+  recordTurnResidual?(sessionId: string, turnState: ActiveTurnState): void;
   pruneSnapshots(): void;
 }
 
@@ -412,6 +419,16 @@ export function normalizeTranscriptMessage(
     final: m.final,
     source: 'agy',
   };
+}
+
+export function findModeConfigId(configOptions: unknown[]): string | undefined {
+  for (const opt of configOptions) {
+    if (!isRecord(opt) || !isString(opt.id)) continue;
+    if (opt.category === 'mode' || opt.id === 'mode' || opt.id === 'permission_mode') {
+      return opt.id;
+    }
+  }
+  return undefined;
 }
 
 export function findEffortConfigId(configOptions: unknown[]): string | undefined {

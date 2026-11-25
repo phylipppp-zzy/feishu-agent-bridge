@@ -439,21 +439,20 @@ test('CLI arg builders enforce P0-2 ACP and stream-json flag contracts', () => {
   const acpCustomArgs = buildAgyAcpArgs({
     processPerSession: false,
     defaultMode: 'accept-edits',
-    addDirs: ['/ssd/zhangzy/scratch', '/data/zhangzy/outputs'],
+    addDirs: ['/tmp/work-a', '/tmp/work-b'],
     extraArgs: ['--agent', 'researcher'],
   });
   assert.deepEqual(acpCustomArgs, [
     'acp',
     '--stdio',
-    '--mode',
-    'accept-edits',
     '--add-dir',
-    '/ssd/zhangzy/scratch',
+    '/tmp/work-a',
     '--add-dir',
-    '/data/zhangzy/outputs',
+    '/tmp/work-b',
     '--agent',
     'researcher',
   ]);
+  assert.equal(acpCustomArgs.includes('--mode'), false);
 
   const streamArgs = buildAgyStreamJsonArgs({
     conversationId: 'conv-1',

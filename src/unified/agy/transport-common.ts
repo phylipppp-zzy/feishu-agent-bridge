@@ -122,6 +122,8 @@ export interface AgyRequestOptions {
   sessionId?: string;
   /** When true, the idle timer defers expiry while waiting on user interaction. */
   isWaitingForUser?: () => boolean;
+  /** Optional synchronous callback invoked when the request settles, before subsequent stdout lines are processed. */
+  onSettled?: (outcome: { ok: true; result: unknown } | { ok: false; error: unknown }) => void;
 }
 
 export interface AgyStreamUsage {
@@ -451,10 +453,6 @@ export function buildAgyAcpArgs(options: AgyAcpTransportOptions = {}): string[] 
   if (options.appDataDir !== undefined) {
     if (!options.appDataDir.trim()) throw contractError('invalid_request', 'appDataDir must be non-empty');
     args.push('--app-data-dir', options.appDataDir);
-  }
-  if (options.defaultMode !== undefined) {
-    if (!options.defaultMode.trim()) throw contractError('invalid_request', 'defaultMode must be non-empty');
-    args.push('--mode', options.defaultMode);
   }
   if (options.addDirs?.length) {
     for (const dir of options.addDirs) {

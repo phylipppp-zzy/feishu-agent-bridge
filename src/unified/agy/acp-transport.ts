@@ -40,6 +40,7 @@ type PendingRpc = {
   sessionId?: string;
   isWaitingForUser?: () => boolean;
   onSuccess?: (result: unknown) => void;
+  onSettled?: (outcome: { ok: true; result: unknown } | { ok: false; error: unknown }) => void;
 };
 
 type PendingServerRequest = {
@@ -55,6 +56,7 @@ type PendingServerRequest = {
  * in-flight request tracking, and generation-fenced server request replies.
  */
 export class AgyAcpTransport {
+  readonly defaultMode?: string;
   private readonly agyBin: string;
   private readonly connectTimeoutMs: number;
   private readonly requestTimeoutMs: number;
@@ -92,6 +94,8 @@ export class AgyAcpTransport {
     this.connectTimeoutMs = resolvePositiveMs(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS, 'connectTimeoutMs');
     this.requestTimeoutMs = resolvePositiveMs(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs');
     this.closeTimeoutMs = resolvePositiveMs(options.closeTimeoutMs, DEFAULT_CLOSE_TIMEOUT_MS, 'closeTimeoutMs');
+    const mode = options.defaultMode?.trim();
+    if (mode) this.defaultMode = mode;
   }
 
   get connectionGeneration(): number {
@@ -275,6 +279,7 @@ export class AgyAcpTransport {
     let idleTimeoutMs: number | undefined;
     let sessionId: string | undefined;
     let isWaitingForUser: (() => boolean) | undefined;
+    let onSettled: AgyRequestOptions['onSettled'];
     try {
       if (typeof timeoutOrOptions === 'object' && timeoutOrOptions !== null) {
         effectiveTimeout = resolvePositiveMs(timeoutOrOptions.timeoutMs, this.requestTimeoutMs, 'timeoutMs');
@@ -283,6 +288,7 @@ export class AgyAcpTransport {
         }
         sessionId = timeoutOrOptions.sessionId;
         isWaitingForUser = timeoutOrOptions.isWaitingForUser;
+        onSettled = timeoutOrOptions.onSettled;
       } else {
         effectiveTimeout = resolvePositiveMs(timeoutOrOptions, this.requestTimeoutMs, 'timeoutMs');
       }
@@ -293,6 +299,7 @@ export class AgyAcpTransport {
       ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(isWaitingForUser !== undefined ? { isWaitingForUser } : {}),
+      ...(onSettled !== undefined ? { onSettled } : {}),
     });
   }
 
@@ -444,6 +451,7 @@ export class AgyAcpTransport {
       idleTimeoutMs?: number;
       sessionId?: string;
       isWaitingForUser?: () => boolean;
+      onSettled?: AgyRequestOptions['onSettled'];
     },
   ): Promise<unknown> {
     const id = ++this.serial;
@@ -455,7 +463,11 @@ export class AgyAcpTransport {
         this.pending.delete(id);
         this.clearPendingTimers(entry);
         this.markDegraded(`request timed out: ${method}`);
-        reject(contractError('outcome_unknown', `ACP request timed out: ${method}`));
+        const err = contractError('outcome_unknown', `ACP request timed out: ${method}`);
+        try {
+          entry.onSettled?.({ ok: false, error: err });
+        } catch {}
+        reject(err);
       }, timeoutMs);
 
       const entry: PendingRpc = {
@@ -466,6 +478,7 @@ export class AgyAcpTransport {
         ...(activity?.idleTimeoutMs !== undefined ? { idleTimeoutMs: activity.idleTimeoutMs } : {}),
         ...(activity?.sessionId !== undefined ? { sessionId: activity.sessionId } : {}),
         ...(activity?.isWaitingForUser !== undefined ? { isWaitingForUser: activity.isWaitingForUser } : {}),
+        ...(activity?.onSettled !== undefined ? { onSettled: activity.onSettled } : {}),
         ...(onSuccess !== undefined ? { onSuccess } : {}),
       };
       this.pending.set(id, entry);
@@ -477,7 +490,11 @@ export class AgyAcpTransport {
         this.pending.delete(id);
         this.clearPendingTimers(entry);
         this.markDegraded('send failed');
-        reject(contractError('outcome_unknown', `failed to send ACP request: ${method}`));
+        const err = contractError('outcome_unknown', `failed to send ACP request: ${method}`);
+        try {
+          entry.onSettled?.({ ok: false, error: err });
+        } catch {}
+        reject(err);
       }
     });
   }
@@ -494,7 +511,11 @@ export class AgyAcpTransport {
       this.pending.delete(id);
       this.clearPendingTimers(entry);
       this.markDegraded(`request idle timed out: ${entry.method}`);
-      entry.reject(contractError('outcome_unknown', `ACP request idle timed out: ${entry.method}`));
+      const err = contractError('outcome_unknown', `ACP request idle timed out: ${entry.method}`);
+      try {
+        entry.onSettled?.({ ok: false, error: err });
+      } catch {}
+      entry.reject(err);
     }, entry.idleTimeoutMs);
   }
 
@@ -579,7 +600,11 @@ export class AgyAcpTransport {
               ...(parsed.error.data !== undefined ? { data: parsed.error.data } : {}),
             }
           : { code: -32000, message: String(parsed.error) };
-        entry.reject(mapJsonRpcError(errPayload));
+        const mapped = mapJsonRpcError(errPayload);
+        try {
+          entry.onSettled?.({ ok: false, error: mapped });
+        } catch {}
+        entry.reject(mapped);
         return;
       }
 
@@ -587,12 +612,18 @@ export class AgyAcpTransport {
         try {
           entry.onSuccess(parsed.result);
         } catch (err) {
+          try {
+            entry.onSettled?.({ ok: false, error: err });
+          } catch {}
           entry.reject(err);
           return;
         }
       } else if (this._status === 'degraded') {
         this.markHealthy();
       }
+      try {
+        entry.onSettled?.({ ok: true, result: parsed.result });
+      } catch {}
       entry.resolve(parsed.result);
       return;
     }
@@ -708,6 +739,9 @@ export class AgyAcpTransport {
   private rejectAllPending(error: ContractError): void {
     for (const entry of this.pending.values()) {
       this.clearPendingTimers(entry);
+      try {
+        entry.onSettled?.({ ok: false, error });
+      } catch {}
       entry.reject(error);
     }
     this.pending.clear();

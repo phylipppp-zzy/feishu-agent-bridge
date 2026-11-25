@@ -17,6 +17,9 @@ import { agyApprovalFingerprint, agyOnceOption, agyPermissionOutcome, classifyAg
 import {
   ack,
   convertSchemaValue,
+  DEFAULT_PROMPT_IDLE_TIMEOUT_MS,
+  DEFAULT_WAKEUP_IDLE_MS,
+  ELICITATION_SKIP_SENTINEL,
   extractSchemaChoices,
   extractTextFromUpdateContent,
   findEffortConfigId,
@@ -31,6 +34,13 @@ import {
   type PendingAgyRequest,
 } from './adapter-types.js';
 
+const classifyPermissionCompat = classifyAgyPermission as (
+  toolCall: Parameters<typeof classifyAgyPermission>[0],
+  project: string,
+  approvalPolicy?: AdapterContext['approvalPolicy'],
+  sessionId?: string,
+) => ReturnType<typeof classifyAgyPermission>;
+
 function appendParagraph(text: string, paragraph: string): string {
   const separator = !text || text.endsWith('\n\n') ? '' : text.endsWith('\n') ? '\n' : '\n\n';
   return text + separator + paragraph;
@@ -44,8 +54,27 @@ function clearWakeupTimer(turnState: ActiveTurnState): void {
 }
 
 function isSessionLocked(ctx: AdapterContext, sessionId: string, generation: number): boolean {
-  const lock = ctx.lockedSessions.get(sessionId);
+  const lock = ctx.lockedSessions?.get(sessionId);
   return Boolean(lock && lock.generation === generation);
+}
+
+function pruneResidualToolCall(
+  ctx: AdapterContext,
+  sessionId: string,
+  generation: number,
+  toolCallId: string,
+): boolean {
+  if (!ctx.turnResiduals) return false;
+  const prefix = `${sessionId}:`;
+  let pruned = false;
+  for (const [key, snap] of ctx.turnResiduals) {
+    if (!key.startsWith(prefix) || snap.generation !== generation) continue;
+    if (snap.inProgressToolCallIds.delete(toolCallId)) {
+      snap.observedAt = new Date().toISOString();
+      pruned = true;
+    }
+  }
+  return pruned;
 }
 
 function hasPendingTurnInteraction(ctx: AdapterContext, sessionId: string, turnId: string): boolean {
@@ -62,11 +91,17 @@ function hasPendingTurnInteraction(ctx: AdapterContext, sessionId: string, turnI
   return false;
 }
 
-function finalizeWakeupTurn(ctx: AdapterContext, id: string, turnState: ActiveTurnState): void {
+function finalizeWakeupTurn(
+  ctx: AdapterContext,
+  id: string,
+  turnState: ActiveTurnState,
+  status: 'completed' | 'failed' = 'completed',
+  failureReason?: string,
+): void {
   if (ctx.isClosed() || ctx.activeTurns.get(id) !== turnState) return;
   if (ctx.transport.connectionGeneration !== turnState.generation) return;
   clearWakeupTimer(turnState);
-  ctx.recordTurnResidual(id, turnState);
+  ctx.recordTurnResidual?.(id, turnState);
   ctx.activeTurns.delete(id);
 
   const ref = ctx.ref(id);
@@ -97,10 +132,33 @@ function finalizeWakeupTurn(ctx: AdapterContext, id: string, turnState: ActiveTu
   expireAllPendingRequests(ctx, turnState.generation, id, turnState.turnId);
 
   const endedAt = new Date().toISOString();
+  if (status === 'failed' && failureReason) {
+    const seq = ctx.nextSequence();
+    ctx.emit({
+      type: 'event',
+      ref,
+      connectionGeneration: turnState.generation,
+      event: {
+        schemaVersion: 1,
+        eventId: randomUUID(),
+        sessionId: id,
+        objectId: turnState.turnId,
+        objectRevision: 0,
+        sequence: seq,
+        type: 'adapter.stream_failed',
+        occurredAt: endedAt,
+        receivedAt: endedAt,
+        operationId: null,
+        cursor: String(seq),
+        data: { reason: failureReason, wakeup: true },
+      },
+    });
+  }
+
   const turn: Turn = {
     turnId: turnState.turnId,
     sessionId: id,
-    status: 'completed',
+    status,
     inputId: null,
     startedAt: turnState.startedAt,
     endedAt,
@@ -114,19 +172,36 @@ function finalizeWakeupTurn(ctx: AdapterContext, id: string, turnState: ActiveTu
 function scheduleWakeupFinalize(ctx: AdapterContext, sessionId: string, turnState: ActiveTurnState): void {
   if (!turnState.isWakeup) return;
   clearWakeupTimer(turnState);
+  const idleMs = ctx.wakeupIdleMs ?? DEFAULT_WAKEUP_IDLE_MS;
   turnState.wakeupTimer = setTimeout(() => {
     delete turnState.wakeupTimer;
     if (ctx.isClosed() || ctx.activeTurns.get(sessionId) !== turnState) return;
     if (ctx.transport.connectionGeneration !== turnState.generation) return;
     if (
-      hasPendingTurnInteraction(ctx, sessionId, turnState.turnId) ||
-      turnState.inProgressToolCalls.size > 0
+      (turnState.inFlightServerRequests ?? 0) > 0 ||
+      hasPendingTurnInteraction(ctx, sessionId, turnState.turnId)
     ) {
       scheduleWakeupFinalize(ctx, sessionId, turnState);
       return;
     }
-    finalizeWakeupTurn(ctx, sessionId, turnState);
-  }, ctx.wakeupIdleMs);
+    if (turnState.inProgressToolCalls.size > 0) {
+      const maxIdleMs = ctx.promptIdleTimeoutMs ?? DEFAULT_PROMPT_IDLE_TIMEOUT_MS;
+      const lastActivity = turnState.lastActivityAt ?? Date.now();
+      if (Date.now() - lastActivity >= maxIdleMs) {
+        finalizeWakeupTurn(
+          ctx,
+          sessionId,
+          turnState,
+          'failed',
+          'wakeup tool call timed out without further updates',
+        );
+        return;
+      }
+      scheduleWakeupFinalize(ctx, sessionId, turnState);
+      return;
+    }
+    finalizeWakeupTurn(ctx, sessionId, turnState, 'completed');
+  }, idleMs);
 }
 
 function ensureWakeupTurn(
@@ -138,13 +213,13 @@ function ensureWakeupTurn(
   if (existing) {
     return existing.generation === generation ? existing : null;
   }
-  if (isSessionLocked(ctx, sessionId, generation)) {
+  if (isSessionLocked(ctx, sessionId, generation) || ctx.controlChanges?.has(sessionId)) {
     return null;
   }
 
   const now = new Date().toISOString();
   const turnId = `wakeup:${randomUUID()}`;
-  const model = ctx.getSessionModel(sessionId);
+  const model = ctx.getSessionModel?.(sessionId) ?? null;
   const turnState: ActiveTurnState = {
     turnId,
     generation,
@@ -158,6 +233,8 @@ function ensureWakeupTurn(
     interrupted: false,
     cancelRequested: false,
     isWakeup: true,
+    lastActivityAt: Date.now(),
+    inFlightServerRequests: 0,
     inProgressToolCalls: new Set(),
     toolCalls: new Map(),
     fullToolCalls: new Set(),
@@ -211,7 +288,7 @@ export function handlePromptCompleted(
   if (ctx.transport.connectionGeneration !== turnState.generation) return;
 
   clearWakeupTimer(turnState);
-  ctx.recordTurnResidual(id, turnState);
+  ctx.recordTurnResidual?.(id, turnState);
   ctx.activeTurns.delete(id);
   const ref = ctx.ref(id);
   const res = isRecord(rawResult) ? rawResult : {};
@@ -314,7 +391,7 @@ export function handlePromptFailed(
 ): void {
   if (ctx.isClosed() || ctx.activeTurns.get(id) !== turnState) return;
   clearWakeupTimer(turnState);
-  ctx.recordTurnResidual(id, turnState);
+  ctx.recordTurnResidual?.(id, turnState);
   ctx.activeTurns.delete(id);
   if (ctx.transport.connectionGeneration !== turnState.generation) return;
   expireAllPendingRequests(ctx, turnState.generation, id, turnState.turnId);
@@ -330,12 +407,13 @@ export function handlePromptFailed(
     try {
       ctx.transport.notify('session/cancel', { sessionId: id });
     } catch {}
-    ctx.lockedSessions.set(id, {
+    ctx.lockedSessions?.set(id, {
       generation: turnState.generation,
       turnId: turnState.turnId,
       reason: message,
       lockedAt: now,
     });
+    ctx.emitSession?.(ref, id);
   }
 
   ctx.emit({
@@ -497,6 +575,18 @@ export function handleAcpNotification(
     return;
   }
 
+  if (
+    (kind === 'tool_call' || kind === 'tool_call_update') &&
+    isString(update.toolCallId) &&
+    isString(update.status) &&
+    terminalToolStatuses.has(update.status)
+  ) {
+    const prunedResidual = pruneResidualToolCall(ctx, sessionId, notification.generation, update.toolCallId);
+    if (prunedResidual && !ctx.activeTurns.has(sessionId)) {
+      return;
+    }
+  }
+
   if (isSessionLocked(ctx, sessionId, notification.generation)) {
     return;
   }
@@ -504,6 +594,7 @@ export function handleAcpNotification(
   const turnState =
     ctx.activeTurns.get(sessionId) ?? ensureWakeupTurn(ctx, sessionId, notification.generation);
   if (!turnState || turnState.generation !== notification.generation) return;
+  turnState.lastActivityAt = Date.now();
   if (turnState.isWakeup) {
     scheduleWakeupFinalize(ctx, sessionId, turnState);
   }
@@ -557,7 +648,12 @@ export function handleAcpNotification(
 
     if (turnState.assistantFinalized) return;
     if (!turnState.assistantMessageId) {
-      turnState.assistantMessageId = isString(update.messageId) ? update.messageId : randomUUID();
+      const rawMsgId = isString(update.messageId) ? update.messageId : null;
+      turnState.assistantMessageId = turnState.isWakeup
+        ? rawMsgId
+          ? `${turnState.turnId}:${rawMsgId}`
+          : randomUUID()
+        : rawMsgId ?? randomUUID();
       turnState.assistantSequence = ctx.nextSequence();
     }
     const chunkId = isString(update.messageId) ? update.messageId : null;
@@ -603,8 +699,12 @@ export async function handleAcpServerRequest(
     safeRespondServerRejection(ctx, req, 'Invalid params: missing sessionId', -32602);
     return;
   }
-  if (!ctx.active.has(sessionId) || isSessionLocked(ctx, sessionId, req.generation)) {
-    safeRespondServerRejection(ctx, req, 'Session is not active or is locked', -32000);
+  if (
+    !ctx.active.has(sessionId) ||
+    isSessionLocked(ctx, sessionId, req.generation) ||
+    (ctx.controlChanges?.has(sessionId) && !ctx.activeTurns.has(sessionId))
+  ) {
+    safeRespondServerRejection(ctx, req, 'Session is not active, locked, or releasing', -32000);
     return;
   }
 
@@ -613,6 +713,7 @@ export async function handleAcpServerRequest(
     safeRespondServerRejection(ctx, req, 'Session turn is unavailable for server request', -32000);
     return;
   }
+  turn.lastActivityAt = Date.now();
   if (turn.isWakeup) {
     scheduleWakeupFinalize(ctx, sessionId, turn);
   }
@@ -672,10 +773,11 @@ export async function handleAcpServerRequest(
         checking.count++;
         checks.set(toolCallId, checking);
       }
+      turn.inFlightServerRequests = (turn.inFlightServerRequests ?? 0) + 1;
       try {
         const fingerprint = agyApprovalFingerprint(toolCall);
         const hadConflicts = hasAgyToolCallConflicts(toolCall);
-        decision = await classifyAgyPermission(toolCall, cwd, ctx.approvalPolicy);
+        decision = await classifyPermissionCompat(toolCall, cwd, ctx.approvalPolicy, sessionId);
         if (!stillCurrent()) {
           safeRespondServerRejection(ctx, req, 'Session turn ended during permission classification', -32000);
           return;
@@ -684,7 +786,7 @@ export async function handleAcpServerRequest(
         const latestFingerprint = agyApprovalFingerprint(latest);
         const latestConflicts = hasAgyToolCallConflicts(latest);
         if (latestFingerprint !== fingerprint || latestConflicts !== hadConflicts) {
-          const rechecked = await classifyAgyPermission(latest, cwd, ctx.approvalPolicy);
+          const rechecked = await classifyPermissionCompat(latest, cwd, ctx.approvalPolicy, sessionId);
           toolCall = checking?.latest ?? latest;
           if (decision.kind !== 'deny') {
             decision = rechecked;
@@ -697,6 +799,10 @@ export async function handleAcpServerRequest(
           toolCall = latest;
         }
       } finally {
+        turn.inFlightServerRequests = Math.max(0, (turn.inFlightServerRequests ?? 1) - 1);
+        if (turn.isWakeup && ctx.activeTurns.get(sessionId) === turn) {
+          scheduleWakeupFinalize(ctx, sessionId, turn);
+        }
         if (toolCallId && checking && checks && --checking.count === 0) {
           checks.delete(toolCallId);
           if (!checks.size) inFlightToolChecks.delete(turn);
@@ -791,11 +897,17 @@ export async function handleAcpServerRequest(
     }
 
     const propertyTypes: Record<string, string> = {};
+    const requiredFields: Record<string, boolean> = {};
+    const explicitRequired = Array.isArray(schema.required)
+      ? new Set(schema.required.filter(isString))
+      : null;
     let interaction: Interaction;
 
     if (propEntries.length > 0) {
       const questions = propEntries.map(([id, prop]) => {
         if (typeof prop.type === 'string') propertyTypes[id] = prop.type;
+        const isRequired = explicitRequired === null ? true : explicitRequired.has(id);
+        requiredFields[id] = isRequired;
         const choices = extractSchemaChoices(prop);
         const prompt =
           (isString(prop.description) && prop.description) ||
@@ -807,6 +919,7 @@ export async function handleAcpServerRequest(
           choices,
           multiple: prop.type === 'array' ? true : false,
           allowFreeText: schemaAllowsFreeText(prop, choices),
+          ...(isRequired ? {} : { required: false }),
         };
       });
       interaction = {
@@ -834,6 +947,7 @@ export async function handleAcpServerRequest(
       allowOptionId: null,
       denyOptionId: null,
       propertyTypes,
+      requiredFields,
     };
     ctx.requests.set(interactionId, entry);
     ctx.emitInteraction(interaction);
@@ -878,16 +992,18 @@ export function handleTransportDisconnect(
     }
   }
 
-  for (const [id, lock] of ctx.lockedSessions) {
-    if (lock.generation === generation) {
-      ctx.lockedSessions.delete(id);
+  if (ctx.lockedSessions) {
+    for (const [id, lock] of ctx.lockedSessions) {
+      if (lock.generation === generation) {
+        ctx.lockedSessions.delete(id);
+      }
     }
   }
 
   for (const [id, turnState] of ctx.activeTurns) {
     if (turnState.generation !== generation) continue;
     clearWakeupTimer(turnState);
-    ctx.recordTurnResidual(id, turnState);
+    ctx.recordTurnResidual?.(id, turnState);
     ctx.activeTurns.delete(id);
     const now = new Date().toISOString();
     const seq = ctx.nextSequence();
@@ -965,6 +1081,20 @@ export async function respondToInteraction(
 
   let result: unknown;
   const elicitAction = (answer as Answer & { action?: AgyElicitationAction }).action;
+  const rejectInvalidAnswer = (message: string): never => {
+    if (
+      guard.operationId &&
+      (current.kind === 'question' || current.kind === 'question_group')
+    ) {
+      void ctx.transport
+        .respondServerRequest(req.generation, req.rpcId, { action: 'decline' })
+        .catch(() => {});
+      req.closedSource ??= 'invalid_answer_declined';
+      publishRequestClosure(ctx, req);
+    }
+    throw contractError('invalid_request', message);
+  };
+
   if (
     current.kind === 'approval' &&
     answer.kind === 'approval' &&
@@ -979,8 +1109,23 @@ export async function respondToInteraction(
     (current.kind === 'question' && answer.kind === 'question') ||
     (current.kind === 'question_group' && answer.kind === 'question_group')
   ) {
+    const isQuestionSkipSentinel =
+      answer.kind === 'question' &&
+      Array.isArray(answer.values) &&
+      answer.values.length === 1 &&
+      answer.values[0] === ELICITATION_SKIP_SENTINEL;
+    const isGroupSkipSentinel =
+      answer.kind === 'question_group' &&
+      isRecord(answer.answers) &&
+      Object.values(answer.answers).length > 0 &&
+      Object.values(answer.answers).every(
+        vals => Array.isArray(vals) && vals.length === 1 && vals[0] === ELICITATION_SKIP_SENTINEL,
+      );
+
     if (elicitAction === 'decline' || elicitAction === 'cancel') {
       result = { action: elicitAction };
+    } else if (isQuestionSkipSentinel || isGroupSkipSentinel) {
+      result = { action: 'decline' };
     } else if (
       current.kind === 'question' &&
       answer.kind === 'question' &&
@@ -1000,9 +1145,14 @@ export async function respondToInteraction(
     } else if (
       current.kind === 'question_group' &&
       answer.kind === 'question_group' &&
-      Object.keys(answer.answers).length === current.questions.length &&
+      isRecord(answer.answers) &&
+      Object.keys(answer.answers).every(k => current.questions.some(q => q.id === k)) &&
       current.questions.every(q => {
         const vals = answer.answers[q.id];
+        const isOptional = req.requiredFields?.[q.id] === false;
+        if (vals === undefined || (Array.isArray(vals) && vals.length === 0)) {
+          return isOptional;
+        }
         return (
           Array.isArray(vals) &&
           vals.length > 0 &&
@@ -1014,18 +1164,27 @@ export async function respondToInteraction(
       })
     ) {
       const content: Record<string, unknown> = {};
-      for (const q of current.questions) {
-        const vals = answer.answers[q.id]!;
-        const propType = req.propertyTypes[q.id];
-        content[q.id] =
-          propType === 'array' ? vals : convertSchemaValue(vals.join(', '), propType);
+      try {
+        for (const q of current.questions) {
+          const vals = answer.answers[q.id];
+          if (!vals || vals.length === 0) continue;
+          const propType = req.propertyTypes[q.id];
+          content[q.id] =
+            propType === 'array' ? vals : convertSchemaValue(vals.join(', '), propType);
+        }
+      } catch (err) {
+        const msg =
+          isRecord(err) && typeof err.message === 'string'
+            ? err.message
+            : 'answer does not match interaction schema';
+        rejectInvalidAnswer(msg);
       }
       result = {
         action: 'accept',
         content,
       };
     } else {
-      throw contractError('invalid_request', 'answer does not match interaction schema');
+      rejectInvalidAnswer('answer does not match interaction schema');
     }
   } else {
     throw contractError('invalid_request', 'answer does not match interaction schema');
@@ -1052,8 +1211,11 @@ export async function respondToInteraction(
   req.submission = 'submitted';
   releaseRequestToolCall(ctx, req);
   const activeTurn = ctx.activeTurns.get(id);
-  if (activeTurn?.isWakeup && activeTurn.turnId === req.turnId) {
-    scheduleWakeupFinalize(ctx, id, activeTurn);
+  if (activeTurn && activeTurn.turnId === req.turnId) {
+    activeTurn.lastActivityAt = Date.now();
+    if (activeTurn.isWakeup) {
+      scheduleWakeupFinalize(ctx, id, activeTurn);
+    }
   }
   if (req.executed) publishToolExecution(ctx, req);
   else if (req.closedSource) {

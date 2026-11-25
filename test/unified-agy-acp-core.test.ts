@@ -130,8 +130,44 @@ rl.on('line', async (line) => {
     return;
   }
 
-  if (method === 'session/set_config_option' || method === 'session/close') {
+  if (method === 'session/set_config_option' || method === 'session/close' || method === 'session/set_mode') {
+    if (method === 'session/close' && params.sessionId === globalThis.__failCloseSid) {
+      replyError(-32601, 'session/close not supported');
+      return;
+    }
     reply({});
+    return;
+  }
+
+  if (method === 'test/fail_close_for') {
+    globalThis.__failCloseSid = params.sessionId;
+    reply({});
+    return;
+  }
+
+  if (method === 'test/emit_terminal_tool') {
+    reply({});
+    writeMsg({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: params.toolCallId, status: 'completed' },
+      },
+    });
+    return;
+  }
+
+  if (method === 'test/emit_stalled_wakeup_tool') {
+    reply({});
+    writeMsg({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: 'tool_call', toolCallId: 'wakeup-stuck-1', title: 'Stuck tool', status: 'in_progress' },
+      },
+    });
     return;
   }
 
@@ -317,6 +353,88 @@ rl.on('line', async (line) => {
       return;
     }
 
+    if (text === 'same-chunk-prompt-and-wakeup') {
+      const promptReply = JSON.stringify({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn', response: 'Done old' } });
+      const wakeupNotif = JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: sid,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            messageId: 'shared-msg-id',
+            content: { type: 'text', text: 'Fresh wakeup text' },
+          },
+        },
+      });
+      writeSync(1, promptReply + '\\n' + wakeupNotif + '\\n');
+      return;
+    }
+
+    if (text === 'cancel-with-pending-perm') {
+      const permPromise = sendServerRequest('session/request_permission', {
+        sessionId: sid,
+        toolCall: { toolCallId: 'tc-cancel-perm', title: 'Needs approval', kind: 'execute', rawInput: { CommandLine: 'sudo whoami' } },
+        options: [
+          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+          { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
+        ],
+      });
+      activePrompts.set(sid, {
+        onCancel: async () => {
+          activePrompts.delete(sid);
+          const permRes = await permPromise;
+          log({ cancelPendingPermReply: permRes });
+          reply({ stopReason: 'cancelled' });
+        },
+      });
+      return;
+    }
+
+    if (text === 'elicit-optional-and-sentinel') {
+      const res1 = await sendServerRequest('elicitation/create', {
+        sessionId: sid,
+        toolCallId: 'tc-opt-1',
+        mode: 'form',
+        message: 'Optional field test',
+        requestedSchema: {
+          type: 'object',
+          required: ['reqField'],
+          properties: {
+            reqField: { type: 'string', description: 'Required' },
+            optField: { type: 'string', description: 'Optional' },
+          },
+        },
+      });
+      const res2 = await sendServerRequest('elicitation/create', {
+        sessionId: sid,
+        toolCallId: 'tc-opt-2',
+        mode: 'form',
+        message: 'Sentinel skip test',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            choice: { type: 'string', enum: ['a', 'b'] },
+          },
+        },
+      });
+      const res3 = await sendServerRequest('elicitation/create', {
+        sessionId: sid,
+        toolCallId: 'tc-opt-3',
+        mode: 'form',
+        message: 'Invalid opId test',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            num: { type: 'integer' },
+          },
+        },
+      });
+      log({ optionalAndSentinelReplies: [res1, res2, res3] });
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
     emitChunk('Echo:' + text);
     reply({ stopReason: 'end_turn' });
   }
@@ -359,12 +477,16 @@ test('P0/P1: DEFAULT_AGY_MODELS omits gemini-3-flash-preview, strict convertSche
   assert.deepEqual(extractSchemaChoices(arrayWithOther), ['x', 'y']);
   assert.equal(schemaAllowsFreeText(arrayWithOther, extractSchemaChoices(arrayWithOther)), true);
 
-  // buildAgyAcpArgs defaults & flags
+  // buildAgyAcpArgs defaults & flags (never emits --mode for agy acp)
   assert.deepEqual(buildAgyAcpArgs(), ['acp', '--stdio', '--process-per-session']);
-  assert.deepEqual(
-    buildAgyAcpArgs({ processPerSession: false, defaultMode: 'plan', addDirs: ['/a', '/b'], extraArgs: ['--foo'] }),
-    ['acp', '--stdio', '--mode', 'plan', '--add-dir', '/a', '--add-dir', '/b', '--foo'],
-  );
+  const customArgs = buildAgyAcpArgs({
+    processPerSession: false,
+    defaultMode: 'plan',
+    addDirs: ['/tmp/a', '/tmp/b'],
+    extraArgs: ['--foo'],
+  });
+  assert.deepEqual(customArgs, ['acp', '--stdio', '--add-dir', '/tmp/a', '--add-dir', '/tmp/b', '--foo']);
+  assert.equal(customArgs.includes('--mode'), false);
 });
 
 test('P0-1: Activity-renewed prompt timeout, approval across idle timeout, timeout sends session/cancel + locks session against late chunks', async () => {
@@ -646,6 +768,150 @@ test('P0-3 & P1: Out-of-turn wakeup synthesis, 0 dangling server requests, elici
     assert.ok(Array.isArray(unroutable) && unroutable.length === 2);
     assert.deepEqual(unroutable[0], { action: 'decline' });
     assert.equal(unroutable[1]?.rpcError?.code, -32602);
+  } finally {
+    await adapter.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Verifier regressions: /stop settles pending perm, same-chunk wakeup isolation, dynamic residual pruning, stalled wakeup timeout, failed close lock persistence, sentinel & optional fields', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-acp-core-reg-'));
+  const binPath = join(root, 'fake-agy.mjs');
+  const rpcLogPath = join(root, 'rpc.jsonl');
+  await writeCoreFakeAgy(binPath, rpcLogPath);
+
+  const transport = new AgyAcpTransport({ agyBin: binPath, defaultMode: 'plan' });
+  const catalog = new AgyCatalog({ dbPath: join(root, 'missing.db'), brainDir: root, allowedProjectRoots: [root] });
+  const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc', undefined, {
+    promptIdleTimeoutMs: 120,
+    promptMaxTimeoutMs: 5000,
+    wakeupIdleMs: 40,
+  });
+  const observed: PlatformObservation[] = [];
+  adapter.onObservation(obs => observed.push(obs));
+
+  try {
+    await transport.connect();
+    const gen1 = transport.connectionGeneration;
+    const created = await adapter.create(root, null);
+    const ref = created.createdSession!.native;
+
+    // 1. /stop settles pending unanswered permission request immediately so server unblocks
+    const s1 = observed.length;
+    const ack1 = await adapter.input(ref, 'new', [{ type: 'text', text: 'cancel-with-pending-perm' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(s1).some(o => o.type === 'interaction' && o.interaction.kind === 'approval'), 2000);
+    await adapter.interrupt(ref, ack1.nativeReference!, makeGuard(gen1));
+    await waitFor(() => observed.slice(s1).some(o => o.type === 'turn' && o.turn.status === 'interrupted'), 2000);
+    assert.equal(transport.health().pendingServerRequests, 0);
+
+    // 2. Dynamic residual pruning: terminal tool_call_update after cancel clears residual from running -> none
+    const s2 = observed.length;
+    const ack2 = await adapter.input(ref, 'new', [{ type: 'text', text: 'cancel-no-reply-confirm' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(s2).some(o => o.type === 'event' && o.event.type === 'tool.updated'), 2000);
+    await adapter.interrupt(ref, ack2.nativeReference!, makeGuard(gen1));
+    await waitFor(() => observed.slice(s2).some(o => o.type === 'turn' && o.turn.status === 'interrupted'), 2000);
+    assert.equal((await adapter.inspectTurnResidual(ref, ack2.nativeReference!)).status, 'running');
+    await transport.request('test/emit_terminal_tool', { sessionId: ref.nativeSessionId, toolCallId: 'tc-res-1' });
+    await new Promise(r => setTimeout(r, 40));
+    const prunedResidual = await adapter.inspectTurnResidual(ref, ack2.nativeReference!);
+    assert.equal(prunedResidual.status, 'none');
+    assert.equal(prunedResidual.count, 0);
+
+    // 3. Same-chunk stdout: prompt response + wakeup notification arrive together -> wakeup gets its own turnId & isolated messageId
+    const s3 = observed.length;
+    const ack3 = await adapter.input(ref, 'new', [{ type: 'text', text: 'same-chunk-prompt-and-wakeup' }], makeGuard(gen1));
+    await waitFor(
+      () => observed.slice(s3).some(o => o.type === 'turn' && o.turn.turnId.startsWith('wakeup:') && o.turn.status === 'completed'),
+      2000,
+    );
+    const wakeupTurn = observed.slice(s3).find(
+      o => o.type === 'turn' && o.turn.turnId.startsWith('wakeup:') && o.turn.status === 'completed',
+    );
+    assert.ok(wakeupTurn?.type === 'turn');
+    assert.notEqual(wakeupTurn.turn.turnId, ack3.nativeReference);
+    const wakeupMsg = observed.slice(s3).find(
+      o => o.type === 'message' && o.message.turnId === wakeupTurn.turn.turnId && o.message.final,
+    );
+    assert.ok(wakeupMsg?.type === 'message');
+    assert.equal(wakeupMsg.message.messageId, `${wakeupTurn.turn.turnId}:shared-msg-id`);
+
+    // 4. Stalled wakeup tool call converges to 'failed' after promptIdleTimeoutMs instead of hanging forever
+    const s4 = observed.length;
+    await transport.request('test/emit_stalled_wakeup_tool', { sessionId: ref.nativeSessionId });
+    await waitFor(
+      () => observed.slice(s4).some(o => o.type === 'turn' && o.turn.turnId.startsWith('wakeup:') && o.turn.status === 'failed'),
+      2000,
+    );
+
+    // 5. Optional field, skip sentinel '[已跳过/取消]', and guard.operationId invalid answer auto-decline
+    const s5 = observed.length;
+    await adapter.input(ref, 'new', [{ type: 'text', text: 'elicit-optional-and-sentinel' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(s5).some(o => o.type === 'interaction' && o.interaction.kind === 'question_group'), 2000);
+    const int1 = observed.slice(s5).find(
+      (o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'question_group',
+    )!.interaction;
+    assert.equal(int1.kind, 'question_group');
+    assert.equal((int1.questions.find(q => q.id === 'optField') as { required?: boolean })?.required, false);
+    await adapter.respond(ref, int1, { kind: 'question_group', answers: { reqField: ['ok'], optField: [] } }, makeGuard(gen1));
+
+    await waitFor(
+      () => observed.slice(s5).filter(o => o.type === 'interaction' && o.interaction.kind === 'question_group' && o.interaction.status === 'awaiting_answer').length >= 2,
+      2000,
+    );
+    const int2 = observed.slice(s5).filter(
+      (o): o is Extract<PlatformObservation, { type: 'interaction' }> =>
+        o.type === 'interaction' && o.interaction.kind === 'question_group' && o.interaction.status === 'awaiting_answer',
+    )[1]!.interaction;
+    await adapter.respond(ref, int2, { kind: 'question_group', answers: { choice: ['[已跳过/取消]'] } }, makeGuard(gen1));
+
+    await waitFor(
+      () => observed.slice(s5).filter(o => o.type === 'interaction' && o.interaction.kind === 'question_group' && o.interaction.status === 'awaiting_answer').length >= 3,
+      2000,
+    );
+    const int3 = observed.slice(s5).filter(
+      (o): o is Extract<PlatformObservation, { type: 'interaction' }> =>
+        o.type === 'interaction' && o.interaction.kind === 'question_group' && o.interaction.status === 'awaiting_answer',
+    )[2]!.interaction;
+    await assert.rejects(
+      adapter.respond(
+        ref,
+        int3,
+        { kind: 'question_group', answers: { num: ['2.9'] } },
+        { ...makeGuard(gen1), operationId: 'op-invalid-int' },
+      ),
+      { code: 'invalid_request' },
+    );
+    await waitFor(() => observed.slice(s5).some(o => o.type === 'turn' && o.turn.status === 'completed'), 2000);
+    assert.equal(transport.health().pendingServerRequests, 0);
+
+    // 6. Locked session exposes failed/unavailable state, and failed session/close does NOT unlock on same generation
+    await transport.request('test/fail_close_for', { sessionId: ref.nativeSessionId });
+    const s6 = observed.length;
+    await adapter.input(ref, 'new', [{ type: 'text', text: 'hang-then-late-chunk' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(s6).some(o => o.type === 'turn' && o.turn.status === 'failed'), 2000);
+    const lockedSession = (await adapter.read(ref)).session;
+    assert.equal(lockedSession.status, 'failed');
+    assert.equal(lockedSession.control.input, 'unavailable');
+    assert.equal(lockedSession.capabilities.send.status, 'temporarily_unavailable');
+    assert.equal(lockedSession.capabilities.handoff.status, 'available');
+
+    // Release with failing session/close + acquire on same gen must KEEP session locked
+    await adapter.control(ref, 'release', makeGuard(gen1));
+    await adapter.control(ref, 'acquire', makeGuard(gen1));
+    await assert.rejects(
+      adapter.input(ref, 'new', [{ type: 'text', text: 'still-locked' }], makeGuard(gen1)),
+      { code: 'control_conflict' },
+    );
+
+    const logs = (await readFile(rpcLogPath, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+    assert.deepEqual(logs.find(e => e.cancelPendingPermReply)?.cancelPendingPermReply, {
+      outcome: { outcome: 'cancelled' },
+    });
+    assert.deepEqual(logs.find(e => e.optionalAndSentinelReplies)?.optionalAndSentinelReplies, [
+      { action: 'accept', content: { reqField: 'ok' } },
+      { action: 'decline' },
+      { action: 'decline' },
+    ]);
   } finally {
     await adapter.close();
     await rm(root, { recursive: true, force: true });
