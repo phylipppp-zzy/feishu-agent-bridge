@@ -40,6 +40,7 @@ export async function runBackgroundWork(
   for (const binding of runtime.taskChannel?.listActiveBindings() ?? []) {
     await isolate(() => interactive.syncTask(binding.taskId));
   }
+  runtime.syncUnknownDeliveryAlerts();
   if (runtime.watchHub?.listOutbox().some(row => row.state === 'pending')) {
     await isolate(async () => { await runtime.watchHub?.flush(); });
   }

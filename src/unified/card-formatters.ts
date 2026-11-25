@@ -112,7 +112,13 @@ function approvalTargets(detail: Record<string, unknown>): string[] {
   const paths = fields.flatMap(field => {
     if (!field) return [];
     return [
-      ...['file_path', 'notebook_path', 'path', 'blockedPath', 'paths', 'grantRoot', 'Path', 'TargetFile']
+      ...[
+        'file_path', 'notebook_path', 'path', 'blockedPath', 'paths', 'grantRoot',
+        'Path', 'TargetFile', 'targetFile', 'FilePath', 'filePath', 'AbsolutePath', 'absolutePath',
+        'SourcePath', 'sourcePath', 'DestinationPath', 'destinationPath',
+        'TargetDirectory', 'targetDirectory', 'DirectoryPath', 'directoryPath',
+        'SearchDirectory', 'searchDirectory', 'Cwd', 'cwd', 'WorkingDirectory', 'workingDirectory',
+      ]
         .flatMap(key => strings(field[key])),
       ...(Array.isArray(field.locations) ? field.locations.flatMap(location => strings(record(location)?.path)) : []),
       ...(Array.isArray(field.changes) ? field.changes.flatMap(change => {
@@ -150,13 +156,13 @@ export function formatApprovalAction(tool: string, action: string, scope: string
     .find(value => /\p{Script=Han}/u.test(value))
     ?? '原端要求人工确认此操作。';
   const target = detail ? approvalTargets(detail).join('\n') : prefix;
-  const summary = shorten(stripCardMentions(target), 400, '\n…（其余内容已省略）')
+  const summary = shorten(stripCardMentions(target), 2000, '\n…（其余内容已省略）')
     .replace(/`{3,}/gu, run => [...run].join('\u200b')) || '原端未提供可展示的操作详情。';
-  const duration = scope === 'session' ? '本会话内同类操作' : '仅本次操作';
+  const duration = scope === 'session' || scope === 'allow_always' ? '本会话内同类操作' : '仅本次操作';
   return {
     toolLabel,
     text: [
-      `**拦截原因**：${escapeCardMarkdown(shorten(reason.replace(/\s+/gu, ' ').trim(), 400, '…'))}`,
+      `**拦截原因**：${escapeCardMarkdown(shorten(reason.replace(/\s+/gu, ' ').trim(), 600, '…'))}`,
       `**操作内容**：\n\`\`\`\n${summary}\n\`\`\``,
       `**生效范围**：${duration}`,
     ].join('\n\n'),

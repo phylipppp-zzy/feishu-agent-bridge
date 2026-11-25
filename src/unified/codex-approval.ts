@@ -50,10 +50,17 @@ export function codexApprovalChoices(value: unknown) {
 
 export function runtimeApprovalScope(config: RuntimeConfig) {
   const policy = config.approvalPolicy;
+  const writeRoots = [...new Set(policy?.extraWriteRoots ?? [])];
+  const readRoots = [...new Set([
+    ...(config.outputRoots ?? []),
+    ...(policy?.extraTrustedRoots ?? []),
+    ...writeRoots,
+  ])];
   return {
     enabled: policy?.enabled !== false,
-    readRoots: [...(config.allowedProjectRoots ?? []), ...(config.outputRoots ?? []), ...(policy?.extraTrustedRoots ?? [])],
-    writeRoots: policy?.extraWriteRoots ?? [],
+    ...(config.allowedProjectRoots !== undefined ? { allowedRoots: config.allowedProjectRoots } : {}),
+    readRoots,
+    writeRoots,
     ...(policy?.homeDir !== undefined ? { homeDir: policy.homeDir } : {}),
   };
 }
