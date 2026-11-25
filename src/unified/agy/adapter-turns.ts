@@ -263,11 +263,12 @@ function safeRespondServerRejection(
   req: AgyServerRequest,
   reason: string,
   rpcCode = -32000,
+  elicitationAction: 'decline' | 'cancel' = 'decline',
 ): void {
   if (ctx.isClosed() || !ctx.transport.connected || req.generation !== ctx.transport.connectionGeneration) return;
   try {
     if (req.method === 'elicitation/create' && rpcCode === -32000) {
-      void ctx.transport.respondServerRequest(req.generation, req.rpcId, { action: 'decline' }).catch(() => {});
+      void ctx.transport.respondServerRequest(req.generation, req.rpcId, { action: elicitationAction }).catch(() => {});
       return;
     }
     if (req.method === 'session/request_permission' && rpcCode === -32000) {
@@ -276,6 +277,49 @@ function safeRespondServerRejection(
     }
     ctx.transport.respondServerError(req.generation, req.rpcId, rpcCode, reason);
   } catch {}
+}
+
+export function cancelPendingTurnServerRequests(
+  ctx: AdapterContext,
+  sessionId: string,
+  turnId: string,
+  generation: number,
+  source: string,
+): void {
+  for (const entry of ctx.requests.values()) {
+    if (
+      entry.interaction.sessionId !== sessionId ||
+      entry.turnId !== turnId ||
+      entry.generation !== generation ||
+      entry.interaction.status !== 'awaiting_answer' ||
+      entry.submission !== null
+    ) {
+      continue;
+    }
+    if (!ctx.isClosed() && ctx.transport.connected && generation === ctx.transport.connectionGeneration) {
+      const cancelPayload =
+        entry.interaction.kind === 'approval' ? agyPermissionOutcome(null) : { action: 'cancel' };
+      void ctx.transport
+        .respondServerRequest(entry.generation, entry.rpcId, cancelPayload)
+        .catch(() => {});
+    }
+  }
+  expireAllPendingRequests(ctx, generation, sessionId, turnId, source);
+}
+
+const RESERVED_PERMISSION_OPTION_IDS = new Set(['allow_always', 'reject_always', 'allow_once', 'reject_once']);
+
+function findUniquePermissionOption(options: unknown, kind: 'allow_always' | 'allow'): string | null {
+  const raw = Array.isArray(options) ? options.filter(isRecord) : [];
+  const option =
+    raw.find(
+      row =>
+        row.kind === kind &&
+        isString(row.optionId) &&
+        (!RESERVED_PERMISSION_OPTION_IDS.has(row.optionId) || row.optionId === kind),
+    ) ?? raw.find(row => row.kind === undefined && row.optionId === kind);
+  const id = option?.optionId;
+  return isString(id) && raw.filter(row => row.optionId === id).length === 1 ? id : null;
 }
 
 export function handlePromptCompleted(
@@ -394,7 +438,7 @@ export function handlePromptFailed(
   ctx.recordTurnResidual?.(id, turnState);
   ctx.activeTurns.delete(id);
   if (ctx.transport.connectionGeneration !== turnState.generation) return;
-  expireAllPendingRequests(ctx, turnState.generation, id, turnState.turnId);
+  cancelPendingTurnServerRequests(ctx, id, turnState.turnId, turnState.generation, 'prompt_failed');
 
   const ref = ctx.ref(id);
   const now = new Date().toISOString();
@@ -402,17 +446,21 @@ export function handlePromptFailed(
   const message =
     isRecord(error) && typeof error.message === 'string' ? error.message : 'ACP prompt failed';
   const isOutcomeUnknown = isRecord(error) && error.code === 'outcome_unknown';
+  let sessionLocked = false;
 
   if (isOutcomeUnknown && ctx.transport.connected) {
     try {
       ctx.transport.notify('session/cancel', { sessionId: id });
     } catch {}
-    ctx.lockedSessions?.set(id, {
-      generation: turnState.generation,
-      turnId: turnState.turnId,
-      reason: message,
-      lockedAt: now,
-    });
+    if (ctx.lockedSessions) {
+      ctx.lockedSessions.set(id, {
+        generation: turnState.generation,
+        turnId: turnState.turnId,
+        reason: message,
+        lockedAt: now,
+      });
+      sessionLocked = true;
+    }
     ctx.emitSession?.(ref, id);
   }
 
@@ -434,7 +482,7 @@ export function handlePromptFailed(
       cursor: String(seq),
       data: {
         reason: message,
-        ...(isOutcomeUnknown ? { outcomeUnknown: true, sessionLocked: true } : {}),
+        ...(isOutcomeUnknown ? { outcomeUnknown: true, sessionLocked } : {}),
         ...(turnState.cancelRequested ? { cancelRequested: true } : {}),
       },
     },
@@ -582,7 +630,8 @@ export function handleAcpNotification(
     terminalToolStatuses.has(update.status)
   ) {
     const prunedResidual = pruneResidualToolCall(ctx, sessionId, notification.generation, update.toolCallId);
-    if (prunedResidual && !ctx.activeTurns.has(sessionId)) {
+    const currentTurn = ctx.activeTurns.get(sessionId);
+    if (prunedResidual && (!currentTurn || !currentTurn.toolCalls.has(update.toolCallId))) {
       return;
     }
   }
@@ -713,6 +762,10 @@ export async function handleAcpServerRequest(
     safeRespondServerRejection(ctx, req, 'Session turn is unavailable for server request', -32000);
     return;
   }
+  if (turn.cancelRequested) {
+    safeRespondServerRejection(ctx, req, 'Session turn cancellation requested', -32000, 'cancel');
+    return;
+  }
   turn.lastActivityAt = Date.now();
   if (turn.isWakeup) {
     scheduleWakeupFinalize(ctx, sessionId, turn);
@@ -751,11 +804,18 @@ export async function handleAcpServerRequest(
     let toolCall = mergeAgyToolCall(previous, requestedCall);
     const compacted = toolCallId && previous && !turn.fullToolCalls.has(toolCallId);
     if (toolCallId) turn.approvalRequestIds.set(toolCallId, turn.approvalRequestIds.has(toolCallId) ? null : interactionId);
-    const allowOptionId = agyOnceOption(p.options, 'allow_once');
+    const allowOptionId =
+      agyOnceOption(p.options, 'allow_once') ?? findUniquePermissionOption(p.options, 'allow');
+    const allowAlwaysOptionId = findUniquePermissionOption(p.options, 'allow_always');
     const denyOptionId = agyOnceOption(p.options, 'reject_once');
     const cwd = ctx.knownSessions.get(sessionId)?.cwd;
-    const stillCurrent = () => !ctx.isClosed() && ctx.transport.connected &&
-      req.generation === ctx.transport.connectionGeneration && ctx.active.has(sessionId) && ctx.activeTurns.get(sessionId) === turn;
+    const stillCurrent = () =>
+      !ctx.isClosed() &&
+      ctx.transport.connected &&
+      req.generation === ctx.transport.connectionGeneration &&
+      ctx.active.has(sessionId) &&
+      ctx.activeTurns.get(sessionId) === turn &&
+      !turn.cancelRequested;
     let decision: GateDecision;
     let checking: ToolCallCheck | undefined;
     if (callIds.size > 1) {
@@ -846,13 +906,20 @@ export async function handleAcpServerRequest(
       action: `${decision.kind === 'ask' ? `${decision.reason}\n` : ''}${JSON.stringify(displayedCall)}`,
       scope: 'this_request',
       toolInputDigest: payloadDigest({ ...p, toolCall: displayedCall }),
-    };
+      ...(allowAlwaysOptionId
+        ? {
+            allowAlways: true,
+            allowedScopes: ['this_request', 'session', 'allow_always'] as const,
+          }
+        : {}),
+    } as Interaction;
 
     const entry: PendingAgyRequest = {
       ...pending,
       toolCallId,
       interaction,
       allowOptionId,
+      allowAlwaysOptionId,
       denyOptionId,
       propertyTypes: {},
     };
@@ -1086,9 +1153,13 @@ export async function respondToInteraction(
       guard.operationId &&
       (current.kind === 'question' || current.kind === 'question_group')
     ) {
-      void ctx.transport
-        .respondServerRequest(req.generation, req.rpcId, { action: 'decline' })
-        .catch(() => {});
+      const declineWrite = ctx.transport.respondServerRequest(
+        req.generation,
+        req.rpcId,
+        { action: 'decline' },
+        () => guard.assertCurrent(),
+      );
+      void declineWrite.catch(() => {});
       req.closedSource ??= 'invalid_answer_declined';
       publishRequestClosure(ctx, req);
     }
@@ -1098,13 +1169,24 @@ export async function respondToInteraction(
   if (
     current.kind === 'approval' &&
     answer.kind === 'approval' &&
-    answer.scope === current.scope &&
-    (answer.decision === 'allow' || answer.decision === 'deny')
+    (answer.decision === 'allow' || answer.decision === 'deny') &&
+    (answer.scope === current.scope ||
+      (answer.decision === 'allow' &&
+        (answer.scope === 'session' || answer.scope === 'allow_always') &&
+        Boolean(req.allowAlwaysOptionId)))
   ) {
-    if (answer.decision === 'allow' && !req.allowOptionId) {
-      throw contractError('unsupported', '原端未提供仅允许本次的权限选项');
+    if (answer.decision === 'allow') {
+      const chosenOptionId =
+        answer.scope === 'session' || answer.scope === 'allow_always'
+          ? req.allowAlwaysOptionId ?? null
+          : req.allowOptionId;
+      if (!chosenOptionId) {
+        throw contractError('unsupported', '原端未提供对应的权限选项');
+      }
+      result = agyPermissionOutcome(chosenOptionId);
+    } else {
+      result = agyPermissionOutcome(req.denyOptionId);
     }
-    result = agyPermissionOutcome(answer.decision === 'allow' ? req.allowOptionId : req.denyOptionId);
   } else if (
     (current.kind === 'question' && answer.kind === 'question') ||
     (current.kind === 'question_group' && answer.kind === 'question_group')

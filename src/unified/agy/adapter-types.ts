@@ -144,6 +144,7 @@ export type PendingAgyRequest = {
   toolCallId: string | null;
   interaction: Interaction;
   allowOptionId: string | null;
+  allowAlwaysOptionId?: string | null;
   denyOptionId: string | null;
   propertyTypes: Record<string, string>;
   requiredFields?: Record<string, boolean>;

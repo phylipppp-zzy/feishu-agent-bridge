@@ -55,7 +55,6 @@ import {
   type SessionLockState,
   type TurnResidualSnapshot,
 } from './adapter-types.js';
-import { agyPermissionOutcome } from './adapter-permission.js';
 import {
   discoverExistingSessions,
   discoverNewerSessions,
@@ -68,6 +67,7 @@ import {
   resolveSessionTitle,
 } from './adapter-discovery.js';
 import {
+  cancelPendingTurnServerRequests,
   expireAllPendingRequests,
   handleAcpNotification,
   handleAcpServerRequest,
@@ -359,7 +359,7 @@ export class AgyAdapter implements PlatformPort {
       control: {
         serviceId: this.serviceId,
         owner: isActive ? this.serviceId : null,
-        input: isActive && !isLocked ? 'available' : 'unavailable',
+        input: isActive ? 'available' : 'unavailable',
         generation: this.controlEpoch.get(id) ?? 0,
         operationId: null,
         reason: isLocked
@@ -646,13 +646,14 @@ export class AgyAdapter implements PlatformPort {
 
     this.assertConnection(generation);
     this.captureServerSessionMeta(id, cwd, res);
+    await this.applyDefaultModeBestEffort(id, res);
+    this.assertConnection(generation);
     const existingLock = this.lockedSessions.get(id);
     if (existingLock && existingLock.generation !== generation) {
       this.lockedSessions.delete(id);
     }
     this.active.add(id);
     this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
-    await this.applyDefaultModeBestEffort(id, res);
     this.emit({ type: 'connection', ref, connectionGeneration: generation });
 
     return {
@@ -798,7 +799,7 @@ export class AgyAdapter implements PlatformPort {
       },
     );
 
-    void promptPromise.catch(() => {});
+    void promptPromise.catch(error => handlePromptFailed(this.ctx, id, turnState, error));
 
     return ack(turnId);
   }
@@ -830,24 +831,7 @@ export class AgyAdapter implements PlatformPort {
     this.transport.notify('session/cancel', { sessionId: id });
     activeTurn.cancelRequested = true;
     activeTurn.cancelRequestedAt = new Date().toISOString();
-
-    for (const entry of this.requests.values()) {
-      if (
-        entry.interaction.sessionId !== id ||
-        entry.turnId !== turnId ||
-        entry.generation !== activeTurn.generation ||
-        entry.interaction.status !== 'awaiting_answer' ||
-        entry.submission !== null
-      ) {
-        continue;
-      }
-      const cancelPayload =
-        entry.interaction.kind === 'approval' ? agyPermissionOutcome(null) : { action: 'cancel' };
-      void this.transport
-        .respondServerRequest(entry.generation, entry.rpcId, cancelPayload)
-        .catch(() => {});
-    }
-    expireAllPendingRequests(this.ctx, activeTurn.generation, id, turnId, 'turn_cancelled');
+    cancelPendingTurnServerRequests(this.ctx, id, turnId, activeTurn.generation, 'turn_cancelled');
     return ack(turnId);
   }
 

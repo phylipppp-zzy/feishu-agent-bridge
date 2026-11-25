@@ -15,6 +15,8 @@ import {
 } from '../src/unified/agy/adapter-types.js';
 import type { DispatchGuard, PlatformObservation } from '../src/unified/adapter.js';
 import type { Answer, Interaction } from '../src/unified/contracts.js';
+import { UnifiedCore } from '../src/unified/service.js';
+import { UnifiedStore } from '../src/unified/store.js';
 
 function makeGuard(expectedConnectionGeneration: number | null): DispatchGuard {
   return {
@@ -388,6 +390,21 @@ rl.on('line', async (line) => {
           reply({ stopReason: 'cancelled' });
         },
       });
+      return;
+    }
+
+    if (text === 'approval-always-test') {
+      const perm = await sendServerRequest('session/request_permission', {
+        sessionId: sid,
+        toolCall: { toolCallId: 'tc-always-1', title: 'Run tool', kind: 'execute', rawInput: { CommandLine: 'sudo true' } },
+        options: [
+          { optionId: 'allow_always', kind: 'allow_always', name: 'Allow always' },
+          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+          { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
+        ],
+      });
+      log({ allowAlwaysPermReply: perm });
+      reply({ stopReason: 'end_turn' });
       return;
     }
 
@@ -884,14 +901,15 @@ test('Verifier regressions: /stop settles pending perm, same-chunk wakeup isolat
     await waitFor(() => observed.slice(s5).some(o => o.type === 'turn' && o.turn.status === 'completed'), 2000);
     assert.equal(transport.health().pendingServerRequests, 0);
 
-    // 6. Locked session exposes failed/unavailable state, and failed session/close does NOT unlock on same generation
+    // 6. Locked session exposes failed + send temporarily_unavailable while keeping control.input='available' for releaseControl,
+    //    and failed session/close does NOT unlock on same generation
     await transport.request('test/fail_close_for', { sessionId: ref.nativeSessionId });
     const s6 = observed.length;
     await adapter.input(ref, 'new', [{ type: 'text', text: 'hang-then-late-chunk' }], makeGuard(gen1));
     await waitFor(() => observed.slice(s6).some(o => o.type === 'turn' && o.turn.status === 'failed'), 2000);
     const lockedSession = (await adapter.read(ref)).session;
     assert.equal(lockedSession.status, 'failed');
-    assert.equal(lockedSession.control.input, 'unavailable');
+    assert.equal(lockedSession.control.input, 'available');
     assert.equal(lockedSession.capabilities.send.status, 'temporarily_unavailable');
     assert.equal(lockedSession.capabilities.handoff.status, 'available');
 
@@ -914,6 +932,106 @@ test('Verifier regressions: /stop settles pending perm, same-chunk wakeup isolat
     ]);
   } finally {
     await adapter.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('UnifiedCore + UnifiedStore end-to-end: timeout lock -> submitInput rejected -> releaseControl -> requestControl -> next turn succeeds + allow_always forwarding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-acp-core-e2e-lock-'));
+  const binPath = join(root, 'fake-agy.mjs');
+  const rpcLogPath = join(root, 'rpc.jsonl');
+  await writeCoreFakeAgy(binPath, rpcLogPath);
+
+  const transport = new AgyAcpTransport({ agyBin: binPath });
+  const catalog = new AgyCatalog({ dbPath: join(root, 'missing.db'), brainDir: root, allowedProjectRoots: [root] });
+  const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc', undefined, {
+    promptIdleTimeoutMs: 100,
+    promptMaxTimeoutMs: 5000,
+    wakeupIdleMs: 40,
+  });
+  const store = new UnifiedStore(join(root, 'core.sqlite'));
+  const core = new UnifiedCore(store, [adapter], () => true);
+
+  try {
+    await transport.connect();
+    const gen1 = transport.connectionGeneration;
+    const created = await adapter.create(root, null);
+    const session = created.createdSession!;
+    store.insertSession(session);
+    store.setConnectionGeneration(session.sessionId, 0, gen1);
+
+    const ctx = (opId: string) => {
+      const cur = store.getSession(session.sessionId);
+      return {
+        operationId: opId,
+        idempotencyKey: opId,
+        targetId: session.sessionId,
+        expectedRevision: cur.revision,
+        controlGeneration: cur.control.generation,
+        identity: { source: 'feishu', subject: 'ou_owner' },
+      };
+    };
+
+    // 1. allow_always option is advertised and forwarded when scope='session'
+    const observed: PlatformObservation[] = [];
+    adapter.onObservation(obs => observed.push(obs));
+    const sAllow = observed.length;
+    await adapter.input(session.native, 'new', [{ type: 'text', text: 'approval-always-test' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(sAllow).some(o => o.type === 'interaction' && o.interaction.kind === 'approval'), 2000);
+    const alwaysInt = observed.slice(sAllow).find(
+      (o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval',
+    )!.interaction as Interaction & { allowAlways?: boolean; allowedScopes?: readonly string[] };
+    assert.equal(alwaysInt.allowAlways, true);
+    assert.deepEqual(alwaysInt.allowedScopes, ['this_request', 'session', 'allow_always']);
+    await adapter.respond(
+      session.native,
+      alwaysInt,
+      { kind: 'approval', decision: 'allow', scope: 'session' },
+      makeGuard(gen1),
+    );
+    await waitFor(() => observed.slice(sAllow).some(o => o.type === 'turn' && o.turn.status === 'completed'), 2000);
+
+    // 2. Timeout lock through UnifiedCore -> submitInput rejected -> releaseControl -> requestControl -> next turn succeeds
+    await core.submitInput({
+      context: ctx('op-hang'),
+      mode: 'new',
+      blocks: [{ type: 'text', text: 'hang-then-late-chunk' }],
+    });
+    await core.dispatch('op-hang');
+    await waitFor(() => store.getSession(session.sessionId).capabilities.send.status === 'temporarily_unavailable', 2000);
+
+    await assert.rejects(
+      core.submitInput({
+        context: ctx('op-blocked'),
+        mode: 'new',
+        blocks: [{ type: 'text', text: 'blocked-while-locked' }],
+      }),
+      /send unavailable/,
+    );
+
+    await core.releaseControl({ context: ctx('op-release'), payload: { owner: 'agy-svc' } });
+    assert.equal((await core.dispatch('op-release')).status, 'completed');
+
+    await core.requestControl({ context: ctx('op-acquire'), payload: { owner: 'agy-svc', strategy: 'wait' } });
+    assert.equal((await core.dispatch('op-acquire')).status, 'completed');
+
+    const sAfter = observed.length;
+    await core.submitInput({
+      context: ctx('op-ok'),
+      mode: 'new',
+      blocks: [{ type: 'text', text: 'after-core-unlock' }],
+    });
+    assert.equal((await core.dispatch('op-ok')).status, 'accepted');
+    await waitFor(() => observed.slice(sAfter).some(o => o.type === 'turn' && o.turn.status === 'completed'), 2000);
+
+    const logs = (await readFile(rpcLogPath, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+    assert.deepEqual(logs.find(e => e.allowAlwaysPermReply)?.allowAlwaysPermReply, {
+      outcome: { outcome: 'selected', optionId: 'allow_always' },
+    });
+  } finally {
+    core.close();
+    await adapter.close();
+    store.close();
     await rm(root, { recursive: true, force: true });
   }
 });
