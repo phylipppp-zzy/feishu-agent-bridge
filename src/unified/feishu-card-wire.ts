@@ -5,13 +5,85 @@ export const QUESTION_INPUT_MAX_LENGTH = 1000;
 export type CardSchema = NonNullable<ChannelCard['schema']>;
 
 const GFM_TABLE_RE = /^\|.+\|\s*\r?\n\|[\s:|-]+\|/m;
-const DETAILS_BLOCK_RE = /<details\b[^>]*>([\s\S]*?)<\/details>/giu;
+const DETAILS_OPEN_RE = /<details\b[^>]*>/iu;
+const DETAILS_CLOSE_RE = /<\/details>/iu;
 const SUMMARY_TAG_RE = /<summary\b[^>]*>([\s\S]*?)<\/summary>/iu;
+
+interface DetailsRange {
+  start: number;
+  end: number;
+  inner: string;
+}
+
+/** Find <details>...</details> ranges strictly outside fenced Markdown code blocks. */
+function findDetailsOutsideFences(text: string): DetailsRange[] {
+  const ranges: DetailsRange[] = [];
+  const fencedIntervals: Array<[number, number]> = [];
+  let pos = 0;
+  let fenceChar: '`' | '~' | null = null;
+  let fenceLen = 0;
+  let fenceStart = 0;
+
+  while (pos < text.length) {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? text.length : nl + 1;
+    const line = text.slice(pos, nl === -1 ? text.length : nl).replace(/\r$/, '');
+    const m = /^[ ]{0,3}(`{3,}|~{3,})/.exec(line);
+    if (m) {
+      const run = m[1]!;
+      const ch = run[0] as '`' | '~';
+      if (!fenceChar) {
+        fenceChar = ch;
+        fenceLen = run.length;
+        fenceStart = pos;
+      } else if (ch === fenceChar && run.length >= fenceLen && line.trim() === run) {
+        fencedIntervals.push([fenceStart, lineEnd]);
+        fenceChar = null;
+        fenceLen = 0;
+      }
+    }
+    pos = lineEnd;
+  }
+  if (fenceChar) fencedIntervals.push([fenceStart, text.length]);
+
+  const inFence = (index: number): boolean =>
+    fencedIntervals.some(([s, e]) => index >= s && index < e);
+
+  let cursor = 0;
+  while (cursor < text.length) {
+    const slice = text.slice(cursor);
+    const openMatch = DETAILS_OPEN_RE.exec(slice);
+    if (!openMatch) break;
+    const openStart = cursor + openMatch.index;
+    const openEnd = openStart + openMatch[0].length;
+    if (inFence(openStart)) {
+      cursor = openEnd;
+      continue;
+    }
+    let searchClose = openEnd;
+    let foundClose: { start: number; end: number } | null = null;
+    while (searchClose < text.length) {
+      const closeMatch = DETAILS_CLOSE_RE.exec(text.slice(searchClose));
+      if (!closeMatch) break;
+      const closeStart = searchClose + closeMatch.index;
+      const closeEnd = closeStart + closeMatch[0].length;
+      if (!inFence(closeStart)) {
+        foundClose = { start: closeStart, end: closeEnd };
+        break;
+      }
+      searchClose = closeEnd;
+    }
+    if (!foundClose) break;
+    ranges.push({ start: openStart, end: foundClose.end, inner: text.slice(openEnd, foundClose.start) });
+    cursor = foundClose.end;
+  }
+  return ranges;
+}
 
 function hasRichMarkdownV2(card: ChannelCard): boolean {
   if (card.format === 'plain' || card.table) return false;
   if (card.executionLog) return true;
-  return GFM_TABLE_RE.test(card.text) || /<details\b[^>]*>[\s\S]*?<\/details>/iu.test(card.text);
+  return GFM_TABLE_RE.test(card.text) || findDetailsOutsideFences(card.text).length > 0;
 }
 
 export const cardSchema = (card: ChannelCard): CardSchema =>
@@ -43,15 +115,15 @@ function header(card: ChannelCard) {
 
 function markdownElementsV2(text: string): unknown[] {
   const cleaned = stripCardMentions(text);
+  const ranges = findDetailsOutsideFences(cleaned);
+  if (!ranges.length) return [markdown(cleaned)];
   const elements: unknown[] = [];
   let lastIndex = 0;
   let panelIndex = 0;
-  DETAILS_BLOCK_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = DETAILS_BLOCK_RE.exec(cleaned)) !== null) {
-    const before = cleaned.slice(lastIndex, match.index).trim();
+  for (const range of ranges) {
+    const before = cleaned.slice(lastIndex, range.start).trim();
     if (before) elements.push(markdown(before));
-    const inner = match[1] ?? '';
+    const inner = range.inner;
     const summaryMatch = SUMMARY_TAG_RE.exec(inner);
     const title = summaryMatch?.[1]?.trim() || '展开详情';
     const body = (summaryMatch
@@ -64,10 +136,9 @@ function markdownElementsV2(text: string): unknown[] {
       header: { title: markdown(title) },
       elements: body ? [markdown(body)] : [],
     });
-    lastIndex = match.index + match[0].length;
+    lastIndex = range.end;
   }
   const after = cleaned.slice(lastIndex);
-  if (panelIndex === 0) return [markdown(cleaned)];
   if (after.trim()) elements.push(markdown(after.trim()));
   return elements;
 }

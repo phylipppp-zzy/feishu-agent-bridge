@@ -238,11 +238,14 @@ function parseAction(value: unknown): RuntimeTrustedAction {
 export function parseFeishuAction<T extends RuntimeTrustedAction = ChannelAction>(value: unknown, formValues?: unknown): T {
   if (object(value) && value.action === 'answer_form') {
     const isDecline = value.decline === true;
-    const normalizedForm = isDecline && formValues === undefined ? {} : formValues;
+    if (value.decline !== undefined && typeof value.decline !== 'boolean') throw new Error('invalid question form callback');
+    if (!isDecline && object(formValues) && Object.hasOwn(formValues, '__decline')) {
+      throw new Error('invalid question form callback');
+    }
+    const normalizedForm = isDecline ? { __decline: true } : formValues;
     if (!str(value.interactionId) || !counter(value.revision) || !counter(value.connectionGeneration) || !object(normalizedForm) || JSON.stringify(normalizedForm).length > 100_000) {
       throw new Error('invalid question form callback');
     }
-    if (value.decline !== undefined && typeof value.decline !== 'boolean') throw new Error('invalid question form callback');
     const pendingMeta = parsePendingMeta(value);
     const taskScope = parseTaskScope(value, true);
     if (pendingMeta && taskScope) throw new Error('invalid question form callback');

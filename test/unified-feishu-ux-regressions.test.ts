@@ -236,15 +236,34 @@ test('ask_question form supports decline button, optional fields, and dropdown+t
   const optionalInput = formElements.find(el => el.name === 'q1_text');
   assert.match(optionalInput.placeholder.content, /可选/);
 
-  // Decline callback round-trips without formValues
+  // Decline callback round-trips without formValues and carries __decline for PendingHub
   const parsedDecline = parseFeishuAction(declineBtn.behaviors[0].value);
   assert.equal(parsedDecline.action, 'answer_form');
-  const decodedDecline = decodeQuestionForm(parsedDecline, {}, i, 'b1');
+  assert.deepEqual((parsedDecline as any).fields, { __decline: true });
+  const decodedDecline = decodeQuestionForm(parsedDecline, (parsedDecline as any).fields, i, 'b1');
   assert.equal(decodedDecline.declined, true);
+  assert.equal((decodedDecline.answer as any).action, 'decline');
   assert.deepEqual(decodedDecline.answer, {
     kind: 'question_group',
     answers: { q1: [DECLINED_ANSWER_MARKER], q2: [DECLINED_ANSWER_MARKER] },
+    action: 'decline',
   });
+
+  // PendingHub passes fields without top-level decline -> still decodes as decline
+  const decodedViaPendingHub = decodeQuestionForm(
+    { action: 'answer_form', bindingId: 'b1', interactionId: 'iq1', revision: 3, connectionGeneration: 2 },
+    { __decline: true },
+    i,
+    'b1',
+  );
+  assert.equal(decodedViaPendingHub.declined, true);
+  assert.equal((decodedViaPendingHub.answer as any).action, 'decline');
+
+  // Forged __decline in untrusted formValues when button value.decline !== true is rejected
+  assert.throws(
+    () => parseFeishuAction({ action: 'answer_form', bindingId: 'b1', interactionId: 'iq1', revision: 3, connectionGeneration: 2 }, { __decline: true }),
+    /invalid question form callback/,
+  );
 
   // Dropdown + free text both filled -> free text wins, optional field left empty -> succeeds!
   const decodedNormal = decodeQuestionForm(
@@ -569,4 +588,171 @@ test('Card JSON 2.0 renders native Markdown tables and <details> collapsible pan
   );
   assert.equal(encodedDetails.body.elements[1].header.title.content, '查看堆栈');
   assert.match(encodedDetails.body.elements[1].elements[0].content, /Error: boom/);
+
+  // <details> inside a fenced code block must NOT be split into collapsible_panel
+  const fencedDetailsCard: ChannelCard = {
+    title: '代码示例',
+    text: '示例 HTML：\n```html\n<details><summary>Demo</summary>\ninside code\n</details>\n```\n结束。',
+    actions: [],
+  };
+  assert.equal(cardSchema(fencedDetailsCard), '1.0');
+  const encodedFencedV2 = encodeCard(fencedDetailsCard, '2.0') as any;
+  assert.deepEqual(
+    encodedFencedV2.body.elements.map((e: any) => e.tag),
+    ['markdown'],
+  );
+  assert.match(encodedFencedV2.body.elements[0].content, /<details><summary>Demo<\/summary>/);
+});
+
+test('E2E: enum-only question decline passes real UnifiedCore + UnifiedStore validation and delivers action=decline', async () => {
+  const { UnifiedStore } = await import('../src/unified/store.js');
+  const { UnifiedCore } = await import('../src/unified/service.js');
+  const dir = mkdtempSync(join(tmpdir(), 'feishu-ux-decline-e2e-'));
+  const store = new UnifiedStore(join(dir, 'core.sqlite'));
+  const responded: Array<{ interactionId: string; answer: any }> = [];
+  const fakePort: any = {
+    provider: 'agy',
+    list: async () => ({ items: [], nextCursor: null }),
+    read: async () => { throw new Error('unused'); },
+    resume: async () => ({ status: 'submitted', nativeReference: null, connectionGeneration: 1 }),
+    create: async () => ({ status: 'submitted', nativeReference: null }),
+    input: async () => ({ status: 'submitted', nativeReference: 't1' }),
+    interrupt: async () => ({ status: 'submitted', nativeReference: null }),
+    respond: async (_ref: any, interaction: any, answer: any, guard: any) => {
+      guard.assertCurrent();
+      responded.push({ interactionId: interaction.interactionId, answer });
+      return { status: 'submitted', nativeReference: null };
+    },
+    onObservation: () => () => {},
+    listArtifacts: async () => [],
+    readArtifact: async () => new Uint8Array(),
+    listModels: async () => [],
+    updateSettings: async () => ({ status: 'submitted', nativeReference: null }),
+    control: async () => ({ status: 'submitted', nativeReference: null }),
+  };
+  const core = new UnifiedCore(store, [fakePort], () => true);
+  const cards: ChannelCard[] = [];
+  const port: FeishuPort = {
+    isTopicDestination: d => d === 'topic:e2e',
+    send: async (_d, card) => { cards.push(card); return 'msg-1'; },
+    update: async () => {},
+    sendFile: async () => {},
+  };
+  const channel = new FeishuChannel(core, port, async () => true, join(dir, 'channel.sqlite'));
+  try {
+    const session: Session = {
+      sessionId: 'agy-enum-s1',
+      native: { provider: 'agy', hostId: 'h', serviceId: 'svc', nativeSessionId: 'n-enum' },
+      project: dir,
+      title: 'AGY Enum Decline',
+      status: 'waiting_question',
+      revision: 1,
+      capabilities: {
+        view: { status: 'available' },
+        send: { status: 'available' },
+        queue: { status: 'available' },
+        steer: { status: 'unsupported', reason: 'no steer' },
+        answer: { status: 'available' },
+        approve: { status: 'available' },
+        interrupt: { status: 'available' },
+        handoff: { status: 'available' },
+        files: { status: 'available' },
+        config: { status: 'available' },
+      },
+      control: { serviceId: 'svc', owner: 'feishu', input: 'available', generation: 1, operationId: null, reason: null },
+    };
+    store.insertSession(session);
+    const enumInteraction: Interaction = {
+      interactionId: 'iq-enum-1',
+      sessionId: session.sessionId,
+      turnId: 'turn-1',
+      nativeRequestId: 'req-1',
+      connectionGeneration: 0,
+      revision: 1,
+      status: 'awaiting_answer',
+      expiresAt: null,
+      toolInputDigest: null,
+      nativeResult: null,
+      kind: 'question',
+      prompt: 'Choose strictly',
+      choices: ['A', 'B'],
+      multiple: false,
+      allowFreeText: false,
+    };
+    store.insertInteraction(enumInteraction);
+    await interactiveBind(channel, core, 'topic:e2e', session.sessionId);
+
+    const db = new DatabaseSync(join(dir, 'channel.sqlite'), { readOnly: true });
+    const bindingId = (db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get('topic:e2e') as { binding_id: string }).binding_id;
+    db.close();
+
+    const wire = renderQuestionForm(questionForm(enumInteraction, bindingId)) as any;
+    const declineBtn = wire.body.elements[0].elements.find((el: any) => el.name === 'decline_question');
+    const action = parseFeishuAction(declineBtn.behaviors[0].value);
+    const op: any = await channel.handle(
+      { eventId: 'evt-decline', destination: 'topic:e2e', identity: { source: 'feishu', subject: 'owner' } },
+      action,
+    );
+    assert.equal(op.status, 'received');
+    await core.dispatch(op.operationId);
+    assert.equal(responded.length, 1);
+    assert.equal(responded[0]!.interactionId, 'iq-enum-1');
+    assert.equal(responded[0]!.answer.action, 'decline');
+    assert.deepEqual(responded[0]!.answer.values, ['A']);
+    const after = await core.getInteraction('iq-enum-1');
+    assert.equal(after.status, 'answer_pending_delivery');
+  } finally {
+    channel.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('staged PDF intake avoids serializing large Uint8Array into SQLite inbox and preserves byte size', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'feishu-ux-pdf-size-'));
+  const submitted: string[] = [];
+  const session = {
+    sessionId: 'agy-pdf',
+    native: { provider: 'agy', hostId: 'h', serviceId: 'svc', nativeSessionId: 'n-pdf' },
+    project: dir,
+    title: 'PDF Session',
+    status: 'idle',
+    revision: 1,
+    capabilities: { send: { status: 'available' }, queue: { status: 'available' }, steer: { status: 'unsupported', reason: 'no' } },
+    control: { input: 'available', generation: 1, owner: 'feishu', serviceId: 'svc', operationId: null, reason: null },
+  } as unknown as Session;
+  const service: any = {
+    getSession: async () => session,
+    submitInput: async ({ context, blocks }: any) => {
+      submitted.push(blocks[0].text);
+      return { ...context, action: 'submitInput', status: 'completed', revision: 1, error: null, payloadDigest: 'd' };
+    },
+  };
+  const port: FeishuPort = {
+    isTopicDestination: d => d === 'topic:pdf',
+    send: async () => 'm',
+    update: async () => {},
+    sendFile: async () => {},
+  };
+  const dbPath = join(dir, 'channel.sqlite');
+  const channel = new FeishuChannel(service as UnifiedService, port, async () => true, dbPath);
+  try {
+    await interactiveBind(channel, service, 'topic:pdf', 'agy-pdf');
+    const bigPdf = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(1024 * 1024, 65)]);
+    const localPath = join(dir, 'big.pdf');
+    await channel.handle(
+      { eventId: 'pdf-1', destination: 'topic:pdf', identity: { source: 'feishu', subject: 'owner' } },
+      { action: 'attachment', name: 'big.pdf', mediaType: 'application/pdf', content: bigPdf, size: bigPdf.length, mode: 'new', localPath },
+    );
+    assert.equal(submitted.length, 1);
+    assert.match(submitted[0]!, new RegExp(`${bigPdf.length} 字节`));
+    assert.match(submitted[0]!, new RegExp(localPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare('SELECT action FROM channel_inbox WHERE event_id=?').get('pdf-1') as { action: string };
+    db.close();
+    assert.ok(row.action.length < 1024, `PDF inbox payload must stay compact, got ${row.action.length} bytes`);
+  } finally {
+    channel.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

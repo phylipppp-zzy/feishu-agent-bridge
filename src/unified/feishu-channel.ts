@@ -77,7 +77,7 @@ export type ChannelAction = (
  | { action: 'full_reply'; messageId: string }
  | { action: 'file'; artifactId: string; contentVersion: string }
  | { action: 'resource_rejected'; reason:'unsupported'|'size'|'encoding' }
- | { action: 'attachment'; name: string; mediaType: string; content: Uint8Array; mode: 'new' | 'queue' | 'steer'; localPath?: string }
+ | { action: 'attachment'; name: string; mediaType: string; content: Uint8Array; mode: 'new' | 'queue' | 'steer'; localPath?: string; size?: number }
  | { action: 'models'; cursor?: string }
  | { action: 'legacy_model'; model?: string; effort?: string; invalid?: boolean }
  | { action: 'help'; scope?: 'admin' }
@@ -410,7 +410,13 @@ export class FeishuChannel {
       } catch(error){this.db.exec('ROLLBACK');throw error;}
     }
     if(a.action==='inspect_unknown'){const action=JSON.stringify(a),envelope=JSON.stringify(e),digest=payloadDigest({destination:e.destination,identity:e.identity,action:JSON.parse(action)});this.db.exec('BEGIN IMMEDIATE');try{if(this.db.prepare('SELECT 1 FROM channel_inbox WHERE event_id=? UNION ALL SELECT 1 FROM channel_steer_inbox_v1 WHERE event_id=?').get(e.eventId,e.eventId))throw Error('idempotency conflict');const old=this.db.prepare('SELECT digest,state FROM channel_candidate_inbox_v1 WHERE event_id=?').get(e.eventId) as {digest:string;state:string}|undefined;if(old){if(old.digest!==digest)throw Error('idempotency conflict');this.db.exec('COMMIT');return {eventId:e.eventId,state:old.state};}if(this.actionScope(a,e.destination)!==capturedScope)throw Error('binding changed');this.db.prepare("INSERT INTO channel_candidate_inbox_v1 VALUES (?,?,?,?,?,'received',NULL)").run(e.eventId,envelope,action,capturedScope,digest);this.db.exec('COMMIT');return {eventId:e.eventId,state:'received'};}catch(error){this.db.exec('ROLLBACK');throw error;}}
-    const serializedAction = JSON.stringify(a.action === 'attachment' ? {...a,content:Array.from(a.content)} : a);
+    const serializedAction = JSON.stringify(
+      a.action === 'attachment'
+        ? a.mediaType === 'application/pdf' && a.localPath
+          ? { ...a, content: [], size: a.size ?? a.content.byteLength }
+          : { ...a, content: Array.from(a.content) }
+        : a,
+    );
     const digest = payloadDigest({destination:e.destination,identity:e.identity,action:JSON.parse(serializedAction)});
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -736,13 +742,7 @@ export class FeishuChannel {
       let decoded;
       try { decoded=decodeQuestionForm(a,a.fields,i,binding.binding_id,this.accessMode(e.destination) === 'read_only'); }
       catch { await reply({title:'答复未提交',text:'问题已变化、已处理或答复无效，请刷新后重试。',actions:[]}); return {status:'rejected',reason:'invalid_or_expired_form'}; }
-      try {
-        op=await this.service.resolveInteraction({context:this.context(e,bound,decoded.revision,session.control.generation),interactionId:decoded.interactionId,expectedConnectionGeneration:decoded.connectionGeneration,answer:decoded.answer,toolInputDigest:null});
-      } catch (error) {
-        if (!decoded.declined) throw error;
-        await reply({title:'已跳过/取消',template:'grey',text:'已跳过或取消本次问题答复。',actions:[]});
-        return {status:'declined'};
-      }
+      op=await this.service.resolveInteraction({context:this.context(e,bound,decoded.revision,session.control.generation),interactionId:decoded.interactionId,expectedConnectionGeneration:decoded.connectionGeneration,answer:decoded.answer,toolInputDigest:null});
     }
     else if (a.action === 'answer') { const i = await this.service.getInteraction(a.interactionId); if (i.sessionId !== bound) throw new Error('interaction target mismatch'); op = await this.service.resolveInteraction({context:this.context(e,bound,a.revision,session.control.generation),interactionId:a.interactionId,expectedConnectionGeneration:a.connectionGeneration,answer:a.answer,toolInputDigest:a.toolInputDigest}); }
     else if (a.action === 'attachment') {
@@ -754,7 +754,8 @@ export class FeishuChannel {
           session.capabilities?.queue?.status === 'available'
             ? 'queue'
             : a.mode;
-        const promptText = `用户上传了 PDF 附件：${a.name}（${a.content.byteLength} 字节）\n本地路径：${a.localPath}\n请使用 read_file 读取该文件。`;
+        const byteSize = a.size ?? a.content.byteLength;
+        const promptText = `用户上传了 PDF 附件：${a.name}（${byteSize} 字节）\n本地路径：${a.localPath}\n请使用 read_file 读取该文件。`;
         queuedPreviewText = promptText;
         op = await this.service.submitInput({context:current(),mode:effectiveInputMode,blocks:[{type:'text',text:promptText}]});
       } else {

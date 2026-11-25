@@ -85,10 +85,16 @@ function multipleChoices(fields: Record<string, unknown>, keys: Set<string>, ind
 export function decodeQuestionForm(value:unknown, fields:unknown, current:Interaction, bindingId:string, readOnly = false, now = Date.now()): FormAnswerAction {
   const form=questionForm(current,bindingId,readOnly,now);
   if (!form.submittable || !record(value) || value.action !== 'answer_form' || value.bindingId !== form.bindingId || value.interactionId !== form.interactionId || value.revision !== form.revision || value.connectionGeneration !== form.connectionGeneration) throw new Error('expired or invalid form');
-  if (value.decline === true) {
-    const declinedAnswer: FormAnswerAction['answer'] = form.kind === 'question'
-      ? { kind: 'question', values: [DECLINED_ANSWER_MARKER] }
-      : { kind: 'question_group', answers: Object.fromEntries(form.questions.map(q => [q.id, [DECLINED_ANSWER_MARKER]])) };
+  if (value.decline === true || (record(fields) && fields.__decline === true)) {
+    const declinedValuesFor = (q: Question): string[] =>
+      !q.allowFreeText && q.choices.length > 0 ? [q.choices[0]!] : [DECLINED_ANSWER_MARKER];
+    const declinedAnswer = (form.kind === 'question'
+      ? { kind: 'question', values: declinedValuesFor(form.questions[0]!), action: 'decline' as const }
+      : {
+          kind: 'question_group',
+          answers: Object.fromEntries(form.questions.map(q => [q.id, declinedValuesFor(q)])),
+          action: 'decline' as const,
+        }) as unknown as FormAnswerAction['answer'];
     return {
       action: 'answer',
       bindingId: form.bindingId,

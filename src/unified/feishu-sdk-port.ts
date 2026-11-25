@@ -218,7 +218,7 @@ async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:s
     if (!isPdfBytes(content)) throw new ResourceRejected('unsupported');
     const displayName = attachmentDisplayName(rawName ?? 'document.pdf');
     const localPath = stageInboundLocalFile(envelope.eventId, displayName, content);
-    await handle(envelope, { action: 'attachment', name: displayName, mediaType: 'application/pdf', content, mode: 'new', localPath }, scope);
+    await handle(envelope, { action: 'attachment', name: displayName, mediaType: 'application/pdf', content: Buffer.alloc(0), size: content.length, mode: 'new', localPath }, scope);
     return;
   }
   if (resourceType === 'file' && !textHint && ((rawName && !isImageName) || (mime && !isImageMime) || (mime && mediaType && mime !== mediaType))) {
