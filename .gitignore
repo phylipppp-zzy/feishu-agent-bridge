@@ -10,3 +10,5 @@ env.pending
 *.sqlite-shm
 *.sqlite-wal
 coverage/
+
+.feishu-release-staging-*/
