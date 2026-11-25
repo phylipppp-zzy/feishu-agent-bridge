@@ -70,7 +70,7 @@ export async function deliverProjectFiles(
   try {
     files = await service.selectProjectFiles(sessionId, args);
   } catch {
-    throw new FileCommandError('文件选择失败：仅支持项目内路径和 *、?、[]、** 模式；凭据、符号链接、超限或不可读文件不会发送。');
+    throw new FileCommandError('文件选择失败：仅支持项目内路径和 *、?、[]、** 模式；凭据、越界符号链接、超限或不可读文件不会发送。');
   }
   if (files.length > 20 || files.reduce((size, file) => size + file.size, 0) > 20 * 1024 * 1024) {
     throw new FileCommandError('文件数量超过 20 个或总大小超过 20 MiB，未发送。');

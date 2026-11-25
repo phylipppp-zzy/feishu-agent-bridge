@@ -16,6 +16,17 @@ import {
   readAgySummaries,
   readAgyTranscript,
 } from '../src/unified/agy-catalog.js';
+import {
+  extractTokenUsage,
+  readAgyTranscriptCreatedAt,
+} from '../src/unified/agy/catalog-transcript.js';
+import {
+  closeAgyCatalogRefreshWorker,
+  getAgyCatalogRefreshWorkerSpawnCount,
+} from '../src/unified/agy/catalog-refresh.js';
+import { reconcilePersistedAgyHistory } from '../src/unified/agy/transcript-reconciliation.js';
+import { discoverNewerSessions, resolveCreatedAtInfo } from '../src/unified/agy/adapter-discovery.js';
+import type { Message } from '../src/unified/contracts.js';
 
 test('deriveAgySessionTitle skips role placeholders', () => {
   const id = '33333333-3333-4333-8333-333333333333';
@@ -641,5 +652,425 @@ test('discoverAgyArtifacts and readAgyArtifact enforce allowlist, excluded dirs/
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('readAgyTranscript degrades to compact transcript.jsonl when transcript_full.jsonl exceeds maxBytes and reports warnings', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agy-large-full-'));
+  try {
+    const brainDir = join(dir, 'brain');
+    const convId = 'conv-large-01';
+    const logsDir = join(brainDir, convId, '.system_generated', 'logs');
+    await mkdir(logsDir, { recursive: true });
+
+    const compactPath = join(logsDir, 'transcript.jsonl');
+    const fullPath = join(logsDir, 'transcript_full.jsonl');
+
+    await writeFile(
+      compactPath,
+      jsonl(
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:00Z',
+          content: '<USER_REQUEST>测试大文件降级</USER_REQUEST>',
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:05Z',
+          content: '紧凑版回复正文\n<truncated 50000 bytes>',
+          truncated_fields: ['content'],
+        },
+      ),
+    );
+    // Write a full transcript larger than our test maxBytes (4 KiB)
+    await writeFile(
+      fullPath,
+      jsonl({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-22T12:00:05Z',
+        content: 'X'.repeat(8192),
+      }),
+    );
+
+    const res = await readAgyTranscript(convId, { brainDir, maxBytes: 4096 });
+    assert.equal(res.messages.length, 2, 'must not return empty history on oversized transcript_full.jsonl');
+    assert.equal(res.messages[0]!.text, '测试大文件降级');
+    assert.equal(res.messages[1]!.text, '紧凑版回复正文');
+    assert.equal(res.fullTranscriptSkippedReason, 'full_transcript_exceeds_max_bytes');
+    assert.ok(res.warnings?.some((w) => w.includes('degraded to compact transcript.jsonl')));
+
+    // Primary-only oversized transcript_full.jsonl (missing compact transcript.jsonl) must degrade to tail window.
+    const convTailFull = 'conv-tail-full';
+    const tailFullLogs = join(brainDir, convTailFull, '.system_generated', 'logs');
+    await mkdir(tailFullLogs, { recursive: true });
+    await writeFile(
+      join(tailFullLogs, 'transcript_full.jsonl'),
+      jsonl(
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:00Z',
+          content: `<USER_REQUEST>${'A'.repeat(5000)}</USER_REQUEST>`,
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:10Z',
+          content: '尾部窗口保留的近期回复',
+        },
+      ),
+    );
+    const tailFullRes = await readAgyTranscript(convTailFull, { brainDir, maxBytes: 2048 });
+    assert.equal(tailFullRes.messages.length, 1);
+    assert.equal(tailFullRes.messages[0]!.text, '尾部窗口保留的近期回复');
+    assert.equal(tailFullRes.fullTranscriptSkippedReason, 'full_transcript_exceeds_max_bytes');
+    assert.ok(tailFullRes.warnings?.some((w) => w.includes('degraded to tail')));
+
+    // Oversized primary compact transcript.jsonl must also degrade to tail window instead of returning empty [].
+    const convTailCompact = 'conv-tail-compact';
+    const tailCompactLogs = join(brainDir, convTailCompact, '.system_generated', 'logs');
+    await mkdir(tailCompactLogs, { recursive: true });
+    await writeFile(
+      join(tailCompactLogs, 'transcript.jsonl'),
+      jsonl(
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:00Z',
+          content: `<USER_REQUEST>${'B'.repeat(5000)}</USER_REQUEST>`,
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:10Z',
+          content: '紧凑版尾部窗口保留回复',
+        },
+      ),
+    );
+    const tailCompactRes = await readAgyTranscript(convTailCompact, { brainDir, maxBytes: 2048 });
+    assert.equal(tailCompactRes.messages.length, 1);
+    assert.equal(tailCompactRes.messages[0]!.text, '紧凑版尾部窗口保留回复');
+    assert.ok(tailCompactRes.warnings?.some((w) => w.includes('degraded to tail')));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('readAgyTranscriptCreatedAt reads only 8 KiB header and unknown createdAt is never used as post-watermark proof', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agy-created-at-'));
+  try {
+    const brainDir = join(dir, 'brain');
+    const proj = join(dir, 'workspace');
+    await mkdir(proj, { recursive: true });
+    const convWithTs = 'conv-with-ts';
+    const convNoTs = 'conv-no-ts';
+    const logsWithTs = join(brainDir, convWithTs, '.system_generated', 'logs');
+    await mkdir(logsWithTs, { recursive: true });
+
+    // Put valid first line followed by 32 KiB of invalid lines that would fail full parse if read.
+    await writeFile(
+      join(logsWithTs, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 0,
+        type: 'SYSTEM_MESSAGE',
+        created_at: '2026-11-22T08:00:00Z',
+        content: 'init',
+      }) + '\n' + 'NOT_JSON_'.repeat(4000) + '\n',
+    );
+
+    const ts = await readAgyTranscriptCreatedAt(convWithTs, { brainDir });
+    assert.equal(ts, '2026-11-22T08:00:00.000Z');
+    assert.equal(await readAgyTranscriptCreatedAt(convNoTs, { brainDir }), null);
+
+    const dbPath = join(dir, 'conversation_summaries.db');
+    createSummaryDb(dbPath, [
+      {
+        conversation_id: convWithTs,
+        title: 'Old Session With Transcript',
+        step_count: 2,
+        last_modified_time: '2026-11-25 10:00:00+00:00',
+        last_user_input_time: '2026-11-25 10:00:00+00:00',
+        workspace_uris: JSON.stringify([pathToFileURL(proj).href]),
+      },
+      {
+        conversation_id: convNoTs,
+        title: 'Old Session Without Transcript',
+        step_count: 2,
+        last_modified_time: '2026-11-25 10:00:00+00:00',
+        last_user_input_time: '2026-11-25 10:00:00+00:00',
+        workspace_uris: JSON.stringify([pathToFileURL(proj).href]),
+      },
+    ]);
+
+    const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [proj] });
+    catalog.refresh();
+    const fakeCtx: any = {
+      catalog,
+      transport: { connected: false, connectionGeneration: 1 },
+      isClosed: () => false,
+      pruneSnapshots: () => {},
+      recentDiscovery: new Map(),
+      controlEpoch: new Map(),
+      serviceId: 'agy-svc',
+      buildSession: (id: string, _s: any, _m: any, createdAt?: string) => ({
+        sessionId: id,
+        createdAt,
+        project: proj,
+        title: id,
+      }),
+    };
+
+    const infoNoTs = await resolveCreatedAtInfo(fakeCtx, catalog.get(convNoTs)!);
+    assert.deepEqual(infoNoTs, { createdAt: null, source: 'unknown' });
+
+    const infoWithTs = await resolveCreatedAtInfo(fakeCtx, catalog.get(convWithTs)!);
+    assert.deepEqual(infoWithTs, { createdAt: '2026-11-22T08:00:00.000Z', source: 'transcript' });
+
+    // Watermark is 2026-11-24: convNoTs has lastModifiedAt on 2026-11-25, but unknown createdAt must NOT pass!
+    const newer = await discoverNewerSessions(fakeCtx, Date.parse('2026-11-24T00:00:00Z'), null, 10);
+    assert.equal(newer.items.length, 0);
+  } finally {
+    await closeAgyCatalogRefreshWorker();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('AgyCatalog supports multiple brainDirs, reusable refresh worker, and preserves missing token usage fields', async () => {
+  // extractTokenUsage must not zero-fill missing/null fields
+  assert.deepEqual(extractTokenUsage({ input_tokens: 120, output_tokens: 30 }), {
+    inputTokens: 120,
+    outputTokens: 30,
+  });
+  assert.deepEqual(extractTokenUsage({ input_tokens: 120, cache_read_tokens: null, output_tokens: 30 }), {
+    inputTokens: 120,
+    outputTokens: 30,
+  });
+  assert.equal(extractTokenUsage({ input_tokens: -1, output_tokens: 10 }), null);
+  assert.equal(extractTokenUsage({ input_tokens: null, output_tokens: undefined }), null);
+
+  const dir = await mkdtemp(join(tmpdir(), 'agy-multi-brain-'));
+  try {
+    const cliBrain = join(dir, 'antigravity-cli', 'brain');
+    const ideBrain = join(dir, 'antigravity', 'brain');
+    const proj = join(dir, 'workspace');
+    await mkdir(proj, { recursive: true });
+
+    const ideConv = 'conv-ide-01';
+    const ideLogs = join(ideBrain, ideConv, '.system_generated', 'logs');
+    await mkdir(ideLogs, { recursive: true });
+    await writeFile(
+      join(ideLogs, 'transcript.jsonl'),
+      jsonl({
+        step_index: 0,
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-22T12:00:00Z',
+        content: '<USER_REQUEST>IDE 会话首条提问</USER_REQUEST>',
+      }),
+    );
+
+    const dbPath = join(dir, 'conversation_summaries.db');
+    createSummaryDb(dbPath, [
+      {
+        conversation_id: ideConv,
+        title: '',
+        preview: '',
+        step_count: 1,
+        app_data_dir: 'antigravity',
+        workspace_uris: JSON.stringify([pathToFileURL(proj).href]),
+      },
+    ]);
+
+    const catalog = new AgyCatalog({
+      dbPath,
+      brainDirs: [cliBrain, ideBrain],
+      allowedProjectRoots: [proj],
+    });
+    const beforeSpawns = getAgyCatalogRefreshWorkerSpawnCount();
+    const first = await catalog.refreshAsync();
+    const afterFirst = getAgyCatalogRefreshWorkerSpawnCount();
+    const second = await catalog.refreshAsync();
+    const afterSecond = getAgyCatalogRefreshWorkerSpawnCount();
+
+    assert.equal(first.length, 1);
+    assert.equal(first[0]!.title, 'IDE 会话首条提问');
+    assert.equal(second.length, 1);
+    assert.equal(afterSecond, afterFirst, 'refresh worker should be reused across calls');
+    assert.ok(afterFirst >= beforeSpawns);
+
+    const tr = await catalog.readTranscript(ideConv);
+    assert.equal(tr.messages.length, 1);
+    assert.equal(tr.messages[0]!.text, 'IDE 会话首条提问');
+
+    // Even when only single brainDir (CLI) is configured, sibling IDE brain dir is resolved via app_data_dir.
+    const singleBrainCatalog = new AgyCatalog({
+      dbPath,
+      brainDir: cliBrain,
+      allowedProjectRoots: [proj],
+    });
+    const singleSessions = singleBrainCatalog.refresh();
+    assert.equal(singleSessions.length, 1);
+    assert.equal(singleSessions[0]!.title, 'IDE 会话首条提问');
+    const singleTr = await singleBrainCatalog.readTranscript(ideConv);
+    assert.equal(singleTr.messages.length, 1);
+    assert.equal(singleTr.messages[0]!.text, 'IDE 会话首条提问');
+  } finally {
+    await closeAgyCatalogRefreshWorker();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('discoverAgyArtifacts supports expanded extensions, on-demand scratch, and whitelisted symlinks', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agy-art-ext-'));
+  try {
+    const brainDir = join(dir, 'brain');
+    const outputsDir = join(dir, 'outputs');
+    const outsideDir = join(dir, 'outside');
+    const convId = 'conv-ext-01';
+    const sessionDir = join(brainDir, convId);
+    await mkdir(join(sessionDir, 'scratch'), { recursive: true });
+    await mkdir(outputsDir, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+
+    await writeFile(join(sessionDir, 'metrics.json'), '{"ok":true}');
+    await writeFile(join(sessionDir, 'analyze.py'), 'print("hi")\n');
+    await writeFile(join(sessionDir, 'run.sh'), '#!/bin/sh\necho ok\n');
+    await writeFile(join(sessionDir, 'paper.tex'), '\\section{Intro}\n');
+    await writeFile(join(sessionDir, 'fig.svg'), '<svg></svg>');
+    await writeFile(join(sessionDir, 'config.yaml'), 'a: 1\n');
+    await writeFile(join(sessionDir, 'scratch', 'probe.py'), 'print("scratch")\n');
+
+    await writeFile(join(outputsDir, 'result.json'), '{"acc":0.95}');
+    await writeFile(join(outputsDir, '.env'), 'SECRET=nope');
+    await writeFile(join(outsideDir, 'leak.json'), '{"leak":true}');
+
+    await symlink(join(outputsDir, 'result.json'), join(sessionDir, 'linked_result.json'));
+    await symlink(join(outputsDir, '.env'), join(sessionDir, 'linked_secret.json'));
+    await symlink(join(outsideDir, 'leak.json'), join(sessionDir, 'linked_outside.json'));
+
+    const defaultList = await discoverAgyArtifacts(convId, {
+      brainDir,
+      allowedSymlinkRoots: [outputsDir],
+    });
+    const rels = defaultList.map((e) => e.relativePath);
+    assert.deepEqual(rels, [
+      'analyze.py',
+      'config.yaml',
+      'fig.svg',
+      'linked_result.json',
+      'metrics.json',
+      'paper.tex',
+      'run.sh',
+    ]);
+
+    const withScratch = await discoverAgyArtifacts(convId, {
+      brainDir,
+      allowedSymlinkRoots: [outputsDir],
+      includeScratch: true,
+    });
+    assert.ok(withScratch.some((e) => e.relativePath === 'scratch/probe.py'));
+
+    const linkedRead = await readAgyArtifact(convId, 'linked_result.json', {
+      brainDir,
+      allowedSymlinkRoots: [outputsDir],
+    });
+    assert.equal(Buffer.from(linkedRead.content).toString('utf8'), '{"acc":0.95}');
+
+    await assert.rejects(
+      readAgyArtifact(convId, 'linked_outside.json', { brainDir, allowedSymlinkRoots: [outputsDir] }),
+    );
+    await assert.rejects(
+      readAgyArtifact(convId, 'linked_secret.json', { brainDir, allowedSymlinkRoots: [outputsDir] }),
+    );
+
+    // Even when the parent directory containing reviews/ or projtool/ is in allowedSymlinkRoots,
+    // symlinks targeting confidential blind-review materials or projtool must remain strictly blocked.
+    const parentRoot = join(dir, 'home-like');
+    const reviewsDir = join(parentRoot, 'reviews');
+    const projtoolDir = join(parentRoot, 'projects', 'projtool');
+    await mkdir(reviewsDir, { recursive: true });
+    await mkdir(projtoolDir, { recursive: true });
+    await writeFile(join(reviewsDir, 'blind_review.md'), 'CONFIDENTIAL REVIEW');
+    await writeFile(join(projtoolDir, 'internal.md'), 'PROJTOOL INTERNAL');
+    await symlink(join(reviewsDir, 'blind_review.md'), join(sessionDir, 'linked_review.md'));
+    await symlink(join(projtoolDir, 'internal.md'), join(sessionDir, 'linked_projtool.md'));
+
+    const withParentRoot = await discoverAgyArtifacts(convId, {
+      brainDir,
+      allowedSymlinkRoots: [parentRoot, outputsDir],
+    });
+    assert.equal(withParentRoot.some((e) => e.relativePath === 'linked_review.md'), false);
+    assert.equal(withParentRoot.some((e) => e.relativePath === 'linked_projtool.md'), false);
+    await assert.rejects(
+      readAgyArtifact(convId, 'linked_review.md', { brainDir, allowedSymlinkRoots: [parentRoot, outputsDir] }),
+    );
+    await assert.rejects(
+      readAgyArtifact(convId, 'linked_projtool.md', { brainDir, allowedSymlinkRoots: [parentRoot, outputsDir] }),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconcilePersistedAgyHistory preserves both sources and marks conflict when repeated prompt has divergent native reply', () => {
+  const mkMsg = (
+    messageId: string,
+    turnId: string,
+    role: 'user' | 'assistant',
+    text: string,
+    sequence: number,
+  ): Message => ({
+    messageId,
+    sessionId: 's1',
+    turnId,
+    role,
+    blocks: [{ type: 'text', text }],
+    sequence,
+    revision: 1,
+    final: true,
+    source: 'agy',
+  });
+
+  const persisted = new Map<string, Message>([
+    ['live-u1', mkMsg('live-u1', 'turn-live-1', 'user', '继续', 1)],
+    ['live-a1', mkMsg('live-a1', 'turn-live-1', 'assistant', '本地记录的回复 A', 2)],
+  ]);
+
+  const observed = {
+    messages: [
+      mkMsg('native-u1', 'step-1', 'user', '继续', 1),
+      mkMsg('native-a1', 'step-2', 'assistant', '原生完全不同的新回复 B', 2),
+    ],
+    turns: [],
+  };
+
+  const res = reconcilePersistedAgyHistory(observed, persisted);
+  assert.equal(res.conflicts.length, 1);
+  assert.equal(res.conflicts[0]!.reason, 'divergent_reply');
+  assert.equal(res.conflicts[0]!.liveTurnId, 'turn-live-1');
+  assert.equal(res.conflicts[0]!.nativeTurnId, 'step-1');
+  assert.equal(res.snapshot.messages.length, 2, 'must not silently drop divergent native reply');
+  const nativeReplyText = res.snapshot.messages[1]!.blocks[0]!;
+  assert.equal(nativeReplyText.type, 'text');
+  if (nativeReplyText.type === 'text') {
+    assert.match(nativeReplyText.text, /对账冲突/);
+    assert.match(nativeReplyText.text, /原生完全不同的新回复 B/);
   }
 });

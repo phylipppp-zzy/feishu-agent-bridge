@@ -25,6 +25,8 @@ export type AgyQuotaState =
 
 export type AgyQuotaHealthStatus = 'healthy' | 'degraded' | 'unverified';
 
+export type AgyQuotaValidity = 'valid' | 'partial' | 'invalid' | 'cached' | 'expired' | 'unavailable';
+
 export interface AgyQuotaWindow {
   group: string;
   label: string;
@@ -58,21 +60,33 @@ export interface AgyQuotaHealthProjection {
 
 export interface AgyQuotaSnapshot {
   state: AgyQuotaState;
+  validity?: AgyQuotaValidity;
   source: 'live' | 'cache' | 'none';
   apiKeyMode: boolean;
   fromCache: boolean;
   stale: boolean;
+  cacheExpired?: boolean;
   timedOut: boolean;
   exitCode: number | null;
   binaryPath: string | null;
   short: AgyQuotaWindow | null;
   weekly: AgyQuotaWindow | null;
   windows: AgyQuotaWindow[];
+  invalidBuckets?: number;
+  warnings?: string[];
   lastSnapshotAt: string | null;
   observedAt: string;
   ageSeconds: number;
   error: string | null;
   health: AgyQuotaHealthProjection;
+}
+
+export interface AgyUsageParseResult {
+  windows: AgyQuotaWindow[] | null;
+  error: string | null;
+  validity: 'valid' | 'partial' | 'invalid';
+  invalidBuckets: number;
+  warnings: string[];
 }
 
 export interface AgyQuotaQueryOptions {
@@ -219,18 +233,21 @@ function parseJsonObjectFromOutput(rawText: string): { parsed: Record<string, un
 
 /**
  * Parse raw stdout of `agy -p /usage --output-format json` into normalized quota windows.
- * Reuses `antigravityusage.py` semantics: ANSI cleanup, last-line JSON fallback, and `reset_time <= 86400` -> `null`.
+ * Strictly validates `remaining_fraction` in `[0, 1]` (never clamping out-of-range values to 0%/100%)
+ * and classifies payloads into `valid`, `partial`, or `invalid`.
  */
 export function parseAgyUsageJson(
   rawText: string,
   snapshotMs: number = Date.now(),
-): { windows: AgyQuotaWindow[] | null; error: string | null } {
+): AgyUsageParseResult {
   const { parsed, parseError } = parseJsonObjectFromOutput(rawText);
-  if (!parsed) return { windows: null, error: parseError };
+  if (!parsed) {
+    return { windows: null, error: parseError, validity: 'invalid', invalidBuckets: 0, warnings: [] };
+  }
 
   if (parsed.status !== 'SUCCESS') {
     const errText = safeId(parsed.error, 200) ?? `agy /usage status=${String(parsed.status ?? 'unknown')}`;
-    return { windows: null, error: errText };
+    return { windows: null, error: errText, validity: 'invalid', invalidBuckets: 0, warnings: [] };
   }
 
   const command = parsed.command;
@@ -244,25 +261,52 @@ export function parseAgyUsageJson(
       : undefined;
 
   if (!Array.isArray(groups)) {
-    return { windows: null, error: 'missing groups array in agy /usage output' };
+    return {
+      windows: null,
+      error: 'missing groups array in agy /usage output',
+      validity: 'invalid',
+      invalidBuckets: 0,
+      warnings: [],
+    };
   }
 
   const snapIso = new Date(snapshotMs).toISOString();
   const windows: AgyQuotaWindow[] = [];
+  let invalidBuckets = 0;
+  const warnings: string[] = [];
 
   for (const grp of groups) {
-    if (!grp || typeof grp !== 'object' || Array.isArray(grp)) continue;
+    if (!grp || typeof grp !== 'object' || Array.isArray(grp)) {
+      invalidBuckets += 1;
+      warnings.push('invalid quota group entry (expected object)');
+      continue;
+    }
     const g = grp as Record<string, unknown>;
     const group = normalizeGroupShortName(g.name);
-    const buckets = Array.isArray(g.buckets) ? g.buckets : [];
+    if (!Array.isArray(g.buckets)) {
+      invalidBuckets += 1;
+      warnings.push(`quota group "${group}" missing buckets array`);
+      continue;
+    }
 
-    for (const rawBucket of buckets) {
-      if (!rawBucket || typeof rawBucket !== 'object' || Array.isArray(rawBucket)) continue;
+    for (const rawBucket of g.buckets) {
+      if (!rawBucket || typeof rawBucket !== 'object' || Array.isArray(rawBucket)) {
+        invalidBuckets += 1;
+        warnings.push(`invalid quota bucket in group "${group}"`);
+        continue;
+      }
       const b = rawBucket as Record<string, unknown>;
       const frac = b.remaining_fraction;
-      if (typeof frac !== 'number' || !Number.isFinite(frac)) continue;
+      if (typeof frac !== 'number' || !Number.isFinite(frac) || frac < 0 || frac > 1) {
+        invalidBuckets += 1;
+        const bucketId = safeId(b.id, 60) ?? safeId(b.window, 40) ?? 'unknown';
+        warnings.push(
+          `invalid remaining_fraction for ${group}/${bucketId}: ${String(frac)} (expected [0, 1])`,
+        );
+        continue;
+      }
 
-      const rem = Math.max(0, Math.min(100, frac * 100));
+      const rem = frac * 100;
       const winRaw = safeId(b.window, 40) ?? '';
       let windowType: AgyQuotaWindow['windowType'] = 'other';
       let winLabel = winRaw || '窗口';
@@ -311,9 +355,21 @@ export function parseAgyUsageJson(
   }
 
   if (windows.length === 0) {
-    return { windows: null, error: 'no valid quota buckets in agy /usage output' };
+    return {
+      windows: null,
+      error: warnings[0] ?? 'no valid quota buckets in agy /usage output',
+      validity: 'invalid',
+      invalidBuckets,
+      warnings,
+    };
   }
-  return { windows, error: null };
+  return {
+    windows,
+    error: null,
+    validity: invalidBuckets > 0 ? 'partial' : 'valid',
+    invalidBuckets,
+    warnings,
+  };
 }
 
 function selectSummaryWindows(windows: readonly AgyQuotaWindow[]): {
@@ -371,11 +427,11 @@ function normalizeCachedWindow(raw: unknown, snapSec: number, nowSec: number, st
 
   const remRaw = item.remainingPercent !== undefined ? item.remainingPercent : item.remaining_percent;
   const usedRaw = item.usedPercent !== undefined ? item.usedPercent : item.used_percent;
-  if (typeof remRaw !== 'number' || !Number.isFinite(remRaw)) return null;
-  const remainingPercent = round4(Math.max(0, Math.min(100, remRaw)));
+  if (typeof remRaw !== 'number' || !Number.isFinite(remRaw) || remRaw < 0 || remRaw > 100) return null;
+  const remainingPercent = round4(remRaw);
   const usedPercent =
-    typeof usedRaw === 'number' && Number.isFinite(usedRaw)
-      ? round4(Math.max(0, Math.min(100, usedRaw)))
+    typeof usedRaw === 'number' && Number.isFinite(usedRaw) && usedRaw >= 0 && usedRaw <= 100
+      ? round4(usedRaw)
       : round4(100 - remainingPercent);
 
   const snapshotAtRaw = item.snapshotAt !== undefined ? item.snapshotAt : item.snapshot_at;
@@ -411,7 +467,7 @@ export async function readAgyQuotaCache(
   cachePath: string,
   nowMs: number = Date.now(),
   markStale = false,
-): Promise<{ windows: AgyQuotaWindow[]; ageSeconds: number; snapshotAt: string } | null> {
+): Promise<{ windows: AgyQuotaWindow[]; ageSeconds: number; snapshotAt: string; expired: boolean } | null> {
   let raw: string;
   try {
     raw = await readFile(resolve(cachePath), 'utf8');
@@ -437,12 +493,23 @@ export async function readAgyQuotaCache(
     const normalized = normalizeCachedWindow(w, snapSec, nowSec, markStale);
     if (normalized) valid.push(normalized);
   }
-  if (valid.length === 0) return null;
+  if (valid.length === 0) {
+    if (rawWindows.length > 0) {
+      return {
+        windows: [],
+        ageSeconds: Math.max(0, Math.floor(nowSec - snapSec)),
+        snapshotAt: new Date(snapSec * 1000).toISOString(),
+        expired: true,
+      };
+    }
+    return null;
+  }
 
   return {
     windows: valid,
     ageSeconds: Math.max(0, Math.floor(nowSec - snapSec)),
     snapshotAt: lastSnapshotIso(valid) ?? new Date(snapSec * 1000).toISOString(),
+    expired: false,
   };
 }
 
@@ -579,6 +646,22 @@ export function projectAgyQuotaHealth(
   const prevFailureReason = previous?.lastFailureReason ?? null;
 
   if (snapshot.state === 'ok') {
+    if (snapshot.validity === 'partial') {
+      const reason = `部分配额桶数值无效已忽略（${snapshot.invalidBuckets ?? 0} 项）`;
+      return {
+        component: 'agy_quota',
+        status: 'degraded',
+        reason,
+        updatedAt: snapshot.observedAt,
+        lastObservedAt: snapshot.observedAt,
+        lastSuccessAt: snapshot.lastSnapshotAt ?? snapshot.observedAt,
+        lastFailureAt: snapshot.observedAt,
+        lastFailureReason: reason,
+        backlog: null,
+        unknown: null,
+        lastDeliveryAt: null,
+      };
+    }
     return {
       component: 'agy_quota',
       status: 'healthy',
@@ -666,6 +749,9 @@ export async function queryAgyQuota(options: AgyQuotaQueryOptions = {}): Promise
   let timedOut = false;
   let apiKeyMode = false;
   let liveWindows: AgyQuotaWindow[] | null = null;
+  let liveValidity: 'valid' | 'partial' | 'invalid' = 'invalid';
+  let invalidBuckets = 0;
+  let warnings: string[] = [];
 
   if (!offline) {
     if (!binaryPath) {
@@ -689,6 +775,9 @@ export async function queryAgyQuota(options: AgyQuotaQueryOptions = {}): Promise
         liveError = parsedErr ?? stderrHint ?? `agy /usage 退出码 ${String(proc.exitCode)}`;
       } else {
         const parsed = parseAgyUsageJson(proc.stdout, nowMs);
+        liveValidity = parsed.validity;
+        invalidBuckets = parsed.invalidBuckets;
+        warnings = parsed.warnings;
         if (parsed.windows) {
           liveWindows = parsed.windows;
         } else {
@@ -707,16 +796,20 @@ export async function queryAgyQuota(options: AgyQuotaQueryOptions = {}): Promise
     const snapAt = lastSnapshotIso(liveWindows) ?? observedAt;
     const base: Omit<AgyQuotaSnapshot, 'health'> = {
       state: 'ok',
+      validity: liveValidity,
       source: 'live',
       apiKeyMode: false,
       fromCache: false,
       stale: false,
+      cacheExpired: false,
       timedOut: false,
       exitCode,
       binaryPath,
       short,
       weekly,
       windows: liveWindows,
+      invalidBuckets,
+      warnings,
       lastSnapshotAt: snapAt,
       observedAt,
       ageSeconds: 0,
@@ -728,16 +821,20 @@ export async function queryAgyQuota(options: AgyQuotaQueryOptions = {}): Promise
   if (apiKeyMode) {
     const base: Omit<AgyQuotaSnapshot, 'health'> = {
       state: 'api_key_mode',
+      validity: 'unavailable',
       source: 'live',
       apiKeyMode: true,
       fromCache: false,
       stale: false,
+      cacheExpired: false,
       timedOut: false,
       exitCode,
       binaryPath,
       short: null,
       weekly: null,
       windows: [],
+      invalidBuckets: 0,
+      warnings: [],
       lastSnapshotAt: options.previousHealth?.lastSuccessAt ?? null,
       observedAt,
       ageSeconds: 0,
@@ -746,23 +843,28 @@ export async function queryAgyQuota(options: AgyQuotaQueryOptions = {}): Promise
     return { ...base, health: projectAgyQuotaHealth(base, options.previousHealth) };
   }
 
+  let cacheExpired = false;
   if (options.cachePath) {
     const resolvedCachePath = resolve(expandHome(options.cachePath, env?.HOME || homedir()));
     const cached = await readAgyQuotaCache(resolvedCachePath, nowMs, !offline);
-    if (cached) {
+    if (cached && !cached.expired) {
       const { short, weekly } = selectSummaryWindows(cached.windows);
       const base: Omit<AgyQuotaSnapshot, 'health'> = {
         state: 'cached',
+        validity: 'cached',
         source: 'cache',
         apiKeyMode: false,
         fromCache: true,
         stale: !offline,
+        cacheExpired: false,
         timedOut,
         exitCode,
         binaryPath,
         short,
         weekly,
         windows: cached.windows,
+        invalidBuckets,
+        warnings,
         lastSnapshotAt: cached.snapshotAt,
         observedAt,
         ageSeconds: cached.ageSeconds,
@@ -770,30 +872,79 @@ export async function queryAgyQuota(options: AgyQuotaQueryOptions = {}): Promise
       };
       return { ...base, health: projectAgyQuotaHealth(base, options.previousHealth) };
     }
+    if (cached?.expired) {
+      cacheExpired = true;
+    }
   }
 
   const base: Omit<AgyQuotaSnapshot, 'health'> = {
     state: offline ? 'offline_empty' : timedOut ? 'timeout' : 'unavailable',
+    validity: cacheExpired ? 'expired' : liveValidity === 'invalid' && invalidBuckets > 0 ? 'invalid' : 'unavailable',
     source: 'none',
     apiKeyMode: false,
     fromCache: false,
     stale: false,
+    cacheExpired,
     timedOut,
     exitCode,
     binaryPath,
     short: null,
     weekly: null,
     windows: [],
+    invalidBuckets,
+    warnings,
     lastSnapshotAt: options.previousHealth?.lastSuccessAt ?? null,
     observedAt,
     ageSeconds: 0,
-    error: offline ? '离线模式且无可用额度缓存' : liveError,
+    error: offline
+      ? cacheExpired
+        ? '离线模式且本地额度缓存已过期'
+        : '离线模式且无可用额度缓存'
+      : liveError,
   };
   return { ...base, health: projectAgyQuotaHealth(base, options.previousHealth) };
 }
 
-/** Stateful quota client retaining health history (`lastSuccessAt`, `lastFailureAt`) across polls. */
+/** Format a structured quota snapshot into human-readable summary lines for `/quota` and `/health`. */
+export function formatAgyQuotaSummary(snapshot: AgyQuotaSnapshot | null): string {
+  if (!snapshot) return 'Antigravity 额度：尚未采样';
+  if (snapshot.state === 'api_key_mode') {
+    return 'Antigravity 额度：当前为 GEMINI_API_KEY 模式（无账号额度窗口）';
+  }
+  const lines: string[] = [];
+  const stateLabel =
+    snapshot.validity === 'valid'
+      ? '实时有效'
+      : snapshot.validity === 'partial'
+        ? `部分有效（忽略 ${snapshot.invalidBuckets ?? 0} 个非法桶）`
+        : snapshot.validity === 'cached'
+          ? snapshot.stale
+            ? `缓存回退（已滞后 ${snapshot.ageSeconds}s）`
+            : `离线缓存（采样于 ${snapshot.ageSeconds}s 前）`
+          : snapshot.validity === 'expired'
+            ? '缓存已过期'
+            : snapshot.validity === 'invalid'
+              ? '数值无效'
+              : '不可用';
+  lines.push(`Antigravity 额度状态：${stateLabel}`);
+  if (snapshot.windows.length > 0) {
+    for (const w of snapshot.windows) {
+      const resetPart = w.resetsAt ? `，重置 ${w.resetsAt}` : '';
+      const disabledPart = w.disabled ? '（已禁用）' : '';
+      lines.push(`- ${w.label}：剩余 ${w.remainingPercent}%（已用 ${w.usedPercent}%${resetPart}）${disabledPart}`);
+    }
+  } else if (snapshot.error) {
+    lines.push(`原因：${snapshot.error}`);
+  }
+  if (snapshot.lastSnapshotAt) {
+    lines.push(`采样时间：${snapshot.lastSnapshotAt}`);
+  }
+  return lines.join('\n');
+}
+
+/** Stateful quota client retaining health history (`lastSuccessAt`, `lastFailureAt`) and last structured snapshot across polls. */
 export class AgyQuotaClient {
+  private lastSnapshot: AgyQuotaSnapshot | null = null;
   private lastHealth: AgyQuotaHealthProjection = {
     component: 'agy_quota',
     status: 'unverified',
@@ -816,8 +967,13 @@ export class AgyQuotaClient {
       ...overrides,
       previousHealth: this.lastHealth,
     });
+    this.lastSnapshot = snapshot;
     this.lastHealth = snapshot.health;
     return snapshot;
+  }
+
+  snapshot(): AgyQuotaSnapshot | null {
+    return this.lastSnapshot ? structuredClone(this.lastSnapshot) : null;
   }
 
   health(): AgyQuotaHealthProjection {

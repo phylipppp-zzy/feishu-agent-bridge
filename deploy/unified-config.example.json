@@ -1,0 +1,86 @@
+{
+  "sdkDb": "/home/<user>/.local/share/feishu-unified-bridge/state/sdk.sqlite",
+  "runtime": {
+    "coreDb": "/home/<user>/.local/share/feishu-unified-bridge/state/core.sqlite",
+    "channelDb": "/home/<user>/.local/share/feishu-unified-bridge/state/channel.sqlite",
+    "artifactStatePath": "/home/<user>/.local/share/feishu-unified-bridge/state/artifacts.json",
+    "ownerOpenId": "ou_xxxxxxxxxxxxxxxxxxxxxxxx",
+    "allowedDestinations": [
+      "oc_xxxxxxxxxxxxxxxxxxxxxxxx"
+    ],
+    "hostId": "local-host",
+    "claudeServiceId": "claude-sdk",
+    "codexServiceId": "codex-app-server",
+    "claudeStateDir": "/home/<user>/.local/share/feishu-unified-bridge/state/claude",
+    "codexEndpoint": "codex-proxy://default",
+    "intervalMs": 1500,
+    "allowedProjectRoots": [
+      "/home/<user>/workspace",
+      "/home/<user>/papers",
+      "/home/<user>/research"
+    ],
+    "outputRoots": [
+      "/data/<user>/outputs",
+      "/ssd/<user>/scratch",
+      "/home/<user>/workspace"
+    ],
+    "approvalPolicy": {
+      "enabled": true,
+      "extraWriteRoots": [
+        "/ssd/<user>/scratch",
+        "/data/<user>/outputs",
+        "/data/<user>/staging"
+      ]
+    },
+    "catalogSources": [
+      {
+        "provider": "claude",
+        "hostId": "local-host",
+        "serviceId": "claude-sdk",
+        "directory": "/home/<user>/.claude/projects"
+      },
+      {
+        "provider": "codex",
+        "hostId": "local-host",
+        "serviceId": "codex-app-server",
+        "directory": "/home/<user>/.codex/sessions"
+      }
+    ],
+    "autoMirror": {
+      "enabled": true,
+      "destination": "oc_xxxxxxxxxxxxxxxxxxxxxxxx",
+      "showTitles": true
+    },
+    "agy": {
+      "enabled": true,
+      "serviceId": "agy-acp",
+      "binPath": "/home/<user>/.gemini/bin/agy",
+      "summariesDbPath": "/home/<user>/.gemini/antigravity/conversation_summaries.db",
+      "brainDir": "/home/<user>/.gemini/antigravity-cli/brain",
+      "quotaCachePath": "/home/<user>/.local/share/feishu-unified-bridge/state/agy-quota.json",
+      "sandbox": false,
+      "processPerSession": true
+    },
+    "taskTopic": {
+      "enabled": false
+    },
+    "watchHub": {
+      "enabled": false,
+      "destination": "oc_xxxxxxxxxxxxxxxxxxxxxxxx",
+      "dbPath": "/home/<user>/.local/share/feishu-unified-bridge/state/watch-hub.sqlite"
+    },
+    "pendingHub": {
+      "enabled": true,
+      "destination": "oc_xxxxxxxxxxxxxxxxxxxxxxxx",
+      "dbPath": "/home/<user>/.local/share/feishu-unified-bridge/state/pending-hub.sqlite"
+    },
+    "decisionSync": {
+      "enabled": false,
+      "dbPath": "/home/<user>/.local/share/feishu-unified-bridge/state/decision-sync.sqlite",
+      "markdownPath": "/home/<user>/research/decisions-view.md",
+      "protectedReadOnlyPaths": [
+        "/home/<user>/待你决定.md"
+      ]
+    }
+  }
+}

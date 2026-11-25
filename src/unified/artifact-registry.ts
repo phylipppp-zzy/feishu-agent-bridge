@@ -7,7 +7,17 @@ import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { Artifact, NativeSessionRef, Page } from './contracts.js';
 
 const digest = (v: string | Uint8Array) => createHash('sha256').update(v).digest('hex');
-interface Entry { artifact: Artifact; path: string; root: string }
+export interface RegisteredArtifact extends Artifact {
+  contentChanged?: boolean;
+  previousContentVersion?: string;
+}
+export interface ArtifactContentChangeStatus {
+  changed: boolean;
+  currentVersion: string | null;
+  previousVersion: string | null;
+  notice: string | null;
+}
+interface Entry { artifact: Artifact; path: string; root: string; previousContentVersion?: string; contentChanged?: boolean }
 /** Roots are set by trusted session/project configuration, never by channel requests. */
 export class ArtifactRegistry {
   private readonly entries = new Map<string, Entry>();
@@ -61,7 +71,9 @@ export class ArtifactRegistry {
       const a = x?.artifact;
       if (!a || typeof a.sessionId !== 'string' || typeof x.path !== 'string' || !isAbsolute(x.path) || typeof x.root !== 'string'  || a.artifactId !== digest(JSON.stringify([a.sessionId,x.path])) || typeof a.name !== 'string' || a.name !== basename(x.path) || (a.relativePath !== undefined && typeof a.relativePath !== 'string') || typeof a.mediaType !== 'string' || !Number.isSafeInteger(a.size) || a.size < 0 || a.size > this.maxBytes || !/^[a-f0-9]{64}$/.test(a.contentVersion)) throw new Error('invalid artifact registry entry');
       if (loaded.has(a.artifactId)) throw new Error('duplicate artifact registry entry');
-      loaded.set(a.artifactId,{artifact:a,path:x.path,root:x.root});
+      const prevVer = typeof x.previousContentVersion === 'string' && /^[a-f0-9]{64}$/.test(x.previousContentVersion) ? x.previousContentVersion : undefined;
+      const changed = x.contentChanged === true;
+      loaded.set(a.artifactId,{artifact:a,path:x.path,root:x.root,...(prevVer ? {previousContentVersion:prevVer} : {}),...(changed ? {contentChanged:true} : {})});
     }
     const times = (state as any).eventTimes ?? {}; if (!times || typeof times !== 'object' || Array.isArray(times) || Object.entries(times).some(([k,v])=>!/^[a-f0-9]{64}$/.test(k) || typeof v !== 'string' || !Number.isFinite(Date.parse(v)))) throw new Error('invalid event times');
     this.entries.clear(); for (const [k,v] of loaded) this.entries.set(k,v); this.eventTimes.clear(); for (const [k,v] of Object.entries(times)) this.eventTimes.set(k,v as string);
@@ -85,18 +97,62 @@ export class ArtifactRegistry {
     } finally { await handle.close(); }
   }
   /** Called only for a path observed as an output or an explicitly trusted safe file reference. */
-  async register(sessionId: string, observedPath: string, mediaType = 'application/octet-stream', explicit = false): Promise<Artifact> {
+  async register(sessionId: string, observedPath: string, mediaType = 'application/octet-stream', explicit = false): Promise<RegisteredArtifact> {
     if (!isAbsolute(observedPath)) throw new Error('absolute observed path required');
     const roots = explicit && this.projectRoots[sessionId] ? [...(this.roots[sessionId] ?? []),this.projectRoots[sessionId]!] : (this.roots[sessionId] ?? []); let data: Uint8Array | undefined; let root = '';
     for (const candidate of roots) { try { data = await this.readSafe(observedPath,candidate); root = resolve(candidate); break; } catch { /* try another authorized root */ } }
     if (!data) throw new Error('artifact unavailable or outside allowed roots');
     const path = resolve(observedPath), artifactId = digest(JSON.stringify([sessionId,path]));
     const artifact: Artifact = {artifactId,sessionId,name:basename(path),mediaType,size:data.length,contentVersion:digest(data),relativePath:this.relativePathFor(sessionId,path,root)};
+    let contentChanged = false;
+    let previousContentVersion: string | undefined;
     const commit = this.tail.catch(()=>undefined).then(async () => {
-      const previous = this.entries.get(artifactId); this.entries.set(artifactId,{artifact,path,root});
+      const previous = this.entries.get(artifactId);
+      if (previous && previous.artifact.contentVersion !== artifact.contentVersion) {
+        contentChanged = true;
+        previousContentVersion = previous.artifact.contentVersion;
+      } else if (previous?.contentChanged) {
+        contentChanged = true;
+        previousContentVersion = previous.previousContentVersion;
+      }
+      this.entries.set(artifactId,{
+        artifact,
+        path,
+        root,
+        ...(contentChanged ? { contentChanged: true } : {}),
+        ...(previousContentVersion ? { previousContentVersion } : {}),
+      });
       try { await this.persist(); } catch (e) { if (previous) this.entries.set(artifactId,previous); else this.entries.delete(artifactId); throw e; }
     });
-    this.tail = commit; await commit; return {...artifact};
+    this.tail = commit; await commit;
+    return {
+      ...artifact,
+      ...(contentChanged ? { contentChanged: true } : {}),
+      ...(previousContentVersion ? { previousContentVersion } : {}),
+    };
+  }
+  getContentChangeStatus(sessionId: string, artifactId: string, expectedVersion?: string): ArtifactContentChangeStatus {
+    const e = this.entries.get(artifactId);
+    if (!e || !this.authorized(e) || e.artifact.sessionId !== sessionId) {
+      return { changed: false, currentVersion: null, previousVersion: null, notice: null };
+    }
+    if (expectedVersion && e.artifact.contentVersion !== expectedVersion) {
+      return {
+        changed: true,
+        currentVersion: e.artifact.contentVersion,
+        previousVersion: expectedVersion,
+        notice: '内容已变更：同路径文件已被新版本覆盖，旧版本字节不可再取回。',
+      };
+    }
+    if (e.contentChanged) {
+      return {
+        changed: true,
+        currentVersion: e.artifact.contentVersion,
+        previousVersion: e.previousContentVersion ?? null,
+        notice: '内容已变更：同路径文件已被新版本覆盖。',
+      };
+    }
+    return { changed: false, currentVersion: e.artifact.contentVersion, previousVersion: null, notice: null };
   }
   has(artifactId: string): boolean { return this.entries.has(artifactId); }
   findRegisteredReplyFiles(ref: NativeSessionRef, blocks: readonly import('./contracts.js').ContentBlock[]): Artifact[] {
@@ -124,7 +180,17 @@ export class ArtifactRegistry {
     const end = Math.min(offset+limit,items.length); return {items:items.slice(offset,end).map(x=>({...x})),nextCursor:end < items.length ? Buffer.from(JSON.stringify({sessionId,fingerprint,offset:end})).toString('base64url') : null};
   }
   async read(sessionId: string, artifactId: string, version: string): Promise<Uint8Array> {
-    const e = this.entries.get(artifactId); if (!e || !this.authorized(e) || e.artifact.sessionId !== sessionId || e.artifact.contentVersion !== version) throw new Error('artifact not found or stale version');
-    const bytes = await this.readSafe(e.path,e.root); if (digest(bytes) !== version) throw new Error('artifact changed'); return bytes;
+    const e = this.entries.get(artifactId);
+    if (!e || !this.authorized(e) || e.artifact.sessionId !== sessionId) {
+      throw new Error('artifact not found or stale version');
+    }
+    if (e.artifact.contentVersion !== version) {
+      throw new Error('内容已变更：同路径文件已被新版本覆盖，请重新获取最新文件列表（artifact content changed）');
+    }
+    const bytes = await this.readSafe(e.path,e.root);
+    if (digest(bytes) !== version) {
+      throw new Error('内容已变更：文件自登记后已被修改，请重新获取最新文件列表（artifact changed）');
+    }
+    return bytes;
   }
 }
