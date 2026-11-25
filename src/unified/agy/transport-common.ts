@@ -87,10 +87,16 @@ export interface AgyAcpTransportOptions {
   agyBin?: string;
   /** Optional args inserted before `acp --stdio` (e.g. a test script path when `agyBin` is `node`). */
   prependArgs?: readonly string[];
+  /** Whether to pass `--process-per-session` to `agy acp` (defaults to `true`). */
+  processPerSession?: boolean;
   /** Custom `--gemini-dir` passed to `agy acp`. */
   geminiDir?: string;
   /** Custom `--app-data-dir` passed to `agy acp`. */
   appDataDir?: string;
+  /** Optional default execution mode passed as `--mode <mode>` to `agy acp`. */
+  defaultMode?: AgyStreamMode | (string & {});
+  /** Optional additional workspace directories passed as repeated `--add-dir <dir>` flags. */
+  addDirs?: readonly string[];
   /** Whether to pass `--sandbox` to `agy acp`. */
   sandbox?: boolean;
   /** Whether to pass `--disable-telemetry` to `agy acp`. */
@@ -105,6 +111,19 @@ export interface AgyAcpTransportOptions {
   clientInfo?: { name: string; version: string };
   clientCapabilities?: Record<string, unknown>;
   onStderr?: (line: string) => void;
+}
+
+export interface AgyRequestOptions {
+  /** Hard wall-clock ceiling in ms. */
+  timeoutMs?: number;
+  /** Activity-renewed inactivity timeout in ms. */
+  idleTimeoutMs?: number;
+  /** Session ID whose `session/update` and server requests renew `idleTimeoutMs`. */
+  sessionId?: string;
+  /** When true, the idle timer defers expiry while waiting on user interaction. */
+  isWaitingForUser?: () => boolean;
+  /** Optional synchronous callback invoked when the request settles, before subsequent stdout lines are processed. */
+  onSettled?: (outcome: { ok: true; result: unknown } | { ok: false; error: unknown }) => void;
 }
 
 export interface AgyStreamUsage {
@@ -242,6 +261,11 @@ export interface AgyStreamRunResult {
 export const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
+export const DEFAULT_CLIENT_CAPABILITIES: Record<string, unknown> = {
+  elicitation: {
+    form: {},
+  },
+};
 export const SERVER_REQUEST_METHODS = new Set<string>(['session/request_permission', 'elicitation/create']);
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -419,6 +443,9 @@ export async function terminateChildProcess(
 /** Build CLI arguments for `agy acp --stdio`. */
 export function buildAgyAcpArgs(options: AgyAcpTransportOptions = {}): string[] {
   const args: string[] = [...(options.prependArgs ?? []), 'acp', '--stdio'];
+  if (options.processPerSession !== false) {
+    args.push('--process-per-session');
+  }
   if (options.geminiDir !== undefined) {
     if (!options.geminiDir.trim()) throw contractError('invalid_request', 'geminiDir must be non-empty');
     args.push('--gemini-dir', options.geminiDir);
@@ -426,6 +453,14 @@ export function buildAgyAcpArgs(options: AgyAcpTransportOptions = {}): string[] 
   if (options.appDataDir !== undefined) {
     if (!options.appDataDir.trim()) throw contractError('invalid_request', 'appDataDir must be non-empty');
     args.push('--app-data-dir', options.appDataDir);
+  }
+  if (options.addDirs?.length) {
+    for (const dir of options.addDirs) {
+      if (typeof dir !== 'string' || !dir.trim()) {
+        throw contractError('invalid_request', 'addDirs entries must be non-empty strings');
+      }
+      args.push('--add-dir', dir);
+    }
   }
   if (options.sandbox) args.push('--sandbox');
   if (options.disableTelemetry) args.push('--disable-telemetry');
