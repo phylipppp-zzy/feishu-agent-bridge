@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { AgyAdapter } from '../src/unified/agy-adapter.js';
+import { classifyAgyPermission, mergeAgyToolCall } from '../src/unified/agy/adapter-permission.js';
 import { AgyCatalog } from '../src/unified/agy-catalog.js';
 import { AgyQuotaClient } from '../src/unified/agy-quota.js';
 import { AgyAcpTransport } from '../src/unified/agy-transport.js';
@@ -138,18 +139,24 @@ async function writeTranscript(
   }
 }
 
-async function writeFakeAgyBinary(binPath: string, rpcLogPath: string, dropFlagPath: string): Promise<void> {
+async function writeFakeAgyBinary(
+  binPath: string,
+  rpcLogPath: string,
+  dropFlagPath: string,
+  listedSessions?: Array<{ sessionId: string; cwd: string; title: string }>,
+): Promise<void> {
   const script = `#!/usr/bin/env node
-import { appendFileSync, existsSync, unlinkSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, unlinkSync, writeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const args = process.argv.slice(2);
 const rpcLogPath = ${JSON.stringify(rpcLogPath)};
 const dropFlagPath = ${JSON.stringify(dropFlagPath)};
+const listedSessions = ${JSON.stringify(listedSessions)};
 const log = (entry) => appendFileSync(rpcLogPath, JSON.stringify(entry) + '\\n');
 
 if (args.includes('/usage')) {
-  process.stdout.write(JSON.stringify({
+  writeSync(1, JSON.stringify({
     status: 'SUCCESS',
     command: {
       data: {
@@ -164,7 +171,7 @@ if (args.includes('/usage')) {
 }
 
 if (!args.includes('acp')) {
-  process.stderr.write('unexpected command: ' + args.join(' ') + '\\n');
+  writeSync(2, 'unexpected command: ' + args.join(' ') + '\\n');
   process.exit(2);
 }
 
@@ -172,9 +179,10 @@ let seq = 0;
 let srvReqId = 1000;
 const pendingServerReplies = new Map();
 const activePrompts = new Map();
+const allowMatchingExecution = new Map();
 
 const writeMsg = (obj) => {
-  process.stdout.write(JSON.stringify(obj) + '\\n');
+  writeSync(1, JSON.stringify(obj) + '\\n');
 };
 
 const sendServerRequest = (method, params) => {
@@ -185,7 +193,8 @@ const sendServerRequest = (method, params) => {
   });
 };
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+// Read the inherited descriptor directly so the mock works in restricted stdio environments.
+const rl = createInterface({ input: createReadStream(undefined, { fd: 0, autoClose: false }), crlfDelay: Infinity });
 rl.on('line', async (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -214,6 +223,17 @@ rl.on('line', async (line) => {
       agentCapabilities: { loadSession: true },
       agentInfo: { name: 'fake-agy', version: '1.5.14-test' },
     });
+    return;
+  }
+
+  if (method === 'session/list') {
+    if (listedSessions === undefined) {
+      writeMsg({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
+    } else if (params.cursor === 'second') {
+      reply({ sessions: listedSessions.slice(1), nextCursor: null });
+    } else {
+      reply({ sessions: listedSessions.slice(0, 1), nextCursor: 'second' });
+    }
     return;
   }
 
@@ -251,6 +271,13 @@ rl.on('line', async (line) => {
     return;
   }
 
+  if (method === 'test/release_matching_execution') {
+    allowMatchingExecution.get(params.sessionId)?.();
+    allowMatchingExecution.delete(params.sessionId);
+    reply({});
+    return;
+  }
+
   if (method === 'session/cancel') {
     const entry = activePrompts.get(params.sessionId);
     if (entry) {
@@ -268,31 +295,131 @@ rl.on('line', async (line) => {
       ? params.prompt.map((b) => (b && b.type === 'text' ? b.text : '')).join('\\n')
       : '';
 
-    const emitChunk = (chunkText) => writeMsg({
+    const emitChunk = (chunkText, messageId) => writeMsg({
       jsonrpc: '2.0',
       method: 'session/update',
       params: {
         sessionId: sid,
         update: {
           sessionUpdate: 'agent_message_chunk',
+          messageId,
           content: { type: 'text', text: chunkText },
         },
       },
     });
+    const emitTool = (toolCallId, status, args = {}) => writeMsg({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: sid,
+        update: { sessionUpdate: 'tool_call_update', toolCallId, status, ...args },
+      },
+    });
+    const permissionOptions = [
+      { optionId: 'allow_always', kind: 'allow_always', name: 'Always allow' },
+      { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+      { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
+    ];
+
+    if (text === 'multi-step') {
+      emitChunk('Opening', 'step-a');
+      emitTool('step-tool', 'completed', { sessionUpdate: 'tool_call', name: 'read_file' });
+      emitChunk('After tool', 'step-a');
+      emitChunk('Next item', 'step-b');
+      emitTool('final-tool', 'completed', { name: 'read_file' });
+      reply({ stopReason: 'end_turn', response: 'Post-tool result' });
+      return;
+    }
+    if (text === 'completion-prefix') {
+      emitChunk('Partial');
+      reply({ stopReason: 'end_turn', response: 'Partial now complete' });
+      return;
+    }
+    if (text === 'completion-suffix') {
+      await new Promise(resolve => allowMatchingExecution.set(sid, resolve));
+      emitTool('before-stream', 'completed', { name: 'read_file' });
+      emitChunk('Later paragraph');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+    if (text === 'completion-divergent') {
+      emitChunk('Live only\\n\\nShared');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
+    if (text.startsWith('tool-progress:')) {
+      const terminal = text.split(':')[1];
+      const input = { TargetFile: 'outputs/eval_summary.md', Content: 'do not display this content' };
+      emitTool('tool-progress', 'pending', { sessionUpdate: 'tool_call', name: 'edit_file', rawInput: input });
+      emitTool('tool-progress', 'in_progress');
+      emitTool('tool-progress', 'in_progress');
+      emitTool('tool-progress', terminal, { rawOutput: 'do not display output' });
+      emitTool('tool-progress', 'in_progress');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
 
     if (text.includes('flow-allow') || text.includes('flow-deny')) {
       emitChunk('Working...');
+      emitTool('tc-perm-1', 'pending', {
+        kind: 'execute', rawInput: { CommandLine: 'sudo systemctl restart nginx' },
+      });
       const permRes = await sendServerRequest('session/request_permission', {
         sessionId: sid,
-        toolCall: { toolCallId: 'tc-perm-1', title: 'Run shell check', kind: 'execute' },
-        options: [
-          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
-          { optionId: 'reject_once', kind: 'reject_once', name: 'Reject once' },
-        ],
+        toolCall: {
+          toolCallId: 'tc-perm-1', title: 'Run shell check', kind: 'execute',
+          rawInput: { CommandLine: 'sudo systemctl restart nginx' },
+        },
+        options: permissionOptions,
       });
-      log({ permissionReply: permRes });
+      log({ permissionCase: text, permissionReply: permRes });
       const accepted = permRes?.outcome?.optionId === 'allow_once';
+      if (accepted) {
+        const release = new Promise(resolve => allowMatchingExecution.set(sid, resolve));
+        emitTool('unrelated-tool', 'in_progress');
+        emitChunk(' Waiting for execution.');
+        await release;
+      }
+      emitTool('tc-perm-1', 'in_progress');
       emitChunk(accepted ? ' Allowed!' : ' Denied!');
+      reply({ stopReason: 'end_turn' });
+      return;
+    }
+
+    if (text.startsWith('flow-auto')) {
+      const toolCallId = 'tc-auto';
+      const command = 'git status -sb && rg -n "UnifiedCore" src/unified | head -n 5';
+      const rawInput = { CommandLine: command };
+      let toolCall = { toolCallId, title: 'Run shell check', kind: 'execute', rawInput };
+      let options = permissionOptions;
+      if (text === 'flow-auto-incremental') {
+        emitTool(toolCallId, 'pending', { ...toolCall, args: rawInput });
+        toolCall = { toolCallId };
+        options = [{ optionId: 'allow_always', kind: 'allow_always' }, { optionId: 'allow_once' }];
+      } else if (text === 'flow-auto-scoped-root') {
+        toolCall = { ...toolCall, rawInput: { CommandLine: 'pwd', Cwd: '..' } };
+      } else if (text === 'flow-auto-bypass') {
+        toolCall = { ...toolCall, rawInput: { ...rawInput, BypassSandbox: true } };
+      } else if (text === 'flow-auto-updated') {
+        emitTool(toolCallId, 'pending', { kind: 'execute', rawInput: { CommandLine: 'pwd' } });
+        toolCall = { ...toolCall, rawInput: { CommandLine: 'pwd', WaitMsBeforeAsync: 500 } };
+      } else if (text === 'flow-auto-evicted') {
+        emitTool(toolCallId, 'pending', { kind: 'execute', rawInput: { CommandLine: 'pwd', BypassSandbox: true } });
+        for (let i = 0; i < 128; i++) emitTool('pending-' + i, 'pending', { rawInput });
+        for (const status of ['completed', 'failed', 'cancelled']) {
+          emitTool(status, status, { kind: 'execute', content: ['large'.repeat(1024)], rawOutput: rawInput, args: rawInput });
+        }
+        toolCall = { ...toolCall, rawInput: { CommandLine: 'pwd' } };
+      } else if (text === 'flow-auto-deny') {
+        toolCall = {
+          toolCallId, title: 'Edit project file', kind: 'edit',
+          rawInput: { TargetFile: '/home/zhangzy/projects/projtool/src/index.ts' },
+        };
+        options = [{ optionId: 'allow_always', kind: 'allow_always' }, { optionId: 'reject_always', kind: 'reject_always' }];
+      }
+      const result = await sendServerRequest('session/request_permission', { sessionId: sid, toolCall, options });
+      log({ permissionCase: text, permissionReply: result });
       reply({ stopReason: 'end_turn' });
       return;
     }
@@ -319,12 +446,15 @@ rl.on('line', async (line) => {
     if (text.includes('flow-drop')) {
       void sendServerRequest('session/request_permission', {
         sessionId: sid,
-        toolCall: { toolCallId: 'tc-drop-1', title: 'Pending before crash' },
-        options: [{ optionId: 'allow_once', kind: 'allow_once' }],
+        toolCall: {
+          toolCallId: 'tc-drop-1', title: 'Pending before crash', kind: 'execute',
+          rawInput: { CommandLine: 'sudo true' },
+        },
+        options: permissionOptions,
       }).catch(() => {});
       if (existsSync(dropFlagPath)) {
         try { unlinkSync(dropFlagPath); } catch {}
-        setTimeout(() => process.exit(1), 60);
+        setTimeout(() => process.kill(process.pid, 'SIGKILL'), 60);
       }
       return;
     }
@@ -581,6 +711,117 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4000, msg = 'condit
   assert.ok(predicate(), msg);
 }
 
+test('Agy permission requires known tool identities and complete, scoped inputs', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-approval-'));
+  try {
+    const project = join(root, 'project');
+    const outside = join(root, 'other');
+    await Promise.all([mkdir(project), mkdir(outside)]);
+    await symlink(outside, join(project, 'linked'));
+
+    const command = { CommandLine: 'pwd' };
+    const execute = { kind: 'execute', rawInput: command };
+    const read = { name: 'view_file', kind: 'read', rawInput: { TargetFile: 'src/index.ts', StartLine: 1 } };
+    const write = { name: 'write_to_file', kind: 'edit', rawInput: { TargetFile: 'notes.md', Content: 'hello' } };
+    const edit = {
+      name: 'edit_file', kind: 'edit',
+      rawInput: { Path: 'src/index.ts', Target: `~/original\n${'source content '.repeat(40)}`, Replacement: 'new source' },
+    };
+    const validCommand = {
+      ...execute, name: 'run_command', rawInput: {
+        ...command, Cwd: './', BypassSandbox: false, IsDaemon: false, WaitMsBeforeAsync: 500,
+        NotificationTimeoutSeconds: 1, toolSummary: 'Print working directory',
+      },
+    };
+    for (const tool of [validCommand, read, write, edit]) {
+      assert.equal((await classifyAgyPermission(tool, project)).kind, 'allow_once', JSON.stringify(tool));
+    }
+
+    for (const tool of [
+      { rawInput: command },
+      { ...execute, name: 'upload_file' },
+      { ...execute, toolName: 'read_file' },
+      { ...execute, toolName: '' },
+      { ...execute, rawInput: { ...command, BypassSandbox: true } },
+      { ...execute, rawInput: { ...command, BypassSandbox: 'false' } },
+      { ...execute, rawInput: { ...command, Shell: 'custom' } },
+      { ...execute, args: { Environment: { PATH: '/tmp/custom' } } },
+      { ...execute, _meta: { BypassSandbox: true } },
+      { ...execute, args: { commandLine: 'git status' } },
+      mergeAgyToolCall({ ...execute, rawInput: { ...command, BypassSandbox: true } },
+        { rawInput: { BypassSandbox: false } }),
+      mergeAgyToolCall({ ...execute, name: 'unknown' }, { name: 'run_command' }),
+      { ...read, rawInput: { ...read.rawInput, FollowSymlinks: true } },
+      { ...read, locations: [{ path: join(outside, 'data.txt'), line: 1 }] },
+      { ...read, args: { TargetFile: 'linked/data.txt' } },
+      { ...write, rawInput: { ...write.rawInput, ArtifactMetadata: { path: join(outside, 'artifact') } } },
+      { ...write, rawInput: { ...write.rawInput, Content: { path: join(outside, 'artifact') } } },
+      { ...edit, rawInput: { ...edit.rawInput, Target: { path: join(outside, 'artifact') } } },
+      { ...edit, rawInput: { ...edit.rawInput, Path: join(outside, 'artifact') } },
+    ]) {
+      assert.equal((await classifyAgyPermission(tool, project)).kind, 'ask', JSON.stringify(tool));
+    }
+
+    const otherDirectory = { ...execute, rawInput: { ...command, Cwd: outside } };
+    assert.equal((await classifyAgyPermission(otherDirectory, project)).kind, 'ask');
+    assert.equal((await classifyAgyPermission(otherDirectory, project, { allowedRoots: [outside] })).kind, 'allow_once');
+    assert.equal((await classifyAgyPermission(execute, project, { allowedRoots: [] })).kind, 'allow_once');
+    assert.equal((await classifyAgyPermission(execute, project, { enabled: false })).kind, 'ask');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AgyAdapter list and read prefer paginated ACP titles and share the title cache', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-adapter-titles-'));
+  const dbPath = join(root, 'conversation_summaries.db');
+  const binPath = join(root, 'fake-agy.mjs');
+  const rpcLogPath = join(root, 'rpc-log.jsonl');
+  const transport = new AgyAcpTransport({ agyBin: binPath });
+  const catalog = new AgyCatalog({ dbPath, brainDir: root, allowedProjectRoots: [root] });
+  const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc');
+  const sessionId = 'conv-real-title';
+  const placeholderId = 'conv-placeholder';
+  const workspaceUris = JSON.stringify([pathToFileURL(root).href]);
+  try {
+    createSummariesDb(dbPath, [
+      { conversation_id: sessionId, preview: 'Raw first prompt', workspace_uris: workspaceUris },
+      { conversation_id: placeholderId, preview: 'Local fallback', workspace_uris: workspaceUris },
+    ]);
+    await writeFakeAgyBinary(binPath, rpcLogPath, join(root, 'drop.flag'), [
+      { sessionId: placeholderId, cwd: root, title: ' [USER] ' },
+      { sessionId, cwd: root, title: ' \u0000Real Client Title\u0007 ' },
+    ]);
+    const offline = await adapter.list(null, 20);
+    const localSession = offline.items.find(item => item.native.nativeSessionId === sessionId);
+    assert.equal(localSession?.title, 'Raw first prompt');
+    await transport.connect();
+
+    const [listed, read] = await Promise.all([adapter.list(null, 20), adapter.read(localSession.native)]);
+    assert.equal(listed.items.find(item => item.native.nativeSessionId === sessionId)?.title, 'Real Client Title');
+    assert.equal(read.session.title, 'Real Client Title');
+    assert.equal(listed.items.find(item => item.native.nativeSessionId === placeholderId)?.title, 'Local fallback');
+    assert.equal((await adapter.read(localSession.native)).session.title, 'Real Client Title');
+
+    const calls = (await readFile(rpcLogPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls.filter(call => call.method === 'session/list').map(call => call.params), [
+      {}, { cursor: 'second' },
+    ]);
+
+    const afterExpiry = Date.now() + 15_001;
+    t.mock.method(Date, 'now', () => afterExpiry);
+    const failedRefresh = t.mock.method(transport, 'request', async () => {
+      throw new Error('session/list unavailable');
+    });
+    assert.equal((await adapter.read(localSession.native)).session.title, 'Real Client Title');
+    assert.equal(failedRefresh.mock.callCount(), 1);
+    assert.equal(transport.health().status, 'healthy');
+  } finally {
+    await adapter.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfill, permission/elicitation, stale generation, cancel, resume', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agy-adapter-e2e-'));
   try {
@@ -666,13 +907,20 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const transport = new AgyAcpTransport({ agyBin: binPath, connectTimeoutMs: 3000, requestTimeoutMs: 5000 });
     const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [join(root, 'workspace')] });
     const quota = new AgyQuotaClient({ agyBin: binPath });
-    const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc-1', quota);
+    const adapter = new AgyAdapter(transport, catalog, 'host-1', 'agy-svc-1', quota, {
+      approvalPolicy: { allowedRoots: [join(root, 'workspace')] },
+    });
+    const store = new UnifiedStore(join(root, 'response-evidence.sqlite'));
+    const core = new UnifiedCore(store, [adapter], () => true);
     try {
 
     const observed: PlatformObservation[] = [];
     adapter.onObservation((obs) => observed.push(obs));
 
     // 1. Read-only discovery & subagent retention & honest boundary
+    const refresh = catalog.refreshAsync();
+    assert.equal(catalog.refreshAsync(), refresh);
+    await refresh;
     const listed = await adapter.list(null, 20);
     assert.equal(listed.items.length, 1);
     const roSession = listed.items[0]!;
@@ -682,6 +930,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(roSession.capabilities.send.status, 'unsupported');
     assert.equal(roSession.capabilities.answer.status, 'unsupported');
     assert.equal(roSession.capabilities.approve.status, 'unsupported');
+    assert.equal(roSession.capabilities.handoff.status, 'unsupported');
     assert.equal((adapter as PlatformPort).archive, undefined);
 
     const newer = await adapter.discoverNewer(Date.parse('2026-11-22T09:00:00Z'), null, 10);
@@ -716,6 +965,28 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(createdAck.status, 'submitted');
     assert.equal(createdAck.nativeReference, 'agy-live-1');
     const liveRef = createdAck.createdSession!.native;
+    const session = createdAck.createdSession!;
+    assert.equal(session.capabilities.handoff.status, 'available');
+    store.insertSession(session);
+    store.setConnectionGeneration(session.sessionId, 0, gen1);
+    assert.equal(adapter.hasActiveNativeSession(liveRef), true);
+    assert.equal(adapter.hasActiveNativeSession(roSession.native), false);
+    assert.equal(adapter.hasActiveNativeSession({ ...liveRef, hostId: 'different-host' }), false);
+    const submitDecision = async (interaction: Interaction, operationId: string, decision: 'allow' | 'deny') => {
+      await core.resolveInteraction({
+        context: {
+          operationId, idempotencyKey: operationId, targetId: session.sessionId,
+          expectedRevision: interaction.revision, controlGeneration: session.control.generation,
+          identity: { source: 'feishu', subject: 'ou_owner' },
+        },
+        interactionId: interaction.interactionId,
+        toolInputDigest: interaction.toolInputDigest,
+        expectedConnectionGeneration: interaction.connectionGeneration,
+        answer: { kind: 'approval', scope: 'this_request', decision },
+      });
+      assert.equal((await core.dispatch(operationId)).status, 'accepted');
+      assert.equal(store.getOutbox(operationId).state, 'done');
+    };
 
     const models = await adapter.listModels(liveRef);
     assert.ok(models.some((m) => m.id === 'gemini-4-hydrogen' && m.reasoningEfforts?.includes('xhigh')));
@@ -729,6 +1000,171 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       () => adapter.input(liveRef, 'steer', [{ type: 'text', text: 'noop' }], makeGuard(gen1)),
       (err: unknown) => typeof err === 'object' && err !== null && (err as { code?: string }).code === 'unsupported',
     );
+
+    const earlierParagraph = '    earlier code\n    with preserved indentation';
+    const suffixSteps = [
+      { step_index: 11, type: 'USER_INPUT', content: '<USER_REQUEST>completion-suffix</USER_REQUEST>' },
+      { step_index: 12, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'earlier <truncated 30 bytes>', truncated_fields: ['content'] },
+      { step_index: 13, type: 'RUN_COMMAND', status: 'DONE' },
+      { step_index: 14, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Later paragraph' },
+    ];
+    const fullSuffix = [{ step_index: 12, type: 'PLANNER_RESPONSE', content: earlierParagraph }];
+    const liveReplies = new Map<string, Message>();
+    for (const [prompt, expected] of [
+      ['multi-step', 'Opening\n\nAfter tool\n\nNext item\n\nPost-tool result'],
+      ['completion-prefix', 'Partial now complete'],
+      ['completion-suffix', 'Later paragraph'],
+      ['completion-divergent', 'Live only\n\nShared'],
+    ] as const) {
+      const start = observed.length;
+      const ack = await adapter.input(liveRef, 'new', [{ type: 'text', text: prompt }], makeGuard(gen1));
+      if (prompt === 'completion-suffix') {
+        await writeTranscript(brainDir, liveRef.nativeSessionId, suffixSteps.slice(0, 2), fullSuffix);
+        const running = await adapter.read(liveRef);
+        assert.equal(running.messages.some(message => message.turnId === 'step-12'), false);
+        await transport.request('test/release_matching_execution', { sessionId: liveRef.nativeSessionId });
+      }
+      await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      const assistant = observed.slice(start).find(o =>
+        o.type === 'message' && o.message.role === 'assistant' && o.message.final);
+      assert.ok(assistant?.type === 'message');
+      assert.equal(assistant.message.turnId, ack.nativeReference);
+      assert.deepEqual(assistant.message.blocks, [{ type: 'text', text: expected }]);
+      liveReplies.set(prompt, assistant.message);
+    }
+    const preSuffix = [
+      { step_index: 0, type: 'USER_INPUT', content: '<USER_REQUEST>multi-step</USER_REQUEST>' },
+      ...['Opening', 'After tool', 'Next item', 'Post-tool result'].map((content, i) =>
+        ({ step_index: i + 1, type: 'PLANNER_RESPONSE', status: 'DONE', content })),
+      { step_index: 5, type: 'USER_INPUT', content: '<USER_REQUEST>completion-prefix</USER_REQUEST>' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Partial now complete on disk' },
+      { step_index: 7, type: 'USER_INPUT', content: '<USER_REQUEST>unmatched native prompt</USER_REQUEST>' },
+      { step_index: 8, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'unmatched native reply' },
+    ];
+    const divergentSteps = [
+      { step_index: 15, type: 'USER_INPUT', content: 'completion-divergent' },
+      { step_index: 16, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Shared' },
+      { step_index: 17, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Transcript only' },
+    ];
+    await writeTranscript(brainDir, liveRef.nativeSessionId, [...preSuffix, ...suffixSteps, ...divergentSteps], fullSuffix);
+    const flushed = await adapter.read(liveRef);
+    assert.equal(flushed.messages.length, 10);
+    assert.deepEqual(flushed.messages.filter(message => message.turnId.startsWith('step-')).map(message => message.turnId),
+      ['step-7', 'step-8']);
+    const ingested = flushed.messages.find(message => message.messageId === liveReplies.get('completion-prefix')!.messageId);
+    assert.equal(ingested?.turnId, liveReplies.get('completion-prefix')!.turnId);
+    assert.deepEqual(ingested?.blocks, [{ type: 'text', text: 'Partial now complete on disk' }]);
+    const suffixId = liveReplies.get('completion-suffix')!.messageId;
+    const fullReplyBlocks = [{ type: 'text', text: `${earlierParagraph}\n\nLater paragraph` }];
+    assert.deepEqual(flushed.messages.find(message => message.messageId === suffixId)?.blocks, fullReplyBlocks);
+    const divergentId = liveReplies.get('completion-divergent')!.messageId;
+    assert.deepEqual(flushed.messages.find(message => message.messageId === divergentId)?.blocks,
+      [{ type: 'text', text: 'Live only\n\nShared\n\nTranscript only' }]);
+
+    // Reopen native history with an empty live cache. An external CLI turn used the same prompt.
+    await writeTranscript(brainDir, liveRef.nativeSessionId, [...preSuffix,
+      { step_index: 9, type: 'USER_INPUT', content: 'completion-suffix' },
+      { step_index: 10, type: 'PLANNER_RESPONSE', status: 'DONE', content: 'external CLI answer' },
+      ...suffixSteps, ...divergentSteps,
+    ], fullSuffix);
+    createSummariesDb(dbPath, [{ conversation_id: liveRef.nativeSessionId,
+      workspace_uris: JSON.stringify([pathToFileURL(projectDir).href]) }]);
+    const restarted = new AgyAdapter(new AgyAcpTransport({ agyBin: binPath }),
+      new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [join(root, 'workspace')] }), 'host-1', 'agy-svc-1', quota);
+    try {
+      const replay = await restarted.read(liveRef);
+      const expected = store.getSession(session.sessionId);
+      const before = store.findMessage(session.sessionId, suffixId)!;
+      const divergentBefore = store.findMessage(session.sessionId, divergentId)!;
+      assert.deepEqual(before.blocks, [{ type: 'text', text: 'Later paragraph' }]);
+      assert.equal(store.applyHistoryRefresh(expected, gen1, replay), true);
+      const restored = store.snapshot(session.sessionId).value.messages;
+      assert.deepEqual(restored.filter(message => message.turnId.startsWith('step-')).map(message => message.turnId),
+        ['step-7', 'step-8', 'step-9', 'step-10']);
+      assert.deepEqual(store.findMessage(session.sessionId, suffixId),
+        { ...before, revision: before.revision + 1, blocks: fullReplyBlocks });
+      assert.deepEqual(store.findMessage(session.sessionId, divergentId), divergentBefore);
+      const context = { operationId: 'reattach-agy', idempotencyKey: 'reattach-agy', targetId: expected.sessionId,
+        expectedRevision: expected.revision, controlGeneration: expected.control.generation,
+        identity: { source: 'feishu', subject: 'ou_owner' } };
+      store.attachSession(context, expected, { mode: 'read_only' }, null, replay);
+      assert.equal(store.applyHistoryRefresh(expected, gen1, replay), true);
+      assert.deepEqual(store.snapshot(session.sessionId).value.messages, restored);
+    } finally {
+      await restarted.close();
+    }
+
+    for (const flow of ['flow-auto', 'flow-auto-incremental', 'flow-auto-scoped-root', 'flow-auto-deny']) {
+      const start = observed.length;
+      await adapter.input(liveRef, 'new', [{ type: 'text', text: flow }], makeGuard(gen1));
+      await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      assert.equal(observed.slice(start).filter(o => o.type === 'interaction').length, 0, flow);
+    }
+
+    for (const [native, phase] of [['completed', 'succeeded'], ['failed', 'failed'], ['cancelled', 'cancelled']]) {
+      const start = observed.length;
+      const operation = await adapter.input(liveRef, 'new', [{ type: 'text', text: `tool-progress:${native}` }], makeGuard(gen1));
+      await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      const updates = observed.slice(start).flatMap(o => o.type === 'event' && o.event.type === 'tool.updated' ? [o] : []);
+      assert.deepEqual(updates.map(o => o.event.data), ['pending', 'running', phase].map(phase => ({
+        turnId: operation.nativeReference, callId: 'tool-progress', phase, tool: 'edit_file', summary: 'edit_file · outputs/eval_summary.md',
+      })));
+      assert.ok(updates.every(o => o.connectionGeneration === gen1));
+      assert.equal(observed.slice(start).some(o => o.type === 'message' && o.message.role === 'assistant'), false);
+    }
+
+    const bypassStart = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-bypass' }], makeGuard(gen1));
+    const isBypassApproval = (o: PlatformObservation): o is Extract<PlatformObservation, { type: 'interaction' }> =>
+      o.type === 'interaction' && o.interaction.kind === 'approval' && o.interaction.status === 'awaiting_answer';
+    await waitFor(() => observed.slice(bypassStart).some(isBypassApproval));
+    await submitDecision(observed.slice(bypassStart).find(isBypassApproval)!.interaction, 'deny-bypass', 'deny');
+    await waitFor(() => observed.slice(bypassStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+
+    const updatedStart = observed.length;
+    const onServerRequest = transport.onServerRequest;
+    transport.onServerRequest = request => {
+      onServerRequest(request);
+      // The handler has started classifying and cannot resume before this update is processed.
+      transport.onNotification({
+        generation: gen1, method: 'session/update', params: {
+          sessionId: liveRef.nativeSessionId,
+          update: {
+            sessionUpdate: 'tool_call_update', toolCallId: 'tc-auto', status: 'cancelled',
+            rawInput: { CommandLine: 'pwd -P' },
+          },
+        },
+      });
+    };
+    try {
+      await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-updated' }], makeGuard(gen1));
+      await waitFor(() => observed.slice(updatedStart).some(isBypassApproval));
+      const updatedApproval = observed.slice(updatedStart).find(isBypassApproval)!.interaction;
+      assert.equal(updatedApproval.kind, 'approval');
+      assert.match(updatedApproval.action, /工具调用参数在审批检查期间发生变化/);
+      const latestCall = JSON.parse(updatedApproval.action.split('\n')[1]!);
+      assert.deepEqual(latestCall.rawInput, { CommandLine: 'pwd -P', WaitMsBeforeAsync: 500 });
+      assert.equal(latestCall.status, 'cancelled');
+      assert.equal(adapter['activeTurns'].get(liveRef.nativeSessionId)!.toolCalls.get('tc-auto')?.rawInput, undefined);
+      await submitDecision(updatedApproval, 'deny-updated', 'deny');
+      await waitFor(() => observed.slice(updatedStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+    } finally {
+      transport.onServerRequest = onServerRequest;
+    }
+
+    const evictedStart = observed.length;
+    await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-evicted' }], makeGuard(gen1));
+    await waitFor(() => observed.slice(evictedStart).some(isBypassApproval));
+    const cachedTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
+    assert.equal(cachedTurn.fullToolCalls.size, 128);
+    assert.deepEqual(cachedTurn.toolCalls.get('tc-auto'), { toolCallId: 'tc-auto', status: 'pending', kind: 'execute' });
+    for (const status of ['completed', 'failed', 'cancelled']) {
+      assert.deepEqual(cachedTurn.toolCalls.get(status), { toolCallId: status, status, kind: 'execute' });
+    }
+    const evictedApproval = observed.slice(evictedStart).find(isBypassApproval)!.interaction;
+    assert.ok(evictedApproval.kind === 'approval' && evictedApproval.action.includes('缺少工具调用的完整参数记录'));
+    await submitDecision(evictedApproval, 'deny-evicted', 'deny');
+    await waitFor(() => observed.slice(evictedStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
 
     // 4. Streaming input + permission allow
     const turn1Idx = observed.length;
@@ -747,7 +1183,17 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
         o.type === 'interaction' && o.interaction.kind === 'approval' && o.interaction.status === 'awaiting_answer',
       )!.interaction;
 
-    await adapter.respond(liveRef, permAllowInt, { kind: 'approval', scope: 'this_request', decision: 'allow' }, makeGuard(gen1));
+    const allowTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
+    assert.ok(allowTurn.toolCalls.get('tc-perm-1')?.rawInput);
+    await submitDecision(permAllowInt, 'allow-approval', 'allow');
+    await waitFor(() => observed.slice(turn1Idx).some(o =>
+      o.type === 'message' && !o.message.final &&
+      o.message.blocks.some(block => block.type === 'text' && block.text.includes('Waiting for execution')),
+    ));
+    assert.equal(store.getOperation('allow-approval').status, 'accepted');
+    assert.equal(store.getInteraction(permAllowInt.interactionId).status, 'answer_pending_delivery');
+    assert.deepEqual(allowTurn.toolCalls.get('tc-perm-1'), { toolCallId: 'tc-perm-1', status: 'pending', kind: 'execute' });
+    await transport.request('test/release_matching_execution', { sessionId: liveRef.nativeSessionId });
     await waitFor(
       () => observed.slice(turn1Idx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
       3000,
@@ -757,7 +1203,10 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const finals = observed.slice(turn1Idx).filter((o): o is Extract<PlatformObservation, { type: 'message' }> => o.type === 'message' && o.message.final && o.message.role === 'assistant');
     assert.ok(partials.length >= 1, 'expected partial streaming message');
     assert.equal(finals.length, 1);
-    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /Working\.\.\.\s*Allowed!/);
+    assert.match((finals[0]!.message.blocks[0] as { text: string }).text, /^Working\.\.\.\n\n Waiting for execution\.\n\n Allowed!$/);
+    assert.equal(store.getOperation('allow-approval').status, 'completed');
+    assert.equal(store.getInteraction(permAllowInt.interactionId).status, 'resolved');
+    assert.equal(store.getOutbox('allow-approval').state, 'done');
 
     // 5. Permission deny
     const turnDenyIdx = observed.length;
@@ -769,11 +1218,23 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const permDenyInt = observed
       .slice(turnDenyIdx)
       .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
-    await adapter.respond(liveRef, permDenyInt, { kind: 'approval', scope: 'this_request', decision: 'deny' }, makeGuard(gen1));
+    const denyTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
+    transport.onNotification({
+      generation: gen1, method: 'session/update', params: {
+        sessionId: liveRef.nativeSessionId,
+        update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc-perm-1', status: 'cancelled', rawOutput: 'large'.repeat(1024) },
+      },
+    });
+    assert.ok(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, 'keep terminal payload while the permission request is unanswered');
+    await submitDecision(permDenyInt, 'deny-approval', 'deny');
+    assert.equal(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, undefined);
     await waitFor(
       () => observed.slice(turnDenyIdx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
       3000,
     );
+    assert.equal(store.getOperation('deny-approval').status, 'accepted');
+    assert.equal(store.getInteraction(permDenyInt.interactionId).nativeResult?.status, 'unknown');
+    assert.equal(store.getOutbox('deny-approval').state, 'done');
 
     // 6. Elicitation Q&A
     const turnElicitIdx = observed.length;
@@ -801,6 +1262,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     const turnCancelIdx = observed.length;
     const cancelAck = await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-cancel' }], makeGuard(gen1));
     const cancelTurnId = cancelAck.nativeReference!;
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen1)), { code: 'busy' });
     await waitFor(
       () => observed.slice(turnCancelIdx).some((o) => o.type === 'turn' && o.turn.status === 'running'),
       2000,
@@ -828,8 +1290,11 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       .slice(turnDropIdx)
       .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
 
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen1)), { code: 'busy' });
+
     // Wait for child process unexpected crash & reconnect
     await waitFor(() => !transport.connected, 3000, 'expected transport disconnect after crash');
+    assert.equal(adapter.hasActiveNativeSession(liveRef), false);
     await transport.connect();
     const gen2 = transport.connectionGeneration;
     assert.ok(gen2 > gen1, 'reconnect must increment connectionGeneration');
@@ -843,11 +1308,61 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     assert.equal(resumedAck.nativeReference, 'agy-live-1', 'resume must load original ID without forking');
     assert.equal(resumedAck.connectionGeneration, gen2);
 
+    // 9. Release an idle session and recover the same native ID through core control.
+    const beforeRelease = (await adapter.read(liveRef)).session;
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen1)), { code: 'control_conflict' });
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen2, false)), /stale control guard/);
+    assert.equal(adapter.hasActiveNativeSession(liveRef), true);
+    const releasing = adapter.control(liveRef, 'release', makeGuard(gen2));
+    await assert.rejects(adapter.input(liveRef, 'new', [{ type: 'text', text: 'blocked' }], makeGuard(gen2)), { code: 'control_conflict' });
+    await assert.rejects(adapter.resume(liveRef), { code: 'busy' });
+    assert.equal((await releasing).nativeReference, 'unsubscribed');
+    assert.equal(adapter.hasActiveNativeSession(liveRef), false);
+    await assert.rejects(adapter.control(liveRef, 'release', makeGuard(gen2)), { code: 'control_conflict' });
+    await waitFor(() => store.getSession(session.sessionId).control.generation === beforeRelease.control.generation + 1, 3000);
+    const released = store.getSession(session.sessionId);
+    assert.equal(released.status, 'read_only');
+    assert.equal(released.control.input, 'unavailable');
+    assert.equal(released.control.owner, null);
+    assert.equal(released.control.generation, beforeRelease.control.generation + 1);
+    assert.equal(released.capabilities.send.status, 'unsupported');
+    assert.equal(released.capabilities.handoff.status, 'available');
+
+    const controlContext = (operationId: string, current: Session) => ({
+      operationId, idempotencyKey: operationId, targetId: session.sessionId,
+      expectedRevision: current.revision, controlGeneration: current.control.generation,
+      identity: { source: 'feishu', subject: 'ou_owner' },
+    });
+    await core.requestControl({
+      context: controlContext('reacquire', released),
+      payload: { owner: 'agy-svc-1', strategy: 'wait' },
+    });
+    assert.equal((await core.dispatch('reacquire')).status, 'completed');
+    assert.equal(adapter.hasActiveNativeSession(liveRef), true);
+    const reacquired = store.getSession(session.sessionId);
+    assert.equal(reacquired.control.input, 'available');
+    assert.equal(reacquired.control.generation, released.control.generation + 1);
+
+    await core.releaseControl({
+      context: controlContext('release', reacquired),
+      payload: { owner: 'agy-svc-1' },
+    });
+    assert.equal((await core.dispatch('release')).status, 'completed');
+    assert.equal(store.getSession(session.sessionId).control.input, 'unavailable');
+
     // Verify RPC log stripped effort suffix and sent expected payloads
     const rpcEntries = (await readFile(rpcLogPath, 'utf8'))
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(rpcEntries.filter(e => e.method === 'session/close'), [
+      { method: 'session/close', params: { sessionId: liveRef.nativeSessionId } },
+      { method: 'session/close', params: { sessionId: liveRef.nativeSessionId } },
+    ]);
+    assert.deepEqual(rpcEntries.filter(e => e.method === 'session/load').map(e => e.params), [
+      { sessionId: liveRef.nativeSessionId, cwd: projectDir, mcpServers: [] },
+      { sessionId: liveRef.nativeSessionId, cwd: projectDir, mcpServers: [] },
+    ]);
     const setModelCalls = rpcEntries.filter((e) => e.method === 'session/set_model');
     assert.ok(setModelCalls.length >= 2);
     for (const call of setModelCalls) {
@@ -855,7 +1370,15 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     }
     const setCfgCalls = rpcEntries.filter((e) => e.method === 'session/set_config_option');
     assert.ok(setCfgCalls.some((c) => (c.params as { value: string }).value === 'xhigh'));
-    assert.ok(rpcEntries.some((e) => (e.permissionReply as { outcome?: { optionId?: string } })?.outcome?.optionId === 'reject_once'));
+    for (const [flow, optionId] of [
+      ['flow-auto', 'allow_once'], ['flow-auto-incremental', 'allow_once'], ['flow-auto-scoped-root', 'allow_once'],
+      ['flow-auto-deny', null], ['flow-auto-bypass', 'reject_once'], ['flow-auto-evicted', 'reject_once'],
+      ['flow-auto-updated', 'reject_once'],
+      ['flow-allow', 'allow_once'], ['flow-deny', 'reject_once'],
+    ]) {
+      const replies = rpcEntries.filter(e => e.permissionCase === flow).map(e => e.permissionReply);
+      assert.deepEqual(replies, [{ outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' } }], flow!);
+    }
     assert.ok(
       rpcEntries.some(
         (e) =>
@@ -865,7 +1388,9 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     );
 
     } finally {
+      core.close();
       await adapter.close();
+      store.close();
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1073,20 +1598,19 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
         await channel!.handle({ eventId, destination, identity: ownerId }, action);
       };
 
-      // 1. /new guidance mentions codex / claude / agy & offers direct create buttons (never misleading list filter buttons)
+      // 1. /new starts a project picker with the three registered backends.
       await sendCmd('ev-new', 'chat-main', { action: 'new_help' });
       const newCard = sentCards.at(-1)!.card;
-      assert.match(newCard.text, /agy/);
-      assert.match(newCard.text, /Antigravity/);
-      assert.equal(newCard.actions.some((a) => a.value.action === 'list'), false);
-      assert.deepEqual(
-        newCard.actions.map((a) => ({ label: a.label, value: a.value })),
-        [
-          { label: '新建 Antigravity', value: { action: 'create', provider: 'agy', project: projectDir, model: null } },
-          { label: '新建 Codex', value: { action: 'create', provider: 'codex', project: projectDir, model: null } },
-          { label: '新建 Claude', value: { action: 'create', provider: 'claude', project: projectDir, model: null } },
-        ],
-      );
+      assert.match(newCard.text, /当前后端：Antigravity/);
+      const token = newCard.actions[0]!.value.t;
+      assert.match(String(token), /^[A-Za-z0-9_-]{22}$/);
+      assert.deepEqual(newCard.actions.map((a) => a.value), [
+        { action: 'new_provider', t: token, r: 0, p: 'agy' },
+        { action: 'new_provider', t: token, r: 0, p: 'codex' },
+        { action: 'new_provider', t: token, r: 0, p: 'claude' },
+        { action: 'new_pick', t: token, r: 0, i: 0 },
+      ]);
+      assert.equal(newCard.actions[3]!.label, 'proj');
 
       // 2. /sessions lists all 3 backends cleanly, and filtering by agy/antigravity isolates agy sessions
       await sendCmd('ev-list-all', 'chat-main', { action: 'list' });
@@ -1094,7 +1618,7 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
       assert.match(listAllCard.text, /Claude Task/);
       assert.match(listAllCard.text, /Codex Task/);
       assert.match(listAllCard.text, /Agy Existing Work/);
-      assert.match(listAllCard.text, /Antigravity \(agy\)/);
+      assert.match(listAllCard.text, /Antigravity · proj/);
       assert.ok(listAllCard.actions.some((a) => a.label === 'Antigravity'));
 
       await sendCmd('ev-list-agy', 'chat-main', { action: 'list', search: 'antigravity' });
@@ -1103,7 +1627,9 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
       assert.doesNotMatch(listAgyCard.text, /Claude Task/);
       assert.doesNotMatch(listAgyCard.text, /Codex Task/);
 
-      await sendCmd('ev-list-codex-filter', 'chat-main', { action: 'list', provider: 'codex', search: 'codex' });
+      const codexFilter = listAllCard.actions.find(a => a.label === 'Codex')!.value;
+      assert.deepEqual(codexFilter,{ action: 'list', provider: 'codex' });
+      await sendCmd('ev-list-codex-filter', 'chat-main', codexFilter as ChannelAction);
       const listCodexCard = sentCards.at(-1)!.card;
       assert.match(listCodexCard.text, /Codex Task/);
       assert.doesNotMatch(listCodexCard.text, /Agy Existing Work/);

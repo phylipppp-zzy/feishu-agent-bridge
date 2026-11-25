@@ -18,6 +18,7 @@ import {
 import { DECISION_SYNC_END, DECISION_SYNC_START } from '../src/unified/decision-sync.js';
 import { parseFeishuAction, toFeishuCard } from '../src/unified/feishu-codec.js';
 import { questionForm, renderQuestionForm } from '../src/unified/feishu-question-forms.js';
+import type { FeishuCallbackValues } from '../src/unified/feishu-callback-values.js';
 import { FeishuSdkPort, handleSdkCardCallback, parseSdkCardCallback } from '../src/unified/feishu-sdk-port.js';
 import {
   createIntegratedRuntime,
@@ -922,6 +923,9 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
         owner: OWNER,
       });
 
+      const { callbackValues } = sdk as unknown as { callbackValues: FeishuCallbackValues };
+      const expand = (messageId: string, value: Record<string, unknown>) =>
+        callbackValues.resolve(messageId, value) as Record<string, unknown>;
       const invokeCallback = async (
         eventId: string,
         messageId: string,
@@ -937,6 +941,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
           async (e, a) => {
             capturedResult = await runtime.handleTrusted(e, a);
           },
+          expand,
         );
         return { callbackResult, capturedResult };
       };
@@ -983,11 +988,13 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       });
       await new Promise((r) => setImmediate(r));
       await runtime.tick();
-      const claudeTaskCardEntry = [...mock.sentCards.entries()].find(
-        ([, v]) => v.content.includes('int-e2e-task-cl') && v.content.includes('t-claude'),
-      )!;
-      const claudeTaskBtn = JSON.parse(claudeTaskCardEntry[1].content).elements[1].actions[0].value;
-      const claudeTaskRes = await invokeCallback('cb-task-cl-ans', claudeTaskCardEntry[0], claudeTaskBtn);
+      const claudeTaskCard = runtime.taskChannel!.listInteractionCards().find(card => card.interactionId === 'int-e2e-task-cl')!;
+      const claudeTaskBtn = JSON.parse(mock.sentCards.get(claudeTaskCard.messageId)!.content).elements[1].actions[0].value;
+      assert.equal(Buffer.byteLength(JSON.stringify(claudeTaskBtn)) <= 256, true);
+      assert.equal(expand(claudeTaskCard.messageId, claudeTaskBtn).interactionId, 'int-e2e-task-cl');
+      const misplaced = await invokeCallback('cb-misplaced', panelMsgId, claudeTaskBtn);
+      assert.match(misplaced.callbackResult!.toast.content, /旧卡或卡片操作已失效/);
+      const claudeTaskRes = await invokeCallback('cb-task-cl-ans', claudeTaskCard.messageId, claudeTaskBtn);
       assert.equal(claudeTaskRes.callbackResult, undefined);
       await runtime.tick();
       assert.equal(claude.responds.length, 1);
@@ -1052,7 +1059,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       assert.ok(dec1Ref.hub_card_message_id);
       const dec1CardJson = JSON.parse(mock.sentCards.get(dec1Ref.hub_card_message_id)!.content);
       const dec1ApproveBtn = dec1CardJson.elements[1].actions[0].value;
-      assert.equal(dec1ApproveBtn.action, 'decision_answer');
+      assert.equal(expand(dec1Ref.hub_card_message_id, dec1ApproveBtn).action, 'decision_answer');
 
       const decRes = await invokeCallback('cb-dec-1', dec1Ref.hub_card_message_id, dec1ApproveBtn);
       assert.deepEqual(decRes.callbackResult, { toast: { type: 'success', content: '已确认' } });
@@ -1086,7 +1093,8 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       assert.equal(mock.patches.length, patchesBeforePage + 1);
       assert.equal(mock.patches[mock.patches.length - 1]!.message_id, summaryMsgId);
       assert.match(mock.patches[mock.patches.length - 1]!.content, /待处理汇总（共 6 项）/);
-      assert.match(mock.patches[mock.patches.length - 1]!.content, /DEC-E2E-7|决定 #7/);
+      const pageCard = JSON.parse(mock.patches[mock.patches.length - 1]!.content);
+      assert.match(pageCard.elements[0].content, /决定 \\#7/);
 
       // pending_page without cardMessageId falls back to port.send
       const createdBeforeSend = mock.created.length;
@@ -1139,6 +1147,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
         toolInputDigest: approvalDigest,
       });
       assert.equal(hubAnswerRes.callbackResult, undefined);
+      await runtime.flushInteractive();
       assert.equal(agy.responds.length, 1);
       assert.equal(runtime.pendingHub!.getRef('interaction:int-e2e-approval')?.card_active, 0);
 
@@ -1157,7 +1166,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
         kind: 'question',
         prompt: '选择或输入验证策略',
         choices: ['快速回归', '全量测试'],
-        multiple: false,
+        multiple: true,
         allowFreeText: true,
       };
       codex.emit({ type: 'interaction', ref: sCodex.native, interaction: codexQuestion });
@@ -1167,22 +1176,23 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       const qRef = runtime.pendingHub!.getRef('interaction:int-e2e-qform')!;
       assert.ok(qRef.hub_card_message_id);
       const qCardJson = JSON.parse(mock.sentCards.get(qRef.hub_card_message_id)!.content);
-      const submitBtn = qCardJson.body.elements[0].elements.find(
+      const submitBtn = qCardJson.body.elements.find((element: {tag: string}) => element.tag === 'form').elements.find(
         (x: { form_action_type?: string }) => x.form_action_type === 'submit',
       );
-      // Verify PendingHub.renderHubItemCard embedded entry & sourceSessionId directly on the Card 2.0 submit value
-      assert.equal(submitBtn.behaviors[0].value.entry, 'hub');
-      assert.equal(submitBtn.behaviors[0].value.sourceSessionId, sCodex.sessionId);
-      assert.equal(submitBtn.behaviors[0].value.category, 'question');
+      const hubSubmit = expand(qRef.hub_card_message_id, submitBtn.behaviors[0].value);
+      assert.equal(hubSubmit.entry, 'hub');
+      assert.equal(hubSubmit.sourceSessionId, sCodex.sessionId);
+      assert.equal(hubSubmit.category, 'question');
       const hubFormRes = await invokeCallback(
         'cb-hub-form',
         qRef.hub_card_message_id,
         submitBtn.behaviors[0].value,
-        { q0_choice: '1' },
+        { q0_multi: ['0', '1'] },
       );
       assert.equal(hubFormRes.callbackResult, undefined);
+      await runtime.flushInteractive();
       assert.equal(codex.responds.length, 1);
-      assert.deepEqual(codex.responds[0]!.answer, { kind: 'question', values: ['全量测试'] });
+      assert.deepEqual(codex.responds[0]!.answer, { kind: 'question', values: ['快速回归', '全量测试'] });
 
       // 6. Verify malformed payload through handleSdkCardCallback does NOT mutate state & returns guidance toast
       const badRes = await invokeCallback('cb-malformed-dec', dec1Ref.hub_card_message_id, {
@@ -1246,7 +1256,7 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
           connectionGeneration: 999,
           taskId: 'task-kept',
         }),
-      ) as { body: { elements: Array<{ elements: Array<{ form_action_type?: string; behaviors?: Array<{ value: Record<string, unknown> }> }> }> } };
+      ) as { body: { elements: Array<{ tag: string; elements: Array<{ form_action_type?: string; behaviors?: Array<{ value: Record<string, unknown> }> }> }> } };
       const safeSubmitVal = safeRendered.body.elements[0]!.elements.find((e) => e.form_action_type === 'submit')!.behaviors![0]!.value;
       assert.equal(safeSubmitVal.action, 'answer_form');
       assert.equal(safeSubmitVal.bindingId, 'bind-keep');
@@ -1272,26 +1282,25 @@ test('end-to-end handleSdkCardCallback -> runtime.handleTrusted across switch_ta
       );
       const renderedTaskQCard = toFeishuCard(taskQCard) as {
         schema: string;
-        body: { elements: Array<{ elements: Array<{ form_action_type?: string; behaviors?: Array<{ value: Record<string, unknown> }> }> }> };
+        body: { elements: Array<{ tag: string; elements: Array<{ form_action_type?: string; behaviors?: Array<{ value: Record<string, unknown> }> }> }> };
       };
       assert.equal(renderedTaskQCard.schema, '2.0');
-      const taskQSubmitVal = renderedTaskQCard.body.elements[0]!.elements.find((e) => e.form_action_type === 'submit')!.behaviors![0]!.value;
+      const taskQSubmitVal = renderedTaskQCard.body.elements.find(element => element.tag === 'form')!.elements.find((e) => e.form_action_type === 'submit')!.behaviors![0]!.value;
       assert.equal(taskQSubmitVal.taskId, taskToken.taskId);
       assert.equal(taskQSubmitVal.targetId, 't-claude');
       assert.equal(taskQSubmitVal.sessionId, sClaude.sessionId);
 
       // Find the real Card 2.0 sent by TaskTopicChannel.syncTask (with taskId + targetId + controlGeneration)
-      const syncedTaskQEntry = [...mock.sentCards.entries()].find(
-        ([, v]) => v.content.includes('int-e2e-task-qform') && v.content.includes('"taskId"'),
-      )!;
-      assert.ok(syncedTaskQEntry, 'expected TaskTopicChannel.syncTask to send Card 2.0 with task scope');
-      const syncedTaskQJson = JSON.parse(syncedTaskQEntry[1].content) as {
+      const syncedTaskQ = runtime.taskChannel!.listInteractionCards().find(card => card.interactionId === 'int-e2e-task-qform')!;
+      assert.ok(syncedTaskQ, 'expected TaskTopicChannel.syncTask to send Card 2.0 with task scope');
+      const syncedTaskQJson = JSON.parse(mock.sentCards.get(syncedTaskQ.messageId)!.content) as {
         schema: string;
-        body: { elements: Array<{ elements: Array<{ form_action_type?: string; behaviors?: Array<{ value: Record<string, unknown> }> }> }> };
+        body: { elements: Array<{ tag: string; elements: Array<{ form_action_type?: string; behaviors?: Array<{ value: Record<string, unknown> }> }> }> };
       };
       assert.equal(syncedTaskQJson.schema, '2.0');
-      const syncedSubmitVal = syncedTaskQJson.body.elements[0]!.elements.find((e) => e.form_action_type === 'submit')!.behaviors![0]!.value;
-      const taskQRes = await invokeCallback('cb-task-qform-e2e', syncedTaskQEntry[0], syncedSubmitVal, { q0_choice: '1' });
+      const syncedSubmitVal = syncedTaskQJson.body.elements.find(element => element.tag === 'form')!.elements.find((e) => e.form_action_type === 'submit')!.behaviors![0]!.value;
+      assert.equal(expand(syncedTaskQ.messageId, syncedSubmitVal).taskId, taskToken.taskId);
+      const taskQRes = await invokeCallback('cb-task-qform-e2e', syncedTaskQ.messageId, syncedSubmitVal, { q0_choice: '1' });
       assert.equal(taskQRes.callbackResult, undefined);
       await runtime.tick();
       assert.equal(claude.responds.length, 2);

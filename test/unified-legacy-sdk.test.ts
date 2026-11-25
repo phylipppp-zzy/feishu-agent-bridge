@@ -17,10 +17,12 @@ test('old and unknown SDK cards show owner-only toast without trusting old field
 });
 test('unknown and malformed slash use static help after owner and chat checks',async()=>{
  const actions:any[]=[];const download=async()=>Readable.from([]);const handle=async(_e:unknown,a:unknown)=>{actions.push(a);};
- for(const text of ['/what-ever','/stop invalid']) await receiveSdkMessage(msg(text),'bot','owner',new Set(['chat']),download,handle);
+ for(const text of [' /what-ever','/stop invalid']) await receiveSdkMessage(msg(text),'bot','owner',new Set(['chat']),download,handle);
  assert.deepEqual(actions,[{action:'help'},{action:'help'}]);
  await assert.rejects(receiveSdkMessage(msg('/what-ever','other'),'bot','owner',new Set(['chat']),download,handle),/unauthorized/);
  await assert.rejects(receiveSdkMessage(msg('/what-ever','owner','outside'),'bot','owner',new Set(['chat']),download,handle),/unauthorized/); assert.equal(actions.length,2);
+ await receiveSdkMessage(msg('/new codex 首句\n  第二行  '),'bot','owner',new Set(['chat']),download,handle);
+ assert.deepEqual(actions.at(-1),{action:'new_help',provider:'codex',initialPrompt:'首句\n  第二行  '});
 });
 test('unimported topic help is rejected before the parent chat handler',async()=>{
  const {FeishuSdkPort}=await import('../src/unified/feishu-sdk-port.js'); const {mkdtempSync,rmSync}=await import('node:fs'); const {join}=await import('node:path'); const {tmpdir}=await import('node:os'); const dir=mkdtempSync(join(tmpdir(),'legacy-topic-')); const port=new FeishuSdkPort({appId:'x',appSecret:'x'},join(dir,'sdk'),new Set(['chat']),'owner'); const received:any[]=[]; const event=msg('/unknown');event.message.root_id='unimported';

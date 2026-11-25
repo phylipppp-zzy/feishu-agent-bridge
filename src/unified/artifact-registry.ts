@@ -1,3 +1,4 @@
+import { matchRegisteredReplyFiles } from './reply-artifacts.js';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, realpath, readFile, rename, unlink, writeFile } from 'node:fs/promises';
@@ -98,6 +99,20 @@ export class ArtifactRegistry {
     this.tail = commit; await commit; return {...artifact};
   }
   has(artifactId: string): boolean { return this.entries.has(artifactId); }
+  findRegisteredReplyFiles(ref: NativeSessionRef, blocks: readonly import('./contracts.js').ContentBlock[]): Artifact[] {
+    const project = this.getProjectRoot(ref);
+    if (!project) return [];
+    const sessionId = JSON.stringify([ref.provider, ref.hostId, ref.serviceId, ref.nativeSessionId]);
+    const files: Artifact[] = [];
+    for (const entry of this.entries.values()) {
+      if (entry.artifact.sessionId !== sessionId || !this.authorized(entry)) continue;
+      const path = relative(project, entry.path);
+      if (path && !isAbsolute(path) && path !== '..' && !path.startsWith('..' + sep)) {
+        files.push({ ...entry.artifact, relativePath: path });
+      }
+    }
+    return matchRegisteredReplyFiles(project, blocks, files);
+  }
   list(sessionId: string, limit: number, cursor?: string): Page<Artifact> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('invalid limit');
     const items = [...this.entries.values()]

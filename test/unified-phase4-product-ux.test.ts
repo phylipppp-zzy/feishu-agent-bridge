@@ -15,6 +15,7 @@ import {
   type Session,
 } from '../src/unified/contracts.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import type { FeishuCallbackValues } from '../src/unified/feishu-callback-values.js';
 import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js';
 import { parseFeishuAction, parseFeishuText } from '../src/unified/feishu-codec.js';
 import { FeishuSdkPort, handleSdkCardCallback } from '../src/unified/feishu-sdk-port.js';
@@ -277,6 +278,7 @@ test('Scene-scoped /help and Main Chat topic-only command guidance', async () =>
     assert.equal(mainHelp.title, '帮助');
     assert.match(mainHelp.text, /\/sessions/);
     assert.match(mainHelp.text, /\/new/);
+  assert.match(mainHelp.text, /\/pending.*待处理审批与问题/);
     assert.match(mainHelp.text, /\/task/);
     assert.match(mainHelp.text, /\/health/);
     assert.match(mainHelp.text, /\/help admin/);
@@ -294,7 +296,7 @@ test('Scene-scoped /help and Main Chat topic-only command guidance', async () =>
     await channel.handle(env('h-admin', 'chat-main'), parseFeishuText('/help admin'));
     const adminHelp = cards.at(-1)!.card;
     assert.match(adminHelp.title, /运维管理/);
-    for (const cmd of ['/health', '/pending', '/panel', '/unbind', '/export']) {
+    for (const cmd of ['/health', '/ops', '/panel', '/unbind', '/export']) {
       assert.ok(adminHelp.text.includes(cmd), `admin help should include ${cmd}`);
     }
 
@@ -364,9 +366,9 @@ test('/swarm passthrough in interactive agy, one-click upgrade in read-only agy 
 
   const service = {
     getSession: async (id: string) => sessions.get(id)!,
-    attachSession: async ({ context, payload }: { context: { operationId: string }; payload: { provider: Provider } }) => {
+    attachSession: async ({ context, payload }: { context: { operationId: string; targetId: string }; payload: { provider: Provider } }) => {
       const sessionId = payload.provider === 'agy' ? 's-agy' : `s-${payload.provider}`;
-      const op = { operationId: context.operationId, status: 'completed', action: 'attachSession', error: null, result: { kind: 'session', sessionId } };
+      const op = { operationId: context.operationId, targetId: context.targetId, status: 'completed', action: 'attachSession', error: null, result: { kind: 'session', sessionId } };
       ops.set(op.operationId, op);
       return op;
     },
@@ -502,8 +504,8 @@ test('TaskTopic /help, /swarm passthrough, and clickable taskScope-stamped /mode
     await runtime.tick();
     const emptyHelpCard = JSON.parse(sdk.replies.at(-1)!.content);
     assert.equal(emptyHelpCard.header.title.content, '帮助 · 任务话题');
-    assert.match(emptyHelpCard.elements[0].text.content, /\/handoff/);
-    assert.match(emptyHelpCard.elements[0].text.content, /\/swarm/);
+    assert.match(emptyHelpCard.elements[0].content, /\/handoff/);
+    assert.match(emptyHelpCard.elements[0].content, /\/swarm/);
 
     // 3. Mount interactive Agy target
     await runtime.handleTrusted(
@@ -517,22 +519,41 @@ test('TaskTopic /help, /swarm passthrough, and clickable taskScope-stamped /mode
       parseFeishuText('/models'),
     );
     await runtime.tick();
-    const modelsCard = JSON.parse(sdk.replies.at(-1)!.content);
+    const modelsReply = sdk.replies.at(-1)!;
+    const modelsCard = JSON.parse(modelsReply.content);
     assert.equal(modelsCard.header.title.content, 'Antigravity · 模型');
     const actionBlock = modelsCard.elements.find((e: { tag: string }) => e.tag === 'action');
     assert.ok(actionBlock && actionBlock.actions.length >= 3, 'TaskTopic /models should render clickable buttons');
     const firstBtn = actionBlock.actions[0];
-    assert.equal(firstBtn.value.action, 'settings');
-    assert.equal(firstBtn.value.model, 'gemini-4-carbon');
-    assert.equal(firstBtn.value.taskId, created.taskId);
-    assert.equal(firstBtn.value.sessionId, sAgy.sessionId);
+    assert.ok(Buffer.byteLength(JSON.stringify(firstBtn.value)) <= 256);
+    assert.match(firstBtn.value.callback_ref, /^[\w-]{43}$/);
 
-    // Clicking the stamped button parses cleanly and updates settings on the active Agy target
-    const parsedModelAction = parseFeishuAction<RuntimeTrustedAction>(firstBtn.value);
-    await runtime.handleTrusted(
-      { eventId: 'card:ev-task-model-click', destination: created.destination, identity: OWNER },
-      parsedModelAction,
+    // Clicking the compacted button resolves the stored action and updates the active Agy target
+    const { callbackValues } = port as unknown as { callbackValues: FeishuCallbackValues };
+    let parsedModelAction: RuntimeTrustedAction | undefined;
+    const toast = await handleSdkCardCallback<RuntimeTrustedAction>(
+      {
+        event_id: 'ev-task-model-click',
+        context: { open_message_id: modelsReply.message_id, open_chat_id: 'chat-main' },
+        operator: { open_id: OWNER_ID },
+        action: { tag: 'button', value: firstBtn.value },
+      } as Parameters<typeof handleSdkCardCallback>[0],
+      OWNER_ID,
+      new Set(['chat-main']),
+      (chatId, messageId) => port.callbackDestination(chatId, messageId),
+      (env, action) => {
+        parsedModelAction = action;
+        return runtime.handleTrusted(env, action);
+      },
+      (messageId, value) => callbackValues.resolve(messageId, value),
     );
+    assert.partialDeepStrictEqual(parsedModelAction, {
+      action: 'settings',
+      model: 'gemini-4-carbon',
+      taskId: created.taskId,
+      sessionId: sAgy.sessionId,
+    });
+    assert.deepEqual(toast, { toast: { type: 'success', content: '已确认' } });
     await runtime.tick();
     assert.equal(agy.settingsUpdates.length, 1);
     assert.equal(agy.settingsUpdates[0]!.model, 'gemini-4-carbon');
@@ -739,6 +760,8 @@ test('handleSdkCardCallback -> runtime.handleTrusted double-click on already-ans
     });
     await runtime.tick();
     const hubDest = runtime.pendingHub!.getRoot()?.topicDestination ?? 'chat-main';
+    const decisionCard = runtime.pendingHub!.getRef(`decision:${decision.decisionId}`)?.hub_card_message_id;
+    assert.ok(decisionCard);
 
     const cardValue = {
       action: 'decision_answer',
@@ -750,7 +773,7 @@ test('handleSdkCardCallback -> runtime.handleTrusted double-click on already-ans
     const makeCardEvt = (eventId: string) =>
       ({
         event_id: eventId,
-        context: { open_message_id: 'om_dec_card_1', open_chat_id: 'chat-main' },
+        context: { open_message_id: decisionCard, open_chat_id: 'chat-main' },
         operator: { open_id: OWNER_ID },
         action: { tag: 'button', value: cardValue },
       }) as Parameters<typeof handleSdkCardCallback>[0];

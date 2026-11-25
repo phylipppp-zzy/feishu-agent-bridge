@@ -1,3 +1,4 @@
+import type { TurnProgressSnapshot } from './turn-progress-store.js';
 import { createHash } from 'node:crypto';
 import { contractError, type ContractError } from './errors.js';
 
@@ -9,11 +10,12 @@ export type Capability = { status: 'available' } | { status: 'unsupported' | 'te
 export type Capabilities = Record<CapabilityName, Capability>;
 export interface Identity { subject: string; source: string }
 /** Identity must be authenticated by the transport, not trusted from client input. */
-export interface WriteContext { operationId: string; idempotencyKey: string; targetId: string; expectedRevision: Revision; controlGeneration: number; identity: Identity }
+export interface ChannelInputScope { destination: string; bindingScope: string; ownerSource: string; ownerSubject: string }
+export interface WriteContext { operationId: string; idempotencyKey: string; targetId: string; expectedRevision: Revision; controlGeneration: number; identity: Identity; channelScope?: ChannelInputScope }
 export interface NativeSessionRef { provider: Provider; hostId: string; serviceId: string; nativeSessionId: string }
 export type RunStatus = 'idle' | 'running' | 'waiting_question' | 'waiting_approval' | 'interrupted' | 'failed' | 'unreachable' | 'read_only';
 export interface ControlState { serviceId: string; owner: string | null; input: 'available' | 'unavailable' | 'unknown'; generation: number; operationId: string | null; reason: string | null }
-export interface Session { createdAt?: string; discoveryObservedAt?:string; updatedAt?: string; sessionId: string; native: NativeSessionRef; project: string; title: string; status: RunStatus; revision: Revision; capabilities: Capabilities; control: ControlState }
+export interface Session { createdAt?: string; discoveryObservedAt?:string; updatedAt?: string; archived?: boolean; sessionId: string; native: NativeSessionRef; project: string; title: string; status: RunStatus; revision: Revision; capabilities: Capabilities; control: ControlState }
 export interface Turn { turnId: string; sessionId: string; status: 'queued' | 'running' | 'completed' | 'interrupted' | 'failed'; inputId: string | null; startedAt: string | null; endedAt: string | null; model: string | null; outputIds: string[] }
 export type ContentBlock = { type: 'text'; text: string } | { type: 'artifact'; artifactId: string; contentVersion: string };
 export interface Message { messageId: string; sessionId: string; turnId: string; role: 'user' | 'assistant' | 'tool'; blocks: ContentBlock[]; sequence: number; revision: Revision; final: boolean; source: string }
@@ -24,16 +26,23 @@ export type OperationResult = {kind:'session'; sessionId:string} | {kind:'artifa
 export interface Operation { operationId: string; idempotencyKey: string; targetId: string; action: string; payloadDigest: string; status: OperationStatus; revision: Revision; error: ContractError | null; result?: OperationResult }
 export type InteractionStatus = 'awaiting_answer' | 'answer_pending_delivery' | 'resolved' | 'expired' | 'cancelled';
 export interface InteractionBase { interactionId: string; sessionId: string; turnId: string; nativeRequestId: string; connectionGeneration: number; revision: Revision; status: InteractionStatus; expiresAt: string | null; toolInputDigest: string | null; nativeResult: NativeResult | null }
-export type Interaction = InteractionBase & ({ kind: 'question'; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean } | { kind: 'approval'; tool: string; action: string; scope: string; toolInputDigest: string } | { kind: 'question_group'; questions: Array<{ id: string; prompt: string; choices: string[]; multiple: boolean | null; allowFreeText: boolean }> });
+export type Interaction = InteractionBase & ({ kind: 'question'; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean } | { kind: 'approval'; tool: string; action: string; scope: string; toolInputDigest: string; allowedDecisions?: readonly ('allow' | 'deny')[] } | { kind: 'question_group'; questions: Array<{ id: string; prompt: string; choices: string[]; multiple: boolean | null; allowFreeText: boolean }> });
 export type NativeResult = { status: 'accepted'; source: string; answer: Answer | null } | { status: 'unknown'; source: string } | { status: 'rejected'; reason: string };
 export type Answer = { kind: 'question'; values: string[] } | { kind: 'approval'; decision: 'allow' | 'deny'; scope: string } | { kind: 'question_group'; answers: Record<string, string[]> };
+export interface ResponseEvidence {
+  operationId: string;
+  interactionId: string;
+  nativeRequestId: string;
+  connectionGeneration: number;
+  answerDigest: string;
+}
 export interface ResolveInteraction { context: WriteContext; interactionId: string; expectedConnectionGeneration: number; answer: Answer; toolInputDigest: string | null }
-export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?:{destination:string;bindingScope:string;ownerSource:string;ownerSubject:string} }
+export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?: ChannelInputScope }
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
 export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
 export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[]; partialFailure?:boolean }
 /** All collections and the cursor are read at one consistent event watermark. Interaction status includes delivery state. */
-export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; connectionGeneration?: number }
+export interface SessionSnapshot { session: Session; messages: Message[]; interactions: Interaction[]; turns?: Turn[]; turnProgress?: TurnProgressSnapshot; connectionGeneration?: number }
 export interface Snapshot<T> { value: T; cursor: string }
 export type EventSubscription = { status: 'events'; events: Event[]; cursor: string } | { status: 'snapshot_required'; error: ContractError };
 
@@ -50,6 +59,7 @@ export function validateSubmitInput(x: SubmitInput): Validation<SubmitInput> {
   if (!['new', 'queue', 'steer'].includes(x.mode) || !Array.isArray(x.blocks) || x.blocks.length === 0 || !x.blocks.every(b => b && (b.type === 'text' ? nonempty(b.text) : b.type === 'artifact' && nonempty(b.artifactId) && nonempty(b.contentVersion)))) return fail('invalid input blocks or mode');
   if (x.mode === 'steer' && (!nonempty(x.requiredTurnId) || !counter(x.expectedConnectionGeneration))) return fail('steer requires a captured turn and connection generation');
   if (x.channelScope && (!nonempty(x.channelScope.destination) || !nonempty(x.channelScope.bindingScope) || !nonempty(x.channelScope.ownerSource) || !nonempty(x.channelScope.ownerSubject) || x.channelScope.ownerSource!==x.context.identity.source || x.channelScope.ownerSubject!==x.context.identity.subject)) return fail('invalid channel scope');
+  if (x.context.channelScope && payloadDigest(x.context.channelScope) !== payloadDigest(x.channelScope ?? null)) return fail('channel scope mismatch');
   return { ok: true, value: x };
 }
 /** Compare against the authoritative interaction before atomic registration. The caller must separately authenticate identity and compare controlGeneration against the current session control in the same transaction. */
@@ -64,6 +74,7 @@ export function validateResolution(x: ResolveInteraction, current: Interaction, 
   if (!x.answer || x.answer.kind !== current.kind) return fail('answer kind mismatch');
   if (current.kind === 'approval') {
     if (x.answer.kind !== 'approval' || !['allow', 'deny'].includes(x.answer.decision) || x.answer.scope !== current.scope || x.toolInputDigest !== current.toolInputDigest) return fail('approval scope or tool input mismatch');
+    if (current.allowedDecisions && !current.allowedDecisions.includes(x.answer.decision)) return fail('native request does not offer this decision');
   } else if (current.kind === 'question_group') {
     if (x.answer.kind !== 'question_group' || !x.answer.answers || Object.keys(x.answer.answers).length !== current.questions.length || new Set(current.questions.map(q => q.id)).size !== current.questions.length || !current.questions.every(q => { const values = x.answer.kind === 'question_group' ? x.answer.answers[q.id] : undefined; return Array.isArray(values) && values.length > 0 && values.every(nonempty) && (q.multiple !== false || values.length === 1) && (q.allowFreeText || values.every(v => q.choices.includes(v))) && new Set(values).size === values.length; })) return fail('invalid grouped question answer');
   } else if (x.answer.kind !== 'question' || !Array.isArray(x.answer.values) || !x.answer.values.length || !x.answer.values.every(nonempty) || (!current.multiple && x.answer.values.length !== 1) || (!current.allowFreeText && !x.answer.values.every(v => current.choices.includes(v))) || new Set(x.answer.values).size !== x.answer.values.length) return fail('invalid question answer');
@@ -82,6 +93,14 @@ export function payloadDigest(value: unknown): string {
     throw new TypeError('payload must be JSON data');
   }
   return createHash('sha256').update(canonical(value)).digest('hex');
+}
+/** Digest the typed answer fields that can actually be delivered to a provider. */
+export function answerDigest(answer: Answer): string {
+  switch (answer.kind) {
+    case 'approval': return payloadDigest({kind: answer.kind, decision: answer.decision, scope: answer.scope});
+    case 'question': return payloadDigest({kind: answer.kind, values: answer.values});
+    case 'question_group': return payloadDigest({kind: answer.kind, answers: answer.answers});
+  }
 }
 export function checkIdempotency(existing: Pick<Operation, 'idempotencyKey' | 'payloadDigest'>, key: string, digest: string): 'same' | 'conflict' | 'different_key' { return existing.idempotencyKey !== key ? 'different_key' : existing.payloadDigest === digest ? 'same' : 'conflict'; }
 const interactionTransitions: Record<InteractionStatus, readonly InteractionStatus[]> = {

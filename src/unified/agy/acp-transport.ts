@@ -293,8 +293,26 @@ export class AgyAcpTransport {
    * Respond with a JSON-RPC result to a pending server-initiated request.
    * Enforces exact `expectedGeneration === connectionGeneration` and single-use `rpcId` delivery.
    */
-  respondServerRequest(expectedGeneration: number, rpcId: JsonRpcId, result: unknown): void {
-    this.sendServerResponse(expectedGeneration, rpcId, { result });
+  respondServerRequest(expectedGeneration: number, rpcId: JsonRpcId, result: unknown, beforeWrite?: () => void): Promise<void> {
+    const { stdin, line } = this.claimServerResponse(expectedGeneration, rpcId, { result }, beforeWrite);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (reason?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (reason) {
+          if (this.connected && this.connectionGeneration === expectedGeneration) this.markDegraded(reason);
+          reject(contractError('outcome_unknown', reason));
+        } else resolve();
+      };
+      const timer = setTimeout(() => finish('ACP server response write receipt timed out'), this.requestTimeoutMs);
+      try {
+        stdin.write(line, 'utf8', error => finish(error ? 'failed to write ACP server response' : undefined));
+      } catch {
+        finish('failed to write ACP server response');
+      }
+    });
   }
 
   /**
@@ -308,9 +326,15 @@ export class AgyAcpTransport {
     if (typeof message !== 'string' || !message) {
       throw contractError('invalid_request', 'JSON-RPC error message must be a non-empty string');
     }
-    this.sendServerResponse(expectedGeneration, rpcId, {
+    const { stdin, line } = this.claimServerResponse(expectedGeneration, rpcId, {
       error: { code, message, ...(data !== undefined ? { data } : {}) },
     });
+    try {
+      stdin.write(line, 'utf8');
+    } catch {
+      this.markDegraded('send failed');
+      throw contractError('outcome_unknown', 'failed to write ACP server error');
+    }
   }
 
   /**
@@ -411,11 +435,12 @@ export class AgyAcpTransport {
     });
   }
 
-  private sendServerResponse(
+  private claimServerResponse(
     expectedGeneration: number,
     rpcId: JsonRpcId,
     body: { result: unknown } | { error: JsonRpcErrorPayload },
-  ): void {
+    beforeWrite?: () => void,
+  ) {
     if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration <= 0) {
       throw contractError('invalid_request', 'expectedGeneration must be a positive integer');
     }
@@ -438,15 +463,16 @@ export class AgyAcpTransport {
     if (!pendingReq || pendingReq.generation !== expectedGeneration) {
       throw contractError('interaction_expired', 'unknown or expired server request');
     }
+    const stdin = proc.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) {
+      throw contractError('interaction_expired', 'ACP response stream is no longer writable');
+    }
+    const line = `${JSON.stringify({ jsonrpc: '2.0', id: rpcId, ...body })}\n`;
 
+    beforeWrite?.();
     this.pendingServerRequests.delete(key);
     this.respondedServerRequestKeys.add(key);
-
-    const payload = { jsonrpc: '2.0', id: rpcId, ...body };
-    if (!writeNdjsonLine(proc, payload)) {
-      this.markDegraded('send failed');
-      throw contractError('outcome_unknown', 'failed to write ACP server response');
-    }
+    return { stdin, line };
   }
 
   private handleStdoutLine(proc: ChildProcess, line: string): void {

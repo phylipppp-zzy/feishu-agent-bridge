@@ -9,6 +9,7 @@ import type { Capabilities, Session } from '../src/unified/contracts.js';
 import { FeishuChannel } from '../src/unified/feishu-channel.js';
 import { FeishuSdkPort } from '../src/unified/feishu-sdk-port.js';
 import { UnifiedRuntime } from '../src/unified/runtime.js';
+import { displayTopicTitle } from '../src/unified/topic-title-sync.js';
 
 const owner = { source: 'feishu', subject: 'owner' };
 const genericTitle = 'Codex 会话 · 1234abcd';
@@ -38,7 +39,7 @@ function transport(dir: string) {
   let messageNumber = 0;
   const message: { create: (request: CardRequest) => Promise<unknown>; reply: () => Promise<unknown>; patch?: (request: CardRequest) => Promise<unknown> } = {
     create: async request => {
-      if (request.data.content.includes('codex · /tmp · idle')) creates.push(titleOf(request));
+      if (request.data.content.includes('Codex · /tmp · 空闲')) creates.push(titleOf(request));
       return { code: 0, data: { message_id: `root-${++messageNumber}` } };
     },
     reply: async () => ({ code: 0, data: { message_id: 'reply' } }),
@@ -66,8 +67,8 @@ function fixture() {
     getSnapshot: async (id: string) => ({ cursor: 'cursor', value: { session: sessions.get(id), interactions: [], messages: [] } }),
     subscribeEvents: async () => ({ status: 'events', cursor: 'cursor', events: [] }),
     getOperation: async (id: string) => operations.get(id),
-    attachSession: async ({ context }: { context: { operationId: string } }) => {
-      const op = { operationId: context.operationId, status: 'completed', action: 'attachSession', result: { kind: 'session', sessionId: 's' } };
+    attachSession: async ({ context }: { context: { operationId: string; targetId: string } }) => {
+      const op = { operationId: context.operationId, targetId: context.targetId, status: 'completed', action: 'attachSession', result: { kind: 'session', sessionId: 's' } };
       operations.set(op.operationId, op);
       return op;
     },
@@ -117,8 +118,9 @@ for (const rejectedWith of ['response', 'axios error'] as const) {
       assert.equal(JSON.parse(requests[0]!.data.content).schema, undefined);
       assert.deepEqual(JSON.parse(requests[1]!.data.content), {
         schema: '2.0',
-        header: { title: { tag: 'plain_text', content: '旧话题的真实标题' } },
-        body: { elements: [{ tag: 'div', text: { tag: 'plain_text', content: 'codex · /tmp · idle' } }] },
+        config: { update_multi: true },
+        header: { title: { tag: 'plain_text', content: '[Codex · tmp] 旧话题的真实标题' } },
+        body: { elements: [{ tag: 'markdown', content: 'Codex · /tmp · 空闲' }] },
       });
       assert.ok(requests.every(request => request.path.message_id === 'legacy-root'));
 
@@ -127,7 +129,7 @@ for (const rejectedWith of ['response', 'axios error'] as const) {
       await f.channel.sync('topic:legacy');
       assert.equal(requests.length, 3);
       assert.equal(JSON.parse(requests[2]!.data.content).schema, '2.0');
-      assert.equal(titleOf(requests[2]!), '改名后的标题');
+      assert.equal(titleOf(requests[2]!), '[Codex · tmp] 改名后的标题');
     } finally {
       f.cleanup();
     }
@@ -166,7 +168,8 @@ test('new topics remember the serialized root header and patch only on title tra
     const destination = await f.bind('chat');
     assert.equal(f.sdk.rootMessageId('chat'), null);
     assert.equal(f.sdk.rootMessageId(destination), 'root-1');
-    assert.deepEqual(f.creates, ['会话 第一版']);
+    assert.deepEqual(f.creates, ['[Codex · tmp] 会话 第一版']);
+    f.sessions.set('s', { ...f.sessions.get('s')!, status: 'running' });
     await f.channel.sync(destination);
     assert.equal(f.patches.length, 0);
 
@@ -175,11 +178,26 @@ test('new topics remember the serialized root header and patch only on title tra
       await f.channel.sync(destination);
       await f.channel.sync(destination);
     }
-    assert.deepEqual(f.patches.map(patch => patch.title), ['你好', '新的话题名', '你好', '新的话题名']);
+    assert.deepEqual(f.patches.map(patch => patch.title), ['你好', '新的话题名', '你好', '新的话题名'].map(title => `[Codex · tmp] ${title}`));
     assert.ok(f.patches.every(patch => patch.root === 'root-1'));
   } finally {
     f.cleanup();
   }
+});
+
+test('a persisted unprefixed root title migrates exactly once even when generic', async () => {
+  const f = fixture();
+  try {
+    const destination = await f.bind('chat');
+    const db = new DatabaseSync(f.channelPath);
+    try {
+      db.prepare('UPDATE channel_topic_titles SET synced_title=? WHERE destination=?').run(genericTitle, destination);
+      await f.channel.sync(destination);
+      await f.channel.sync(destination);
+      assert.deepEqual(f.patches, [{ root: 'root-1', title: `[Codex · tmp] ${genericTitle}` }]);
+      assert.equal(db.prepare('SELECT synced_title FROM channel_topic_titles WHERE destination=?').get(destination)?.synced_title, `[Codex · tmp] ${genericTitle}`);
+    } finally { db.close(); }
+  } finally { f.cleanup(); }
 });
 
 test('interactive finish seeds a new root before its first sync', async () => {
@@ -189,7 +207,7 @@ test('interactive finish seeds a new root before its first sync', async () => {
     const op = await f.channel.handle(f.envelope('chat'), { action: 'bind', sessionId: 's', mode: 'interactive' }) as { operationId: string };
     const result = await f.channel.handle(f.envelope('chat'), { action: 'finish', operationId: op.operationId }) as { destination: string };
     await f.channel.sync(result.destination);
-    assert.deepEqual(f.creates, ['交互会话标题']);
+    assert.deepEqual(f.creates, ['[Codex · tmp] 交互会话标题']);
     assert.deepEqual(f.patches, []);
   } finally {
     f.cleanup();
@@ -205,7 +223,7 @@ test('an existing SDK root remains eligible for its first title patch when bind 
     await f.channel.sync('topic:existing');
     await f.channel.sync('topic:existing');
     assert.deepEqual(f.creates, []);
-    assert.deepEqual(f.patches, [{ root: 'legacy-root', title: '存量会话真实标题' }]);
+    assert.deepEqual(f.patches, [{ root: 'legacy-root', title: '[Codex · tmp] 存量会话真实标题' }]);
   } finally {
     f.cleanup();
   }
@@ -221,7 +239,7 @@ test('rebinding a topic does not reuse a stale title or skip a known change to a
     await f.channel.sync(destination);
     await f.bind(destination);
     await f.channel.sync(destination);
-    assert.deepEqual(f.patches.map(patch => patch.title), [genericTitle, '旧绑定标题']);
+    assert.deepEqual(f.patches.map(patch => patch.title), [`[Codex · tmp] ${genericTitle}`, '[Codex · tmp] 旧绑定标题']);
   } finally {
     f.cleanup();
   }
@@ -293,8 +311,8 @@ test('230031 permanently skips the expired root while a replacement root resumes
     await f.channel.sync(destination);
     await f.channel.sync(destination);
     assert.deepEqual(f.patches, [
-      { root: 'legacy-root', title: '过期根卡的新标题' },
-      { root: 'replacement-root', title: '换根后的标题' },
+      { root: 'legacy-root', title: '[Codex · tmp] 过期根卡的新标题' },
+      { root: 'replacement-root', title: '[Codex · tmp] 换根后的标题' },
     ]);
   } finally {
     f.cleanup();
@@ -312,7 +330,7 @@ test('a mock SDK without message.patch leaves synchronization usable', async () 
     assert.equal(f.channel.unconfirmedDeliveryCount(), 0);
     f.message.patch = f.patch;
     await f.channel.sync('topic:legacy');
-    assert.deepEqual(f.patches, [{ root: 'legacy-root', title: '兼容旧测试传输' }]);
+    assert.deepEqual(f.patches, [{ root: 'legacy-root', title: '[Codex · tmp] 兼容旧测试传输' }]);
   } finally {
     f.cleanup();
   }
@@ -330,7 +348,7 @@ test('a root route lookup failure leaves creation and synchronization usable', a
 
     f.sdk.rootMessageId = rootMessageId;
     await f.channel.sync(destination);
-    assert.deepEqual(f.patches, [{ root: 'root-1', title: '路由恢复后的标题' }]);
+    assert.deepEqual(f.patches, [{ root: 'root-1', title: '[Codex · tmp] 路由恢复后的标题' }]);
   } finally {
     f.cleanup();
   }
@@ -344,6 +362,7 @@ for (const changed of [false, true]) {
       f.seedRoute('topic:legacy', 's');
       f.seedChannel('topic:legacy');
       await f.channel.sync('topic:legacy');
+      assert.equal(f.patches.length, 0);
       f.title('确认后恢复');
       db.exec(`
         CREATE TRIGGER fail_title_receipt BEFORE INSERT ON channel_topic_titles
@@ -356,7 +375,7 @@ for (const changed of [false, true]) {
       db.exec('DROP TRIGGER fail_title_receipt');
       if (changed) f.title(genericTitle);
       await f.channel.sync('topic:legacy');
-      assert.deepEqual(f.patches.map(patch => patch.title), changed ? ['确认后恢复', genericTitle] : ['确认后恢复']);
+      assert.deepEqual(f.patches.map(patch => patch.title), changed ? ['[Codex · tmp] 确认后恢复', `[Codex · tmp] ${genericTitle}`] : ['[Codex · tmp] 确认后恢复']);
       assert.equal(f.channel.unconfirmedDeliveryCount(), 0);
     } finally {
       db.close();
@@ -409,13 +428,13 @@ test('automatic privacy masking holds for both legacy roots and already-patched 
     assert.equal(patches.length, 0);
 
     await runtime.channel.sync('topic:visible');
-    assert.equal(patches[0]?.title, visible.title);
+    assert.equal(patches[0]?.title, displayTopicTitle(visible));
     runtime.channel.markAutoPrivateTitle(visible.native);
     runtime.store.updateSession({ ...visible, revision: 1, title: '保密改名' }, 0, 0);
     await runtime.channel.sync('topic:visible');
     await runtime.channel.sync('topic:visible');
     assert.equal(patches.length, 2);
-    assert.match(patches[1]!.title, /^Codex 会话 · [0-9a-f]{8}$/);
+    assert.match(patches[1]!.title, /^\[Codex · tmp\] Codex 会话 · [0-9a-f]{8}$/);
     assert.doesNotMatch(JSON.stringify(patches), /不得出现在飞书|保密改名/);
   } finally {
     await runtime.close();

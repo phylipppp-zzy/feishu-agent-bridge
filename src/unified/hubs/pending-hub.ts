@@ -6,14 +6,15 @@ import {
   type Identity,
   type Operation,
   type Provider,
-  type Session,
 } from '../contracts.js';
-import type { ChannelCard } from '../feishu-cards.js';
+import { interactionStatusText, type ChannelCard } from '../feishu-cards.js';
 import { StoreError } from '../store.js';
 import type { DecisionSyncStore } from './decision-store.js';
 import {
+  buildAnsweredDecisionCard,
   buildDecisionPendingItem,
   buildInteractionPendingItem,
+  buildPendingInteractionStatusCard,
   buildPendingRootCard,
   buildWithdrawnCard,
   formatPendingSummaryCard,
@@ -22,7 +23,8 @@ import {
   paginatePendingItems,
   renderPendingItemCard,
 } from './pending-cards.js';
-import { describePendingWithdrawalReason, executePendingSubmit } from './pending-submit.js';
+import { discoverPendingItems } from './pending-discovery.js';
+import { executePendingSubmit } from './pending-submit.js';
 import {
   DEFAULT_PENDING_ROOT_KEY,
   DEFAULT_PENDING_TOPIC_TITLE,
@@ -40,6 +42,7 @@ import {
   type PendingQuery,
   type PendingRefRow,
   type PendingRootRow,
+  type PendingSubmitNotifications,
   type PendingSubmitPayload,
   type PendingSubmitResult,
 } from './pending-types.js';
@@ -66,7 +69,11 @@ export class PendingHub {
     | ((sessionId: string, hubDestination: string) => Promise<string | null> | string | null)
     | undefined;
   private readonly now: () => number;
-  private readonly withdrawLocks = new Map<string, Promise<void>>();
+  private readonly shouldRefreshSource: PendingHubOptions['shouldRefreshSource'];
+  private readonly refLocks = new Map<string, Promise<void>>();
+  private summaryLock = Promise.resolve();
+  private rootCreation: Promise<PendingHubRoot> | undefined;
+  private summaryVersion = 0;
 
   constructor(options: PendingHubOptions) {
     if (!options || !nonempty(options.dbPath)) fail('invalid_request', 'dbPath is required');
@@ -87,6 +94,7 @@ export class PendingHub {
     this.authorize = options.authorize;
     this.resolveTopicLink = options.resolveTopicLink;
     this.now = options.now ?? (() => Date.now());
+    this.shouldRefreshSource = options.shouldRefreshSource;
 
     this.db = new DatabaseSync(options.dbPath);
     this.db.exec(PENDING_HUB_SCHEMA_SQL);
@@ -132,7 +140,7 @@ export class PendingHub {
    * Registers an externally created source card messageId (e.g. rendered by FeishuChannel)
    * so that resolving via Hub or native terminal withdraws both cards.
    */
-  trackSourceCard(params: {
+  async trackSourceCard(params: {
     interactionId: string;
     category?: 'question' | 'approval';
     provider: Provider;
@@ -141,10 +149,17 @@ export class PendingHub {
     messageId: string;
     revision: number;
     connectionGeneration: number;
-  }): void {
+  }): Promise<void> {
     this.bindSourceSession(params.sourceSessionId, params.sourceDestination);
-    const category = params.category ?? 'question';
     const refId = `interaction:${params.interactionId}`;
+    await this.withRefLock(refId, async () => {
+      this.recordSourceCard(refId, params);
+      await this.refreshInteractionRefLocked(params.interactionId);
+    });
+  }
+
+  private recordSourceCard(refId: string, params: Parameters<PendingHub['trackSourceCard']>[0]): void {
+    const category = params.category ?? 'question';
     const existing = this.getRef(refId);
     const now = this.now();
     if (!existing) {
@@ -173,7 +188,10 @@ export class PendingHub {
       this.db
         .prepare(
           `UPDATE pending_hub_refs_v1
-           SET category=?, source_destination=?, source_card_message_id=?, revision=?, connection_generation=?, updated_at=?
+           SET category=?, source_destination=?, source_card_message_id=?,
+               revision=MAX(revision,?), connection_generation=?,
+               withdrawn_reason=CASE WHEN source_card_message_id IS ? THEN withdrawn_reason ELSE NULL END,
+               updated_at=?
            WHERE ref_id=?`,
         )
         .run(
@@ -182,6 +200,7 @@ export class PendingHub {
           params.messageId,
           params.revision,
           params.connectionGeneration,
+          params.messageId,
           now,
           refId,
         );
@@ -228,7 +247,12 @@ export class PendingHub {
     }
   }
 
-  async ensureRoot(): Promise<PendingHubRoot> {
+  ensureRoot(): Promise<PendingHubRoot> {
+    this.rootCreation ??= this.ensureRootOnce().finally(() => { this.rootCreation = undefined; });
+    return this.rootCreation;
+  }
+
+  private async ensureRootOnce(): Promise<PendingHubRoot> {
     this.checkBaseAuth(this.owner, this.destination);
     const now = this.now();
     const deliveryId = `pending-root:${payloadDigest([
@@ -343,106 +367,16 @@ export class PendingHub {
     return null;
   }
 
-  private async collectAuthoritativePending(nowMs: number): Promise<PendingItemView[]> {
-    const items: PendingItemView[] = [];
-    const seenInteractions = new Set<string>();
+  private collectAuthoritativePending(now: number): Promise<PendingItemView[]> {
     const hubDest = this.getRoot()?.topicDestination ?? this.destination;
-
-    let cursor: string | undefined;
-    const seenCursors = new Set<string>();
-    const sessions: Session[] = [];
-    do {
-      const page = await this.service.listSessions({ limit: 100, ...(cursor ? { cursor } : {}) });
-      sessions.push(...page.items);
-      cursor = page.nextCursor ?? undefined;
-      if (cursor) {
-        if (seenCursors.has(cursor) || seenCursors.size >= 100) break;
-        seenCursors.add(cursor);
-      }
-    } while (cursor);
-
-    for (const session of sessions) {
-      let snapshot: Awaited<ReturnType<UnifiedService['getSnapshot']>>;
-      try {
-        snapshot = await this.service.getSnapshot(session.sessionId);
-      } catch {
-        continue;
-      }
-      const sourceDestination = this.getSourceDestination(session.sessionId);
-      for (const interaction of snapshot.value.interactions) {
-        seenInteractions.add(interaction.interactionId);
-        if (
-          !isActionableInteraction(
-            interaction,
-            snapshot.value.session,
-            snapshot.value.connectionGeneration,
-            nowMs,
-          )
-        ) {
-          continue;
-        }
-        const sourceTopicUrl = await this.resolveSourceLink(session.sessionId, hubDest);
-        items.push(
-          buildInteractionPendingItem({
-            interaction,
-            session,
-            sourceSessionId: session.sessionId,
-            sourceDestination,
-            sourceTopicUrl,
-          }),
-        );
-      }
-    }
-
-    // Also re-check any bound source sessions that might not have appeared in listSessions
-    const boundRows = this.db
-      .prepare('SELECT session_id, source_destination FROM pending_hub_sessions_v1')
+    const boundSources = this.db.prepare('SELECT session_id, source_destination FROM pending_hub_sessions_v1')
       .all() as Array<{ session_id: string; source_destination: string }>;
-    for (const row of boundRows) {
-      if (sessions.some((s) => s.sessionId === row.session_id)) continue;
-      let snapshot: Awaited<ReturnType<UnifiedService['getSnapshot']>>;
-      try {
-        snapshot = await this.service.getSnapshot(row.session_id);
-      } catch {
-        continue;
-      }
-      for (const interaction of snapshot.value.interactions) {
-        if (seenInteractions.has(interaction.interactionId)) continue;
-        seenInteractions.add(interaction.interactionId);
-        if (
-          !isActionableInteraction(
-            interaction,
-            snapshot.value.session,
-            snapshot.value.connectionGeneration,
-            nowMs,
-          )
-        ) {
-          continue;
-        }
-        const sourceTopicUrl = await this.resolveSourceLink(row.session_id, hubDest);
-        items.push(
-          buildInteractionPendingItem({
-            interaction,
-            session: snapshot.value.session,
-            sourceSessionId: row.session_id,
-            sourceDestination: row.source_destination,
-            sourceTopicUrl,
-          }),
-        );
-      }
-    }
-
-    if (this.decisionStore) {
-      const decisions = this.decisionStore.listDecisions({ status: 'pending' });
-      for (const decision of decisions) {
-        if (!isActionableDecision(decision, nowMs)) continue;
-        const sourceTopicUrl = await this.resolveSourceLink(decision.source.sessionId ?? null, hubDest);
-        items.push(buildDecisionPendingItem(decision, sourceTopicUrl));
-      }
-    }
-
-    items.sort((a, b) => a.refId.localeCompare(b.refId));
-    return items;
+    return discoverPendingItems({
+      service: this.service,
+      decisionStore: this.decisionStore,
+      boundSources,
+      resolveSourceLink: (sessionId) => this.resolveSourceLink(sessionId, hubDest),
+    }, now);
   }
 
   /**
@@ -514,17 +448,117 @@ export class PendingHub {
     const inserted = this.db
       .prepare("INSERT OR IGNORE INTO pending_hub_deliveries_v1 VALUES (?, 'unknown')")
       .run(deliveryId);
-    if (!inserted.changes) return false;
+    if (!inserted.changes) {
+      const previous = this.db.prepare('SELECT state FROM pending_hub_deliveries_v1 WHERE delivery_id=?')
+        .get(deliveryId) as { state: string } | undefined;
+      if (previous?.state === 'sent') return false;
+    }
+    // PATCH of the current card is idempotent, including after a lost receipt.
     await this.port.update(destination, messageId, card, deliveryId);
     this.db.prepare("UPDATE pending_hub_deliveries_v1 SET state='sent' WHERE delivery_id=?").run(deliveryId);
     return true;
   }
 
-  /**
-   * Synchronizes authoritative pending items to both source topics and the fixed Pending Hub,
-   * and withdraws any active cards whose authoritative state is resolved/expired/cancelled/stale.
-   * Never resurrects already-answered or expired items after restart.
-   */
+  private async withRefLock<T>(refId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.refLocks.get(refId) ?? Promise.resolve();
+    const work = previous.then(fn);
+    const tail = work.then(() => {}, () => {});
+    this.refLocks.set(refId, tail);
+    try {
+      return await work;
+    } finally {
+      if (this.refLocks.get(refId) === tail) this.refLocks.delete(refId);
+    }
+  }
+
+  private async currentItem(item: PendingItemView, nowMs: number): Promise<PendingItemView | null> {
+    if (item.provider === 'decision') {
+      const decision = this.findDecision(item.decisionId);
+      return decision && isActionableDecision(decision, nowMs)
+        ? buildDecisionPendingItem(decision, item.sourceTopicUrl)
+        : null;
+    }
+    const { value: snapshot } = await this.service.getSnapshot(item.sourceSessionId);
+    const interaction = snapshot.interactions.find((candidate) => candidate.interactionId === item.interactionId);
+    if (!interaction || !isActionableInteraction(interaction, snapshot.session, snapshot.connectionGeneration, nowMs)) {
+      return null;
+    }
+    return buildInteractionPendingItem({
+      interaction,
+      session: snapshot.session,
+      sourceSessionId: item.sourceSessionId,
+      sourceDestination: this.getSourceDestination(item.sourceSessionId),
+      sourceTopicUrl: item.sourceTopicUrl,
+    });
+  }
+
+  private async deliverActionableItem(item: PendingItemView, hubDest: string, hubBindingId: string): Promise<void> {
+    const existing = this.getRef(item.refId);
+    const itemRevision = item.provider !== 'decision' ? item.revision : item.version;
+    const itemConnGen = item.provider !== 'decision' ? item.connectionGeneration : null;
+
+    let sourceCardMessageId = existing?.source_card_message_id ?? null;
+    let hubCardMessageId = existing?.hub_card_message_id ?? null;
+
+    if (item.sourceDestination) {
+      const sourceCard = this.renderHubItemCard(item, 'source', hubBindingId);
+      if (!sourceCardMessageId) {
+        const deliveryId = `pending-src:${payloadDigest([item.refId, item.sourceDestination, itemRevision])}`;
+        sourceCardMessageId = await this.deliverOnce(item.sourceDestination, sourceCard, deliveryId);
+      } else if (existing && existing.revision < itemRevision && this.canUpdateSource(existing)) {
+        const deliveryId = `pending-src-upd:${payloadDigest([item.refId, item.sourceDestination, itemRevision])}`;
+        await this.updateOnce(item.sourceDestination, sourceCardMessageId, sourceCard, deliveryId);
+      }
+    }
+
+    const hubCard = this.renderHubItemCard(item, 'hub', hubBindingId);
+    if (!hubCardMessageId) {
+      const deliveryId = `pending-hub:${payloadDigest([item.refId, hubDest, itemRevision])}`;
+      hubCardMessageId = await this.deliverOnce(hubDest, hubCard, deliveryId);
+    } else if (existing && existing.revision < itemRevision) {
+      const deliveryId = `pending-hub-upd:${payloadDigest([item.refId, hubDest, itemRevision])}`;
+      await this.updateOnce(hubDest, hubCardMessageId, hubCard, deliveryId);
+    }
+
+    const now = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO pending_hub_refs_v1(
+          ref_id, category, provider, source_session_id, source_destination,
+          interaction_id, decision_id, revision, connection_generation,
+          source_card_message_id, hub_card_message_id, card_active, withdrawn_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+        ON CONFLICT(ref_id) DO UPDATE SET
+          category=excluded.category,
+          provider=excluded.provider,
+          source_session_id=excluded.source_session_id,
+          source_destination=COALESCE(excluded.source_destination, pending_hub_refs_v1.source_destination),
+          revision=excluded.revision,
+          connection_generation=excluded.connection_generation,
+          source_card_message_id=COALESCE(excluded.source_card_message_id, pending_hub_refs_v1.source_card_message_id),
+          hub_card_message_id=COALESCE(excluded.hub_card_message_id, pending_hub_refs_v1.hub_card_message_id),
+          card_active=1,
+          withdrawn_reason=NULL,
+          updated_at=excluded.updated_at`,
+      )
+      .run(
+        item.refId,
+        item.category,
+        item.provider,
+        item.sourceSessionId,
+        item.sourceDestination,
+        item.category === 'question' || item.category === 'approval' ? item.interactionId : null,
+        item.category === 'business_decision' || item.category === 'execution_auth' ? item.decisionId : null,
+        itemRevision,
+        itemConnGen,
+        sourceCardMessageId,
+        hubCardMessageId,
+        now,
+        now,
+      );
+  }
+
+  /** Revalidate each interaction inside the same lock used for targeted updates. */
   async sync(options: { nowMs?: number; query?: PendingQuery } = {}): Promise<{
     activeCount: number;
     withdrawnRefs: string[];
@@ -534,161 +568,171 @@ export class PendingHub {
     const hubDest = root.topicDestination ?? root.chatDestination;
     const hubBindingId = createHash('sha256').update(this.rootKey).digest('hex').slice(0, 16);
 
-    const activeItems = await this.collectAuthoritativePending(nowMs);
-    const activeByRefId = new Map(activeItems.map((item) => [item.refId, item]));
+    const version = this.summaryVersion;
+    const candidates = await this.collectAuthoritativePending(nowMs);
+    const candidateIds = new Set(candidates.map((item) => item.refId));
+    const active: PendingItemView[] = [];
     const withdrawnRefs: string[] = [];
 
-    // 1. Withdraw any tracked active cards that are no longer actionable in authoritative stores
-    const activeRefs = this.db
-      .prepare('SELECT * FROM pending_hub_refs_v1 WHERE card_active=1')
-      .all() as unknown as PendingRefRow[];
-    for (const ref of activeRefs) {
-      if (activeByRefId.has(ref.ref_id)) continue;
-      const reason = await this.describeWithdrawalReason(ref);
-      await this.withdrawRefCards(ref, reason, hubDest);
-      withdrawnRefs.push(ref.ref_id);
+    const tracked = this.db
+      .prepare(`SELECT * FROM pending_hub_refs_v1 WHERE card_active=1
+        OR (interaction_id IS NOT NULL AND
+          (withdrawn_reason IN (?, ?, ?) OR withdrawn_reason LIKE '已通过%提交答复%'))`)
+      .all('答复已提交，等待原端确认', '答复结果未知，请查看原会话', '已提交答复，等待确认回执') as unknown as PendingRefRow[];
+    for (const ref of tracked) {
+      if (candidateIds.has(ref.ref_id)) continue;
+      const result = ref.interaction_id
+        ? await this.refreshInteractionRef(ref.interaction_id, nowMs)
+        : await this.refreshDecisionRef(ref.decision_id!, nowMs);
+      if (result.sourceUpdated || result.hubUpdated) withdrawnRefs.push(ref.ref_id);
     }
 
-    // 2. Render/update cards for currently actionable items ONLY
-    for (const item of activeItems) {
-      const existing = this.getRef(item.refId);
-      const itemRevision = item.provider !== 'decision' ? item.revision : item.version;
-      const itemConnGen = item.provider !== 'decision' ? item.connectionGeneration : null;
-
-      let sourceCardMessageId = existing?.source_card_message_id ?? null;
-      let hubCardMessageId = existing?.hub_card_message_id ?? null;
-
-      if (item.sourceDestination) {
-        const sourceCard = this.renderHubItemCard(item, 'source', hubBindingId);
-        if (!sourceCardMessageId) {
-          const deliveryId = `pending-src:${payloadDigest([item.refId, item.sourceDestination, itemRevision])}`;
-          sourceCardMessageId = await this.deliverOnce(item.sourceDestination, sourceCard, deliveryId);
-        } else if (existing && existing.revision < itemRevision) {
-          const deliveryId = `pending-src-upd:${payloadDigest([item.refId, item.sourceDestination, itemRevision])}`;
-          await this.updateOnce(item.sourceDestination, sourceCardMessageId, sourceCard, deliveryId);
+    for (const candidate of candidates) {
+      await this.withRefLock(candidate.refId, async () => {
+        const item = await this.currentItem(candidate, nowMs);
+        if (item) {
+          await this.deliverActionableItem(item, hubDest, hubBindingId);
+          active.push(item);
+          return;
         }
-      }
-
-      const hubCard = this.renderHubItemCard(item, 'hub', hubBindingId);
-      if (!hubCardMessageId) {
-        const deliveryId = `pending-hub:${payloadDigest([item.refId, hubDest, itemRevision])}`;
-        hubCardMessageId = await this.deliverOnce(hubDest, hubCard, deliveryId);
-      } else if (existing && existing.revision < itemRevision) {
-        const deliveryId = `pending-hub-upd:${payloadDigest([item.refId, hubDest, itemRevision])}`;
-        await this.updateOnce(hubDest, hubCardMessageId, hubCard, deliveryId);
-      }
-
-      const now = this.now();
-      this.db
-        .prepare(
-          `INSERT INTO pending_hub_refs_v1(
-            ref_id, category, provider, source_session_id, source_destination,
-            interaction_id, decision_id, revision, connection_generation,
-            source_card_message_id, hub_card_message_id, card_active, withdrawn_reason, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
-          ON CONFLICT(ref_id) DO UPDATE SET
-            category=excluded.category,
-            provider=excluded.provider,
-            source_session_id=excluded.source_session_id,
-            source_destination=COALESCE(excluded.source_destination, pending_hub_refs_v1.source_destination),
-            revision=excluded.revision,
-            connection_generation=excluded.connection_generation,
-            source_card_message_id=COALESCE(excluded.source_card_message_id, pending_hub_refs_v1.source_card_message_id),
-            hub_card_message_id=COALESCE(excluded.hub_card_message_id, pending_hub_refs_v1.hub_card_message_id),
-            card_active=1,
-            withdrawn_reason=NULL,
-            updated_at=excluded.updated_at`,
-        )
-        .run(
-          item.refId,
-          item.category,
-          item.provider,
-          item.sourceSessionId,
-          item.sourceDestination,
-          item.category === 'question' || item.category === 'approval' ? item.interactionId : null,
-          item.category === 'business_decision' || item.category === 'execution_auth' ? item.decisionId : null,
-          itemRevision,
-          itemConnGen,
-          sourceCardMessageId,
-          hubCardMessageId,
-          now,
-          now,
-        );
+        const result = candidate.provider === 'decision'
+          ? await this.refreshDecisionRefLocked(candidate.decisionId, nowMs)
+          : await this.refreshInteractionRefLocked(candidate.interactionId, nowMs);
+        if (result.sourceUpdated || result.hubUpdated) withdrawnRefs.push(candidate.refId);
+      });
     }
 
-    // 3. Update Hub summary overview card
-    await this.refreshSummaryCard(hubDest, options.query, nowMs);
+    const card = this.formatSummaryCard(paginatePendingItems(active, options.query), options.query);
+    await this.queueSummaryUpdate(hubDest, card, version);
+    return { activeCount: active.length, withdrawnRefs };
+  }
 
-    return {
-      activeCount: activeItems.length,
-      withdrawnRefs,
+  private canUpdateSource(ref: PendingRefRow): boolean {
+    return !ref.interaction_id || !ref.source_session_id || !ref.source_destination || !ref.source_card_message_id ||
+      !this.shouldRefreshSource || this.shouldRefreshSource({
+        interactionId: ref.interaction_id,
+        sessionId: ref.source_session_id,
+        destination: ref.source_destination,
+        messageId: ref.source_card_message_id,
+      });
+  }
+
+  private async updateRefCards(
+    ref: PendingRefRow,
+    reason: string,
+    revision: number,
+    card = buildWithdrawnCard(ref.category, reason),
+  ): Promise<PendingSubmitResult['withdrawnCards']> {
+    if (ref.card_active === 0 && ref.withdrawn_reason === reason && ref.revision === revision) {
+      return { sourceUpdated: false, hubUpdated: false };
+    }
+    const root = this.getRoot();
+    const hubDest = root?.topicDestination ?? root?.chatDestination ?? this.destination;
+    const update = (destination: string, messageId: string, entry: string) => {
+      const deliveryId = `pending-withdraw-${entry}:${payloadDigest([ref.ref_id, messageId, revision, reason])}`;
+      return this.updateOnce(destination, messageId, card, deliveryId);
     };
+    const sourceId = ref.source_card_message_id;
+    const sourceDest = ref.source_destination;
+    const [source, hub] = await Promise.allSettled([
+      sourceId && sourceDest && this.canUpdateSource(ref) ? update(sourceDest, sourceId, 'src') : false,
+      ref.hub_card_message_id ? update(hubDest, ref.hub_card_message_id, 'hub') : false,
+    ]);
+    if (source.status === 'rejected') throw source.reason;
+    if (hub.status === 'rejected') throw hub.reason;
+    this.db
+      .prepare(`UPDATE pending_hub_refs_v1
+        SET card_active=0, withdrawn_reason=?, revision=?, updated_at=? WHERE ref_id=?`)
+      .run(reason, revision, this.now(), ref.ref_id);
+    return { sourceUpdated: source.value, hubUpdated: hub.value };
   }
 
-  private async describeWithdrawalReason(ref: PendingRefRow): Promise<string> {
-    return describePendingWithdrawalReason(ref, this.service, this.decisionStore);
+  async refreshInteractionRef(interactionId: string, nowMs = this.now()): Promise<PendingSubmitResult['withdrawnCards']> {
+    return this.withRefLock(`interaction:${interactionId}`, () => this.refreshInteractionRefLocked(interactionId, nowMs));
   }
 
-  private async withdrawRefCards(ref: PendingRefRow, reason: string, hubDest: string): Promise<{
-    sourceUpdated: boolean;
-    hubUpdated: boolean;
-  }> {
-    const previous = this.withdrawLocks.get(ref.ref_id) ?? Promise.resolve();
-    let release!: () => void;
-    const lock = new Promise<void>((r) => {
-      release = r;
-    });
-    const tail = previous.then(() => lock);
-    this.withdrawLocks.set(ref.ref_id, tail);
-    await previous;
+  private async refreshInteractionRefLocked(
+    interactionId: string,
+    nowMs = this.now(),
+  ): Promise<PendingSubmitResult['withdrawnCards']> {
+    const ref = this.getRef(`interaction:${interactionId}`);
+    if (!ref) return { sourceUpdated: false, hubUpdated: false };
 
+    const interaction = await this.service.getInteraction(interactionId).catch(() => null);
+    if (!interaction) return this.updateRefCards(ref, '该请求已不可用', ref.revision);
+
+    const operation = await this.service.getResponseOperation?.(interactionId);
+    const status = interactionStatusText(interaction, operation);
+    if (status) {
+      const card = buildPendingInteractionStatusCard(interaction, status, operation);
+      return this.updateRefCards(ref, status, interaction.revision, card);
+    }
+
+    // Only an awaiting request needs a session-level check for expiry or lost control.
+    const snapshot = await this.service.getSnapshot(interaction.sessionId).catch(() => null);
+    if (snapshot && isActionableInteraction(interaction, snapshot.value.session, snapshot.value.connectionGeneration, nowMs)) {
+      return { sourceUpdated: false, hubUpdated: false };
+    }
+    const reason = interaction.expiresAt !== null && Date.parse(interaction.expiresAt) <= nowMs
+      ? '该请求已过期'
+      : '原会话的连接或控制状态已变化，卡片已失效';
+    return this.updateRefCards(ref, reason, interaction.revision);
+  }
+
+  async refreshDecisionRef(decisionId: string, nowMs = this.now()): Promise<PendingSubmitResult['withdrawnCards']> {
+    return this.withRefLock(`decision:${decisionId}`, () => this.refreshDecisionRefLocked(decisionId, nowMs));
+  }
+
+  private findDecision(decisionId: string) {
     try {
-      const latest = this.getRef(ref.ref_id);
-      if (!latest || latest.card_active === 0) {
-        return { sourceUpdated: false, hubUpdated: false };
-      }
-
-      let sourceUpdated = false;
-      let hubUpdated = false;
-      const withdrawnCard = buildWithdrawnCard(latest.category, reason);
-      const stamp = this.now();
-
-      if (latest.source_card_message_id && latest.source_destination) {
-        const deliveryId = `pending-withdraw-src:${payloadDigest([latest.ref_id, latest.source_card_message_id, latest.revision])}`;
-        sourceUpdated = await this.updateOnce(
-          latest.source_destination,
-          latest.source_card_message_id,
-          withdrawnCard,
-          deliveryId,
-        );
-      }
-      if (latest.hub_card_message_id) {
-        const deliveryId = `pending-withdraw-hub:${payloadDigest([latest.ref_id, latest.hub_card_message_id, latest.revision])}`;
-        hubUpdated = await this.updateOnce(hubDest, latest.hub_card_message_id, withdrawnCard, deliveryId);
-      }
-
-      this.db
-        .prepare(
-          'UPDATE pending_hub_refs_v1 SET card_active=0, withdrawn_reason=?, updated_at=? WHERE ref_id=?',
-        )
-        .run(reason, stamp, latest.ref_id);
-
-      return { sourceUpdated, hubUpdated };
-    } finally {
-      release();
-      if (this.withdrawLocks.get(ref.ref_id) === tail) {
-        this.withdrawLocks.delete(ref.ref_id);
-      }
+      return this.decisionStore?.getDecision(decisionId);
+    } catch (error) {
+      // getDecision reports a missing key as invalid_request.
+      if (!(error instanceof StoreError) || error.detail.code !== 'invalid_request') throw error;
+      return undefined;
     }
   }
 
-  private async refreshSummaryCard(hubDest: string, query?: PendingQuery, nowMs = this.now()): Promise<void> {
+  private async refreshDecisionRefLocked(
+    decisionId: string,
+    nowMs: number,
+  ): Promise<PendingSubmitResult['withdrawnCards']> {
+    const ref = this.getRef(`decision:${decisionId}`);
+    if (!ref) return { sourceUpdated: false, hubUpdated: false };
+    const decision = this.findDecision(decisionId);
+    if (!decision) return this.updateRefCards(ref, '该决定已不可用', ref.revision);
+    if (isActionableDecision(decision, nowMs)) return { sourceUpdated: false, hubUpdated: false };
+    if (decision.status === 'answered') {
+      const answer = this.decisionStore?.getAnswers(decisionId)
+        .find(a => a.decisionVersion === decision.version && a.decisionDigest === decision.digest);
+      return this.updateRefCards(ref, '决定已确认', decision.version, buildAnsweredDecisionCard(decision, answer));
+    }
+    const reason = decision.status === 'cancelled' ? '决定已取消' : '决定已过期';
+    return this.updateRefCards(ref, reason, decision.version);
+  }
+
+  private queueSummaryUpdate(hubDest: string, summaryCard: ChannelCard, version: number): Promise<void> {
+    const work = this.summaryLock.then(async () => {
+      if (version === this.summaryVersion) await this.writeSummaryCard(hubDest, summaryCard);
+    });
+    this.summaryLock = work.catch(() => {});
+    return work;
+  }
+
+  private async refreshSummaryCard(): Promise<void> {
+    const root = this.getRoot();
+    if (!root) return;
+    const version = this.summaryVersion;
+    const card = await this.buildSummaryCard();
+    await this.queueSummaryUpdate(root.topicDestination ?? root.chatDestination, card, version);
+  }
+
+  private async writeSummaryCard(hubDest: string, summaryCard: ChannelCard): Promise<void> {
     const rootRow = this.db
       .prepare('SELECT summary_message_id, summary_signature FROM pending_hub_roots_v1 WHERE hub_key=?')
       .get(this.rootKey) as { summary_message_id: string | null; summary_signature: string | null } | undefined;
     if (!rootRow) return;
 
-    const summaryCard = await this.buildSummaryCard(query, nowMs);
     const signature = payloadDigest(summaryCard);
     if (rootRow.summary_message_id && rootRow.summary_signature === signature) return;
 
@@ -702,54 +746,31 @@ export class PendingHub {
       }
     } else {
       const deliveryId = `pending-summary-upd:${payloadDigest([this.rootKey, hubDest, signature])}`;
-      const updated = await this.updateOnce(hubDest, rootRow.summary_message_id, summaryCard, deliveryId);
-      if (updated) {
-        this.db
-          .prepare('UPDATE pending_hub_roots_v1 SET summary_signature=?, updated_at=? WHERE hub_key=?')
-          .run(signature, this.now(), this.rootKey);
-      }
+      await this.port.update(hubDest, rootRow.summary_message_id, summaryCard, deliveryId);
+      this.db
+        .prepare('UPDATE pending_hub_roots_v1 SET summary_signature=?, updated_at=? WHERE hub_key=?')
+        .run(signature, this.now(), this.rootKey);
     }
   }
 
-  /**
-   * Synchronizes card withdrawal when UnifiedCore emits a native observation
-   * (e.g. native terminal answered first, or connection generation advanced).
-   */
+  markSummaryDirty(): void {
+    this.summaryVersion++;
+  }
+
+  /** Native observations target the relevant tracked cards and invalidate an older overview scan. */
   async handleObservation(observation: PlatformObservation): Promise<void> {
-    const root = this.getRoot();
-    if (!root || root.state !== 'active') return;
-    const hubDest = root.topicDestination ?? root.chatDestination;
-
-    if (observation.type === 'interaction') {
-      const refId = `interaction:${observation.interaction.interactionId}`;
-      const ref = this.getRef(refId);
-      if (ref && ref.card_active === 1 && observation.interaction.status !== 'awaiting_answer') {
-        const nativeSource =
-          observation.interaction.nativeResult && 'source' in observation.interaction.nativeResult
-            ? observation.interaction.nativeResult.source
-            : null;
-        const reason =
-          nativeSource === 'terminal'
-            ? '已在原终端完成处理，两处卡片同步撤下'
-            : await this.describeWithdrawalReason(ref);
-        await this.withdrawRefCards(ref, reason, hubDest);
-        await this.refreshSummaryCard(hubDest);
-      }
-      return;
-    }
-
-    if (observation.type === 'connection') {
-      const activeRefs = this.db
-        .prepare('SELECT * FROM pending_hub_refs_v1 WHERE card_active=1 AND interaction_id IS NOT NULL')
-        .all() as unknown as PendingRefRow[];
-      let changed = false;
-      for (const ref of activeRefs) {
-        if (ref.connection_generation !== null && ref.connection_generation < observation.connectionGeneration) {
-          await this.withdrawRefCards(ref, '连接代数已更新，旧请求卡片已失效', hubDest);
-          changed = true;
-        }
-      }
-      if (changed) await this.refreshSummaryCard(hubDest);
+    if (observation.type === 'interaction' && observation.interaction.status !== 'awaiting_answer') {
+      this.markSummaryDirty();
+      await this.refreshInteractionRef(observation.interaction.interactionId);
+    } else if (observation.type === 'connection') {
+      this.markSummaryDirty();
+      const refs = this.db.prepare(`SELECT interaction_id FROM pending_hub_refs_v1
+        WHERE interaction_id IS NOT NULL AND provider=? AND connection_generation < ? AND
+          (card_active=1 OR withdrawn_reason IN (?, ?))`).all(
+        observation.ref.provider, observation.connectionGeneration,
+        '答复已提交，等待原端确认', '答复结果未知，请查看原会话',
+      ) as Array<{ interaction_id: string }>;
+      await Promise.all(refs.map((ref) => this.refreshInteractionRef(ref.interaction_id)));
     }
   }
 
@@ -783,23 +804,34 @@ export class PendingHub {
     entryPoint: 'hub' | 'source',
     envelope: PendingEnvelope,
     payload: PendingSubmitPayload,
+    notifications?: PendingSubmitNotifications,
   ): Promise<PendingSubmitResult> {
     return executePendingSubmit(
       {
-        destination: this.destination,
         rootKey: this.rootKey,
-        autoDispatch: this.autoDispatch,
+        autoDispatch: this.autoDispatch && !notifications,
         service: this.service,
         decisionStore: this.decisionStore,
         now: this.now,
-        getRoot: () => this.getRoot(),
         getRef: (refId) => this.getRef(refId),
         getSourceDestination: (sessionId) => this.getSourceDestination(sessionId),
         checkEnvelopeAuth: (ep, env, targetId, expectedSourceDest) =>
           this.checkEnvelopeAuth(ep, env, targetId, expectedSourceDest),
-        describeWithdrawalReason: (ref) => this.describeWithdrawalReason(ref),
-        withdrawRefCards: (ref, reason, hubDest) => this.withdrawRefCards(ref, reason, hubDest),
-        refreshSummaryCard: (hubDest) => this.refreshSummaryCard(hubDest),
+        refresh: async (refId, operation, sessionId) => {
+          this.markSummaryDirty();
+          if (notifications) {
+            if (sessionId) notifications.notifyInteraction(sessionId, refId.slice('interaction:'.length));
+            else notifications.notifyDecision?.(refId.slice('decision:'.length));
+            if (operation?.status === 'received') notifications.notifyOperation(operation.operationId);
+            notifications.notifySummary();
+            return { sourceUpdated: false, hubUpdated: false };
+          }
+          const updated = sessionId
+            ? await this.refreshInteractionRef(refId.slice('interaction:'.length))
+            : await this.refreshDecisionRef(refId.slice('decision:'.length));
+          await this.refreshSummaryCard();
+          return updated;
+        },
       },
       entryPoint,
       envelope,

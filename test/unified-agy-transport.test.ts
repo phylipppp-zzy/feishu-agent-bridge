@@ -32,7 +32,7 @@ const hasCode = (expected: string) => (err: unknown): boolean =>
 function fakeAcpServerSource(): string {
   return `
 import { createInterface } from 'node:readline';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, writeSync } from 'node:fs';
 
 const logFile = process.env.FAKE_LOG_FILE || '';
 const mode = process.env.FAKE_MODE || 'normal';
@@ -45,11 +45,11 @@ function log(entry) {
 }
 
 function send(msg) {
-  process.stdout.write(JSON.stringify(msg) + '\\n');
+  writeSync(1, JSON.stringify(msg) + '\\n');
 }
 
 if (mode === 'crash_before_init') {
-  process.stderr.write('fatal before init\\n');
+  writeSync(2, 'fatal before init\\n');
   process.exit(1);
 }
 
@@ -60,7 +60,8 @@ if (mode === 'ignore_eof_and_sigterm') {
   });
 }
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+// Read the inherited descriptor directly so the mock works in restricted stdio environments.
+const rl = createInterface({ input: createReadStream(undefined, { fd: 0, autoClose: false }), crlfDelay: Infinity });
 let activePromptId = null;
 let promptTimer = null;
 
@@ -220,8 +221,8 @@ rl.on('line', line => {
 
     if (scenario === 'crash_mid_request') {
       setTimeout(() => {
-        process.stderr.write('unexpected crash\\n');
-        process.exit(1);
+        writeSync(2, 'unexpected crash\\n');
+        process.kill(process.pid, 'SIGKILL');
       }, 20);
       return;
     }
@@ -317,18 +318,19 @@ rl.on('close', () => {
 function fakeStreamJsonServerSource(): string {
   return `
 import { createInterface } from 'node:readline';
+import { createReadStream, writeSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
 const mode = process.env.FAKE_STREAM_MODE || 'normal';
 
 if (mode === 'cli_error') {
-  process.stderr.write('Error: invalid flag combination\\n');
+  writeSync(2, 'Error: invalid flag combination\\n');
   process.exit(2);
 }
 
 if (mode === 'hang_and_ignore_sigterm') {
   process.on('SIGTERM', () => {});
-  process.stdout.write(JSON.stringify({
+  writeSync(1, JSON.stringify({
     event: 'init',
     conversation_id: 'conv-hang',
     init: { model: 'gemini-4-hydrogen', cwd: process.cwd() },
@@ -336,7 +338,7 @@ if (mode === 'hang_and_ignore_sigterm') {
   setInterval(() => {}, 1000);
 }
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const rl = createInterface({ input: createReadStream(undefined, { fd: 0, autoClose: false }), crlfDelay: Infinity });
 const receivedInputs = [];
 
 rl.on('line', line => {
@@ -348,7 +350,7 @@ rl.on('close', async () => {
   if (mode === 'hang_and_ignore_sigterm') return;
 
   // Emit an init event split across chunks and multi-byte UTF-8 boundary, plus a non-JSON warning line
-  process.stdout.write('diagnostic non-json preamble\\n');
+  writeSync(1, 'diagnostic non-json preamble\\n');
   const initLine = JSON.stringify({
     event: 'init',
     conversation_id: 'conv-123',
@@ -362,9 +364,9 @@ rl.on('close', async () => {
     },
   }) + '\\n';
   const initBuf = Buffer.from(initLine, 'utf8');
-  process.stdout.write(initBuf.subarray(0, 20));
+  writeSync(1, initBuf.subarray(0, 20));
   await new Promise(r => setTimeout(r, 10));
-  process.stdout.write(initBuf.subarray(20));
+  writeSync(1, initBuf.subarray(20));
 
   const step1 = JSON.stringify({
     event: 'step_update',
@@ -380,11 +382,11 @@ rl.on('close', async () => {
   const step1Buf = Buffer.from(step1, 'utf8');
   // Split right inside a 3-byte UTF-8 sequence to verify StringDecoder chunk safety
   const splitIdx = step1Buf.indexOf(Buffer.from('中', 'utf8')) + 1;
-  process.stdout.write(step1Buf.subarray(0, splitIdx));
+  writeSync(1, step1Buf.subarray(0, splitIdx));
   await new Promise(r => setTimeout(r, 10));
-  process.stdout.write(step1Buf.subarray(splitIdx));
+  writeSync(1, step1Buf.subarray(splitIdx));
 
-  process.stdout.write(JSON.stringify({
+  writeSync(1, JSON.stringify({
     event: 'step_update',
     conversation_id: 'conv-123',
     step_update: {
@@ -397,7 +399,7 @@ rl.on('close', async () => {
     },
   }) + '\\n');
 
-  process.stdout.write(JSON.stringify({
+  writeSync(1, JSON.stringify({
     event: 'result',
     conversation_id: 'conv-123',
     result: {
@@ -564,6 +566,7 @@ test('AgyAcpTransport enforces bidirectional permission/elicitation, single-resp
     const logFile = join(dir, 'rpc.log');
     const serverRequests: AgyServerRequest[] = [];
     const disconnects: number[] = [];
+    const writes: Array<Promise<void>> = [];
 
     const transport = new AgyAcpTransport({
       agyBin: fakeBin,
@@ -574,9 +577,12 @@ test('AgyAcpTransport enforces bidirectional permission/elicitation, single-resp
     transport.onServerRequest = req => {
       serverRequests.push(req);
       if (req.method === 'session/request_permission') {
-        transport.respondServerRequest(req.generation, req.rpcId, {
-          outcome: { optionId: 'allow_once' },
-        });
+        const result = { outcome: { outcome: 'selected', optionId: 'allow_once' } };
+        const rejection = new Error('stale operation');
+        assert.throws(() => transport.respondServerRequest(req.generation, req.rpcId, result, () => {
+          throw rejection;
+        }), error => error === rejection);
+        writes.push(transport.respondServerRequest(req.generation, req.rpcId, result));
         // Duplicate response for the same numeric rpcId must be rejected synchronously without sending a second reply
         assert.throws(
           () => transport.respondServerRequest(req.generation, req.rpcId, { outcome: { optionId: 'reject_once' } }),
@@ -587,10 +593,10 @@ test('AgyAcpTransport enforces bidirectional permission/elicitation, single-resp
           hasCode('idempotency_conflict'),
         );
       } else if (req.method === 'elicitation/create' && req.rpcId === 'elicit-1') {
-        transport.respondServerRequest(req.generation, req.rpcId, {
+        writes.push(transport.respondServerRequest(req.generation, req.rpcId, {
           action: 'accept',
           content: { env: 'staging' },
-        });
+        }));
         // Duplicate response for string rpcId must also be rejected
         assert.throws(
           () => transport.respondServerRequest(req.generation, req.rpcId, { action: 'cancel' }),
@@ -607,6 +613,8 @@ test('AgyAcpTransport enforces bidirectional permission/elicitation, single-resp
       scenario: 'permission_and_elicitation',
     })) as { stopReason: string; completedInteractions: unknown[] };
 
+    assert.equal(writes.length, 2);
+    await Promise.all(writes);
     assert.equal(promptResult.stopReason, 'end_turn');
     assert.deepEqual(promptResult.completedInteractions, [101, 'elicit-1']);
     assert.deepEqual(
@@ -722,7 +730,7 @@ test('AgyAcpTransport rejects in-flight requests, updates degraded health, and f
     assert.equal(transport.connected, false);
     assert.equal(transport.status, 'degraded');
     assert.equal(healthStates.at(-1)?.status, 'degraded');
-    assert.match(healthStates.at(-1)?.reason ?? '', /exited with code 1/);
+    assert.match(healthStates.at(-1)?.reason ?? '', /exited on signal SIGKILL/);
     assert.deepEqual(disconnectedGens, [1]);
 
     // Test request timeout on live connection

@@ -1,6 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { compactCardField, compactProjectName, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { payloadDigest, type Session } from './contracts.js';
-import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
+import { providerDisplayLabel, providerTitlePrefix, type ChannelCard } from './feishu-cards.js';
+import { escapeCardMarkdown } from './feishu-card-wire.js';
 import type { FeishuPort } from './feishu-channel.js';
 import { isGenericSessionTitle, normalizeTopicTitle } from './session-title.js';
 
@@ -24,11 +26,24 @@ const inFlightRoots = new WeakMap<FeishuPort, Set<string>>();
 const EXPIRED_ROOT_RETRY_AFTER = Number.MAX_SAFE_INTEGER;
 
 export function topicRootCard(session: Session): ChannelCard {
+  const template = sessionStatusTemplate(session.status);
   return {
-    title: normalizeTopicTitle(session.title),
-    text: `${providerDisplayLabel(session.native.provider)} · ${session.project} · ${session.status}`,
+    title: displayTopicTitle(session),
+    text: `${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${sessionStatusLabel(session.status)}`,
+    ...(template ? { template } : {}),
     actions: [],
   };
+}
+
+export function displayTopicTitle(session: Session): string {
+  const provider = session.native.provider === 'agy' ? 'AGY' : providerTitlePrefix(session.native.provider);
+  const project = compactProjectName(session.project).replace(/\s+/gu, ' ');
+  const prefix = `[${provider} · ${compactCardField(project, 24)}]`;
+  const fullPrefix = `[${provider} · ${project}]`;
+  const title = session.title.replace(/\s+/gu, ' ').trim();
+  const existingPrefix = [prefix, fullPrefix].find(candidate => title.startsWith(candidate));
+  const description = existingPrefix ? title.slice(existingPrefix.length).trimStart() : title;
+  return normalizeTopicTitle(`${prefix} ${description || '未命名会话'}`);
 }
 
 async function lookupRoot(port: FeishuPort, destination: string, creationDeliveryId?: string): Promise<string | null> {
@@ -65,7 +80,7 @@ export async function recordNewTopicRootTitle(
     SELECT ?,?,?,?,? WHERE NOT EXISTS (
       SELECT 1 FROM channel_topic_titles WHERE destination=? AND root_message_id=?
     )
-  `).run(destination, session.sessionId, scope, rootId, normalizeTopicTitle(session.title), destination, rootId);
+  `).run(destination, session.sessionId, scope, rootId, displayTopicTitle(session), destination, rootId);
 }
 
 function titlePatchRetryAfter(error: unknown): number {
@@ -123,10 +138,11 @@ export async function syncTopicRootTitle(
     await guard();
     // For old installations with no title history, assume the original generic title.
     // When a root is reused, use the latest known title across binding scopes.
-    if (!unsettled && (lastApplied?.synced_title === card.title || (!row && !lastApplied && isGenericSessionTitle(card.title)))) {
+    if (!unsettled && lastApplied?.synced_title === card.title) {
       rememberTitle();
       return;
     }
+    if (!unsettled && !row && !lastApplied && isGenericSessionTitle(session.title)) return;
 
     // A title can recur after an intervening rename. The last successful write
     // identifies this transition and lets us recover a patch accepted before a restart.

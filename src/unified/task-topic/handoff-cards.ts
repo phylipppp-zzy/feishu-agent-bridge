@@ -1,4 +1,6 @@
 import type { Provider, Session } from '../contracts.js';
+import { shortenHomePath } from '../card-formatters.js';
+import { escapeCardMarkdown, stripCardMentions } from '../feishu-card-wire.js';
 import { providerDisplayLabel, providerTitlePrefix, type ChannelCard } from '../feishu-cards.js';
 import {
   MAX_HANDOFF_SUMMARY_CHARS,
@@ -17,19 +19,19 @@ export function handoffPreviewCard(
 ): ChannelCard {
   const artifactsText = draft.artifactRefs.length
     ? draft.artifactRefs
-        .map((a) => `- ${a.name} (id=${a.artifactId}, ver=${a.contentVersion.slice(0, 12)})`)
+        .map((a) => `- ${escapeCardMarkdown(a.name)} (id=${escapeCardMarkdown(a.artifactId)}, ver=${escapeCardMarkdown(a.contentVersion.slice(0, 12))})`)
         .join('\n')
     : '（无引用文件）';
   const constraintsText = draft.constraints.length
-    ? draft.constraints.map((c) => `- ${c}`).join('\n')
+    ? draft.constraints.map((c) => `- ${escapeCardMarkdown(c)}`).join('\n')
     : '（无额外约束）';
   const summaryPreview =
     [...draft.summary].length > 800 ? `${[...draft.summary].slice(0, 800).join('')}…` : draft.summary;
   const text = [
-    `来源: ${providerDisplayLabel(sourceProvider)} (${draft.sourceTargetId})`,
-    `目标: ${providerDisplayLabel(targetProvider)} (${draft.targetTargetId}) · gen=${draft.targetGeneration}`,
-    `目标工作目录: ${draft.targetCwd}`,
-    `摘要:\n${summaryPreview}`,
+    `来源: ${providerDisplayLabel(sourceProvider)} (${escapeCardMarkdown(draft.sourceTargetId)})`,
+    `目标: ${providerDisplayLabel(targetProvider)} (${escapeCardMarkdown(draft.targetTargetId)})`,
+    `目标工作目录: ${escapeCardMarkdown(shortenHomePath(draft.targetCwd))}`,
+    `摘要:\n${stripCardMentions(summaryPreview)}`,
     `约束:\n${constraintsText}`,
     `引用文件:\n${artifactsText}`,
     `预览摘要哈希: ${draft.previewDigest.slice(0, 16)}`,

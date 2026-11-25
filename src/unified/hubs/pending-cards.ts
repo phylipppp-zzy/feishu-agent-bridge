@@ -1,4 +1,6 @@
-import type { Interaction, Session } from '../contracts.js';
+import type { Interaction, Operation, Session } from '../contracts.js';
+import { formatApprovalAction } from '../card-formatters.js';
+import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import {
   interactionCard,
   providerDisplayLabel,
@@ -6,7 +8,7 @@ import {
   type ChannelCard,
 } from '../feishu-cards.js';
 import { questionForm } from '../feishu-question-forms.js';
-import type { DecisionRecord } from './decision-types.js';
+import type { DecisionAnswerRecord, DecisionRecord } from './decision-types.js';
 import {
   PENDING_CATEGORY_LABELS,
   fail,
@@ -31,7 +33,32 @@ export function buildPendingRootCard(topicTitle: string): ChannelCard {
 export function buildWithdrawnCard(category: PendingCategory, reason: string): ChannelCard {
   return {
     title: `【已失效 · ${PENDING_CATEGORY_LABELS[category]}】`,
+    template: 'grey',
+    ...(category === 'question' ? { schema: '2.0' as const } : {}),
     text: `${reason}。本卡片操作已撤下，不可重复提交。`,
+    actions: [],
+  };
+}
+
+export function buildPendingInteractionStatusCard(
+  interaction: Interaction,
+  status: string,
+  operation?: Operation | null,
+): ChannelCard {
+  const base = interactionCard(interaction, false, operation);
+  if (interaction.kind === 'approval') return base;
+  if (interaction.status === 'resolved' || operation?.status === 'completed') return { ...base, schema: '2.0' };
+  return { title: `模型问答 · ${status}`, text: status, schema: '2.0', actions: [] };
+}
+
+export function buildAnsweredDecisionCard(decision: DecisionRecord, answer?: DecisionAnswerRecord): ChannelCard {
+  const selected = answer?.selectedLabel ?? answer?.freeText;
+  const extra = answer?.selectedLabel && answer.freeText ? `补充：${answer.freeText}` : '';
+  return {
+    title: `${PENDING_CATEGORY_LABELS[decision.kind]} · 已确认`,
+    template: 'green',
+    format: 'plain',
+    text: [decision.title, decision.prompt, selected && `已选择：${selected}`, extra].filter(Boolean).join('\n'),
     actions: [],
   };
 }
@@ -76,18 +103,20 @@ export function buildInteractionPendingItem(params: {
 }): PendingInteractionItem {
   const { interaction, session, sourceSessionId, sourceDestination, sourceTopicUrl } = params;
   const category: 'question' | 'approval' = interaction.kind === 'approval' ? 'approval' : 'question';
-  const title =
-    interaction.kind === 'approval'
-      ? `${providerTitlePrefix(session.native.provider)} 工具权限: ${interaction.tool}`
-      : interaction.kind === 'question'
-        ? `${providerTitlePrefix(session.native.provider)} 问题: ${interaction.prompt}`
-        : `${providerTitlePrefix(session.native.provider)} 组合问题 (${interaction.questions.length} 项)`;
-  const summary =
-    interaction.kind === 'approval'
-      ? `${interaction.tool}: ${interaction.action} (范围: ${interaction.scope})`
-      : interaction.kind === 'question'
-        ? interaction.prompt
-        : interaction.questions.map((q) => q.prompt).join('；');
+  const provider = providerTitlePrefix(session.native.provider);
+  let title: string;
+  let summary: string;
+  if (interaction.kind === 'approval') {
+    const approval = formatApprovalAction(interaction.tool, interaction.action, interaction.scope);
+    title = `${provider} 工具权限 · ${approval.toolLabel}`;
+    summary = approval.text;
+  } else if (interaction.kind === 'question') {
+    title = `${provider} 问题: ${interaction.prompt}`;
+    summary = interaction.prompt;
+  } else {
+    title = `${provider} 组合问题 (${interaction.questions.length} 项)`;
+    summary = interaction.questions.map(q => q.prompt).join('；');
+  }
 
   return {
     refId: `interaction:${interaction.interactionId}`,
@@ -154,20 +183,22 @@ export function renderPendingItemCard(
       entryPoint === 'source'
         ? `【等待你处理 · ${PENDING_CATEGORY_LABELS[item.category]}】`
         : `【待处理 · ${PENDING_CATEGORY_LABELS[item.category]} · ${providerDisplayLabel(item.provider)}】`;
+    const sourceNote = entryPoint === 'source' ? '（已同步至「待处理」汇总，任一处处理即可）' : '';
     const card: ChannelCard = {
+      ...base,
       title: `${prefix}${base.title}`,
-      text:
-        entryPoint === 'source'
-          ? `轻量等待引用 (${item.interactionId})\n${base.text}\n同一请求已在「待处理」汇总同步；任一入口提交后两处同时失效。`
-          : `来源会话: ${item.sourceSessionId} (${providerDisplayLabel(item.provider)})\n${base.text}`,
+      text: item.interaction.kind === 'approval' ? [base.text, sourceNote].filter(Boolean).join('\n\n') : '',
       actions,
     };
     if (item.interaction.kind !== 'approval') {
+      card.schema = '2.0';
+      card.actions = actions.filter(action => action.url);
       card.form = questionForm(item.interaction, hubBindingId, false, nowMs, {
         entry: entryPoint,
         category: item.category,
         sourceSessionId: item.sourceSessionId,
       });
+      if (sourceNote) card.form.statusText = sourceNote;
     }
     return card;
   }
@@ -191,11 +222,11 @@ export function renderPendingItemCard(
   }
   const specLine =
     d.kind === 'execution_auth' && d.executionSpec
-      ? `\n执行目标: ${d.executionSpec.target} · 动作摘要: ${d.executionSpec.actionDigest} · 过期: ${d.executionSpec.expiry}`
+      ? `\n执行目标: ${escapeCardMarkdown(d.executionSpec.target)} · 动作摘要: ${escapeCardMarkdown(d.executionSpec.actionDigest)} · 过期: ${escapeCardMarkdown(d.executionSpec.expiry)}`
       : '\n性质: 仅业务决定（绝不自动触发执行器/shell）';
   return {
     title: `【待处理 · ${PENDING_CATEGORY_LABELS[item.category]}】${d.title}`,
-    text: `ID: ${d.decisionId} (v${d.version})\n${d.prompt}${specLine}`,
+    text: `ID: ${escapeCardMarkdown(d.decisionId)} (v${d.version})\n${escapeCardMarkdown(d.prompt)}${specLine}`,
     actions,
   };
 }
@@ -217,12 +248,12 @@ export function formatPendingSummaryCard(
       ? ['当前没有待处理事项。']
       : page.items.map(
           (item, idx) =>
-            `${idx + 1}. [${PENDING_CATEGORY_LABELS[item.category]}] (${item.provider}) ${item.title}${item.sourceSessionId ? ` · 会话 ${item.sourceSessionId}` : ''}`,
+            `${idx + 1}. 【${PENDING_CATEGORY_LABELS[item.category]}】${escapeCardMarkdown(item.title.replace(/\s+/gu, ' '))}`,
         );
   const actions: ChannelCard['actions'] = [];
-  for (const item of page.items) {
+  for (const [index, item] of page.items.entries()) {
     if (isSafePendingAppLink(item.sourceTopicUrl)) {
-      actions.push({ label: `跳回源: ${item.refId.slice(0, 18)}`, value: {}, url: item.sourceTopicUrl });
+      actions.push({ label: `${index + 1} · 跳回源话题`, value: {}, url: item.sourceTopicUrl });
     }
   }
   if (page.nextCursor !== null) {

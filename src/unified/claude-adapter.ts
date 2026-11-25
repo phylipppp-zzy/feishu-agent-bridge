@@ -1,3 +1,4 @@
+import { summarizeTool, ToolProgressTracker } from './tool-progress.js';
 import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
@@ -9,23 +10,67 @@ import { payloadDigest, type Answer, type Artifact, type Capabilities, type Inte
 import { contractError } from './errors.js';
 import { ClaudeState } from './claude-state.js';
 import { ClaudeResidualObservation } from './claude-residual.js';
+import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type ApprovalRequest, type ApprovalScope } from './approval-policy.js';
+import { unknown as unknownApprovalScope } from './approval-policy-paths.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
-type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
+type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; operationId?: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
 type Live = { title?: string; completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
+const startupTimeoutMs = 15_000;
 const safeNumber = (n: unknown): number | null => typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
 const ack = (nativeReference: string | null = null): PlatformAcknowledgement => ({ status: 'submitted', nativeReference });
 const available = { status: 'available' as const };
 const unsupported = { status: 'unsupported' as const, reason: 'Claude SDK port does not support this capability' };
-const liveCaps: Capabilities = { view: available, send: available, queue: unsupported, steer: unsupported, answer: available, approve: available, interrupt: available, handoff: unsupported, files: unsupported, config: available };
+const liveCaps: Capabilities = { view: available, send: available, queue: unsupported, steer: unsupported, answer: available, approve: available, interrupt: available, handoff: available, files: unsupported, config: available };
 const readCaps: Capabilities = { ...liveCaps, send: unsupported, answer: unsupported, approve: unsupported, interrupt: unsupported, handoff: unsupported, config: unsupported };
+const releasedCaps: Capabilities = { ...readCaps, handoff: available };
 
-/** SDK sessions created by this instance are interactive; discovered external sessions are read-only. */
+const readTools = new Set(['Read', 'Glob', 'Grep', 'LS']);
+const claudeToolFields: Record<string, readonly string[]> = {
+  Bash: ['command', 'description', 'timeout', 'run_in_background', 'dangerouslyDisableSandbox'],
+  Read: ['file_path', 'offset', 'limit', 'pages'],
+  Write: ['file_path', 'content'],
+  Edit: ['file_path', 'old_string', 'new_string', 'replace_all'],
+  MultiEdit: ['file_path', 'edits'],
+  Glob: ['pattern', 'path'],
+  Grep: ['pattern', 'path', 'glob', 'output_mode', '-B', '-A', '-C', 'context', '-n', '-i', '-o', 'type', 'head_limit', 'offset', 'multiline'],
+  LS: ['path', 'ignore'],
+  NotebookEdit: ['notebook_path', 'cell_id', 'new_source', 'cell_type', 'edit_mode'],
+};
+
+type ClaudeApprovalRequest = ApprovalRequest & { incomplete?: boolean };
+
+function claudeApprovalRequest(tool: string, input: unknown): ClaudeApprovalRequest {
+  if (tool === 'AskUserQuestion' || tool === 'business_decision') return { kind: 'question' };
+  if (!input || typeof input !== 'object' || Array.isArray(input) || !Object.hasOwn(claudeToolFields, tool)) return { kind: 'unknown' };
+  const fields = input as Record<string, unknown>;
+  const extraFields = Object.keys(fields).some(field => !claudeToolFields[tool]!.includes(field));
+  if (tool === 'Bash') {
+    const incomplete = extraFields || fields.dangerouslyDisableSandbox !== undefined && fields.dangerouslyDisableSandbox !== false;
+    return { kind: 'command', incomplete, ...(typeof fields.command === 'string' ? { command: fields.command } : {}) };
+  }
+  const incomplete = extraFields || tool === 'MultiEdit' && (!Array.isArray(fields.edits) || fields.edits.some(edit =>
+    !edit || typeof edit !== 'object' || Array.isArray(edit)
+    || Object.keys(edit).some(field => !['old_string', 'new_string', 'replace_all'].includes(field))));
+  const read = readTools.has(tool);
+  const search = read && tool !== 'Read';
+  const path = search ? fields.path === undefined ? '.' : fields.path : tool === 'NotebookEdit' ? fields.notebook_path : fields.file_path;
+  return { kind: read ? 'read' : 'write', incomplete, ...(typeof path === 'string' ? { paths: [path] } : {}) };
+}
+
+async function evaluateClaudeApproval(request: ClaudeApprovalRequest, context: ApprovalContext) {
+  const decision = evaluateApproval(await resolveApprovalFacts(request, context));
+  return decision.kind === 'allow_once' && request.incomplete ? { kind: 'ask' as const, reason: unknownApprovalScope } : decision;
+}
+
+/** External sessions are read-only until an explicit resume opens a live SDK query. */
 export class ClaudeAdapter implements PlatformPort {
   readonly provider = 'claude' as const;
   private readonly lives = new Map<string, Live>();
+  private readonly opening = new Map<string, Live | null>();
+  private readonly controlGeneration = new Map<string, number>();
   private readonly known = new Map<string, SDKSessionInfo>();
   private readonly owned: ClaudeState;
   private readonly listeners = new Set<(o: PlatformObservation) => void>();
@@ -33,7 +78,14 @@ export class ClaudeAdapter implements PlatformPort {
   private readonly metadataPending=new Map<string,Promise<unknown>>();
   private sequence = 0;
   private closed = false;
-  constructor(readonly hostId: string, readonly serviceId: string, stateDir: string, private readonly sdk: SDK = { query, listSessions, getSessionMessages }, private readonly claudeBin: string = process.env.CLAUDE_BIN?.trim() || 'claude') {
+  constructor(
+    readonly hostId: string,
+    readonly serviceId: string,
+    stateDir: string,
+    private readonly sdk: SDK = { query, listSessions, getSessionMessages },
+    private readonly claudeBin: string = process.env.CLAUDE_BIN?.trim() || 'claude',
+    private readonly options: { approvalPolicy?: ApprovalScope } = {},
+  ) {
     if (!hostId || !serviceId) throw contractError('invalid_request'); this.owned = new ClaudeState(stateDir, hostId, serviceId);
   }
   private async boundedMetadata<T>(kind:string,call:()=>Promise<T>):Promise<T> {
@@ -43,13 +95,36 @@ export class ClaudeAdapter implements PlatformPort {
   }
   private ref(id: string): NativeSessionRef { return { provider: 'claude', hostId: this.hostId, serviceId: this.serviceId, nativeSessionId: id }; }
   private check(ref: NativeSessionRef): string { if (ref.provider !== 'claude' || ref.hostId !== this.hostId || ref.serviceId !== this.serviceId || !ref.nativeSessionId) throw contractError('invalid_request'); return ref.nativeSessionId; }
+  seedControlGeneration(ref: NativeSessionRef, minimum: number): void {
+    const id = this.check(ref);
+    if (!Number.isSafeInteger(minimum) || minimum < 0) throw contractError('invalid_request');
+    if (this.lives.has(id) || this.opening.has(id)) throw contractError('busy', 'session has active SDK state');
+    this.controlGeneration.set(id, Math.max(minimum, this.controlGeneration.get(id) ?? 0));
+  }
+  hasActiveNativeSession(ref: NativeSessionRef): boolean {
+    return !this.closed && ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
+      && this.lives.has(ref.nativeSessionId) && !!this.owned.get(ref.nativeSessionId);
+  }
+  requiresControlRecovery(ref: NativeSessionRef): boolean { return !this.hasActiveNativeSession(ref); }
   private emit(o: PlatformObservation): void { for (const f of this.listeners) f(o); }
   onObservation(f: (o: PlatformObservation) => void): () => void { this.listeners.add(f); return () => this.listeners.delete(f); }
   private session(info: SDKSessionInfo): Session {
     const live = this.lives.get(info.sessionId); const pending = live && [...live.pending.values()].some(p => p.interaction.status === 'awaiting_answer');
     const timestamp = info.lastModified; const updatedAt = typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8.64e15 ? new Date(timestamp).toISOString() : undefined;
     const createdAt=Number.isSafeInteger(info.createdAt) && info.createdAt!>0 && info.createdAt!<=8.64e15 ? new Date(info.createdAt!).toISOString() : undefined;
-    return { ...(createdAt ? {createdAt} : {}), ...(updatedAt ? {updatedAt} : {}), sessionId: info.sessionId, native: this.ref(info.sessionId), project: info.cwd ?? '', title: info.customTitle?.trim() || info.summary?.trim() || live?.title || '', status: live ? pending ? 'waiting_approval' : live.turn ? 'running' : 'idle' : 'read_only', revision: 0, capabilities: live ? liveCaps : readCaps, control: { serviceId: this.serviceId, owner: null, input: live ? 'available' : 'unavailable', generation: 0, operationId: null, reason: live ? null : 'external native session is read-only' } };
+    const owned = this.owned.get(info.sessionId);
+    return {
+      ...(createdAt ? { createdAt } : {}), ...(updatedAt ? { updatedAt } : {}),
+      sessionId: info.sessionId, native: this.ref(info.sessionId), project: info.cwd ?? '',
+      title: info.customTitle?.trim() || info.summary?.trim() || live?.title || '',
+      status: live ? pending ? 'waiting_approval' : live.turn ? 'running' : 'idle' : 'read_only',
+      revision: 0, capabilities: live ? liveCaps : owned ? releasedCaps : readCaps,
+      control: {
+        serviceId: this.serviceId, owner: live ? this.serviceId : null, input: live ? 'available' : 'unavailable',
+        generation: this.controlGeneration.get(info.sessionId) ?? 0, operationId: null,
+        reason: live ? null : owned ? 'interactive SDK session is not connected' : 'external native session is read-only',
+      },
+    };
   }
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
     const offset = cursor === null ? 0 : Number(cursor); if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request');
@@ -79,39 +154,206 @@ export class ClaudeAdapter implements PlatformPort {
     const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter((x: any) => x?.type === 'text' && typeof x.text === 'string').map((x: any) => x.text).join('\n') : '';
     if (!text) return null; return { messageId: m.uuid, sessionId: id, turnId: m.uuid, role: m.type, blocks: [{ type: 'text', text }], sequence: seq, revision: 1, final: true, source: 'claude' };
   }
-  async read(ref: NativeSessionRef): Promise<SessionSnapshot> { const id = this.check(ref), info = await this.find(id), live = this.lives.get(id); const history = await this.boundedMetadata(`read:${id}`,()=>this.sdk.getSessionMessages(id, info.cwd ? { dir: info.cwd } : undefined)); const messages:Message[]=[]; for(const [i,raw] of history.entries()) {const m=this.normalize(id,raw,i+1); if(!m) continue; const alias=this.owned.messageAlias(id,raw.uuid); if(alias) m.messageId=alias; const old=messages.find(x=>x.messageId===m.messageId); if(old && alias) {const first=old.blocks[0],next=m.blocks[0];if(first?.type==='text' && next?.type==='text') first.text += '\n'+next.text;} else messages.push(m); } const liveIds=new Set(live?.messages.map(m=>m.messageId) ?? []); const visible=messages.filter(m=>!liveIds.has(m.messageId)); return { session: this.session(info), messages: [...visible, ...(live?.messages ?? [])], interactions: live ? [...live.pending.values()].map(p => p.interaction) : [], ...(live ? {connectionGeneration:live.generation} : {}) }; }
-  async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { if (!cwd) throw contractError('invalid_request'); const id = randomUUID(); this.start(id, cwd, model, false); try { this.owned.put(id, { origin: 'bridge_sdk' }); } catch (e) { const live = this.lives.get(id); live?.queue.close(); live?.query.close(); throw e; } const live = this.lives.get(id)!; return {status:'submitted',nativeReference:id,createdSession:this.session({sessionId:id,cwd,summary:'',lastModified:0}),connectionGeneration:live.generation}; }
-  async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> { const id = this.check(ref); if (this.lives.has(id)) { const generation = this.lives.get(id)!.generation; this.emit({type:'connection',ref,connectionGeneration:generation}); return {...ack(id),connectionGeneration:generation}; } const owned = this.owned.get(id); if (!owned) throw contractError('unsupported', 'external native sessions are read-only'); const info = await this.find(id); if (!info.cwd) throw contractError('temporarily_unavailable', 'session working directory unavailable'); this.start(id, info.cwd, null, true); const generation = this.lives.get(id)!.generation; this.emit({type:'connection',ref,connectionGeneration:generation}); return {...ack(id),connectionGeneration:generation}; }
-  private start(id: string, cwd: string, model: string | null, resume: boolean): void {
+  async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
+    const id = this.check(ref), info = await this.find(id);
+    const history = await this.boundedMetadata(`read:${id}`, () =>
+      this.sdk.getSessionMessages(id, info.cwd ? { dir: info.cwd } : undefined));
+    const messages: Message[] = [];
+    for (const [i, raw] of history.entries()) {
+      const message = this.normalize(id, raw, i + 1);
+      if (!message) continue;
+      const link = this.owned.messageLink(id, raw.uuid);
+      if (link) {
+        message.messageId = link.id;
+        message.turnId = link.turnId ?? message.turnId;
+      }
+      const old = link && messages.find(entry => entry.messageId === message.messageId);
+      if (old) {
+        const first = old.blocks[0], next = message.blocks[0];
+        if (first?.type === 'text' && next?.type === 'text') first.text += '\n' + next.text;
+        if (link.turnId) old.turnId = link.turnId;
+      } else messages.push(message);
+    }
+    const live = this.lives.get(id);
+    const liveIds = new Set(live?.messages.map(m => m.messageId));
+    return {
+      session: this.session(info),
+      messages: [...messages.filter(m => !liveIds.has(m.messageId)), ...(live?.messages ?? [])],
+      interactions: live ? [...live.pending.values()].map(p => p.interaction) : [],
+      ...(live ? { connectionGeneration: live.generation } : {}),
+    };
+  }
+  async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> {
+    if (!cwd) throw contractError('invalid_request');
+    const id = randomUUID();
+    const live = this.start(id, cwd, model, false);
+    try {
+      this.owned.put(id, { origin: 'bridge_sdk' });
+    } catch (error) {
+      this.discard(live);
+      throw error;
+    }
+    this.activate(live);
+    return { ...ack(id), createdSession: this.session({ sessionId: id, cwd, summary: '', lastModified: 0 }), connectionGeneration: live.generation };
+  }
+  async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> {
+    return this.open(ref);
+  }
+  private async open(ref: NativeSessionRef, guard?: DispatchGuard): Promise<PlatformAcknowledgement> {
+    const id = this.check(ref);
+    const current = this.lives.get(id);
+    if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
+    if (current) {
+      if (guard) throw contractError('busy', 'session is already connected');
+      this.emit({ type: 'connection', ref, connectionGeneration: current.generation });
+      return { ...ack(id), connectionGeneration: current.generation };
+    }
+    if (this.opening.has(id)) throw contractError('busy', 'session is already opening');
+    this.opening.set(id, null);
+    let live: Live | undefined;
+    let info: SDKSessionInfo;
+    try {
+      info = await this.find(id);
+      if (typeof info.cwd !== 'string' || !info.cwd.trim()) {
+        throw contractError('temporarily_unavailable', 'session working directory unavailable');
+      }
+      guard?.assertCurrent();
+      live = this.start(id, info.cwd, null, true);
+      this.opening.set(id, live);
+      await this.awaitInitialization(live.query);
+      if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
+      guard?.assertCurrent();
+      if (!this.owned.get(id)) this.owned.put(id, { origin: 'external_resume' });
+    } catch (error) {
+      if (live && !this.closed) this.discard(live);
+      throw error;
+    } finally {
+      this.opening.delete(id);
+    }
+    this.controlGeneration.set(id, (this.controlGeneration.get(id) ?? 0) + 1);
+    this.activate(live);
+    this.emit({ type: 'connection', ref, connectionGeneration: live.generation });
+    if (guard) this.emit({ type: 'session', ref, session: this.session(info) });
+    return { ...ack(id), connectionGeneration: live.generation };
+  }
+  private async awaitInitialization(query: Query): Promise<void> {
+    const ready = query.initializationResult?.();
+    if (!ready) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([ready, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(contractError('temporarily_unavailable', 'Claude SDK initialization timed out')), startupTimeoutMs);
+      })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  private discard(live: Live): void {
+    live.queue.close();
+    try { live.query.close(); } catch { /* Preserve the startup error. */ }
+  }
+  private activate(live: Live): void {
+    this.lives.set(live.id, live);
+    live.completion = this.consume(live);
+  }
+  private start(id: string, cwd: string, model: string | null, resume: boolean): Live {
     if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
     const queue = new InputQueue<SDKUserMessage>(); const generation = this.owned.nextGeneration();
-    const canUseTool: CanUseTool = (tool, input, opts) => new Promise(resolve => {
-      const live = this.lives.get(id); if (!live || opts.signal.aborted) { resolve({ behavior: 'deny', message: 'session closed' }); return; }
-      const interactionId = randomUUID(), base = { interactionId, sessionId: id, turnId: live.turn ?? '', nativeRequestId: opts.toolUseID, connectionGeneration: generation, revision: 1, status: 'awaiting_answer' as const, expiresAt: null, nativeResult: null };
-      let interaction: Interaction;
-      if (tool === 'AskUserQuestion' && Array.isArray(input.questions) && input.questions.length) {
-        const prompts = input.questions.map((q: any) => q?.question);
-        if (prompts.some((q: unknown) => typeof q !== 'string' || !q.trim()) || new Set(prompts).size !== prompts.length) {
-          const now = new Date().toISOString(), sequence = ++this.sequence;
-          this.emit({ type: 'event', ref: this.ref(id), event: { schemaVersion: 1, eventId: randomUUID(), sessionId: id, objectId: opts.toolUseID, objectRevision: 0, sequence, type: 'interaction.unsupported', occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: { reason: 'duplicate or invalid question text cannot be represented by Claude answers' } } });
-          resolve({ behavior: 'deny', message: 'Unsupported question group: question text must be unique and non-empty' }); return;
+    const hookCwds = new Map<string, string>();
+    const approvalContext = { ...this.options.approvalPolicy, project: cwd };
+    const canUseTool: CanUseTool = async (tool, input, opts) => {
+      const toolCwd = hookCwds.get(opts.toolUseID) ?? cwd;
+      hookCwds.delete(opts.toolUseID);
+      const context = { ...approvalContext, cwd: toolCwd };
+      const request = claudeApprovalRequest(tool, input);
+      let decision = request.kind === 'question' ? { kind: 'question' as const }
+        : await evaluateClaudeApproval(request, context);
+      if (decision.kind !== 'deny' && typeof opts.blockedPath === 'string' && opts.blockedPath) {
+        const blocked = evaluateApproval(await resolveApprovalFacts({
+          kind: readTools.has(tool) ? 'read' : 'write', paths: [opts.blockedPath],
+        }, { ...context, enabled: true }));
+        if (blocked.kind === 'deny') decision = blocked;
+      }
+      const live = this.lives.get(id);
+      if (this.closed || live?.generation !== generation || opts.signal.aborted) return { behavior: 'deny', message: 'session closed' };
+      if (decision.kind === 'deny') return { behavior: 'deny', message: decision.reason };
+      if (decision.kind !== 'question' && (opts.matchedAskRule !== undefined || opts.blockedPath !== undefined || opts.defaultToNo === true)) {
+        decision = { kind: 'ask', reason: opts.decisionReason || '原生权限规则要求人工确认' };
+      }
+      if (decision.kind === 'allow_once') return { behavior: 'allow', updatedInput: input };
+      return new Promise(resolve => {
+        const interactionId = randomUUID(), base = { interactionId, sessionId: id, turnId: live.turn ?? '', nativeRequestId: opts.toolUseID, connectionGeneration: generation, revision: 1, status: 'awaiting_answer' as const, expiresAt: null, nativeResult: null };
+        let interaction: Interaction;
+        if (decision.kind === 'question') {
+          const questionsInput = Array.isArray(input.questions) ? input.questions
+            : typeof input.question === 'string' ? [{ question: input.question }] : [];
+          const prompts = questionsInput.map((q: any) => q?.question);
+          if (!prompts.length || prompts.some((q: unknown) => typeof q !== 'string' || !q.trim()) || new Set(prompts).size !== prompts.length) {
+            const now = new Date().toISOString(), sequence = ++this.sequence;
+            this.emit({ type: 'event', ref: this.ref(id), event: { schemaVersion: 1, eventId: randomUUID(), sessionId: id, objectId: opts.toolUseID, objectRevision: 0, sequence, type: 'interaction.unsupported', occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: { reason: 'duplicate or invalid question text cannot be represented by Claude answers' } } });
+            resolve({ behavior: 'deny', message: 'Unsupported question group: question text must be unique and non-empty' }); return;
+          }
+          const questions = questionsInput.map((q: any, n: number) => ({ id: String(n), prompt: String(q.question ?? ''), choices: Array.isArray(q.options) ? q.options.map((o: any) => String(o.label ?? '')).filter(Boolean) : [], multiple: !!q.multiSelect, allowFreeText: true }));
+          interaction = { ...base, kind: 'question_group', toolInputDigest: null, questions };
+        } else {
+          const details = opts.blockedPath ? { input, blockedPath: opts.blockedPath } : input;
+          interaction = { ...base, kind: 'approval', tool, action: `${decision.reason}\n${JSON.stringify(details)}`, scope: 'this_request', toolInputDigest: payloadDigest(input) };
         }
-        const questions = input.questions.map((q: any, n: number) => ({ id: String(n), prompt: String(q.question ?? ''), choices: Array.isArray(q.options) ? q.options.map((o: any) => String(o.label ?? '')).filter(Boolean) : [], multiple: !!q.multiSelect, allowFreeText: true }));
-        interaction = { ...base, kind: 'question_group', toolInputDigest: null, questions };
-      } else interaction = { ...base, kind: 'approval', tool, action: JSON.stringify(input), scope: 'this_request', toolInputDigest: payloadDigest(input) };
-      const pending: Pending = { interaction, input, toolId: opts.toolUseID, settle: resolve }; live.pending.set(interactionId, pending);
-      opts.signal.addEventListener('abort', () => { if (pending.interaction.status === 'resolved' || pending.interaction.status === 'expired') return; pending.interaction = { ...pending.interaction, status: 'expired', revision: pending.interaction.revision + 1 }; this.emit({ type: 'interaction', ref: this.ref(id), interaction: pending.interaction }); resolve({ behavior: 'deny', message: 'request expired' }); }, { once: true });
-      this.emit({ type: 'interaction', ref: this.ref(id), interaction });
-    });
-    const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool };
-    const q = this.sdk.query({ prompt: queue, options }); const live: Live = { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream:null, residual:new ClaudeResidualObservation(id) }; this.lives.set(id, live); live.completion = this.consume(live);
+        const pendingInput = decision.kind === 'question' && !Array.isArray(input.questions) ? { ...input, questions: [{ question: input.question }] } : input;
+        const pending: Pending = { interaction, input: pendingInput, toolId: opts.toolUseID, settle: resolve }; live.pending.set(interactionId, pending);
+        opts.signal.addEventListener('abort', () => { if (pending.interaction.status === 'resolved' || pending.interaction.status === 'expired') return; pending.interaction = { ...pending.interaction, status: 'expired', revision: pending.interaction.revision + 1 }; this.emit({ type: 'interaction', ref: this.ref(id), interaction: pending.interaction }); resolve({ behavior: 'deny', message: 'request expired' }); }, { once: true });
+        this.emit({ type: 'interaction', ref: this.ref(id), interaction });
+      });
+    };
+    const hooks: Options['hooks'] = { PreToolUse: [{ hooks: [async (event, _, { signal }) => {
+      if (event.hook_event_name !== 'PreToolUse') return {};
+      const live = this.lives.get(id);
+      if (this.closed || live?.generation !== generation || signal.aborted) {
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: '会话已关闭' } };
+      }
+      const decision = await evaluateClaudeApproval(claudeApprovalRequest(event.tool_name, event.tool_input), { ...approvalContext, cwd: event.cwd });
+      if (this.closed || this.lives.get(id) !== live || signal.aborted) {
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: '会话已关闭' } };
+      }
+      if (decision.kind === 'allow_once' || decision.kind === 'question') return {};
+      if (decision.kind === 'ask') {
+        if (hookCwds.size >= 128) hookCwds.delete(hookCwds.keys().next().value!);
+        hookCwds.set(event.tool_use_id, event.cwd);
+      }
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: decision.kind, permissionDecisionReason: decision.reason } };
+    }] }] };
+    const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool, hooks };
+    try {
+      const q = this.sdk.query({ prompt: queue, options });
+      return { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream: null, residual: new ClaudeResidualObservation(id) };
+    } catch (error) {
+      queue.close();
+      throw error;
+    }
   }
   private async consume(live: Live): Promise<void> {
     const ref = this.ref(live.id);
+    const tools = new ToolProgressTracker();
+    let toolTurn: string | null = null;
     let streamFailure: {kind:string; exitCode:number|null} | null = null;
     try { for await (const raw of live.query) {
+      if (this.closed || this.lives.get(live.id) !== live) break;
       const m = raw as any;
       if(!this.closed && this.lives.get(live.id)===live)live.residual.observe(m);
+      if (live.turn && !this.closed && this.lives.get(live.id) === live && !m.parent_tool_use_id && !m.parent_agent_id) {
+        if (toolTurn !== live.turn) { tools.clear(); toolTurn = live.turn; }
+        const blocks = m.type === 'stream_event' && m.event?.type === 'content_block_start'
+          ? [m.event.content_block]
+          : (m.type === 'assistant' || m.type === 'user') && Array.isArray(m.message?.content) ? m.message.content : [];
+        for (const block of blocks) {
+          const update = block?.type === 'tool_use' && typeof block.id === 'string'
+            ? tools.observe(ref, live.generation, live.turn, block.id, 'running', summarizeTool(block.name, block.input, live.cwd))
+            : block?.type === 'tool_result' && typeof block.tool_use_id === 'string'
+              ? tools.observe(ref, live.generation, live.turn, block.tool_use_id, block.is_error === true ? 'failed' : 'succeeded')
+              : undefined;
+          if (update) this.emit(update);
+        }
+      }
       let providerEvent: { type: string; data: Record<string, unknown> } | null = null;
       if (m.type === 'system' && m.subtype === 'api_retry') {
         const status = safeNumber(m.error_status);
@@ -124,7 +366,37 @@ export class ClaudeAdapter implements PlatformPort {
       }
       if (providerEvent && !this.closed && this.lives.get(live.id)===live) { const now = new Date().toISOString(), sequence = ++this.sequence; this.emit({ type: 'event', ref, connectionGeneration:live.generation, event: { schemaVersion: 1, eventId: randomUUID(), sessionId: live.id, objectId: live.turn ?? live.id, objectRevision: 0, sequence, type: providerEvent.type, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: providerEvent.data } }); }
       if(m.type==='stream_event' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id)===live) { const event=m.event; if(event?.type==='message_start' && typeof event.message?.id==='string') live.stream={id:event.message.id,blocks:new Map(),sequence:++this.sequence,revision:0,current:null,stopped:false}; const stream=live.stream; if(stream && event?.type==='content_block_start' && event.content_block?.type==='text' && typeof event.index==='number') {stream.blocks.set(event.index,typeof event.content_block.text==='string'?event.content_block.text:'');stream.current=event.index;} if(stream && !stream.stopped && event?.type==='content_block_delta' && event.delta?.type==='text_delta' && typeof event.delta.text==='string' && stream.blocks.has(event.index)) { stream.blocks.set(event.index,stream.blocks.get(event.index)!+event.delta.text); const text=[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n'); const value:Message={messageId:stream.id,sessionId:live.id,turnId:live.turn ?? stream.id,role:'assistant',blocks:[{type:'text',text}],sequence:stream.sequence,revision:++stream.revision,final:false,source:'claude'}; live.messages=live.messages.filter(x=>x.messageId!==value.messageId); live.messages.push(value); this.emit({type:'message',ref,message:value,connectionGeneration:live.generation}); } if(stream && event?.type==='message_stop' && !stream.stopped) {stream.stopped=true; const text=[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n'); if(text) {const value:Message={messageId:stream.id,sessionId:live.id,turnId:live.turn ?? stream.id,role:'assistant',blocks:[{type:'text',text}],sequence:stream.sequence,revision:++stream.revision,final:true,source:'claude'};live.messages=live.messages.filter(x=>x.messageId!==value.messageId);live.messages.push(value);this.emit({type:'message',ref,message:value,connectionGeneration:live.generation});} } }
-      if (m.type === 'assistant' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id)===live) { const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence); if (normalized) { const stream=live.stream; if(stream && m.message?.id===stream.id) {if(typeof m.uuid==='string') this.owned.linkMessage(live.id,m.uuid,stream.id,live.generation); const complete=Array.isArray(m.message?.content) ? m.message.content.filter((b:any)=>b?.type==='text' && typeof b.text==='string').map((b:any)=>b.text) as string[] : []; if(stream.stopped && stream.blocks.size>1) { if(complete.length!==stream.blocks.size) continue; [...stream.blocks.keys()].sort((a,b)=>a-b).forEach((key,index)=>stream.blocks.set(key,complete[index]!)); } else if(stream.current!==null) stream.blocks.set(stream.current,(normalized.blocks[0] as {type:'text';text:string}).text);normalized.messageId=stream.id;normalized.sequence=stream.sequence;normalized.revision=++stream.revision;normalized.final=stream.stopped; normalized.blocks=[{type:'text',text:[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n')}];} normalized.turnId = live.turn ?? normalized.turnId; live.messages=live.messages.filter(x=>x.messageId!==normalized.messageId); live.messages.push(normalized); this.emit({ type: 'message', ref, message: normalized,connectionGeneration:live.generation }); } }
+      if (m.type === 'assistant' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id) === live) {
+        const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence);
+        if (normalized) {
+          const stream = live.stream?.id === m.message?.id ? live.stream : null;
+          const priorLink = typeof m.uuid === 'string' ? this.owned.messageLink(live.id, m.uuid) : undefined;
+          const turnId = priorLink?.turnId ?? live.turn ?? undefined;
+          normalized.messageId = stream?.id ?? priorLink?.id ?? normalized.messageId;
+          normalized.turnId = turnId ?? normalized.turnId;
+          if (typeof m.uuid === 'string' && (stream || turnId)) {
+            this.owned.linkMessage(live.id, m.uuid, normalized.messageId, live.generation, turnId);
+          }
+          if (stream) {
+            const complete = Array.isArray(m.message?.content)
+              ? m.message.content.filter((b: any) => b?.type === 'text' && typeof b.text === 'string').map((b: any) => b.text) as string[]
+              : [];
+            if (stream.stopped && stream.blocks.size > 1) {
+              if (complete.length !== stream.blocks.size) continue;
+              [...stream.blocks.keys()].sort((a, b) => a - b).forEach((key, index) => stream.blocks.set(key, complete[index]!));
+            } else if (stream.current !== null) {
+              stream.blocks.set(stream.current, (normalized.blocks[0] as { type: 'text'; text: string }).text);
+            }
+            normalized.sequence = stream.sequence;
+            normalized.revision = ++stream.revision;
+            normalized.final = stream.stopped;
+            normalized.blocks = [{ type: 'text', text: [...stream.blocks.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v).join('\n') }];
+          }
+          live.messages = live.messages.filter(x => x.messageId !== normalized.messageId);
+          live.messages.push(normalized);
+          this.emit({ type: 'message', ref, message: normalized, connectionGeneration: live.generation });
+        }
+      }
       if (m.type === 'user' && Array.isArray(m.message?.content)) for (const b of m.message.content) if (b.type === 'tool_result') for (const p of live.pending.values()) if (p.toolId === b.tool_use_id && p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'resolved', revision: p.interaction.revision + 1, nativeResult: { status: 'unknown', source: b.is_error ? 'claude_tool_result_error' : 'claude_tool_result' } }; this.emit({ type: 'interaction', ref, interaction: p.interaction }); }
       if (m.type === 'result' && live.turn && !this.closed && this.lives.get(live.id)===live) { const turn: Turn = { turnId: live.turn, sessionId: live.id, status: live.interrupted ? 'interrupted' : m.subtype === 'success' && !m.is_error ? 'completed' : 'failed', inputId: null, startedAt: null, endedAt: new Date().toISOString(), model: live.turnModel, outputIds: [] }; live.turn = null; live.interrupted = false; this.emit({ type: 'turn', ref, turn,connectionGeneration:live.generation }); }
     } } catch (error) { const exitCode = error && typeof error === 'object' && 'exitCode' in error && Number.isSafeInteger((error as {exitCode:unknown}).exitCode) ? (error as {exitCode:number}).exitCode : null; streamFailure = {kind:'sdk_stream_error',exitCode}; } finally { const current=!this.closed && this.lives.get(live.id)===live;if (this.lives.get(live.id) === live) this.lives.delete(live.id); if (live.turn && current) { const failure = streamFailure ?? {kind:'sdk_stream_closed_without_result',exitCode:null}; const now = new Date().toISOString(); this.emit({type:'event',ref,connectionGeneration:live.generation,event:{schemaVersion:1,eventId:randomUUID(),sessionId:live.id,objectId:live.turn,objectRevision:0,sequence:++this.sequence,type:'adapter.stream_failed',occurredAt:now,receivedAt:now,operationId:null,cursor:String(this.sequence),data:failure}}); this.emit({type:'turn',ref,connectionGeneration:live.generation,turn:{turnId:live.turn,sessionId:live.id,status:'failed',inputId:null,startedAt:null,endedAt:now,model:live.turnModel,outputIds:[]}}); live.turn=null; }  for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'expired', revision: p.interaction.revision + 1, nativeResult: p.interaction.status === 'answer_pending_delivery' ? { status: 'unknown', source: 'connection_closed' } : null }; p.settle({ behavior: 'deny', message: 'connection closed' }); this.emit({ type: 'interaction', ref, interaction: p.interaction }); } }
@@ -132,6 +404,7 @@ export class ClaudeAdapter implements PlatformPort {
   /** Stop owned SDK queries and settle outstanding requests before detaching observers. */
   async close(): Promise<void> {
     if (this.closed) return; this.closed = true;
+    for (const live of this.opening.values()) if (live) this.discard(live);
     const lives = [...this.lives.values()];
     for (const live of lives) {
       for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') {
@@ -163,7 +436,7 @@ export class ClaudeAdapter implements PlatformPort {
   async respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard), p = live.pending.get(interaction.interactionId), i = p?.interaction; if (!p || !i || i.status !== 'awaiting_answer' || i.connectionGeneration !== interaction.connectionGeneration || i.connectionGeneration !== guard.expectedConnectionGeneration) throw contractError('interaction_expired'); if (i.revision !== interaction.revision || i.toolInputDigest !== interaction.toolInputDigest || i.nativeRequestId !== interaction.nativeRequestId) throw contractError('stale_revision'); let result: Awaited<ReturnType<CanUseTool>>;
     if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope) result = answer.decision === 'allow' ? { behavior: 'allow', updatedInput: p.input } : { behavior: 'deny', message: 'Denied by user' };
     else if (i.kind === 'question_group' && answer.kind === 'question_group' && Object.keys(answer.answers).length === i.questions.length && i.questions.every(q => Array.isArray(answer.answers[q.id]) && answer.answers[q.id]!.length && (q.multiple || answer.answers[q.id]!.length === 1) && answer.answers[q.id]!.every(x => typeof x === 'string' && x.trim()))) { const questions = p.input.questions as Array<{ question: string }>; result = { behavior: 'allow', updatedInput: { ...p.input, answers: Object.fromEntries(i.questions.map((q, n) => [questions[n]!.question, answer.answers[q.id]!.join(', ')])) } }; } else throw contractError('invalid_request');
-    guard.assertCurrent(); p.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 }; p.settle(result); this.emit({ type: 'interaction', ref, interaction: p.interaction }); return ack(); }
+    guard.assertCurrent(); p.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 }; p.settle(result); if (guard.operationId) p.operationId = guard.operationId; this.emit({ type: 'interaction', ref, interaction: p.interaction }); return ack(); }
   async listArtifacts(ref: NativeSessionRef): Promise<Artifact[]> { this.check(ref); throw contractError('unsupported'); }
   async readArtifact(ref: NativeSessionRef, _id: string, _version: string): Promise<Uint8Array> { this.check(ref); throw contractError('unsupported'); }
   async listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string; reasoningEfforts?: string[] }>> {
@@ -197,5 +470,32 @@ export class ClaudeAdapter implements PlatformPort {
       throw contractError('outcome_unknown', 'Claude session settings may have partially changed');
     }
   }
-  async control(ref: NativeSessionRef, _action: 'acquire' | 'release', _guard: DispatchGuard): Promise<PlatformAcknowledgement> { this.check(ref); throw contractError('unsupported', 'Claude SDK does not provide observable native control handoff'); }
+  async control(ref: NativeSessionRef, action: 'acquire' | 'release', guard: DispatchGuard): Promise<PlatformAcknowledgement> {
+    const id = this.check(ref);
+    if (!this.owned.get(id)) throw contractError('unsupported', 'session ownership has not been established');
+    if (action === 'acquire') return this.open(ref, guard);
+
+    const live = this.lives.get(id);
+    if (this.closed || !live || (guard.expectedConnectionGeneration !== null && guard.expectedConnectionGeneration !== live.generation)) {
+      throw contractError('control_conflict', 'session is not connected at the expected generation');
+    }
+    if (live.turn || [...live.pending.values()].some(({ interaction }) =>
+      interaction.status === 'awaiting_answer' || interaction.status === 'answer_pending_delivery')) {
+      throw contractError('busy', 'session has a running turn or a pending interaction');
+    }
+    const known = this.known.get(id);
+    const info = { ...known, sessionId: id, cwd: live.cwd, summary: known?.summary || live.title || '', lastModified: known?.lastModified ?? 0 };
+    guard.assertCurrent();
+    try {
+      live.query.close();
+    } catch {
+      throw contractError('outcome_unknown', 'Claude SDK query close could not be confirmed');
+    }
+    live.queue.close();
+    this.lives.delete(id);
+    this.known.set(id, info);
+    this.controlGeneration.set(id, (this.controlGeneration.get(id) ?? 0) + 1);
+    this.emit({ type: 'session', ref, session: this.session(info) });
+    return ack('unsubscribed');
+  }
 }

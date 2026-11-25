@@ -280,7 +280,7 @@ test('E2E: /task create -> /task mount -> /task panel -> /handoff -> confirm_han
     // Root card text reflects taskTopicRuntimeEnabled=true
     const rootCard = JSON.parse(sdk.created[0]!.content);
     assert.equal(
-      rootCard.elements[0].text.content,
+      rootCard.elements[0].content,
       '任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。',
     );
     // Confirmation card in main group has clickable topic link button
@@ -306,8 +306,9 @@ test('E2E: /task create -> /task mount -> /task panel -> /handoff -> confirm_han
     // Latest reply in task topic is updated taskPanelCard showing both targets & switch button
     const panelReply = JSON.parse(sdk.replies.at(-1)!.content);
     assert.equal(panelReply.header.title.content, '任务目标面板');
-    assert.match(panelReply.elements[0].text.content, new RegExp(mountClaude.targetId));
-    assert.match(panelReply.elements[0].text.content, new RegExp(mountAgy.targetId));
+    assert.ok(panelReply.elements[0].content.includes(mountClaude.targetId));
+    assert.ok(panelReply.elements[0].content.includes(mountAgy.targetId));
+    assert.doesNotMatch(panelReply.elements[0].content, /rev=|activeRev=|gen=/);
 
     // 4. /task (no args) inside task topic shows task panel on tick
     const repliesBeforePanel = sdk.replies.length;
@@ -378,7 +379,7 @@ test('taskTopic.enabled=false fails closed on /task and /handoff, and T0 root te
     // T0 createTaskTopicOnce preserves exact legacy root card text
     await port.createTaskTopic('chat-main', 't0_task_1', 'op_t0_1', OWNER_ID);
     const t0Card = JSON.parse(sdk.created[0]!.content);
-    assert.equal(t0Card.elements[0].text.content, '任务话题已建立，目标功能待启用。');
+    assert.equal(t0Card.elements[0].content, '任务话题已建立，目标功能待启用。');
 
     // /task and /handoff fail closed when taskTopic.enabled is false
     for (const cmd of ['/task 测试', '/task', '/task mount s1', '/handoff t1']) {
@@ -487,8 +488,8 @@ test('topicLinkForTask wires jump buttons for WatchHub and PendingHub on task-mo
       .map((r) => JSON.parse(r.content))
       .find(
         (c) =>
-          typeof c.elements?.[0]?.text?.content === 'string' &&
-          c.elements[0].text.content.includes('cleanup.sh') &&
+          c.elements?.[0]?.tag === 'markdown' &&
+          c.elements[0].content.includes('cleanup.sh') &&
           (c.elements.find((e: { tag: string }) => e.tag === 'action')?.actions ?? []).some(
             (b: { url?: string }) => b.url === created.topicUrl,
           ),

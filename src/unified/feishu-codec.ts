@@ -1,4 +1,5 @@
-import { renderQuestionForm } from './feishu-question-forms.js';
+import { encodeCard } from './feishu-card-wire.js';
+import type { Provider } from './contracts.js';
 import type { ChannelAction } from './feishu-channel.js';
 import type { ChannelCard } from './feishu-cards.js';
 import type { PendingHubEntry, RuntimeTrustedAction } from './runtime.js';
@@ -6,65 +7,13 @@ import type { PendingHubEntry, RuntimeTrustedAction } from './runtime.js';
 /** Converts a presentation card into the Lark interactive card content object.
  * Pass JSON.stringify(result) as the SDK message content with msg_type=interactive. */
 export function toFeishuCard(card: ChannelCard): object {
-  if (card.form) return renderQuestionForm(card.form);
-  const elements: unknown[] = [];
-  if (card.table) {
-    const renderColumns = (cells: string[], bold: boolean) =>
-      card.table!.columns.map((col, idx) => ({
-        tag: 'column',
-        width: 'weighted',
-        weight: col.weight ?? 1,
-        vertical_align: 'top',
-        elements: [
-          {
-            tag: 'div',
-            text: {
-              tag: 'lark_md',
-              content: bold ? `**${cells[idx] ?? col.header}**` : (cells[idx] ?? ''),
-            },
-          },
-        ],
-      }));
-    elements.push(
-      {
-        tag: 'column_set',
-        flex_mode: 'none',
-        background_style: 'grey',
-        columns: renderColumns(card.table.columns.map(c => c.header), true),
-      },
-      { tag: 'hr' },
-      ...card.table.rows.map(row => ({
-        tag: 'column_set',
-        flex_mode: 'none',
-        columns: renderColumns(row, false),
-      })),
-    );
-    if (card.table.footer) {
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: card.table.footer } });
-    }
-  } else {
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: card.text } });
-  }
-  if (card.actions.length) {
-    elements.push({
-      tag: 'action',
-      actions: card.actions.map(a => ({
-        tag: 'button',
-        text: { tag: 'plain_text', content: a.label },
-        type: 'default',
-        ...(a.url ? { url: a.url } : { value: a.value }),
-      })),
-    });
-  }
-  return {
-    config: { wide_screen_mode: true },
-    header: { title: { tag: 'plain_text', content: card.title.trim() || '未命名会话' } },
-    elements,
-  };
+  return encodeCard(card);
 }
 const object = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
 const str = (x: unknown): x is string => typeof x === 'string' && x.length > 0;
 const nonempty = (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0;
+const isProvider = (x: unknown): x is Provider => x === 'codex' || x === 'claude' || x === 'agy';
+const draftToken = (x: unknown): x is string => typeof x === 'string' && /^[A-Za-z0-9_-]{22}$/.test(x);
 const counter = (x: unknown): x is number => Number.isSafeInteger(x) && (x as number) >= 0;
 
 const PENDING_ENTRIES = new Set<PendingHubEntry>(['hub', 'source', 'pending_hub']);
@@ -76,6 +25,10 @@ const WAVE2_BINDING_EXEMPT_ACTIONS = new Set([
   'bind',
   'list',
   'new_help',
+  'new_provider',
+  'new_pick',
+  'pending',
+  'pending_open',
   'finish',
   'inspect_unknown',
   'create',
@@ -166,8 +119,23 @@ function parseAction(value: unknown): RuntimeTrustedAction {
   switch (value.action) {
     case 'panel': if ((value.sessionId === undefined || str(value.sessionId)) && (value.turnId === undefined || str(value.turnId)) && (value.inputId === undefined || str(value.inputId))) return {action:'panel',...(str(value.sessionId) ? {sessionId:value.sessionId}:{}),...(str(value.turnId) ? {turnId:value.turnId}:{}),...(str(value.inputId) ? {inputId:value.inputId}:{})}; break;
     case 'inspect_unknown': if(str(value.operationId)&&(value.cursor===undefined||str(value.cursor))&&(value.nativeId===undefined||str(value.nativeId))&&!(value.cursor&&value.nativeId))return {action:'inspect_unknown',operationId:value.operationId,...(str(value.cursor)?{cursor:value.cursor}:{}),...(str(value.nativeId)?{nativeId:value.nativeId}:{})};break;
-    case 'list': if ((value.cursor === undefined || str(value.cursor)) && (value.search === undefined || str(value.search)) && (value.provider === undefined || value.provider === 'all' || value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy')) return {action:'list',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(str(value.search) ? {search:value.search}:{}),...(value.provider !== undefined ? {provider:value.provider}:{})}; break;
+    case 'list': {
+      const {cursor,search,provider} = value;
+      if ((cursor !== undefined && !str(cursor)) || (search !== undefined && !str(search))
+        || (provider !== undefined && provider !== 'all' && !isProvider(provider))) break;
+      const implicit = isProvider(provider) && provider === search && value.explicitSearch !== true;
+      return {action:'list',...(str(cursor) ? {cursor} : {}),...(str(search) && !implicit ? {search} : {}),
+        ...(provider !== undefined ? {provider} : {})};
+    }
     case 'new_help': return {action:'new_help'};
+    case 'new_provider':
+      if (draftToken(value.t) && counter(value.r) && isProvider(value.p)) return {action:'new_provider',t:value.t,r:value.r,p:value.p};
+      break;
+    case 'new_pick':
+      if (draftToken(value.t) && counter(value.r) && counter(value.i)) return {action:'new_pick',t:value.t,r:value.r,i:value.i};
+      break;
+    case 'pending':
+    case 'pending_open': return {action:value.action};
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
@@ -182,6 +150,7 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     case 'bind': if (str(value.sessionId) && (value.mode === undefined || value.mode === 'read_only' || value.mode === 'interactive')) return {action:'bind',sessionId:value.sessionId,...(value.mode ? {mode:value.mode} : {})}; break;
     case 'create': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.project) && (value.model === null || str(value.model))) return {action:'create',provider:value.provider,project:value.project,model:value.model}; break;
     case 'artifacts': if ((value.sessionId === undefined || str(value.sessionId)) && (value.cursor === undefined || str(value.cursor))) return {action:'artifacts',...(str(value.sessionId) ? {sessionId:value.sessionId} : {}),...(str(value.cursor) ? {cursor:value.cursor} : {})}; break;
+    case 'full_reply': if (str(value.messageId) && value.messageId.length <= 512) { const taskScope = parseTaskScope(value, true); return {action:'full_reply',messageId:value.messageId,...(taskScope ?? {})}; } break;
     case 'file': if (str(value.artifactId) && str(value.contentVersion)) { const taskScope = parseTaskScope(value, false); return {action:'file',artifactId:value.artifactId,contentVersion:value.contentVersion,...(taskScope ?? {})}; } break;
     case 'reconcile': case 'finish': if (str(value.operationId)) return {action:value.action,operationId:value.operationId}; break;
     case 'switch_target': {
@@ -316,7 +285,12 @@ export function parseFeishuText(text: string): ChannelAction {
       const prompt = input.slice(command!.length).trim();
       return {action:'swarm',prompt,rawText:input};
     }
-    case '/new': return {action:'new_help'};
+    case '/new': {
+      const tail = text.trimStart().slice(command.length).trimStart();
+      const provider = isProvider(parts[0]) ? parts[0] : undefined;
+      const prompt = provider ? tail.slice(provider.length).trimStart() : tail;
+      return {action:'new_help',...(provider ? {provider} : {}),...(prompt.trim() ? {initialPrompt:prompt} : {})};
+    }
     case '/sessions': return rest ? {action:'list',search:rest} : {action:'list'};
     case '/candidates': if(parts.length===1||parts.length===2)return {action:'inspect_unknown',operationId:parts[0]!,...(parts[1]?{nativeId:parts[1]}:{})};break;
     case '/model': return parts.length === 0 ? {action:'legacy_model'} : parts.length === 2 ? {action:'legacy_model',model:parts[0]!,effort:parts[1]!} : {action:'legacy_model',invalid:true};
@@ -347,7 +321,8 @@ export function parseFeishuText(text: string): ChannelAction {
     case '/file':
     case '/files': return {action:'artifacts'};
     case '/models': return {action:'models'};
-    case '/pending': return {action:'pending'};
+    case '/pending': if (!parts.length) return {action:'pending_open'}; break;
+    case '/ops': if (!parts.length) return {action:'pending'}; break;
     case '/health': return {action:'health'};
     case '/upgrade': return {action:'upgrade'};
     case '/unbind': return {action:'unbind'};
