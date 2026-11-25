@@ -1,15 +1,44 @@
-import { constants } from 'node:fs';
+import { constants, existsSync, realpathSync } from 'node:fs';
 import { lstat, open, opendir, readdir, realpath, stat } from 'node:fs/promises';
-import { basename, isAbsolute, relative, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LIST_MAX_ENTRIES, type DirectoryEntry, type DirectoryListing } from '../claude/deliver.js';
 
-const privateDirs = new Set(['.git','.ssh','.gnupg','.aws','.kube','.docker','.config','.claude']);
+const privateDirs = new Set(['.git','.ssh','.gnupg','.aws','.kube','.docker','.config','.claude','reviews','projtool']);
 const secretName = /^\.env(?:\..*)?$|^\.(?:netrc|npmrc|pypirc|git-credentials)$|^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$|\.(?:pem|key|p12|pfx|jks|keystore)$|secret|credential|passw/i;
 const hidden = (name:string) => privateDirs.has(name) || secretName.test(name);
 
 function isInsideRoot(target: string, root: string): boolean {
   const rel = relative(root, target);
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+function confidentialHomeRoots(): string[] {
+  const homes = new Set<string>();
+  if (process.env.HOME?.trim()) homes.add(resolve(process.env.HOME.trim()));
+  homes.add(resolve(homedir()));
+  const roots: string[] = [];
+  for (const h of homes) {
+    for (const sub of ['reviews', join('projects', 'projtool')]) {
+      const candidate = join(h, sub);
+      if (!roots.includes(candidate)) roots.push(candidate);
+      try {
+        if (existsSync(candidate)) {
+          const real = realpathSync(candidate);
+          if (!roots.includes(real)) roots.push(real);
+        }
+      } catch {
+        // ignore unreadable home subdirs
+      }
+    }
+  }
+  return roots;
+}
+
+function isProtectedConfidentialPath(canonicalTarget: string): boolean {
+  const segments = canonicalTarget.split(sep).filter(Boolean);
+  if (segments.some(seg => seg === 'reviews' || seg === 'projtool')) return true;
+  return confidentialHomeRoots().some(root => isInsideRoot(canonicalTarget, root));
 }
 
 async function canonicalizeWhitelistRoots(roots?: readonly string[]): Promise<string[]> {
@@ -35,6 +64,7 @@ async function resolveWhitelistedSymlink(entryPath: string, whitelistRoots: read
   } catch {
     return null;
   }
+  if (isProtectedConfidentialPath(target)) return null;
   const matchedRoot = whitelistRoots.find(r => isInsideRoot(target, r));
   if (!matchedRoot) return null;
   const rel = relative(matchedRoot, target);

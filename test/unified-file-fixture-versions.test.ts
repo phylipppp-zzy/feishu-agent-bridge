@@ -231,6 +231,21 @@ test('project-files allows whitelisted outputRoots symlinks while blocking escap
   await assert.rejects(selectSafeProjectFiles(project,'escape/leak.md',whitelist));
   await assert.rejects(selectSafeProjectFiles(project,'output/run1/.env',whitelist));
 
+  // Even if the parent directory containing reviews/ or projtool/ is in allowedSymlinkRoots,
+  // symlinks targeting confidential reviews/ or projtool/ must remain strictly blocked.
+  const homeLike=join(dir,'home-like');
+  await mkdir(join(homeLike,'reviews'),{recursive:true});
+  await mkdir(join(homeLike,'projects','projtool'),{recursive:true});
+  await writeFile(join(homeLike,'reviews','blind.md'),'CONFIDENTIAL\n');
+  await writeFile(join(homeLike,'projects','projtool','core.md'),'INTERNAL\n');
+  await symlink(join(homeLike,'reviews'),join(project,'review-link'));
+  await symlink(join(homeLike,'projects','projtool','core.md'),join(project,'projtool-link.md'));
+  const wideWhitelist=[project,outputs,homeLike];
+  const reviewListing=await listSafeProjectDirectory('review-link',project,false,wideWhitelist);
+  assert.equal(reviewListing.kind,'error');
+  await assert.rejects(selectSafeProjectFiles(project,'review-link/blind.md',wideWhitelist));
+  await assert.rejects(selectSafeProjectFiles(project,'projtool-link.md',wideWhitelist));
+
   // ArtifactRegistry marks same-path overwrites with contentChanged and explicit error notice.
   const ref={provider:'agy' as const,hostId:'h',serviceId:'s',nativeSessionId:'conv-1'};
   const sessionId=JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId]);

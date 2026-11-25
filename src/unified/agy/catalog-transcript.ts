@@ -154,6 +154,49 @@ async function readRegularFileWithinRoot(
   }
 }
 
+async function readTailWithinRoot(
+  filePath: string,
+  canonicalRoot: string,
+  maxBytes: number,
+): Promise<{ buffer: Buffer; totalSize: number } | null> {
+  let info;
+  try {
+    info = await lstat(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`refusing non-regular or symlinked file: ${filePath}`);
+  }
+  const canonicalPath = await realpath(filePath);
+  if (!isInside(canonicalPath, canonicalRoot)) {
+    throw new Error(`file escapes allowed root: ${filePath}`);
+  }
+  const handle = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`file invalid: ${filePath}`);
+    const toRead = Math.min(stat.size, maxBytes);
+    const startOffset = Math.max(0, stat.size - toRead);
+    const buf = Buffer.allocUnsafe(toRead);
+    let offset = 0;
+    while (offset < toRead) {
+      const { bytesRead } = await handle.read(buf, offset, toRead - offset, startOffset + offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    let slice = buf.subarray(0, offset);
+    if (startOffset > 0) {
+      const firstNewline = slice.indexOf(0x0a);
+      slice = firstNewline >= 0 ? slice.subarray(firstNewline + 1) : Buffer.alloc(0);
+    }
+    return { buffer: slice, totalSize: stat.size };
+  } finally {
+    await handle.close();
+  }
+}
+
 async function resolveTranscriptSessionDir(
   conversationId: string,
   options: { brainDir?: string; brainDirs?: readonly string[]; appDataDir?: string },
@@ -418,13 +461,46 @@ export async function readAgyTranscript(
   const compactPath = join(canonicalSessionDir, '.system_generated', 'logs', 'transcript.jsonl');
   const fullPath = join(canonicalSessionDir, '.system_generated', 'logs', 'transcript_full.jsonl');
 
-  const compactBuf = await readRegularFileWithinRoot(compactPath, canonicalSessionDir, maxBytes);
-  let primaryBuf = compactBuf;
+  let compactBuf: Buffer | null = null;
+  let primaryBuf: Buffer | null = null;
   let usedFullFallback = false;
+  let primaryTailDegraded = false;
   let fullBufCache: Buffer | null | undefined;
 
+  try {
+    compactBuf = await readRegularFileWithinRoot(compactPath, canonicalSessionDir, maxBytes);
+  } catch (err) {
+    if (err instanceof FileExceedsMaxBytesError) {
+      if (expectedPrefixDigest !== null && startLine > 0) throw new Error('stale or invalid cursor');
+      const tail = await readTailWithinRoot(compactPath, canonicalSessionDir, maxBytes);
+      compactBuf = tail?.buffer ?? null;
+      primaryTailDegraded = true;
+      warnings.push(
+        `transcript.jsonl exceeds max bytes (${err.fileSize} > ${err.maxBytes}); degraded to tail ${maxBytes} bytes window`,
+      );
+    } else {
+      throw err;
+    }
+  }
+  primaryBuf = compactBuf;
+
   if (primaryBuf === null) {
-    fullBufCache = await readRegularFileWithinRoot(fullPath, canonicalSessionDir, maxBytes);
+    try {
+      fullBufCache = await readRegularFileWithinRoot(fullPath, canonicalSessionDir, maxBytes);
+    } catch (err) {
+      if (err instanceof FileExceedsMaxBytesError) {
+        if (expectedPrefixDigest !== null && startLine > 0) throw new Error('stale or invalid cursor');
+        const tail = await readTailWithinRoot(fullPath, canonicalSessionDir, maxBytes);
+        fullBufCache = tail?.buffer ?? null;
+        primaryTailDegraded = true;
+        fullTranscriptSkippedReason = 'full_transcript_exceeds_max_bytes';
+        warnings.push(
+          `transcript_full.jsonl exceeds max bytes (${err.fileSize} > ${err.maxBytes}); degraded to tail ${maxBytes} bytes window`,
+        );
+      } else {
+        throw err;
+      }
+    }
     primaryBuf = fullBufCache;
     usedFullFallback = fullBufCache !== null;
   }
@@ -436,6 +512,9 @@ export async function readAgyTranscript(
 
   const primaryText = primaryBuf.toString('utf8');
   const { lines, truncatedTrailingLine } = splitCompleteJsonlLines(primaryText);
+  if (primaryTailDegraded && expectedPrefixDigest !== null && startLine > 0) {
+    throw new Error('stale or invalid cursor');
+  }
 
   if (startLine > lines.length) {
     if (expectedPrefixDigest !== null) throw new Error('stale or invalid cursor');

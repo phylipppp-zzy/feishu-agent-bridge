@@ -8,6 +8,7 @@ import {
   DEFAULT_MAX_ARTIFACT_BYTES,
   expandHomePath,
   isInside,
+  isProtectedConfidentialTarget,
   MAX_ARTIFACT_SCAN_DEPTH,
   MAX_ARTIFACT_SCAN_ENTRIES,
   MEDIA_TYPES,
@@ -69,6 +70,7 @@ async function canonicalizeSymlinkRoots(roots?: readonly string[]): Promise<stri
 }
 
 function isSafeSymlinkTarget(canonicalTarget: string, canonicalSymlinkRoots: readonly string[], includeScratch: boolean): boolean {
+  if (isProtectedConfidentialTarget(canonicalTarget)) return false;
   const matchedRoot = canonicalSymlinkRoots.find((root) => isInside(canonicalTarget, root));
   if (!matchedRoot) return false;
   const rel = relative(matchedRoot, canonicalTarget);

@@ -603,8 +603,33 @@ export async function readSessionSnapshot(
         },
       });
     }
-  } catch {
-    // Fresh ACP session may not yet have a transcript directory on disk.
+  } catch (err) {
+    // ENOENT is already handled as an empty result inside readAgyTranscript;
+    // any exception here is a genuine read/policy failure and must emit a warning.
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.emit({
+      type: 'event',
+      ref: ctx.ref(id),
+      event: {
+        schemaVersion: 1,
+        eventId: `agy-transcript-error:${id}:${ctx.nextSequence()}`,
+        sessionId: id,
+        objectId: id,
+        objectRevision: 0,
+        sequence: ctx.nextSequence(),
+        type: 'transcript.warning',
+        occurredAt: new Date().toISOString(),
+        receivedAt: new Date().toISOString(),
+        operationId: null,
+        cursor: `warn-err:${id}`,
+        data: {
+          warnings: [`failed to read transcript: ${message}`],
+          parseErrors: 0,
+          truncatedTrailingLine: false,
+          fullTranscriptSkippedReason: 'transcript_read_error',
+        },
+      },
+    });
   }
 
   const live = ctx.liveMessages.get(id) ?? [];

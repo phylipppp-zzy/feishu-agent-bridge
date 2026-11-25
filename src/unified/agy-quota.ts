@@ -60,20 +60,20 @@ export interface AgyQuotaHealthProjection {
 
 export interface AgyQuotaSnapshot {
   state: AgyQuotaState;
-  validity: AgyQuotaValidity;
+  validity?: AgyQuotaValidity;
   source: 'live' | 'cache' | 'none';
   apiKeyMode: boolean;
   fromCache: boolean;
   stale: boolean;
-  cacheExpired: boolean;
+  cacheExpired?: boolean;
   timedOut: boolean;
   exitCode: number | null;
   binaryPath: string | null;
   short: AgyQuotaWindow | null;
   weekly: AgyQuotaWindow | null;
   windows: AgyQuotaWindow[];
-  invalidBuckets: number;
-  warnings: string[];
+  invalidBuckets?: number;
+  warnings?: string[];
   lastSnapshotAt: string | null;
   observedAt: string;
   ageSeconds: number;
@@ -647,7 +647,7 @@ export function projectAgyQuotaHealth(
 
   if (snapshot.state === 'ok') {
     if (snapshot.validity === 'partial') {
-      const reason = `部分配额桶数值无效已忽略（${snapshot.invalidBuckets} 项）`;
+      const reason = `部分配额桶数值无效已忽略（${snapshot.invalidBuckets ?? 0} 项）`;
       return {
         component: 'agy_quota',
         status: 'degraded',
@@ -916,7 +916,7 @@ export function formatAgyQuotaSummary(snapshot: AgyQuotaSnapshot | null): string
     snapshot.validity === 'valid'
       ? '实时有效'
       : snapshot.validity === 'partial'
-        ? `部分有效（忽略 ${snapshot.invalidBuckets} 个非法桶）`
+        ? `部分有效（忽略 ${snapshot.invalidBuckets ?? 0} 个非法桶）`
         : snapshot.validity === 'cached'
           ? snapshot.stale
             ? `缓存回退（已滞后 ${snapshot.ageSeconds}s）`

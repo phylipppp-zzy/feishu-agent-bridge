@@ -707,6 +707,67 @@ test('readAgyTranscript degrades to compact transcript.jsonl when transcript_ful
     assert.equal(res.messages[1]!.text, '紧凑版回复正文');
     assert.equal(res.fullTranscriptSkippedReason, 'full_transcript_exceeds_max_bytes');
     assert.ok(res.warnings?.some((w) => w.includes('degraded to compact transcript.jsonl')));
+
+    // Primary-only oversized transcript_full.jsonl (missing compact transcript.jsonl) must degrade to tail window.
+    const convTailFull = 'conv-tail-full';
+    const tailFullLogs = join(brainDir, convTailFull, '.system_generated', 'logs');
+    await mkdir(tailFullLogs, { recursive: true });
+    await writeFile(
+      join(tailFullLogs, 'transcript_full.jsonl'),
+      jsonl(
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:00Z',
+          content: `<USER_REQUEST>${'A'.repeat(5000)}</USER_REQUEST>`,
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:10Z',
+          content: '尾部窗口保留的近期回复',
+        },
+      ),
+    );
+    const tailFullRes = await readAgyTranscript(convTailFull, { brainDir, maxBytes: 2048 });
+    assert.equal(tailFullRes.messages.length, 1);
+    assert.equal(tailFullRes.messages[0]!.text, '尾部窗口保留的近期回复');
+    assert.equal(tailFullRes.fullTranscriptSkippedReason, 'full_transcript_exceeds_max_bytes');
+    assert.ok(tailFullRes.warnings?.some((w) => w.includes('degraded to tail')));
+
+    // Oversized primary compact transcript.jsonl must also degrade to tail window instead of returning empty [].
+    const convTailCompact = 'conv-tail-compact';
+    const tailCompactLogs = join(brainDir, convTailCompact, '.system_generated', 'logs');
+    await mkdir(tailCompactLogs, { recursive: true });
+    await writeFile(
+      join(tailCompactLogs, 'transcript.jsonl'),
+      jsonl(
+        {
+          step_index: 0,
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:00Z',
+          content: `<USER_REQUEST>${'B'.repeat(5000)}</USER_REQUEST>`,
+        },
+        {
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-22T12:00:10Z',
+          content: '紧凑版尾部窗口保留回复',
+        },
+      ),
+    );
+    const tailCompactRes = await readAgyTranscript(convTailCompact, { brainDir, maxBytes: 2048 });
+    assert.equal(tailCompactRes.messages.length, 1);
+    assert.equal(tailCompactRes.messages[0]!.text, '紧凑版尾部窗口保留回复');
+    assert.ok(tailCompactRes.warnings?.some((w) => w.includes('degraded to tail')));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -857,6 +918,19 @@ test('AgyCatalog supports multiple brainDirs, reusable refresh worker, and prese
     const tr = await catalog.readTranscript(ideConv);
     assert.equal(tr.messages.length, 1);
     assert.equal(tr.messages[0]!.text, 'IDE 会话首条提问');
+
+    // Even when only single brainDir (CLI) is configured, sibling IDE brain dir is resolved via app_data_dir.
+    const singleBrainCatalog = new AgyCatalog({
+      dbPath,
+      brainDir: cliBrain,
+      allowedProjectRoots: [proj],
+    });
+    const singleSessions = singleBrainCatalog.refresh();
+    assert.equal(singleSessions.length, 1);
+    assert.equal(singleSessions[0]!.title, 'IDE 会话首条提问');
+    const singleTr = await singleBrainCatalog.readTranscript(ideConv);
+    assert.equal(singleTr.messages.length, 1);
+    assert.equal(singleTr.messages[0]!.text, 'IDE 会话首条提问');
   } finally {
     await closeAgyCatalogRefreshWorker();
     await rm(dir, { recursive: true, force: true });
@@ -924,6 +998,31 @@ test('discoverAgyArtifacts supports expanded extensions, on-demand scratch, and 
     );
     await assert.rejects(
       readAgyArtifact(convId, 'linked_secret.json', { brainDir, allowedSymlinkRoots: [outputsDir] }),
+    );
+
+    // Even when the parent directory containing reviews/ or projtool/ is in allowedSymlinkRoots,
+    // symlinks targeting confidential blind-review materials or projtool must remain strictly blocked.
+    const parentRoot = join(dir, 'home-like');
+    const reviewsDir = join(parentRoot, 'reviews');
+    const projtoolDir = join(parentRoot, 'projects', 'projtool');
+    await mkdir(reviewsDir, { recursive: true });
+    await mkdir(projtoolDir, { recursive: true });
+    await writeFile(join(reviewsDir, 'blind_review.md'), 'CONFIDENTIAL REVIEW');
+    await writeFile(join(projtoolDir, 'internal.md'), 'PROJTOOL INTERNAL');
+    await symlink(join(reviewsDir, 'blind_review.md'), join(sessionDir, 'linked_review.md'));
+    await symlink(join(projtoolDir, 'internal.md'), join(sessionDir, 'linked_projtool.md'));
+
+    const withParentRoot = await discoverAgyArtifacts(convId, {
+      brainDir,
+      allowedSymlinkRoots: [parentRoot, outputsDir],
+    });
+    assert.equal(withParentRoot.some((e) => e.relativePath === 'linked_review.md'), false);
+    assert.equal(withParentRoot.some((e) => e.relativePath === 'linked_projtool.md'), false);
+    await assert.rejects(
+      readAgyArtifact(convId, 'linked_review.md', { brainDir, allowedSymlinkRoots: [parentRoot, outputsDir] }),
+    );
+    await assert.rejects(
+      readAgyArtifact(convId, 'linked_projtool.md', { brainDir, allowedSymlinkRoots: [parentRoot, outputsDir] }),
     );
   } finally {
     await rm(dir, { recursive: true, force: true });

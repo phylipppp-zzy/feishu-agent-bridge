@@ -23,6 +23,8 @@ export const AGY_EXCLUDED_ARTIFACT_DIRS = new Set([
   '.docker',
   '.config',
   '.claude',
+  'reviews',
+  'projtool',
 ]);
 
 export const DEFAULT_AGY_ARTIFACT_EXTENSIONS = new Set([
@@ -289,10 +291,32 @@ export interface AgyArtifactOptions {
   allowedSymlinkRoots?: readonly string[];
 }
 
+export function isProtectedConfidentialTarget(canonicalTarget: string): boolean {
+  const segments = canonicalTarget.split(sep).filter(Boolean);
+  if (segments.some((seg) => seg === 'reviews' || seg === 'projtool')) return true;
+  const homes = new Set<string>();
+  if (process.env.HOME?.trim()) homes.add(resolve(process.env.HOME.trim()));
+  homes.add(resolve(homedir()));
+  for (const h of homes) {
+    for (const sub of ['reviews', join('projects', 'projtool')]) {
+      const candidate = join(h, sub);
+      if (isInside(canonicalTarget, candidate)) return true;
+      try {
+        if (existsSync(candidate) && isInside(canonicalTarget, realpathSync(candidate))) return true;
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * Resolve candidate brain directories ordered by `appDataDir` preference.
  * When neither `brainDir` nor `brainDirs` is explicitly specified, includes both
  * `~/.gemini/antigravity-cli/brain` and `~/.gemini/antigravity/brain`.
+ * When a single `brainDir` (ending with `brain`) is specified without `brainDirs` and `appDataDir` is known,
+ * also includes the sibling `<parent>/<appDataDir>/brain` (or `<appDataDir>/brain` if absolute).
  */
 export function resolveAgyBrainDirs(options?: {
   brainDir?: string;
@@ -306,9 +330,22 @@ export function resolveAgyBrainDirs(options?: {
     if (!candidates.includes(resolved)) candidates.push(resolved);
   };
 
-  const hasExplicit = Boolean(options?.brainDir?.trim()) || Boolean(options?.brainDirs?.length);
-  if (hasExplicit) {
-    if (options?.brainDir) pushUnique(options.brainDir);
+  const appDataDir = options?.appDataDir?.trim();
+  const hasExplicitList = Boolean(options?.brainDirs?.length);
+  const hasExplicitSingle = Boolean(options?.brainDir?.trim());
+
+  if (hasExplicitSingle || hasExplicitList) {
+    if (options?.brainDir) {
+      const resolvedSingle = resolve(expandHomePath(options.brainDir.trim()));
+      pushUnique(resolvedSingle);
+      if (!hasExplicitList && appDataDir && basename(resolvedSingle) === 'brain') {
+        if (isAbsolute(appDataDir)) {
+          pushUnique(join(resolve(appDataDir), 'brain'));
+        } else if (!appDataDir.includes('/') && !appDataDir.includes('\\') && appDataDir !== '.' && appDataDir !== '..') {
+          pushUnique(join(dirname(dirname(resolvedSingle)), appDataDir, 'brain'));
+        }
+      }
+    }
     if (options?.brainDirs) {
       for (const dir of options.brainDirs) pushUnique(dir);
     }
@@ -317,7 +354,6 @@ export function resolveAgyBrainDirs(options?: {
     pushUnique(DEFAULT_AGY_IDE_BRAIN_DIR);
   }
 
-  const appDataDir = options?.appDataDir?.trim();
   if (appDataDir && candidates.length > 1) {
     const normalizedApp = isAbsolute(appDataDir) ? resolve(appDataDir) : appDataDir;
     candidates.sort((a, b) => {
