@@ -42,10 +42,13 @@ export const DEFAULT_AGY_MODELS: readonly ModelOption[] = [
   { id: 'gemini-4-neon', label: 'Gemini 4 Neon', reasoningEfforts: [...AGY_REASONING_EFFORTS] },
   { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', reasoningEfforts: [...AGY_REASONING_EFFORTS] },
   { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', reasoningEfforts: [...AGY_REASONING_EFFORTS] },
-  { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', reasoningEfforts: [...AGY_REASONING_EFFORTS] },
 ];
 
-export const DEFAULT_PROMPT_TIMEOUT_MS = 10 * 60_000;
+export const DEFAULT_PROMPT_MAX_TIMEOUT_MS = 4 * 60 * 60_000;
+export const DEFAULT_PROMPT_IDLE_TIMEOUT_MS = 10 * 60_000;
+export const DEFAULT_PROMPT_TIMEOUT_MS = DEFAULT_PROMPT_MAX_TIMEOUT_MS;
+export const DEFAULT_WAKEUP_IDLE_MS = 1_500;
+export const MAX_TURN_RESIDUAL_SNAPSHOTS = 64;
 export const LIST_SNAPSHOT_TTL_MS = 120_000;
 export const MAX_LIST_SNAPSHOTS = 8;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -92,6 +95,22 @@ export type LiveSessionMeta = {
   effortConfigId?: string;
 };
 
+export type AgyElicitationAction = 'accept' | 'decline' | 'cancel';
+
+export type TurnResidualSnapshot = {
+  turnId: string;
+  generation: number;
+  inProgressToolCalls: number;
+  observedAt: string;
+};
+
+export type SessionLockState = {
+  generation: number;
+  turnId: string;
+  reason: string;
+  lockedAt: string;
+};
+
 export type ActiveTurnState = {
   turnId: string;
   generation: number;
@@ -105,6 +124,10 @@ export type ActiveTurnState = {
   lastChunkMessageId?: string;
   assistantFinalized: boolean;
   interrupted: boolean;
+  cancelRequested: boolean;
+  cancelRequestedAt?: string;
+  isWakeup?: boolean;
+  wakeupTimer?: ReturnType<typeof setTimeout>;
   inProgressToolCalls: Set<string>;
   toolCalls: Map<string, Obj>;
   fullToolCalls: Set<string>;
@@ -151,10 +174,13 @@ export interface AdapterContext {
   readonly hostId: string;
   readonly serviceId: string;
   readonly approvalPolicy?: ApprovalScope;
+  readonly wakeupIdleMs: number;
   readonly active: Set<string>;
   readonly controlEpoch: Map<string, number>;
   readonly knownSessions: Map<string, LiveSessionMeta>;
   readonly activeTurns: Map<string, ActiveTurnState>;
+  readonly lockedSessions: Map<string, SessionLockState>;
+  readonly turnResiduals: Map<string, TurnResidualSnapshot>;
   readonly sessionTurns: Map<string, Map<string, Turn>>;
   readonly liveMessages: Map<string, Message[]>;
   readonly preLiveTranscriptIds: Map<string, Set<string>>;
@@ -179,6 +205,8 @@ export interface AdapterContext {
   ): Session & { subagentCount?: number };
   upsertLiveMessage(sessionId: string, message: Message): void;
   putSessionTurn(sessionId: string, turn: Turn): void;
+  getSessionModel(sessionId: string): string | null;
+  recordTurnResidual(sessionId: string, turnState: ActiveTurnState): void;
   pruneSnapshots(): void;
 }
 
@@ -252,22 +280,120 @@ export function extractSchemaChoices(prop: Obj): string[] {
       )
       .filter(s => s.trim().length > 0);
   }
+  if (Array.isArray(prop.anyOf)) {
+    const out: string[] = [];
+    for (const branch of prop.anyOf) {
+      if (!isRecord(branch)) continue;
+      if (typeof branch.const === 'string' && branch.const.trim().length > 0) {
+        out.push(branch.const);
+      } else {
+        out.push(...extractSchemaChoices(branch));
+      }
+    }
+    return [...new Set(out)];
+  }
   if (isRecord(prop.items)) {
     return extractSchemaChoices(prop.items);
   }
   return [];
 }
 
-export function convertSchemaValue(rawValue: string, propType: string | undefined): unknown {
-  if (propType === 'boolean') {
-    if (rawValue === 'true') return true;
-    if (rawValue === 'false') return false;
+function branchAllowsFreeText(node: Obj): boolean {
+  if (Array.isArray(node.anyOf)) {
+    return node.anyOf.some(
+      branch =>
+        isRecord(branch) &&
+        !Array.isArray(branch.enum) &&
+        !Array.isArray(branch.oneOf) &&
+        branch.const === undefined &&
+        (branch.type === 'string' || branch.type === 'number' || branch.type === 'integer' || !branch.type),
+    );
   }
-  if (propType === 'number' || propType === 'integer') {
-    const n = Number(rawValue);
-    if (Number.isFinite(n)) return propType === 'integer' ? Math.trunc(n) : n;
+  return false;
+}
+
+export function schemaAllowsFreeText(prop: Obj, choices: readonly string[]): boolean {
+  if (choices.length === 0) return true;
+  if (prop.type === 'array') {
+    if (isRecord(prop.items)) {
+      return branchAllowsFreeText(prop.items);
+    }
+    return false;
+  }
+  return branchAllowsFreeText(prop);
+}
+
+export function convertSchemaValue(rawValue: string, propType: string | undefined): unknown {
+  const trimmed = rawValue.trim();
+  if (propType === 'boolean') {
+    if (trimmed === 'true') return true;
+    if (trimmed === 'false') return false;
+    throw contractError('invalid_request', `invalid boolean value: ${rawValue}`);
+  }
+  if (propType === 'integer') {
+    if (!/^[+-]?\d+$/.test(trimmed)) {
+      throw contractError('invalid_request', `invalid integer value: ${rawValue}`);
+    }
+    const n = Number(trimmed);
+    if (!Number.isSafeInteger(n)) {
+      throw contractError('invalid_request', `integer out of safe range: ${rawValue}`);
+    }
+    return n;
+  }
+  if (propType === 'number') {
+    if (!trimmed) {
+      throw contractError('invalid_request', `invalid number value: ${rawValue}`);
+    }
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) {
+      throw contractError('invalid_request', `invalid finite number value: ${rawValue}`);
+    }
+    return n;
   }
   return rawValue;
+}
+
+export function extractServerCurrentSettings(
+  res: unknown,
+): { model?: string; effort?: AgyEffortLevel } | null {
+  if (!isRecord(res)) return null;
+  let model: string | undefined;
+  let effort: AgyEffortLevel | undefined;
+
+  const rawModelId =
+    (isRecord(res.models) && isString(res.models.currentModelId) && res.models.currentModelId) ||
+    (isString(res.currentModelId) && res.currentModelId) ||
+    (isString(res.modelId) && res.modelId) ||
+    null;
+
+  if (rawModelId) {
+    const stripped = stripAgyModelEffortSuffix(rawModelId);
+    if (stripped.baseModel) model = stripped.baseModel;
+    if (stripped.extractedEffort) effort = stripped.extractedEffort;
+  }
+
+  if (Array.isArray(res.configOptions)) {
+    const effortId = findEffortConfigId(res.configOptions);
+    if (effortId) {
+      for (const opt of res.configOptions) {
+        if (!isRecord(opt) || opt.id !== effortId) continue;
+        const val = isString(opt.currentValue)
+          ? opt.currentValue.toLowerCase()
+          : isString(opt.value)
+            ? opt.value.toLowerCase()
+            : null;
+        if (val && AGY_REASONING_EFFORTS.includes(val as AgyEffortLevel)) {
+          effort = val as AgyEffortLevel;
+        }
+      }
+    }
+  }
+
+  if (!model && !effort) return null;
+  return {
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+  };
 }
 
 export function normalizeTranscriptMessage(

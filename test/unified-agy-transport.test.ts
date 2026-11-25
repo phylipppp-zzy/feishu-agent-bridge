@@ -427,12 +427,32 @@ test('CLI arg builders enforce P0-2 ACP and stream-json flag contracts', () => {
   assert.deepEqual(acpArgs, [
     'acp',
     '--stdio',
+    '--process-per-session',
     '--gemini-dir',
     '/tmp/gem',
     '--app-data-dir',
     'app-cli',
     '--sandbox',
     '--disable-telemetry',
+  ]);
+
+  const acpCustomArgs = buildAgyAcpArgs({
+    processPerSession: false,
+    defaultMode: 'accept-edits',
+    addDirs: ['/ssd/zhangzy/scratch', '/data/zhangzy/outputs'],
+    extraArgs: ['--agent', 'researcher'],
+  });
+  assert.deepEqual(acpCustomArgs, [
+    'acp',
+    '--stdio',
+    '--mode',
+    'accept-edits',
+    '--add-dir',
+    '/ssd/zhangzy/scratch',
+    '--add-dir',
+    '/data/zhangzy/outputs',
+    '--agent',
+    'researcher',
   ]);
 
   const streamArgs = buildAgyStreamJsonArgs({
@@ -500,6 +520,7 @@ test('AgyAcpTransport completes initialize, session/new, streaming session/promp
     assert.deepEqual((init.agentCapabilities?._meta?.antigravity as { argv: string[] }).argv, [
       'acp',
       '--stdio',
+      '--process-per-session',
       '--gemini-dir',
       join(dir, 'gem'),
       '--app-data-dir',

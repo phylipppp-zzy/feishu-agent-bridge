@@ -3,6 +3,7 @@ import { contractError, type ContractError } from '../errors.js';
 import {
   buildAgyAcpArgs,
   createLineParser,
+  DEFAULT_CLIENT_CAPABILITIES,
   DEFAULT_CLOSE_TIMEOUT_MS,
   DEFAULT_CONNECT_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
@@ -22,6 +23,7 @@ import {
   type AgyAuthMethod,
   type AgyHealthStatus,
   type AgyInitializeResult,
+  type AgyRequestOptions,
   type AgyServerRequest,
   type AgyServerRequestMethod,
   type JsonRpcErrorPayload,
@@ -33,6 +35,10 @@ type PendingRpc = {
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+  idleTimer?: ReturnType<typeof setTimeout>;
+  idleTimeoutMs?: number;
+  sessionId?: string;
+  isWaitingForUser?: () => boolean;
   onSuccess?: (result: unknown) => void;
 };
 
@@ -40,6 +46,7 @@ type PendingServerRequest = {
   generation: number;
   rpcId: JsonRpcId;
   method: AgyServerRequestMethod;
+  sessionId?: string;
 };
 
 /**
@@ -220,7 +227,7 @@ export class AgyAcpTransport {
           'initialize',
           {
             protocolVersion: 1,
-            clientCapabilities: this.options.clientCapabilities ?? {},
+            clientCapabilities: this.options.clientCapabilities ?? DEFAULT_CLIENT_CAPABILITIES,
             clientInfo: this.options.clientInfo ?? { name: 'feishu-agent-bridge', version: '0.1.0' },
           },
           this.connectTimeoutMs,
@@ -256,7 +263,7 @@ export class AgyAcpTransport {
   }
 
   /** Send an arbitrary JSON-RPC 2.0 request over the active ACP connection. */
-  request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
+  request(method: string, params?: unknown, timeoutOrOptions?: number | AgyRequestOptions): Promise<unknown> {
     if (!method || typeof method !== 'string') {
       return Promise.reject(contractError('invalid_request', 'JSON-RPC method must be a non-empty string'));
     }
@@ -265,12 +272,38 @@ export class AgyAcpTransport {
       return Promise.reject(contractError('temporarily_unavailable', 'ACP transport not connected'));
     }
     let effectiveTimeout: number;
+    let idleTimeoutMs: number | undefined;
+    let sessionId: string | undefined;
+    let isWaitingForUser: (() => boolean) | undefined;
     try {
-      effectiveTimeout = resolvePositiveMs(timeoutMs, this.requestTimeoutMs, 'timeoutMs');
+      if (typeof timeoutOrOptions === 'object' && timeoutOrOptions !== null) {
+        effectiveTimeout = resolvePositiveMs(timeoutOrOptions.timeoutMs, this.requestTimeoutMs, 'timeoutMs');
+        if (timeoutOrOptions.idleTimeoutMs !== undefined) {
+          idleTimeoutMs = resolvePositiveMs(timeoutOrOptions.idleTimeoutMs, this.requestTimeoutMs, 'idleTimeoutMs');
+        }
+        sessionId = timeoutOrOptions.sessionId;
+        isWaitingForUser = timeoutOrOptions.isWaitingForUser;
+      } else {
+        effectiveTimeout = resolvePositiveMs(timeoutOrOptions, this.requestTimeoutMs, 'timeoutMs');
+      }
     } catch (err) {
       return Promise.reject(err);
     }
-    return this.sendRequestInternal(proc, method, params, effectiveTimeout);
+    return this.sendRequestInternal(proc, method, params, effectiveTimeout, undefined, {
+      ...(idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(isWaitingForUser !== undefined ? { isWaitingForUser } : {}),
+    });
+  }
+
+  /** Renew activity-based idle timers for any in-flight request bound to `sessionId`. */
+  touchSessionActivity(sessionId: string): void {
+    if (!sessionId) return;
+    for (const [id, entry] of this.pending) {
+      if (entry.sessionId === sessionId && entry.idleTimeoutMs !== undefined) {
+        this.scheduleIdleTimer(id, entry);
+      }
+    }
   }
 
   /** Send a JSON-RPC 2.0 notification (no `id`) over the active ACP connection. */
@@ -407,12 +440,20 @@ export class AgyAcpTransport {
     params: unknown,
     timeoutMs: number,
     onSuccess?: (result: unknown) => void,
+    activity?: {
+      idleTimeoutMs?: number;
+      sessionId?: string;
+      isWaitingForUser?: () => boolean;
+    },
   ): Promise<unknown> {
     const id = ++this.serial;
     const payload = params === undefined ? { jsonrpc: '2.0', id, method } : { jsonrpc: '2.0', id, method, params };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (!this.pending.delete(id)) return;
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        this.pending.delete(id);
+        this.clearPendingTimers(entry);
         this.markDegraded(`request timed out: ${method}`);
         reject(contractError('outcome_unknown', `ACP request timed out: ${method}`));
       }, timeoutMs);
@@ -422,17 +463,47 @@ export class AgyAcpTransport {
         resolve,
         reject,
         timer,
+        ...(activity?.idleTimeoutMs !== undefined ? { idleTimeoutMs: activity.idleTimeoutMs } : {}),
+        ...(activity?.sessionId !== undefined ? { sessionId: activity.sessionId } : {}),
+        ...(activity?.isWaitingForUser !== undefined ? { isWaitingForUser: activity.isWaitingForUser } : {}),
         ...(onSuccess !== undefined ? { onSuccess } : {}),
       };
       this.pending.set(id, entry);
+      if (entry.idleTimeoutMs !== undefined) {
+        this.scheduleIdleTimer(id, entry);
+      }
 
       if (!writeNdjsonLine(proc, payload)) {
         this.pending.delete(id);
-        clearTimeout(timer);
+        this.clearPendingTimers(entry);
         this.markDegraded('send failed');
         reject(contractError('outcome_unknown', `failed to send ACP request: ${method}`));
       }
     });
+  }
+
+  private scheduleIdleTimer(id: number, entry: PendingRpc): void {
+    if (entry.idleTimeoutMs === undefined) return;
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    entry.idleTimer = setTimeout(() => {
+      if (this.pending.get(id) !== entry) return;
+      if (entry.isWaitingForUser?.()) {
+        this.scheduleIdleTimer(id, entry);
+        return;
+      }
+      this.pending.delete(id);
+      this.clearPendingTimers(entry);
+      this.markDegraded(`request idle timed out: ${entry.method}`);
+      entry.reject(contractError('outcome_unknown', `ACP request idle timed out: ${entry.method}`));
+    }, entry.idleTimeoutMs);
+  }
+
+  private clearPendingTimers(entry: PendingRpc): void {
+    clearTimeout(entry.timer);
+    if (entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      delete entry.idleTimer;
+    }
   }
 
   private claimServerResponse(
@@ -472,6 +543,9 @@ export class AgyAcpTransport {
     beforeWrite?.();
     this.pendingServerRequests.delete(key);
     this.respondedServerRequestKeys.add(key);
+    if (pendingReq.sessionId) {
+      this.touchSessionActivity(pendingReq.sessionId);
+    }
     return { stdin, line };
   }
 
@@ -495,7 +569,7 @@ export class AgyAcpTransport {
     if (!hasMethod && typeof parsed.id === 'number' && this.pending.has(parsed.id)) {
       const entry = this.pending.get(parsed.id)!;
       this.pending.delete(parsed.id);
-      clearTimeout(entry.timer);
+      this.clearPendingTimers(entry);
 
       if ('error' in parsed && parsed.error !== undefined && parsed.error !== null) {
         const errPayload: JsonRpcErrorPayload = isRecord(parsed.error)
@@ -552,10 +626,18 @@ export class AgyAcpTransport {
         });
         return;
       }
+      const reqSessionId =
+        isRecord(parsed.params) && typeof parsed.params.sessionId === 'string' && parsed.params.sessionId.length > 0
+          ? parsed.params.sessionId
+          : undefined;
+      if (reqSessionId) {
+        this.touchSessionActivity(reqSessionId);
+      }
       const req: PendingServerRequest = {
         generation,
         rpcId: parsed.id,
         method: method as AgyServerRequestMethod,
+        ...(reqSessionId !== undefined ? { sessionId: reqSessionId } : {}),
       };
       this.pendingServerRequests.set(key, req);
       try {
@@ -565,11 +647,25 @@ export class AgyAcpTransport {
           method: method as AgyServerRequestMethod,
           params: parsed.params,
         });
-      } catch {}
+      } catch {
+        if (this.pendingServerRequests.has(key) && this.activeGeneration === generation && this.connected) {
+          try {
+            this.respondServerError(generation, parsed.id, -32603, 'Internal error handling server request');
+          } catch {}
+        }
+      }
       return;
     }
 
     if (hasMethod && !hasId) {
+      if (
+        parsed.method === 'session/update' &&
+        isRecord(parsed.params) &&
+        typeof parsed.params.sessionId === 'string' &&
+        parsed.params.sessionId.length > 0
+      ) {
+        this.touchSessionActivity(parsed.params.sessionId);
+      }
       try {
         this.onNotification({
           generation,
@@ -611,7 +707,7 @@ export class AgyAcpTransport {
 
   private rejectAllPending(error: ContractError): void {
     for (const entry of this.pending.values()) {
-      clearTimeout(entry.timer);
+      this.clearPendingTimers(entry);
       entry.reject(error);
     }
     this.pending.clear();
