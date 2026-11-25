@@ -1045,6 +1045,7 @@ export async function createLiveRuntime(config:RuntimeConfig, credentials:{appId
       ...(config.agy!.summariesDbPath !== undefined ? { dbPath: config.agy!.summariesDbPath } : {}),
       ...(config.agy!.brainDir !== undefined ? { brainDir: config.agy!.brainDir } : {}),
       ...(config.allowedProjectRoots !== undefined ? { allowedProjectRoots: config.allowedProjectRoots } : {}),
+      ...(config.outputRoots !== undefined ? { outputRoots: config.outputRoots } : {}),
     });
     const agyTransportOptions = {
       ...(config.agy!.binPath !== undefined ? { agyBin: config.agy!.binPath } : {}),
