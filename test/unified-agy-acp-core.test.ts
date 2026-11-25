@@ -463,7 +463,7 @@ rl.on('line', async (line) => {
 
 test('P0/P1: DEFAULT_AGY_MODELS omits gemini-3-flash-preview, strict convertSchemaValue & schemaAllowsFreeText', () => {
   assert.equal(DEFAULT_AGY_MODELS.some(m => m.id === 'gemini-3-flash-preview'), false);
-  assert.equal(DEFAULT_PROMPT_MAX_TIMEOUT_MS, 4 * 60 * 60_000);
+  assert.equal(DEFAULT_PROMPT_MAX_TIMEOUT_MS, 24 * 60 * 60_000);
 
   // Strict convertSchemaValue rejects 2.9 for integer, NaN/Infinity for number, bad booleans
   assert.equal(convertSchemaValue('42', 'integer'), 42);

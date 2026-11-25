@@ -44,7 +44,7 @@ export const DEFAULT_AGY_MODELS: readonly ModelOption[] = [
   { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', reasoningEfforts: [...AGY_REASONING_EFFORTS] },
 ];
 
-export const DEFAULT_PROMPT_MAX_TIMEOUT_MS = 4 * 60 * 60_000;
+export const DEFAULT_PROMPT_MAX_TIMEOUT_MS = 24 * 60 * 60_000;
 export const DEFAULT_PROMPT_IDLE_TIMEOUT_MS = 10 * 60_000;
 export const DEFAULT_PROMPT_TIMEOUT_MS = DEFAULT_PROMPT_MAX_TIMEOUT_MS;
 export const DEFAULT_WAKEUP_IDLE_MS = 1_500;

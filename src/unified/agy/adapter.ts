@@ -786,6 +786,7 @@ export class AgyAdapter implements PlatformPort {
         idleTimeoutMs: this.promptIdleTimeoutMs,
         sessionId: id,
         isWaitingForUser: () =>
+          turnState.inProgressToolCalls.size > 0 ||
           this.pendingRequests(id).some(
             p => p.interaction.status === 'awaiting_answer' || p.submission === 'writing',
           ),
