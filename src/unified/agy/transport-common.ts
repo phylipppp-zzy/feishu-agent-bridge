@@ -1,8 +1,10 @@
 import { type ChildProcess } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { contractError, type ContractError, type ErrorCode } from '../errors.js';
 
-export const DEFAULT_AGY_BIN = '/home/zhangzy/.gemini/bin/agy';
+export const DEFAULT_AGY_BIN = join(homedir(), '.gemini', 'bin', 'agy');
 
 export type JsonRpcId = string | number;
 export type AgyHealthStatus = 'healthy' | 'degraded' | 'unverified';
@@ -81,7 +83,7 @@ export interface AgyAcpHealthSnapshot {
 }
 
 export interface AgyAcpTransportOptions {
-  /** Path to the `agy` binary (defaults to `/home/zhangzy/.gemini/bin/agy`). */
+  /** Path to the `agy` binary (defaults to `$HOME/.gemini/bin/agy`). */
   agyBin?: string;
   /** Optional args inserted before `acp --stdio` (e.g. a test script path when `agyBin` is `node`). */
   prependArgs?: readonly string[];
@@ -194,7 +196,7 @@ export type AgyStreamEvent =
 export type AgyStreamInputContent = string | Array<{ type: 'text'; text: string }>;
 
 export interface AgyStreamJsonRunnerOptions {
-  /** Path to the `agy` binary (defaults to `/home/zhangzy/.gemini/bin/agy`). */
+  /** Path to the `agy` binary (defaults to `$HOME/.gemini/bin/agy`). */
   agyBin?: string;
   /** Optional args inserted before `-p= --input-format stream-json --output-format stream-json`. */
   prependArgs?: readonly string[];

@@ -1,12 +1,13 @@
 import {createHash} from 'node:crypto';
 import {lstatSync,mkdirSync,readFileSync,realpathSync,statSync,writeFileSync} from 'node:fs';
+import {homedir} from 'node:os';
 import {dirname,isAbsolute,join,relative,resolve,sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {NativeTestLineRpc} from './native-test-rpc.js';
 import {NativeTestWorker} from './native-test-worker.js';
 import {NativeTestUnitBroker,SystemdBrokerManager,currentBrokerParent} from './native-test-unit-broker.js';
 
-const cli='/home/zhangzy/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe';
+const cli=join(homedir(),'.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe');
 const cliHash='708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd';
 const sdkFiles:ReadonlyArray<readonly [string,string]>=[["LICENSE.md", "8ce94b9478bb9868f9641f818e06cd722fbe55d4c22e2d2ed11971b20146173a"], ["README.md", "786e57ced73510c752e2e15901d290c7c22786e4791d8a2e2d96991a9a97c192"], ["agentSdkTypes.d.ts", "1005d810b1bec12c856632bb7d54087af7c516251a4b557eb05ae8d474fc5a93"], ["bridge.d.ts", "1ee98f40a605ef53c50c31aab8998a3df986298c398e8c95faacefc34fc7bac6"], ["bridge.mjs", "0447d93793e35b19de8387e4ab61255e116e4296960529a4cbb7ce63004ece17"], ["browser-sdk.d.ts", "d98512eb8c7d656f5f8698ad712be2f501d4f570470391af1069b17eeb8992d9"], ["browser-sdk.js", "8c363707b47da6a04d5f12b9094caf8640e706af4af9a4e9c855a24fec39d8c6"], ["core-kgfyd2t2.mjs", "58d2dd22e4566fe71b6646b0203424149e72813410cd66032fc004d01d1bd17d"], ["core-q38rzykt.mjs", "3caa66457c5acb5a9ea432e32f7f378af744d66e691377f3141397e2657c5e27"], ["core.d.ts", "df8b63bf4bc2300a9afc91aa38a1767aa6adecbe45139ed320e679ca7afd2df8"], ["core.mjs", "c92fa33ef0d3eb6b1f58583db24d3643347b67b440cb0a9eb6222379f4bb5593"], ["extractFromBunfs.d.ts", "eedc9d6a3adb2e0f12984ddf3d2cc3a72f56906b4a4069660bd08fd36c3d2984"], ["extractFromBunfs.js", "1286171f98b1147a4ed46d48296a1ab8ee4f79cee2d893ace5210ebe361d8c27"], ["manifest.json", "7654db465063ffed4718ac52ad9eaaba489511bb326abdbbbc2203e44b8e61fe"], ["manifest.zst.json", "b1863cabc63a02f5f498e7040f99814879a81c08abfa73a598b9016e392add6e"], ["package.json", "9383c390073a387bcb300c7c5e833f30e3c971093ad031537fa142bc33f7806d"], ["sdk-tools.d.ts", "91ab2df2cb687cd3692f74a149867a847e3a4c88478c55a255e6a33df7fc5fca"], ["sdk.d.ts", "e21c63715af18e383c817716d8cb4a68466ef1b8aff93fc5807c9fcaabbaf240"], ["sdk.mjs", "21fbc4b359e517a370524dd6e25c40c5eab40368eb122491530ac4233021925d"]];
 const hash=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex');

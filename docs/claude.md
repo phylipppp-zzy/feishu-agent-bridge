@@ -1,6 +1,6 @@
 # 飞书 ↔ Claude Code 桥接
 
-> 本机 = gpu3（/home/zhangzy）。下文的示例路径按 gpu3 写。
+> 下文的示例路径以 `$HOME` 为例，实际使用时请替换为本机路径。
 
 本仓库除了 Codex 桥接，还包含一个独立的 Claude Code 桥接。它把本机 Claude Code 的会话（VS Code 扩展和终端里的都算）同步到一个飞书私密话题群，方便在手机上查看。在会话话题里直接回复就能继续这个会话，也可以从飞书新建会话；Claude 仍然在这台电脑上运行，使用你本机的 `claude` 和设置。
 
@@ -28,12 +28,12 @@ Claude 桥接和 Codex 桥接互不影响：各用一个飞书应用、一个私
 
 ```bash
 # 方式一：通过安装器（可写多个 --sync-dir；会复用已有的飞书应用和 hook）
-./install-claude.sh --sync-dir /home/zhangzy/workspace --sync-dir /data/projects
+./install-claude.sh --sync-dir "$HOME/workspace" --sync-dir /data/projects
 # 恢复同步全部目录
 ./install-claude.sh --sync-all
 
 # 方式二：直接编辑环境文件，然后重启服务
-#   ~/.config/feishu-claude-bridge/env 中写：SYNC_DIRS="/home/zhangzy/workspace,/data/projects"
+#   ~/.config/feishu-claude-bridge/env 中写：SYNC_DIRS="$HOME/workspace,/data/projects"
 systemctl --user restart feishu-claude-bridge.service
 ```
 

@@ -24,7 +24,7 @@
 
 ## 三、本地项目现状
 
-项目位置：`/home/sar/usr/zhangzy/workspace/feishu-agent-bridge`。当前部署的是 `feat/claude-mirror` 分支，HEAD 为 `685a213`，由 systemd 用户服务 `feishu-claude-bridge.service` 运行。
+项目位置：`<workspace>/feishu-agent-bridge`。当前部署的是 `feat/claude-mirror` 分支，HEAD 为 `685a213`，由 systemd 用户服务 `feishu-claude-bridge.service` 运行。
 
 ### 3.1 工作方式
 
