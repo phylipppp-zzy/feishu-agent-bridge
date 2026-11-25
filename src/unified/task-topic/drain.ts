@@ -9,6 +9,7 @@ import {
   type WriteContext,
 } from '../contracts.js';
 import { contractError, type ErrorCode } from '../errors.js';
+import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import {
   operationCard,
   providerTitlePrefix,
@@ -22,6 +23,8 @@ import {
   buildSwarmUnsupportedCard,
   buildTaskTopicHelpCard,
 } from '../help-cards.js';
+import { replyText } from '../turn-progress-card.js';
+import { readTurnReply } from '../turn-reply.js';
 import { taskPanelCard } from './cards.js';
 import { getBindingRow, getTargetRow } from './schema.js';
 import {
@@ -81,6 +84,7 @@ export interface TaskDrainDeps extends TaskDeliverDeps {
     expectedRootGeneration: number;
     owner: Identity;
   }) => Promise<TaskBindingRecord>;
+  onInteractionChanged?: (sessionId: string, interactionId: string) => void;
   renderInteraction: (
     binding: BindingRow,
     target: TargetRow,
@@ -309,7 +313,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       .run(eventId);
     if (!claim.changes) return { status: 'unknown' };
     const text = {
-      unsupported: '仅支持图片和 UTF-8 文本附件。',
+      unsupported: '仅支持图片（PNG/JPG/GIF/WebP）和 UTF-8 文本文件（.txt）。',
       size: '文本附件为空或超过 1 MiB，未提交。',
       encoding: '文本附件不是有效 UTF-8 或包含 NUL，未提交。',
     }[a.reason];
@@ -551,7 +555,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         row.target_id,
         {
           title: `${label} · 文件`,
-          text: page.items.map((f) => `${f.name} (${f.contentVersion})`).join('\n') || '暂无文件。',
+          text: page.items.map((f) => `${escapeCardMarkdown(f.name)} (${escapeCardMarkdown(f.contentVersion)})`).join('\n') || '暂无文件。',
           actions: page.items.map((f) => ({
             label: (counts.get(f.name) ?? 0) > 1 ? `${f.name} (${f.contentVersion.slice(0, 8)})` : f.name,
             value: {
@@ -570,6 +574,26 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         `${eventId}:artifacts`,
       );
       result = page;
+    } else if (a.action === 'full_reply') {
+      const message = await readTurnReply(deps.service, row.session_id, a.messageId);
+      if (!message) return finalize('rejected', { status: 'rejected', reason: 'reply_not_found' });
+      const text = replyText(message);
+      const digest = payloadDigest(text);
+      const deliveryId = `task-full-reply:${payloadDigest([row.task_id, row.root_generation, row.target_id, row.target_generation, row.session_id, message.messageId, digest])}`;
+      const guard = async () => {
+        const current = await verifyCapturedTarget();
+        if (!current.ok) throw contractError(current.status === 'expired' ? 'stale_revision' : 'unauthorized');
+      };
+      await guard();
+      const claimed = deps.db.prepare(
+        "INSERT OR IGNORE INTO task_deliveries_v1(delivery_id, task_id, target_id, state) VALUES (?, ?, ?, 'unknown')",
+      ).run(deliveryId, row.task_id, row.target_id).changes;
+      if (claimed) {
+        await deps.port.sendFile(e.destination, `完整正文-${digest.slice(0, 12)}.txt`, Buffer.from(text, 'utf8'), deliveryId, guard);
+        deps.db.prepare("UPDATE task_deliveries_v1 SET state = 'sent' WHERE delivery_id = ?").run(deliveryId);
+      }
+      const delivery = deps.db.prepare('SELECT state FROM task_deliveries_v1 WHERE delivery_id=?').get(deliveryId);
+      result = { deliveryId, status: delivery?.state };
     } else if (a.action === 'file') {
       const page = await deps.service.listArtifacts(row.session_id, { limit: 100 });
       const file = page.items.find(
@@ -626,7 +650,8 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       (result as Operation).status !== 'failed' &&
       (result as Operation).status !== 'unknown'
     ) {
-      try {
+      if (deps.onInteractionChanged) deps.onInteractionChanged(row.session_id, a.interactionId);
+      else try {
         const updatedInteraction = await deps.service.getInteraction(a.interactionId);
         const currentBinding = getBindingRow(deps.db, row.task_id);
         const currentTarget = getTargetRow(deps.db, row.task_id, row.target_id);

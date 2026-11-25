@@ -4,8 +4,10 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { DispatchGuard, PlatformPort } from '../src/unified/adapter.js';
 import {
+  answerDigest,
   payloadDigest,
   type Answer,
   type Capabilities,
@@ -309,6 +311,46 @@ test('aggregates 4 categories across claude/codex/agy with filtering, pagination
     assert.ok(summarySend);
     assert.match(summarySend.card.text, /模型问答: 3 项 · 工具权限: 3 项 · 业务决定: 1 项 · 执行授权: 1 项/);
     assert.ok(summarySend.card.actions.some((a) => a.url?.startsWith('https://applink.feishu.cn/')));
+    const sourceApprovalId = hub.getRef('interaction:int-claude-a')?.source_card_message_id;
+    const sourceApproval = fake.sends.find(send => send.messageId === sourceApprovalId)?.card;
+    assert.ok(sourceApproval);
+    assert.equal(sourceApproval.template, 'orange');
+    assert.match(sourceApproval.text, /（已同步至「待处理」汇总，任一处处理即可）$/u);
+    assert.doesNotMatch(sourceApproval.text, /int-claude-a|轻量等待引用|awaiting_answer/u);
+
+    const assertWithdrawn = (refId: string) => {
+      const ref = hub.getRef(refId);
+      assert.equal(ref?.card_active, 0);
+      for (const id of [ref?.source_card_message_id, ref?.hub_card_message_id]) {
+        assert.ok(id);
+        assert.ok(fake.updates.some(update => update.messageId === id && update.card.actions.length === 0));
+      }
+    };
+    const decisionsDb = new DatabaseSync(decDbPath);
+    try {
+      decisionsDb.prepare('DELETE FROM decisions_v1 WHERE decision_id=?').run('dec-biz-1');
+    } finally {
+      decisionsDb.close();
+    }
+    store.insertInteraction({
+      ...store.getInteraction('int-claude-q'),
+      interactionId: 'int-claude-q-new',
+      nativeRequestId: 'nr-c-q-new',
+    });
+    assert.deepEqual(await hub.sync(), { activeCount: 8, withdrawnRefs: ['decision:dec-biz-1'] });
+    assertWithdrawn('decision:dec-biz-1');
+    assert.equal(hub.getRef('interaction:int-claude-q-new')?.card_active, 1);
+
+    const hubWithoutDecisionStore = new PendingHub({
+      dbPath: hubDbPath, owner, destination: 'chat-main', service: core, port: fake.port,
+    });
+    try {
+      assert.deepEqual(await hubWithoutDecisionStore.sync(), { activeCount: 7, withdrawnRefs: ['decision:dec-exec-1'] });
+      assertWithdrawn('decision:dec-exec-1');
+      assert.deepEqual(await hubWithoutDecisionStore.sync(), { activeCount: 7, withdrawnRefs: [] });
+    } finally {
+      hubWithoutDecisionStore.close();
+    }
   } finally {
     hub.close();
     decisionStore.close();
@@ -318,13 +360,36 @@ test('aggregates 4 categories across claude/codex/agy with filtering, pagination
   }
 });
 
-test('3-way competition (source vs hub vs native terminal) guarantees single winner and withdraws both cards', async () => {
+test('competing callbacks update both cards immediately while stale background discovery is blocked', { timeout: 5000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pending-race-'));
   const store = new UnifiedStore(join(dir, 'core.sqlite'));
   const { ports, respondCalls } = createProviderPorts();
   const core = new UnifiedCore(store, ports, () => true);
   const decisionStore = new DecisionSyncStore({ dbPath: join(dir, 'decisions.sqlite') });
   const fake = createFakePendingPort();
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => { resolve = done; });
+    return { promise, resolve };
+  };
+  const discoveryStarted = deferred();
+  const releaseDiscovery = deferred();
+  const listSessions = core.listSessions.bind(core);
+  let lists = 0;
+  core.listSessions = async (query) => {
+    lists++;
+    return listSessions(query);
+  };
+  const linkForSession = fake.port.topicLinkForSession!;
+  let holdDiscovery = false;
+  let staleSync: ReturnType<PendingHub['sync']> | undefined;
+  fake.port.topicLinkForSession = async (destination, sessionId) => {
+    if (holdDiscovery && sessionId === 'sess_claude_race') {
+      discoveryStarted.resolve();
+      await releaseDiscovery.promise;
+    }
+    return linkForSession(destination, sessionId);
+  };
   const hub = new PendingHub({
     dbPath: join(dir, 'hub.sqlite'),
     owner,
@@ -403,49 +468,102 @@ test('3-way competition (source vs hub vs native terminal) guarantees single win
     assert.ok(ref2Before.source_card_message_id);
     assert.ok(ref2Before.hub_card_message_id);
 
-    // 1. Concurrent Hub vs Source answer on int-race-1 -> ONLY ONE winner, port.respond called ONCE, both cards withdrawn
-    const [hubAttempt, srcAttempt] = await Promise.allSettled([
-      hub.submitFromHub(
-        { eventId: 'evt-hub-win', destination: 'topic:pending-hub-1', identity: owner },
-        {
-          kind: 'interaction',
-          sourceSessionId: claudeSess.sessionId,
-          interactionId: 'int-race-1',
-          revision: 1,
-          connectionGeneration: 1,
-          answer: { kind: 'approval', decision: 'allow', scope: 'this_request' },
-          toolInputDigest: digest1,
-          cardMessageId: ref1Before.hub_card_message_id!,
-        },
-      ),
-      hub.submitFromSource(
-        { eventId: 'evt-src-lose', destination: 'topic:claude-race', identity: owner },
-        {
-          kind: 'interaction',
-          sourceSessionId: claudeSess.sessionId,
-          interactionId: 'int-race-1',
-          revision: 1,
-          connectionGeneration: 1,
-          answer: { kind: 'approval', decision: 'deny', scope: 'this_request' },
-          toolInputDigest: digest1,
-          cardMessageId: ref1Before.source_card_message_id!,
-        },
-      ),
+    holdDiscovery = true;
+    staleSync = hub.sync();
+    await discoveryStarted.promise;
+    const listsBeforeSubmit = lists;
+    const sendsBeforeSubmit = fake.sends.length;
+    const answer: Answer = { kind: 'approval', decision: 'allow', scope: 'this_request' };
+    const hubEnvelope = { eventId: 'evt-hub-win', destination: 'topic:pending-hub-1', identity: owner };
+    const sourceEnvelope = { eventId: 'evt-src-lose', destination: 'topic:claude-race', identity: owner };
+    const payload = {
+      kind: 'interaction' as const,
+      sourceSessionId: claudeSess.sessionId,
+      interactionId: int1.interactionId,
+      revision: 1,
+      connectionGeneration: 1,
+      answer,
+      toolInputDigest: digest1,
+    };
+    const submittedOperations = new Set<string>();
+    const refRefresh = new Set<string>();
+    let summaryDirty = false;
+    const notifications = {
+      notifyOperation: (operationId: string) => { submittedOperations.add(operationId); },
+      notifyInteraction: (_sessionId: string, interactionId: string) => { refRefresh.add(interactionId); },
+      notifySummary: () => { summaryDirty = true; },
+    };
+    const hubPayload = { ...payload, cardMessageId: ref1Before.hub_card_message_id! };
+    const sourcePayload = { ...payload, cardMessageId: ref1Before.source_card_message_id! };
+
+    const [hubAttempt, sourceAttempt] = await Promise.allSettled([
+      hub.submitAnswer('hub', hubEnvelope, hubPayload, notifications),
+      hub.submitAnswer('source', sourceEnvelope, sourcePayload, notifications),
     ]);
+    assert.ok(summaryDirty);
+    assert.equal(lists, listsBeforeSubmit, 'fast callbacks never start a summary scan');
+    assert.equal([hubAttempt, sourceAttempt].filter((attempt) => attempt.status === 'fulfilled').length, 1);
+    const winner = hubAttempt.status === 'fulfilled' ? hubAttempt : sourceAttempt;
+    const receipt = winner.status === 'fulfilled' ? winner.value.operation! : assert.fail('missing approval winner');
+    assert.equal(receipt.status, 'received');
+    assert.deepEqual([...submittedOperations], [receipt.operationId]);
+    assert.deepEqual([...refRefresh], [int1.interactionId]);
+    assert.equal(respondCalls.length, 0);
 
-    const fulfilled = [hubAttempt, srcAttempt].filter((r) => r.status === 'fulfilled');
-    const rejected = [hubAttempt, srcAttempt].filter((r) => r.status === 'rejected');
-    assert.equal(fulfilled.length, 1);
-    assert.equal(rejected.length, 1);
-    assert.equal(respondCalls.filter((c) => c.interactionId === 'int-race-1').length, 1);
+    const [acknowledgement] = await Promise.all([
+      core.dispatch(receipt.operationId),
+      hub.refreshInteractionRef(int1.interactionId),
+    ]);
+    assert.equal(acknowledgement.status, 'accepted');
+    assert.equal(store.getOutbox(receipt.operationId).state, 'done');
+    assert.equal(respondCalls.filter((call) => call.interactionId === int1.interactionId).length, 1);
+    assert.equal(hub.getRef('interaction:int-race-1')!.card_active, 0);
+    const messageIds = [ref1Before.source_card_message_id, ref1Before.hub_card_message_id];
+    for (const messageId of messageIds) {
+      const patches = fake.updates.filter((update) => update.messageId === messageId);
+      assert.equal(patches.length, 1);
+      assert.deepEqual(patches[0]!.card.actions, []);
+      assert.match(patches[0]!.card.text, /答复已提交，等待原端确认/);
+    }
 
-    const ref1After = hub.getRef('interaction:int-race-1')!;
-    assert.equal(ref1After.card_active, 0);
-    // Both source card and hub card updated with actions: []
-    const srcWithdraw1 = fake.updates.find((u) => u.messageId === ref1Before.source_card_message_id);
-    const hubWithdraw1 = fake.updates.find((u) => u.messageId === ref1Before.hub_card_message_id);
-    assert.ok(srcWithdraw1 && srcWithdraw1.card.actions.length === 0);
-    assert.ok(hubWithdraw1 && hubWithdraw1.card.actions.length === 0);
+    // The already-claimed event is idempotent, including after the visible card advances.
+    const replay = await (hubAttempt.status === 'fulfilled'
+      ? hub.submitAnswer('hub', hubEnvelope, hubPayload, notifications)
+      : hub.submitAnswer('source', sourceEnvelope, sourcePayload, notifications));
+    assert.equal(replay.operation?.operationId, receipt.operationId);
+    assert.equal(replay.operation?.status, 'accepted');
+    assert.equal(lists, listsBeforeSubmit);
+
+    holdDiscovery = false;
+    releaseDiscovery.resolve();
+    await staleSync;
+    assert.equal(fake.sends.length, sendsBeforeSubmit, 'stale discovery must not send a replacement card');
+    for (const messageId of messageIds) {
+      assert.equal(fake.updates.filter((update) => update.messageId === messageId).length, 1);
+    }
+
+    const responseEvidence = {
+      operationId: receipt.operationId,
+      interactionId: int1.interactionId,
+      nativeRequestId: int1.nativeRequestId,
+      connectionGeneration: int1.connectionGeneration,
+      answerDigest: answerDigest(answer),
+    };
+    const confirmation = {
+      type: 'interaction' as const,
+      ref: claudeSess.native,
+      interaction: { ...int1, status: 'resolved' as const, nativeResult: { status: 'accepted' as const, source: 'adapter', answer } },
+      responseEvidence,
+    };
+    await core.observe(confirmation);
+    await hub.handleObservation(confirmation);
+    assert.equal((await core.getOperation(receipt.operationId)).status, 'completed');
+    for (const messageId of messageIds) {
+      const patches = fake.updates.filter((update) => update.messageId === messageId);
+      assert.equal(patches.length, 2, 'terminal evidence updates the same withdrawn card');
+      assert.deepEqual(patches[1]!.card.actions, []);
+      assert.match(patches[1]!.card.text, /原端已确认答复/);
+    }
 
     // 2. Native terminal resolves int-race-terminal FIRST -> 0 respond calls, both cards withdrawn via observation
     await core.observe({
@@ -514,6 +632,8 @@ test('3-way competition (source vs hub vs native terminal) guarantees single win
     assert.equal([decWin, decLose].filter((r) => r.status === 'rejected').length, 1);
     assert.equal(hub.getRef('decision:dec-race-1')?.card_active, 0);
   } finally {
+    releaseDiscovery.resolve();
+    await staleSync?.catch(() => {});
     hub.close();
     decisionStore.close();
     core.close();

@@ -3,9 +3,11 @@ import type { UnifiedService } from '../adapter.js';
 import { payloadDigest, type Identity } from '../contracts.js';
 import { contractError } from '../errors.js';
 import type { ChannelAction, FeishuPort, TrustedEnvelope } from '../feishu-channel.js';
+import type { RuntimeTrustedAction } from '../runtime.js';
 import type { TaskTopicToken } from '../task-topic-store.js';
 import { taskPanelCard } from './cards.js';
 import type { TaskTopicChannel } from './channel.js';
+import { handoffPreviewCard } from './handoff-cards.js';
 import type { TaskHandoffService } from './handoff.js';
 import { TaskHandoffError } from './handoff-types.js';
 import { TaskChannelError, type TaskAccessMode } from './types.js';
@@ -41,6 +43,51 @@ export function isTaskControlAction(action: { action: string }): action is TaskC
     action.action === 'task_panel' ||
     action.action === 'handoff_preview'
   );
+}
+
+export async function handleTaskHandoffConfirmation(
+  handoff: TaskHandoffService,
+  taskChannel: TaskTopicChannel | undefined,
+  port: Pick<FeishuPort, 'update'>,
+  envelope: TrustedEnvelope,
+  action: Extract<RuntimeTrustedAction, { action: 'confirm_handoff' }>,
+) {
+  const { destination, identity, eventId, cardMessageId } = envelope;
+  const binding = taskChannel?.getBindingByDestination(destination);
+  if (taskChannel && binding?.taskId !== action.taskId) {
+    throw new TaskHandoffError('stale_revision', 'task binding mismatch');
+  }
+  const draft = handoff.getHandoff(action.handoffId);
+  if (draft && draft.taskId !== action.taskId) {
+    throw new TaskHandoffError('stale_revision', 'handoff task mismatch');
+  }
+  if (draft && draft.activeRevision !== action.activeRevision) {
+    throw new TaskHandoffError('stale_revision', 'active revision mismatch');
+  }
+  const result = await handoff.confirmHandoff(
+    action.handoffId, action.previewDigest, action.targetGeneration, identity, eventId,
+  );
+  if (result.status === 'submitted' && cardMessageId && taskChannel && binding) {
+    const { handoff: submitted } = result;
+    const source = taskChannel.getTarget(action.taskId, submitted.sourceTargetId);
+    const target = taskChannel.getTarget(action.taskId, submitted.targetTargetId);
+    const text = source && target
+      ? handoffPreviewCard(submitted, source.native.provider, target.native.provider).text
+      : '交接摘要已提交到目标会话。';
+    const guard = async () => {
+      const current = taskChannel.getBindingByDestination(destination);
+      if (current?.state !== 'active' || current.taskId !== binding.taskId ||
+          current.rootGeneration !== binding.rootGeneration ||
+          current.owner.source !== identity.source || current.owner.subject !== identity.subject) {
+        throw new TaskHandoffError('stale_revision', 'task binding changed after confirmation');
+      }
+    };
+    // The measured port records a delivery failure independently of the committed handoff.
+    await port.update(destination, cardMessageId, {
+      title: '✅ 已确认交接', template: 'green', text, actions: [],
+    }, `handoff-confirmed:${eventId}`, guard).catch(() => undefined);
+  }
+  return result;
 }
 
 export async function handleTaskControlAction(

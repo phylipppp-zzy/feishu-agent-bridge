@@ -11,6 +11,8 @@ import type {
 } from '../contracts.js';
 import { contractError } from '../errors.js';
 import {
+  formatSessionTitle,
+  isGenericAgyTitle,
   isRecord,
   isString,
   LIST_SNAPSHOT_TTL_MS,
@@ -18,10 +20,65 @@ import {
   normalizeTranscriptMessage,
   readCaps,
   type AdapterContext,
+  type LiveSessionMeta,
 } from './adapter-types.js';
+import { isPlaceholderAgyTitle } from './catalog-summaries.js';
+import { ALL_CONTROL_CHARS_RE } from './catalog-types.js';
+import { agyPromptText, reconcileAgyReply } from './transcript-reconciliation.js';
 
-export function mergeAllSessions(ctx: AdapterContext): Array<Session & { subagentCount?: number }> {
-  const catalogSessions = ctx.catalog.refresh();
+const ACP_TITLES_TTL_MS = 15_000;
+
+async function fetchAcpSessionTitles(ctx: AdapterContext): Promise<void> {
+  const generation = ctx.transport.connectionGeneration;
+  const titles = new Map<string, string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 5; page++) {
+    const result = await ctx.transport.request('session/list', cursor ? { cursor } : {}, 3000);
+    if (ctx.isClosed() || !ctx.transport.connected || ctx.transport.connectionGeneration !== generation) return;
+    if (!isRecord(result) || !Array.isArray(result.sessions)) return;
+    for (const session of result.sessions) {
+      if (!isRecord(session) || !isString(session.sessionId) || !session.sessionId.trim() || !isString(session.title)) continue;
+      const title = session.title.replace(ALL_CONTROL_CHARS_RE, '').trim();
+      if (!isGenericAgyTitle(title, session.sessionId)) titles.set(session.sessionId, title);
+    }
+    if (!isString(result.nextCursor)) break;
+    cursor = result.nextCursor;
+  }
+  ctx.acpTitles.clear();
+  for (const [id, title] of titles) ctx.acpTitles.set(id, title);
+}
+
+async function refreshAcpSessionTitles(ctx: AdapterContext): Promise<void> {
+  if (!ctx.transport.connected || ctx.isClosed()) return;
+  if (ctx.acpTitlesRefresh) return ctx.acpTitlesRefresh;
+  if (ctx.acpTitlesExpiresAt !== undefined && Date.now() < ctx.acpTitlesExpiresAt) return;
+
+  ctx.acpTitlesRefresh = fetchAcpSessionTitles(ctx).catch(() => {
+    // session/list is optional. Keep cached titles and let discovery use its catalog fallback.
+  }).finally(() => {
+    ctx.acpTitlesExpiresAt = Date.now() + ACP_TITLES_TTL_MS;
+    delete ctx.acpTitlesRefresh;
+  });
+  return ctx.acpTitlesRefresh;
+}
+
+export function resolveSessionTitle(
+  id: string,
+  summary: AgyDiscoveredSession | null,
+  liveMeta: LiveSessionMeta | undefined,
+  acpTitle: string | undefined,
+): string {
+  const liveTitle = liveMeta?.title && !isPlaceholderAgyTitle(liveMeta.title) ? liveMeta.title : '';
+  const summaryTitle = summary?.title && !isPlaceholderAgyTitle(summary.title) ? summary.title : '';
+  const baseTitle = (liveMeta?.nativeTitle && liveTitle) || acpTitle ||
+    (!isGenericAgyTitle(summaryTitle, id) && summaryTitle) || liveTitle || summaryTitle ||
+    `Antigravity 会话 · ${id.slice(0, 8)}`;
+  return formatSessionTitle(baseTitle, summary?.subagentCount ?? 0);
+}
+
+async function mergeAllSessions(ctx: AdapterContext): Promise<Array<Session & { subagentCount?: number }>> {
+  await refreshAcpSessionTitles(ctx);
+  const catalogSessions = await ctx.catalog.refreshAsync();
   const merged = new Map<string, Session & { subagentCount?: number }>();
 
   for (const s of catalogSessions) {
@@ -51,7 +108,7 @@ export async function listSessions(
   let offset = 0;
 
   if (cursor === null) {
-    items = mergeAllSessions(ctx);
+    items = await mergeAllSessions(ctx);
     snapshotKey = randomUUID();
     if (items.length > limit) {
       while (ctx.listSnapshots.size >= MAX_LIST_SNAPSHOTS) {
@@ -120,14 +177,14 @@ export async function discoverExistingSessions(
     throw contractError('invalid_request', 'invalid limit');
   }
   ctx.pruneSnapshots();
+  await refreshAcpSessionTitles(ctx);
 
   let snapshotKey: string;
   let ids: string[];
   let offset = 0;
 
   if (cursor === null) {
-    const all = ctx.catalog
-      .refresh()
+    const all = (await ctx.catalog.refreshAsync())
       .filter(s => s.isTopLevel && s.projectAllowed && s.project !== '' && (s.stepCount > 0 || s.lastModifiedAt !== null));
     ids = all.map(s => s.conversationId);
     snapshotKey = randomUUID();
@@ -217,6 +274,7 @@ export async function discoverNewerSessions(
     throw contractError('invalid_request', 'invalid discoverNewer query');
   }
   ctx.pruneSnapshots();
+  await refreshAcpSessionTitles(ctx);
 
   const key = cursor ?? randomUUID();
   let state = ctx.recentDiscovery.get(key);
@@ -224,7 +282,7 @@ export async function discoverNewerSessions(
   if (cursor === null) {
     const buffer: Session[] = [];
     const observedAt = new Date().toISOString();
-    const summaries = ctx.catalog.refresh();
+    const summaries = await ctx.catalog.refreshAsync();
 
     for (const summary of summaries) {
       if (!summary.isTopLevel || !summary.projectAllowed || !summary.project) continue;
@@ -294,7 +352,8 @@ export async function discoverRunningSessions(
     throw contractError('snapshot_required', 'invalid cursor');
   }
 
-  const summaries = ctx.catalog.refresh();
+  await refreshAcpSessionTitles(ctx);
+  const summaries = await ctx.catalog.refreshAsync();
   const items: Session[] = [];
   for (const s of summaries) {
     if (!s.isTopLevel || !s.projectAllowed || !s.project) continue;
@@ -342,7 +401,7 @@ export async function readAutoActivityForSession(
     return { status: 'unknown' };
   }
 
-  ctx.catalog.refresh();
+  await ctx.catalog.refreshAsync();
   const summary = ctx.catalog.get(id);
   if (!summary || !summary.isTopLevel || !summary.projectAllowed || !summary.project) {
     return { status: 'unknown' };
@@ -435,18 +494,71 @@ export async function readAutoActivityForSession(
   };
 }
 
+function visibleTranscript(
+  ctx: AdapterContext,
+  id: string,
+  transcript: readonly Message[],
+  live: readonly Message[],
+): Message[] {
+  const baseline = ctx.preLiveTranscriptIds.get(id);
+  const liveIds = new Set(live.map(message => message.messageId));
+  const prompts = live.filter(message => message.role === 'user');
+  const assistants = new Map(live.filter(message => message.role === 'assistant').map(message => [message.turnId, message]));
+  const visible: Message[] = [];
+  let nextPrompt = 0;
+  let counterpart: Message | undefined;
+  let pendingCounterpart = false;
+  let nativeReply: Message[] = [];
+
+  const settleReply = () => {
+    if (counterpart) {
+      const reply = reconcileAgyReply(counterpart, nativeReply, true);
+      if (reply !== counterpart) ctx.upsertLiveMessage(id, reply);
+    }
+    nativeReply = [];
+    counterpart = undefined;
+    pendingCounterpart = false;
+  };
+
+  for (const message of transcript) {
+    if (message.role === 'user' || baseline?.has(message.messageId)) settleReply();
+    if (baseline && !baseline.has(message.messageId)) {
+      if (message.role === 'user') {
+        const text = agyPromptText(message);
+        // Match only rows written after the baseline. Keep unmatched native turns visible.
+        const index = prompts.findIndex((prompt, i) => i >= nextPrompt &&
+          (agyPromptText(prompt) === text || !message.final && agyPromptText(prompt).startsWith(text)));
+        if (index >= 0) {
+          nextPrompt = index + 1;
+          const turnId = prompts[index]!.turnId;
+          counterpart = assistants.get(turnId);
+          pendingCounterpart = ctx.activeTurns.get(id)?.turnId === turnId;
+          continue;
+        }
+      } else if (message.role === 'assistant' && (counterpart || pendingCounterpart)) {
+        nativeReply.push(message);
+        continue;
+      }
+    }
+    if (!liveIds.has(message.messageId)) visible.push(message);
+  }
+  settleReply();
+  return visible;
+}
+
 export async function readSessionSnapshot(
   ctx: AdapterContext,
   ref: NativeSessionRef,
 ): Promise<SessionSnapshot> {
   const id = ctx.check(ref);
-  ctx.catalog.refresh();
+  if (!ctx.knownSessions.has(id)) await ctx.catalog.refreshAsync();
   const summary = ctx.catalog.get(id);
   const liveMeta = ctx.knownSessions.get(id);
   if (!summary && !liveMeta) {
     throw contractError('invalid_request', 'agy session not found');
   }
 
+  await refreshAcpSessionTitles(ctx);
   let transcriptMessages: Message[] = [];
   let createdAt: string | undefined;
   try {
@@ -460,8 +572,7 @@ export async function readSessionSnapshot(
   }
 
   const live = ctx.liveMessages.get(id) ?? [];
-  const liveIds = new Set(live.map(m => m.messageId));
-  const historyVisible = transcriptMessages.filter(m => !liveIds.has(m.messageId));
+  const historyVisible = visibleTranscript(ctx, id, transcriptMessages, live);
   const baseSeq = historyVisible.length;
   const mergedLive = live.map((m, idx) => ({
     ...m,

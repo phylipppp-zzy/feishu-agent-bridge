@@ -1,9 +1,11 @@
 import { verifiedMessageAppLink } from './feishu-message-link.js';
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseIncoming, parseCardAction } from '../feishu.js';
-import { toFeishuCard, parseFeishuAction, parseFeishuText } from './feishu-codec.js';
+import { parseFeishuAction, parseFeishuText } from './feishu-codec.js';
+import { FeishuCallbackValues, packCardCallbacks, type CallbackReferences } from './feishu-callback-values.js';
+import { cardSchema, encodeCard, type CardSchema } from './feishu-card-wire.js';
 import type { ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import type { RuntimeTrustedAction } from './runtime.js';
 import type { ChannelCard } from './feishu-cards.js';
@@ -11,23 +13,67 @@ import type { Provider } from './contracts.js';
 import { imageMediaType } from '../image-media.js';
 import {TaskTopicStore,type TaskTopicToken} from './task-topic-store.js';
 import {attachmentDisplayName,decodeTextAttachment,MAX_TEXT_ATTACHMENT_BYTES} from './text-attachment.js';
+import { BindingExpired } from './topic-title-sync.js';
 import type { Readable } from 'node:stream';
 
 class ResourceRejected extends Error {}
-class FeishuApiRejected extends Error { readonly deliveryKind='api_rejected'; constructor(readonly platformCode:number) {super('Feishu API rejected request');} }
-function rejectCode(code:unknown):void {if(typeof code==='number' && Number.isSafeInteger(code) && code!==0) throw new FeishuApiRejected(code);}
-function requiresCardSchemaV2(value: unknown): boolean {
-  const failure = value as { code?: unknown; msg?: unknown; response?: { data?: { code?: unknown; msg?: unknown } } } | null;
-  const { code, msg } = failure?.response?.data ?? failure ?? {};
-  return code === 200830 || code === '200830' ||
-    ((code === 230099 || code === '230099') && typeof msg === 'string' && /\bErrCode:\s*200830\b/.test(msg));
+class UnsupportedInboundFile extends ResourceRejected {
+  constructor() { super('unsupported resource type'); }
 }
-function topicRootSchemaV2(card: ChannelCard): object {
-  return {
-    schema: '2.0',
-    header: { title: { tag: 'plain_text', content: card.title } },
-    body: { elements: [{ tag: 'div', text: { tag: 'plain_text', content: card.text } }] },
-  };
+export class FeishuApiRejected extends Error {
+  readonly deliveryKind = 'api_rejected';
+  constructor(readonly platformCode: number) { super('Feishu API rejected request'); }
+}
+
+type FeishuErrorBody = { code?: unknown; msg?: unknown };
+
+function platformErrorCode(value: unknown): number | null {
+  const code = typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : value;
+  return typeof code === 'number' && Number.isSafeInteger(code) && code !== 0 ? code : null;
+}
+
+function readFeishuError(error: unknown): { code: number; msg: unknown } | undefined {
+  // The SDK can throw an Axios error, a Feishu response body or both in an array.
+  for (const entry of Array.isArray(error) ? error : [error]) {
+    if (!entry || typeof entry !== 'object') continue;
+    const failure = entry instanceof FeishuApiRejected ? { code: entry.platformCode } :
+      entry as FeishuErrorBody & { response?: { data?: FeishuErrorBody } };
+    for (const body of [failure.response?.data, failure]) {
+      const { code, msg } = body ?? {};
+      const numeric = platformErrorCode(code);
+      if (numeric !== null) return { code: numeric, msg };
+    }
+  }
+  return undefined;
+}
+
+export function extractFeishuErrorCode(error: unknown): number | null {
+  return readFeishuError(error)?.code ?? null;
+}
+
+function normalizeFeishuRejection(error: unknown): unknown {
+  const code = extractFeishuErrorCode(error);
+  return code === null || error instanceof FeishuApiRejected ? error : new FeishuApiRejected(code);
+}
+
+function rejectCode(code: unknown): void {
+  const rejection = platformErrorCode(code);
+  if (rejection !== null) throw new FeishuApiRejected(rejection);
+}
+
+async function feishuMessageWrite<T extends FeishuErrorBody>(write: () => Promise<T>): Promise<T> {
+  try {
+    const response = await write();
+    rejectCode(response?.code);
+    return response;
+  } catch (error) {
+    throw normalizeFeishuRejection(error);
+  }
+}
+
+function requiresCardSchemaV2(value: unknown): boolean {
+  const { code, msg } = readFeishuError(value) ?? {};
+  return code === 200830 || (code === 230099 && typeof msg === 'string' && /\bErrCode:\s*200830\b/.test(msg));
 }
 class UnknownTopic extends Error {}
 class TaskPendingRoute extends Error {}
@@ -37,11 +83,12 @@ class UnknownTestRoute extends Error {}
 class ClosedKnownTestCreation extends Error { readonly deliveryKind='known_closed'; }
 class PendingKnownTestCreation extends Error { readonly deliveryKind='known_pending'; }
 export const MAX_INBOUND_BYTES = 20 * 1024 * 1024;
+const IMAGE_SIGNATURE_BYTES = 12; // The longest signature checked by imageMediaType is WebP.
 type ResourceMetadata={name?:string;mime?:string};
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
 export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:string, destinations:ReadonlySet<string>, download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>, handle:(e:TrustedEnvelope,a:ChannelAction)=>Promise<unknown>, queueResource?:(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',metadata?:ResourceMetadata)=>void|Promise<void>, resolveDestination?:(chatId:string,rootId?:string,parentId?:string,threadId?:string)=>string):Promise<void> {
-  const m=parseIncoming(data,botId); if (!m) return;
+  const m=parseIncoming(data,botId,true); if (!m) return;
   const threadId=(data.message as unknown as {thread_id?:string}).thread_id;
   const inTopic=Boolean(m.rootId || m.parentId || threadId);
   if (m.mentionedBot) {
@@ -52,7 +99,8 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
     if (!inTopic && !isMainSlash) return;
   }
   let textAction:ChannelAction | undefined;
-  if (data.message.message_type === 'text' && m.text) { try { textAction=parseFeishuText(m.text); } catch (error) { if (!m.text.startsWith('/')) throw error; textAction={action:'help'}; } }
+  const hasText = m.text.trim().length > 0;
+  if (data.message.message_type === 'text' && hasText) { try { textAction=parseFeishuText(m.text); } catch (error) { if (!m.text.trimStart().startsWith('/')) throw error; textAction={action:'help'}; } }
   let destination:string;
   try {
     destination=resolveDestination ? resolveDestination(m.chatId,m.rootId,m.parentId,threadId) : m.chatId;
@@ -62,7 +110,7 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
   }
   const envelope={eventId:`message:${m.messageId}`,destination,identity:{source:'feishu',subject:m.senderOpenId}};
   if (textAction) { await handle(envelope,textAction); return; }
-  if (!m.mentionedBot && data.message.message_type === 'text' && !m.text) return;
+  if (!m.mentionedBot && data.message.message_type === 'text' && !hasText) return;
   if (data.message.message_type !== 'image' && data.message.message_type !== 'file') throw new Error('unsupported inbound message type');
   let body:unknown; try { body=JSON.parse(data.message.content); } catch { throw new Error('invalid resource message'); }
   if (!body || typeof body !== 'object') throw new Error('invalid resource message');
@@ -74,8 +122,20 @@ export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:s
 }
 async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:string,resourceType:'image'|'file',download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>,handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>,scope?:string,metadata?:ResourceMetadata):Promise<void> {
   const rawName=metadata?.name, mime=metadata?.mime?.toLowerCase();const textHint=resourceType==='file' && (typeof rawName==='string'&&/\.txt$/i.test(rawName)||mime==='text/plain');const stream=await download(messageId,key,resourceType); const chunks:Buffer[]=[]; let length=0;
-  try { for await (const part of stream) { const chunk=Buffer.isBuffer(part) ? part : Buffer.from(part); length+=chunk.length; if(length>(textHint?MAX_TEXT_ATTACHMENT_BYTES:MAX_INBOUND_BYTES)) throw new ResourceRejected(textHint?'size':'inbound resource exceeds limit'); chunks.push(chunk); } } finally { if (!stream.destroyed) stream.destroy(); }
-  const content=Buffer.concat(chunks); const mediaType=imageMediaType(content);if(resourceType==='file'&&!textHint&&((rawName&&!/\.(png|jpe?g|gif|webp)$/i.test(rawName))||(mime&&!['image/png','image/jpeg','image/gif','image/webp'].includes(mime))||(mime&&mediaType&&mime!==mediaType)))throw new ResourceRejected('unsupported');if(textHint){if(mediaType || (mime&&mime!=='text/plain') || (rawName&&!/\.txt$/i.test(rawName)))throw new ResourceRejected('unsupported');try{decodeTextAttachment(content)}catch(error){throw new ResourceRejected(content.length===0||content.length>MAX_TEXT_ATTACHMENT_BYTES?'size':'encoding')}await handle(envelope,{action:'attachment',name:attachmentDisplayName(rawName??'attachment.txt'),mediaType:'text/plain',content,mode:'new'},scope);return;} if (!mediaType) throw new ResourceRejected('unsupported resource type');
+  try {
+    for await (const part of stream) {
+      const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
+      if (resourceType === 'file' && !rawName && !mime && length < IMAGE_SIGNATURE_BYTES && length + chunk.length >= IMAGE_SIGNATURE_BYTES) {
+        const signature = Buffer.concat([...chunks, chunk.subarray(0, IMAGE_SIGNATURE_BYTES - length)], IMAGE_SIGNATURE_BYTES);
+        if (!imageMediaType(signature)) throw new UnsupportedInboundFile();
+      }
+      length += chunk.length;
+      if (length > (textHint ? MAX_TEXT_ATTACHMENT_BYTES : MAX_INBOUND_BYTES)) throw new ResourceRejected(textHint ? 'size' : 'inbound resource exceeds limit');
+      chunks.push(chunk);
+    }
+  } finally { if (!stream.destroyed) stream.destroy(); }
+  const content=Buffer.concat(chunks); const mediaType=imageMediaType(content);if(resourceType==='file'&&!textHint&&((rawName&&!/\.(png|jpe?g|gif|webp)$/i.test(rawName))||(mime&&!['image/png','image/jpeg','image/gif','image/webp'].includes(mime))||(mime&&mediaType&&mime!==mediaType)))throw new ResourceRejected('unsupported');if(textHint){if(mediaType || (mime&&mime!=='text/plain') || (rawName&&!/\.txt$/i.test(rawName)))throw new ResourceRejected('unsupported');try{decodeTextAttachment(content)}catch(error){throw new ResourceRejected(content.length===0||content.length>MAX_TEXT_ATTACHMENT_BYTES?'size':'encoding')}await handle(envelope,{action:'attachment',name:attachmentDisplayName(rawName??'attachment.txt'),mediaType:'text/plain',content,mode:'new'},scope);return;}
+  if (!mediaType) throw resourceType === 'file' ? new UnsupportedInboundFile() : new ResourceRejected('unsupported resource type');
   const ext={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp'}[mediaType];
   await handle(envelope,{action:'attachment',name:rawName?attachmentDisplayName(rawName):`image.${ext}`,mediaType,content,mode:'new'},scope);
 }
@@ -86,7 +146,7 @@ export function parseSdkCardCallback<T extends RuntimeTrustedAction = ChannelAct
   if (a.openId !== owner) throw new Error('unauthorized');
   return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseFeishuAction<T>(a.value,a.formValues)};
 }
-const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target']);
+const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target', 'cancel', 'archive', 'notice_settings', 'control']);
 function isAlreadyHandledCardError(error: unknown): boolean {
   const obj = typeof error === 'object' && error !== null ? (error as { code?: unknown; detail?: unknown }) : null;
   const code = obj && 'code' in obj ? String(obj.code ?? '') : '';
@@ -98,11 +158,11 @@ function isAlreadyHandledCardError(error: unknown): boolean {
   );
 }
 /** Old or malformed cards are guidance only; their untrusted values never reach the channel. */
-export async function handleSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:T)=>Promise<unknown>):Promise<{toast:{type:'info'|'success';content:string}} | undefined> {
+export async function handleSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, destinations:ReadonlySet<string>, resolve:(chatId:string,messageId:string)=>string, handle:(e:TrustedEnvelope,a:T)=>Promise<unknown>, expandValue?:(messageId:string,value:Record<string,unknown>)=>unknown):Promise<{toast:{type:'info'|'success';content:string}} | undefined> {
   const a=parseCardAction(data); if (!a || !a.eventId) return undefined;
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:T;
-  try { action=parseFeishuAction<T>(a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
+  try { action=parseFeishuAction<T>(expandValue ? expandValue(a.openMessageId,a.value) : a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
   let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof TaskPendingRoute ? {toast:{type:'info',content:'任务话题待核查，写入暂不可用。'}} : error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownTestRoute ? {toast:{type:'info',content:'测试话题创建结果待核查，请联系管理员。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
   const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})};
   try {await handle(envelope,action);} catch (error) {return isAlreadyHandledCardError(error) ? {toast:{type:'info',content:'该项已处理完成，无需重复操作。'}} : {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};}
@@ -115,6 +175,7 @@ type TestLaneHandler={handle:(e:TrustedEnvelope,a:ChannelAction,token:TestLaneTo
 export class FeishuSdkPort implements FeishuPort {
   private readonly client: Lark.Client;
   private readonly appId:string;
+  private readonly callbackValues: FeishuCallbackValues;
   private testHandler:TestLaneHandler|undefined;
   private readonly testResourceFlights=new Map<string,Promise<void>>();
   private readonly testCreates=new Set<Promise<unknown>>();private readonly taskStore:TaskTopicStore;private closeRequested=false;
@@ -126,7 +187,6 @@ export class FeishuSdkPort implements FeishuPort {
   private routeGeneration=0;
   private readonly linkCache=new Map<string,{url:string;expires:number}>();
   private readonly linkFlights=new Map<string,Promise<string|null>>();
-  private readonly schemaV2TopicRoots = new Set<string>();
   private dbClosed = false;
   constructor(credentials: {appId:string; appSecret:string}, dbPath:string, private readonly destinations: ReadonlySet<string>, private readonly owner:string,private readonly taskEnabled=false,private readonly taskTopicRuntimeEnabled=false) {
     if (!credentials.appId || !credentials.appSecret || !destinations.size || !owner) throw new Error('missing SDK configuration');
@@ -134,17 +194,19 @@ export class FeishuSdkPort implements FeishuPort {
     const base = { appId: credentials.appId, appSecret: credentials.appSecret, appType:Lark.AppType.SelfBuild, domain:Lark.Domain.Feishu };
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
     this.db = new DatabaseSync(dbPath); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_task_creations_v1 (operation_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,state TEXT NOT NULL,root_id TEXT,destination TEXT,payload_digest TEXT NOT NULL,delivery_id TEXT NOT NULL UNIQUE)"); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_text_resources_v1 (event_id TEXT PRIMARY KEY,envelope TEXT NOT NULL,message_id TEXT NOT NULL,resource_key TEXT NOT NULL,metadata TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,reason TEXT,next_attempt INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sdk_text_resource_tokens_v1 (event_id TEXT PRIMARY KEY,token TEXT NOT NULL)"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_creations (operation_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, provider TEXT NOT NULL, delivery_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, root_id TEXT, destination TEXT)'); this.db.exec("DROP INDEX IF EXISTS sdk_lane_creation_provider; CREATE UNIQUE INDEX IF NOT EXISTS sdk_lane_creation_reserved ON sdk_lane_creations(provider) WHERE state<>'rejected'; CREATE TABLE IF NOT EXISTS sdk_lane_resource_tokens (event_id TEXT PRIMARY KEY, token TEXT NOT NULL)"); this.db.exec("CREATE TABLE IF NOT EXISTS sdk_native_lane_creations (operation_id TEXT PRIMARY KEY,chat_id TEXT NOT NULL,provider TEXT NOT NULL,delivery_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,root_id TEXT,destination TEXT); CREATE UNIQUE INDEX IF NOT EXISTS sdk_native_lane_reserved ON sdk_native_lane_creations(provider) WHERE state<>'rejected'"); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_lane_registry (root_id TEXT PRIMARY KEY, destination TEXT NOT NULL UNIQUE, app_id TEXT NOT NULL, chat_id TEXT NOT NULL, owner TEXT NOT NULL, lane_id TEXT NOT NULL, namespace TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL, operation_id TEXT NOT NULL, delivery_id TEXT NOT NULL, created_at INTEGER NOT NULL)'); this.db.exec('CREATE TABLE IF NOT EXISTS sdk_topic_routes (destination TEXT PRIMARY KEY, chat_id TEXT NOT NULL, root_id TEXT NOT NULL UNIQUE, thread_id TEXT, session_id TEXT NOT NULL, UNIQUE(chat_id,session_id)); CREATE TABLE IF NOT EXISTS sdk_message_routes (message_id TEXT PRIMARY KEY, destination TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_deliveries (id TEXT PRIMARY KEY, message_id TEXT); CREATE TABLE IF NOT EXISTS sdk_inbound_resources (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, message_id TEXT NOT NULL, resource_key TEXT NOT NULL, resource_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_scopes (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sdk_resource_failures (event_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL, reason TEXT NOT NULL, next_attempt INTEGER NOT NULL)');
+    this.db.exec('CREATE TABLE IF NOT EXISTS sdk_card_schemas (message_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL)');
+    this.callbackValues=new FeishuCallbackValues(this.db);
     this.taskStore=new TaskTopicStore(this.db,this.appId,this.owner,this.destinations);
   }
   /** Only a local, constrained operator can create either mock provider root. */
   /** Explicitly enabled, owner-scoped task creation; no implicit topic creation. */
   createTaskTopic(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {if(!this.taskEnabled||this.closing) return Promise.reject(new Error('task topic unavailable'));const flight=this.createTaskTopicOnce(chatId,taskId,operationId,owner);this.testCreates.add(flight);void flight.finally(()=>{this.testCreates.delete(flight);if(this.closeRequested&&!this.testCreates.size&&!this.dbClosed){this.dbClosed=true;this.db.close();}}).catch(()=>{});return flight;}
-  private async createTaskTopicOnce(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {const claim=this.taskStore.claim(chatId,taskId,operationId,owner);if(claim.existing)return claim.existing;const rootText=this.taskTopicRuntimeEnabled?'任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。':'任务话题已建立，目标功能待启用。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务话题',text:rootText,actions:[]}))}});if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.taskStore.rejected(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw Error('task creation outcome unknown');const token=this.taskStore.record(chatId,taskId,operationId,response.data.message_id,response.data.thread_id??null,this.closing);if(!token)throw Error('task topic created and closed');return token;}
+  private async createTaskTopicOnce(chatId:string,taskId:string,operationId:string,owner:string):Promise<TaskTopicToken> {const claim=this.taskStore.claim(chatId,taskId,operationId,owner);if(claim.existing)return claim.existing;const rootText=this.taskTopicRuntimeEnabled?'任务话题已建立，进入话题后发送 /help 查看可用功能，或发送 /task 管理后端目标。':'任务话题已建立，目标功能待启用。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务话题',text:rootText,actions:[]},'1.0'))}});if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.taskStore.rejected(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw Error('task creation outcome unknown');const token=this.taskStore.record(chatId,taskId,operationId,response.data.message_id,response.data.thread_id??null,this.closing);if(!token)throw Error('task topic created and closed');return token;}
   recoverKnownTaskTopic(chatId:string,taskId:string,operationId:string,owner:string):TaskTopicToken|null {if(!this.taskEnabled||this.closing)throw Error('task topic unavailable');return this.taskStore.finishKnown(chatId,taskId,operationId,owner);}
   lookupTaskTopic(destination:string,owner:string):TaskTopicToken|null {if(!this.taskEnabled||this.closing||owner!==this.owner)return null;return this.taskStore.lookup(destination);}
   closeTaskTopic(token:TaskTopicToken,owner:string):void {if(!this.taskEnabled||this.closing)throw Error('task topic unavailable');this.taskStore.close(token,owner);this.routeGeneration++;}
   private taskToken(destination:string):TaskTopicToken|null{return this.taskEnabled&&!this.closing?this.taskStore.lookup(destination):null;}
-  private async handleTask(e:TrustedEnvelope,token:TaskTopicToken):Promise<unknown> {if(e.identity.source!=='feishu'||e.identity.subject!==this.owner||JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const id=`task-t0:${e.eventId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes){const prior=this.db.prepare('SELECT message_id FROM sdk_deliveries WHERE id=?').get(id) as {message_id:string|null}|undefined;return {status:prior?.message_id?'sent':'unknown'};}if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务话题',text:'任务目标功能尚未启用，当前未发送模型输入。',actions:[]})),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw Error('task delivery outcome unknown');if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');this.remember(id,response.data.message_id,token.destination);return {status:'unavailable'};}
+  private async handleTask(e:TrustedEnvelope,token:TaskTopicToken):Promise<unknown> {if(e.identity.source!=='feishu'||e.identity.subject!==this.owner||JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const id=`task-t0:${e.eventId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes){const prior=this.db.prepare('SELECT message_id FROM sdk_deliveries WHERE id=?').get(id) as {message_id:string|null}|undefined;return {status:prior?.message_id?'sent':'unknown'};}if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务话题',text:'任务目标功能尚未启用，当前未发送模型输入。',actions:[]},'1.0')),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw Error('task delivery outcome unknown');if(JSON.stringify(this.taskToken(e.destination))!==JSON.stringify(token))throw Error('task topic unavailable');this.remember(id,response.data.message_id,token.destination,'1.0');return {status:'unavailable'};}
   createTestTopic(chatId:string,provider:'codex'|'claude',operationId:string,active:()=>boolean):Promise<TestLaneToken> {const flight=this.createTestTopicInner(chatId,provider,operationId,active);this.testCreates.add(flight);void flight.finally(()=>{this.testCreates.delete(flight);if(this.closeRequested && !this.testCreates.size && !this.dbClosed){this.dbClosed=true;this.db.close();}}).catch(()=>{});return flight;}
   async drainTestCreates():Promise<void>{await Promise.allSettled([...this.testCreates]);}
   private async createTestTopicInner(chatId:string,provider:'codex'|'claude',operationId:string,active:()=>boolean):Promise<TestLaneToken> {
@@ -153,12 +215,12 @@ export class FeishuSdkPort implements FeishuPort {
     if(prior){if(prior.state==='rejected')throw new Error('test creation rejected');if(prior.state==='known')throw new PendingKnownTestCreation('test root known; route recovery required');if(prior.state==='closed')throw new ClosedKnownTestCreation('test topic created and closed');if(prior.state==='active'&&prior.destination){const token=this.testToken(prior.destination);if(token&&token.chatId===chatId&&token.provider===provider)return token;}throw new Error('test creation outcome unknown');}
     if(this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE provider=? AND state<>'rejected' LIMIT 1").get(provider)) throw new Error('test provider already reserved');const attempts=this.db.prepare('SELECT COUNT(*) AS n FROM sdk_lane_creations WHERE provider=?').get(provider) as {n:number};if(attempts.n>=3)throw new Error('test creation attempt limit reached');
     this.db.prepare("INSERT INTO sdk_lane_creations VALUES (?,?,?,?,'unknown',NULL,NULL)").run(operationId,chatId,provider,deliveryId);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'测试话题',text:`${provider} 模拟测试`,actions:[]}))}});
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'测试话题',text:`${provider} 模拟测试`,actions:[]},'1.0'))}});
     if(typeof response.code==='number' && Number.isSafeInteger(response.code) && response.code!==0){this.db.prepare("UPDATE sdk_lane_creations SET state='rejected' WHERE operation_id=? AND state='unknown'").run(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw new Error('test creation outcome unknown');
     const root=response.data.message_id,destination=`topic:${randomUUID()}`,namespace=`mock-test:${provider}`,lane='mock-test';
     this.db.prepare("UPDATE sdk_lane_creations SET state='known',root_id=?,destination=? WHERE operation_id=? AND state='unknown'").run(root,destination,operationId);
     const closed=this.closing || !active(),state=closed?'closed':'active';
-    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,lane,namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.db.prepare("UPDATE sdk_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,lane,namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.recordCardSchema(root,'1.0');this.db.prepare("UPDATE sdk_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
     if(closed)throw new ClosedKnownTestCreation('test topic created and closed');const token=this.testToken(destination);if(!token)throw new Error('test creation outcome unknown');return token;
   }
   /** Explicit opt-in native Claude root; separate from the immutable mock creation ledger. */
@@ -169,10 +231,10 @@ export class FeishuSdkPort implements FeishuPort {
     if(prior){if(prior.state==='rejected')throw new Error('test creation rejected');if(prior.state==='active'&&prior.destination){const token=this.testToken(prior.destination);if(token?.laneId==='native-test'&&token.chatId===chatId&&token.provider===provider)return token;}throw new Error('test creation outcome unknown');}
     if(this.db.prepare("SELECT 1 FROM sdk_native_lane_creations WHERE provider=? AND state<>'rejected' LIMIT 1").get(provider))throw new Error('native test provider already reserved');const count=this.db.prepare("SELECT COUNT(*) AS n FROM sdk_native_lane_creations WHERE provider=?").get(provider) as {n:number};if(count.n>=3)throw new Error('test creation attempt limit reached');
     const deliveryId=`native-test-root:${operationId}`;this.db.prepare("INSERT INTO sdk_native_lane_creations VALUES (?,?,?,?,'unknown',NULL,NULL)").run(operationId,chatId,provider,deliveryId);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'原生隔离测试',text:`${provider==='claude'?'Claude':'Codex'} · 本地模拟服务`,actions:[]}))}});
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'原生隔离测试',text:`${provider==='claude'?'Claude':'Codex'} · 本地模拟服务`,actions:[]},'1.0'))}});
     if(typeof response.code==='number'&&Number.isSafeInteger(response.code)&&response.code!==0){this.db.prepare("UPDATE sdk_native_lane_creations SET state='rejected' WHERE operation_id=? AND state='unknown'").run(operationId);throw new FeishuApiRejected(response.code);}if(typeof response.data?.message_id!=='string'||!response.data.message_id.trim())throw new Error('test creation outcome unknown');
     const root=response.data.message_id,destination=`topic:${randomUUID()}`,namespace=`native-test:${provider}`;this.db.prepare("UPDATE sdk_native_lane_creations SET state='known',root_id=?,destination=? WHERE operation_id=? AND state='unknown'").run(root,destination,operationId);const closed=this.closing||!active(),state=closed?'closed':'active';
-    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,'native-test',namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.db.prepare("UPDATE sdk_native_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+    this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO sdk_lane_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(root,destination,this.appId,chatId,this.owner,'native-test',namespace,closed?2:1,state,1,operationId,deliveryId,Date.now());this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(destination,chatId,root,response.data.thread_id??null,namespace);this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,destination);this.recordCardSchema(root,'1.0');this.db.prepare("UPDATE sdk_native_lane_creations SET state=? WHERE operation_id=? AND state='known'").run(state,operationId);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
     if(closed)throw new ClosedKnownTestCreation('test topic created and closed');const token=this.testToken(destination);if(!token)throw new Error('test creation outcome unknown');return token;
   }
   private testToken(destination:string):TestLaneToken|null {
@@ -192,8 +254,20 @@ export class FeishuSdkPort implements FeishuPort {
     return {
       isTopicDestination:(destination)=>{try{validate(destination);return true;}catch{return false;}},
       authorizedDestination:(destination)=>{try{validate(destination);return true;}catch{return false;}},
-      send:async(destination,card,deliveryId,guard)=>{await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'interactive',content:JSON.stringify(toFeishuCard(card)),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);return response.data.message_id;},
-      update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const response=await this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(toFeishuCard(card))}});rejectCode(response.code);this.remember(deliveryId,messageId,destination);},
+      send:async(destination,card,deliveryId,guard)=>{
+        await guard?.();
+        validate(destination);
+        const schema = cardSchema(card);
+        const {content,references} = packCardCallbacks(encodeCard(card,schema));
+        const response = await feishuMessageWrite(() => this.client.im.message.reply({
+          path: { message_id: token.rootId },
+          data: { msg_type: 'interactive', content, reply_in_thread: true },
+        }));
+        if(!response.data?.message_id)throw new Error('test delivery outcome unknown');
+        this.remember(deliveryId,response.data.message_id,destination,schema,references);
+        return response.data.message_id;
+      },
+      update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const schema=await this.patchCard(messageId,card);this.remember(deliveryId,messageId,destination,schema);},
       sendFile:async(destination,name,content,deliveryId,guard)=>{if(content.length>1024*1024 || !/^[^/\\\x00-\x1f]{1,80}$/.test(name))throw new Error('test fixture rejected');await guard?.();validate(destination);const uploaded=await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});if(!uploaded?.file_key)throw new Error('test upload outcome unknown');await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'file',content:JSON.stringify({file_key:uploaded.file_key}),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);},
       lookupDelivery:async(deliveryId)=>{validate(token.destination);const row=this.db.prepare('SELECT m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {destination:string}|undefined;return row?.destination===token.destination?'sent':'unknown';}
     };
@@ -285,9 +359,25 @@ export class FeishuSdkPort implements FeishuPort {
     if ((route?.chat_id ?? row.destination)!==chatId) throw new UnknownCardRoute('card chat mismatch');
     return row.destination;
   }
-  private remember(id:string, messageId:string|null,destination:string):void {
-    const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined; if(prior && prior.destination!==destination) this.routeGeneration++;
-    this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT OR REPLACE INTO sdk_deliveries VALUES (?,?)').run(id,messageId); if(messageId) this.db.prepare('INSERT OR REPLACE INTO sdk_message_routes VALUES (?,?)').run(messageId,destination); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+  private recordCardSchema(messageId: string, schema: CardSchema): void {
+    this.db.prepare('INSERT INTO sdk_card_schemas(message_id,schema_version) VALUES (?,?) ON CONFLICT(message_id) DO NOTHING').run(messageId,schema);
+  }
+  private remember(id:string, messageId:string|null,destination:string,schema?:CardSchema,references?:CallbackReferences):void {
+    const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined;
+    if(prior && prior.destination!==destination) this.routeGeneration++;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT OR REPLACE INTO sdk_deliveries VALUES (?,?)').run(id,messageId);
+      if (messageId) {
+        this.db.prepare('INSERT OR REPLACE INTO sdk_message_routes VALUES (?,?)').run(messageId,destination);
+        if (schema) this.recordCardSchema(messageId,schema);
+        if (references) this.callbackValues.store(messageId,references);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   async createTopic(destination:string,sessionId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<string> {
     this.allowed(destination); const chat=this.route(destination)?.chat_id ?? destination;
@@ -296,39 +386,88 @@ export class FeishuSdkPort implements FeishuPort {
     // An uncertain root creation must never be replayed automatically.
     if (!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes) throw new Error('topic creation outcome unknown');
     await guard?.(); this.allowed(destination);
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content:JSON.stringify(toFeishuCard(card))}});
+    const schema = cardSchema(card);
+    const {content,references} = packCardCallbacks(encodeCard(card,schema));
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content}});
     rejectCode(response.code); if(!response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
     const root=response.data.message_id; const key=`topic:${randomUUID()}`;
-    this.routeGeneration++; this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId); this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key); this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId); this.db.exec('COMMIT'); } catch(e) { this.db.exec('ROLLBACK'); throw e; }
+    this.routeGeneration++;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO sdk_topic_routes VALUES (?,?,?,?,?)').run(key,chat,root,response.data.thread_id ?? null,sessionId);
+      this.db.prepare('INSERT INTO sdk_message_routes VALUES (?,?)').run(root,key);
+      this.db.prepare('UPDATE sdk_deliveries SET message_id=? WHERE id=?').run(root,deliveryId);
+      this.recordCardSchema(root,schema);
+      this.callbackValues.store(root,references);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     return key;
   }
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
-    await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const content=JSON.stringify(toFeishuCard(card));
-    const response=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}});
-    rejectCode(response.code); if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
-    this.remember(deliveryId,response.data.message_id,destination); return response.data.message_id;
+    await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const schema=cardSchema(card); const {content,references}=packCardCallbacks(encodeCard(card,schema));
+    const response = await feishuMessageWrite(() => route
+      ? this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}})
+      : this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}}));
+    if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
+    this.remember(deliveryId,response.data.message_id,destination,schema,references); return response.data.message_id;
+  }
+  async sendText(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string> {
+    await guard?.();
+    this.allowedTaskOrProduction(destination);
+    const route = this.route(destination);
+    if (!route) throw new Error('text completion requires a topic');
+    const known = await this.lookupMessageId(deliveryId);
+    if (known) return known;
+    await guard?.();
+    this.allowedTaskOrProduction(destination);
+    if (this.route(destination)?.root_id !== route.root_id) throw new Error('topic route changed');
+    const uuid = createHash('sha256').update(deliveryId).digest('hex').slice(0, 40);
+    const response = await feishuMessageWrite(() => this.client.im.message.reply({
+      path: { message_id: route.root_id },
+      data: { msg_type: 'text', reply_in_thread: true, content: JSON.stringify({ text }), uuid },
+    }));
+    if (!response.data?.message_id) throw new Error('Feishu text reply outcome unknown');
+    this.remember(deliveryId, response.data.message_id, destination);
+    return response.data.message_id;
   }
   async update(destination:string,messageId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     await guard?.(); this.allowedTaskOrProduction(destination); if(this.callbackDestination(this.route(destination)?.chat_id ?? destination,messageId)!==destination) throw new Error('message route mismatch');
     const isTitlePatch = deliveryId.startsWith('topic-title:') && this.route(destination)?.root_id === messageId &&
       !card.form && !card.table && card.actions.length === 0;
-    const useV2 = isTitlePatch && this.schemaV2TopicRoots.has(messageId);
-    const patch = (content: object) => this.client.im.message.patch({path:{message_id:messageId},data:{content:JSON.stringify(content)}});
-    const response = await patch(useV2 ? topicRootSchemaV2(card) : toFeishuCard(card)).catch(error => {
-      if (!isTitlePatch || useV2 || !requiresCardSchemaV2(error)) throw error;
-      return null;
-    });
-    if (isTitlePatch && !useV2 && (response === null || requiresCardSchemaV2(response))) {
-      this.schemaV2TopicRoots.add(messageId);
+    const schema = await this.patchCard(messageId,card,isTitlePatch ? async () => {
       await guard?.();
       this.allowedTaskOrProduction(destination);
       const route = this.route(destination);
       if (route?.root_id !== messageId || this.callbackDestination(route.chat_id,messageId) !== destination) throw new Error('message route mismatch');
-      rejectCode((await patch(topicRootSchemaV2(card))).code);
-    } else {
-      rejectCode(response?.code);
+    } : undefined);
+    this.remember(deliveryId,messageId,destination,schema);
+  }
+  private async patchCard(messageId: string, card: ChannelCard, legacyRootGuard?: () => Promise<void>): Promise<CardSchema> {
+    const row = this.db.prepare('SELECT schema_version FROM sdk_card_schemas WHERE message_id=?').get(messageId) as {schema_version:string}|undefined;
+    const recorded = row?.schema_version;
+    if (recorded !== undefined && recorded !== '1.0' && recorded !== '2.0') throw new Error('invalid stored card schema');
+    const schema = recorded ?? cardSchema(card);
+    const patch = (version: CardSchema) => {
+      const {content,references}=packCardCallbacks(encodeCard(card,version));
+      this.callbackValues.store(messageId,references);
+      return this.client.im.message.patch({path:{message_id:messageId},data:{content}});
+    };
+    const retryGuard = !row && schema === '1.0' ? legacyRootGuard : undefined;
+    try {
+      const response = await patch(schema);
+      if (!retryGuard || !requiresCardSchemaV2(response)) {
+        rejectCode(response?.code);
+        return schema;
+      }
+    } catch (error) {
+      if (!retryGuard || !requiresCardSchemaV2(error)) throw normalizeFeishuRejection(error);
     }
-    this.remember(deliveryId,messageId,destination);
+    await retryGuard();
+    await feishuMessageWrite(() => patch('2.0'));
+    return '2.0';
   }
   async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
     this.allowedTaskOrProduction(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
@@ -391,15 +530,42 @@ export class FeishuSdkPort implements FeishuPort {
   /** GET may safely repeat; per-item failures are persisted and never block later work. */
   async drainInbound(handle:(envelope:TrustedEnvelope,action:ChannelAction,scope?:string)=>Promise<unknown>):Promise<void> {
     await this.drainTextInbound(handle);
-    const rows=this.db.prepare("SELECT r.* FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE NOT EXISTS (SELECT 1 FROM sdk_lane_resource_tokens l WHERE l.event_id=r.event_id) AND (f.event_id IS NULL OR (f.state='retry' AND f.next_attempt<=?)) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file'}>;
+    const rows=this.db.prepare("SELECT r.*, f.state, f.attempts FROM sdk_inbound_resources r LEFT JOIN sdk_resource_failures f ON f.event_id=r.event_id WHERE NOT EXISTS (SELECT 1 FROM sdk_lane_resource_tokens l WHERE l.event_id=r.event_id) AND (f.event_id IS NULL OR (f.state IN ('retry','reject_pending') AND f.next_attempt<=?)) ORDER BY r.rowid").all(Date.now()) as Array<{event_id:string;envelope:string;message_id:string;resource_key:string;resource_type:'image'|'file';state:string|null;attempts:number|null}>;
     for(const row of rows) {
+      let rejectionPending = row.state === 'reject_pending';
       try {
-        const e=JSON.parse(row.envelope) as TrustedEnvelope; this.allowedTaskOrProduction(e.destination); if(e.identity.source!=='feishu' || e.identity.subject!==this.owner) throw new ResourceRejected('authorization changed');
+        const e=JSON.parse(row.envelope) as TrustedEnvelope;
+        const check=()=>{this.allowedTaskOrProduction(e.destination); if(e.identity.source!=='feishu' || e.identity.subject!==this.owner) throw new ResourceRejected('authorization changed');};
+        check();
         const saved=this.db.prepare('SELECT scope FROM sdk_resource_scopes WHERE event_id=?').get(row.event_id) as {scope:string}|undefined; if (!saved) throw new ResourceRejected('resource missing binding scope');
-        await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>{this.allowedTaskOrProduction(e.destination);return (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream();},async (envelope,action,scope)=>{this.allowedTaskOrProduction(envelope.destination);return handle(envelope,action,scope);},saved.scope);
+        const dispatch=async (envelope:TrustedEnvelope,action:ChannelAction)=>{check();return handle(envelope,action,saved.scope);};
+        if (!rejectionPending) {
+          try {
+            await downloadAndIntake(e,row.message_id,row.resource_key,row.resource_type,async (messageId,key,type)=>{check();return (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream();},dispatch,saved.scope);
+          } catch (error) {
+            if (!(error instanceof UnsupportedInboundFile) || !this.isTopicDestination(e.destination)) throw error;
+            // A retry can deliver the rejection without fetching the bad resource again.
+            this.db.prepare("INSERT OR REPLACE INTO sdk_resource_failures VALUES (?, 'reject_pending', ?, ?, 0)").run(row.event_id,(row.attempts ?? 0)+1,error.message);
+            rejectionPending = true;
+          }
+        }
+        if (rejectionPending) {
+          await dispatch({...e,eventId:`${e.eventId}:rejected`},{action:'resource_rejected',reason:'unsupported'});
+          this.db.prepare("UPDATE sdk_resource_failures SET state='rejected' WHERE event_id=? AND state='reject_pending'").run(row.event_id);
+          continue;
+        }
         this.db.exec('BEGIN IMMEDIATE'); try { this.db.prepare('DELETE FROM sdk_inbound_resources WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_failures WHERE event_id=?').run(row.event_id); this.db.prepare('DELETE FROM sdk_resource_scopes WHERE event_id=?').run(row.event_id); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
         try {this.onResourceHealth('healthy',null);} catch {}
       } catch(error) {
+        if (rejectionPending && error instanceof BindingExpired) {
+          this.db.prepare("UPDATE sdk_resource_failures SET state='rejected' WHERE event_id=? AND state='reject_pending'").run(row.event_id);
+          continue;
+        }
+        if (rejectionPending && !(error instanceof ResourceRejected)) {
+          this.db.prepare("UPDATE sdk_resource_failures SET next_attempt=? WHERE event_id=? AND state='reject_pending'").run(Date.now()+1000,row.event_id);
+          try {this.onResourceHealth('degraded','附件拒绝提示待核对');} catch {}
+          continue;
+        }
         const previous=this.db.prepare('SELECT attempts FROM sdk_resource_failures WHERE event_id=?').get(row.event_id) as {attempts:number}|undefined;
         const attempts=(previous?.attempts ?? 0)+1; const permanent=error instanceof ResourceRejected;
         const state=permanent?'rejected':attempts>=3?'needs_review':'retry';
@@ -430,12 +596,12 @@ export class FeishuSdkPort implements FeishuPort {
     if(!hasRoot&&data.message.message_type==='text'&&['/help','/health','/sessions'].includes(m.text))return false;
     const id=`task-pending-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes)return true;if(this.closing)throw new Error('SDK port closing');
     if(!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId))return true;
-    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'任务提示',text:'任务话题待核查，写入暂不可用。',actions:[]}))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(id,response.data.message_id,m.chatId);return true;
+    const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务提示',text:'任务话题待核查，写入暂不可用。',actions:[]},'1.0'))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(id,response.data.message_id,m.chatId,'1.0');return true;
   }
   private async guideTestUnavailable(data:MessageEvent,botId:string):Promise<boolean>{
     const info=this.parseEligibleMessage(data,botId);if(!info)return false;const {m,thread}=info;const ids=[m.rootId,m.parentId,thread].filter((x):x is string=>!!x);if(!ids.length)return false;
     const task=ids.some(id=>!!this.db.prepare("SELECT 1 FROM sdk_lane_registry l JOIN sdk_topic_routes r ON r.destination=l.destination LEFT JOIN sdk_message_routes m ON m.destination=l.destination WHERE l.chat_id=? AND l.lane_id='task' AND (l.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1").get(m.chatId,id,id,id));if(task)return false;const closed=ids.some(id=>!!this.db.prepare("SELECT 1 FROM sdk_lane_registry l JOIN sdk_topic_routes r ON r.destination=l.destination LEFT JOIN sdk_message_routes m ON m.destination=l.destination WHERE l.chat_id=? AND l.lane_id IN ('mock-test','native-test') AND l.state='closed' AND (l.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1").get(m.chatId,id,id,id));const taskPending=!!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId);const unknown=!!this.db.prepare("SELECT 1 FROM sdk_lane_creations WHERE chat_id=? AND state IN ('unknown','known')").get(m.chatId);if(!closed&&(taskPending||!unknown))return false;
-    const deliveryId=`test-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes)return true;if(this.closing)throw new Error('SDK port closing');const text=closed?'此测试话题已关闭。':'测试话题创建结果待核查，请联系管理员。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(toFeishuCard({title:'测试提示',text,actions:[]}))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(deliveryId,response.data.message_id,m.chatId);return true;
+    const deliveryId=`test-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes)return true;if(this.closing)throw new Error('SDK port closing');const text=closed?'此测试话题已关闭。':'测试话题创建结果待核查，请联系管理员。';const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'测试提示',text,actions:[]},'1.0'))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(deliveryId,response.data.message_id,m.chatId,'1.0');return true;
   }
   async start(handle:(envelope:TrustedEnvelope,action:ChannelAction)=>Promise<unknown>, captureScope:(e:TrustedEnvelope)=>Promise<string>):Promise<void> {
     if (this.started || this.closing) throw new Error('already started or closing'); this.started = true;
@@ -447,7 +613,7 @@ export class FeishuSdkPort implements FeishuPort {
     const handles: Partial<Lark.EventHandles> & {'card.action.trigger':(data:Lark.RawCardActionEvent)=>Promise<any>} = {
       'im.message.receive_v1': async data => { try {if(await this.guideTaskPending(data,botId))return;await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),async (e,a)=>{if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId))return this.guideTaskPending(data,botId);return this.dispatchLane(e,a,handle);},async (e,id,key,type,metadata)=>{if(await this.guideTaskPending(data,botId))return;const task=this.taskToken(e.destination);if(task){if(e.identity.source!=='feishu'||e.identity.subject!==this.owner)throw Error('task topic unauthorized');if(!this.taskTopicRuntimeEnabled){this.taskStore.holdResource(task,e,e.eventId,id,key,type,metadata);await this.handleTask(e,task);return;}const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;this.queueResource(e,id,key,type,scope,metadata);return;}const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);const scope=await handler.capture(e,token);if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);this.queueTestResource(e,id,key,type,scope,token,metadata);}else{const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId)){await this.guideTaskPending(data,botId);return;}this.queueResource(e,id,key,type,scope,metadata);}},(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread));}catch(error){if(error instanceof UnknownTopic && await this.guideTaskPending(data,botId,true))return;if(error instanceof UnknownTopic && await this.guideTestUnavailable(data,botId))return;throw error;} },
       'card.action.trigger': async data => {
-        const work = handleSdkCardCallback<RuntimeTrustedAction>(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle));
+        const work = handleSdkCardCallback<RuntimeTrustedAction>(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle),(message,value)=>this.callbackValues.resolve(message,value));
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<{toast:{type:'info';content:string}}>(resolve => {
           timer = setTimeout(() => resolve({toast:{type:'info',content:'正在处理…'}}), 1500);

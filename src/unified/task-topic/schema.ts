@@ -52,6 +52,8 @@ export function ensureTaskTopicSchema(db: DatabaseSync): void {
       steer_connection_generation INTEGER,
       steer_control_generation INTEGER
     );
+    CREATE INDEX IF NOT EXISTS task_targets_active_session_v1 ON task_targets_v1(session_id) WHERE state='active';
+    CREATE INDEX IF NOT EXISTS task_inbox_received_task_v1 ON task_inbox_scope_v1(task_id) WHERE state='received';
     CREATE TABLE IF NOT EXISTS task_cursors_v1 (
       task_id TEXT NOT NULL,
       target_id TEXT NOT NULL,
@@ -83,6 +85,15 @@ export function ensureTaskTopicSchema(db: DatabaseSync): void {
       PRIMARY KEY(task_id, target_id, target_generation, session_id, turn_key)
     );
     CREATE TABLE IF NOT EXISTS task_known_messages_v1 (
+      task_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      target_generation INTEGER NOT NULL,
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      PRIMARY KEY(task_id, target_id, target_generation, session_id, message_id)
+    );
+    CREATE TABLE IF NOT EXISTS task_baseline_messages_v1 (
       task_id TEXT NOT NULL,
       target_id TEXT NOT NULL,
       target_generation INTEGER NOT NULL,

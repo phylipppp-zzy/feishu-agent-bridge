@@ -17,6 +17,9 @@ export class LaneFixtureService {
     this.service=new Proxy(base,{get(target,key,receiver){
       if(['attachSession','createSession','requestControl','releaseControl','interruptTurn','cancelQueuedInput'].includes(String(key)))return async()=>{throw contractError('unsupported','mock fixture does not implement this operation')};
       if(key==='getConfirmedSettings')return async()=>null;
+      if(key==='eventWatermark')return ()=>self.last();
+      if(key==='getMessage')return async(_id:string,id:string)=>self.messages().find(message=>message.messageId===id)??null;
+      if(key==='findRegisteredReplyFiles')return async()=>[];
       if(key==='getSnapshot')return async()=>{const snapshot=await base.getSnapshot('s');return {...snapshot,cursor:String(self.last()),value:{...snapshot.value,session:self.session(snapshot.value.session),messages:self.messages(),interactions:self.interactions()}}};
       if(key==='getSession')return async(id:string)=>self.session(await base.getSession(id));
       if(key==='listSessions')return async()=>({items:[self.session(await base.getSession('s'))],nextCursor:null});

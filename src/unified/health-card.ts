@@ -120,6 +120,7 @@ export function buildHealthCard(health: readonly HealthEntry[]): ChannelCard {
     title: '健康状态',
     text: sections.length ? sections.join('\n\n') : '暂无健康状态记录。',
     ...(table ? { table } : {}),
-    actions: [],
+    ...(attention.length ? { template: 'orange' } : {}),
+    actions: attention.length ? [{ label: '查看待核对操作', value: { action: 'pending' } }] : [],
   };
 }

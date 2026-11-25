@@ -86,6 +86,7 @@ export function renderWatchCard(params: {
   const prefix = event.state === 'recovered' ? '【已恢复】' : event.severity === 'high' ? '【高优提醒】' : '【运行提醒】';
   return {
     title: `${prefix}${event.title}`,
+    format: 'plain',
     text: lines.join('\n'),
     actions,
   };

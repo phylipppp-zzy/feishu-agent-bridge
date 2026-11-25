@@ -1,9 +1,10 @@
 import type { DirectoryListing } from '../claude/deliver.js';
-import type { ModelOption, ConfirmedSettings } from './contracts.js';
+import type { ModelOption, ConfirmedSettings, ResponseEvidence } from './contracts.js';
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
+export type { ResponseEvidence } from './contracts.js';
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
   hasProvider?(provider: Provider): boolean;
@@ -18,16 +19,22 @@ export interface UnifiedService {
   readHistory(sessionId: string, query: ListQuery): Promise<Page<Message>>;
   listProjectFiles?(sessionId:string, directory:string, showHidden:boolean):Promise<DirectoryListing>;
   selectProjectFiles?(sessionId:string, args:string):Promise<Artifact[]>;
+  eventWatermark?(sessionId: string): number;
+  getMessage?(sessionId: string, messageId: string): Promise<Message | null>;
   getSnapshot(sessionId: string): Promise<Snapshot<SessionSnapshot>>;
   initialCursor?(sessionId:string):Promise<string>;
+  restoreInteractive?(sessionId:string,identity:WriteContext['identity'],stillAuthorized:()=>Promise<boolean>):Promise<void>;
   subscribeEvents(sessionId: string, cursor: string, limit: number): Promise<EventSubscription>;
   getTurn?(sessionId:string,turnId:string):Promise<Turn|null>;
   hasStopRequest?(sessionId:string,turnId:string):Promise<boolean>;
+  wasQueuedInputCancelled?(sessionId:string,inputId:string):Promise<boolean>;
   getWorkState(sessionId:string): Promise<{runningTurns:Turn[];queuedInputs:Array<{inputId:string}>;canArchive:boolean}>;
   submitInput(request: SubmitInput): Promise<Operation>;
+  resumeFirstPrompt?(operationId:string,authorized:boolean):Promise<Operation|null>;
   captureSteer?(identity:{source:string;subject:string},sessionId:string):Promise<{turnId:string;connectionGeneration:number;controlGeneration:number}>;
   listInteractions(sessionId: string, query: ListQuery): Promise<Page<Interaction>>;
   getInteraction(interactionId: string): Promise<Interaction>;
+  getResponseOperation?(interactionId: string): Promise<Operation | null>;
   resolveInteraction(request: ResolveInteraction): Promise<Operation>;
   interruptTurn(request: WriteRequest<{ turnId: string }>): Promise<Operation>;
   inspectTurnResidual?(sessionId:string,turnId:string):Promise<TurnResidual>;
@@ -35,6 +42,7 @@ export interface UnifiedService {
   getControlState(sessionId: string): Promise<ControlState>;
   requestControl(request: WriteRequest<{ owner: string; strategy: 'wait' | 'interrupt' }>): Promise<Operation>;
   releaseControl(request: WriteRequest<{ owner: string }>): Promise<Operation>;
+  findRegisteredReplyFiles?(sessionId: string, blocks: readonly import('./contracts.js').ContentBlock[]): Promise<Artifact[]>;
   listArtifacts(sessionId: string, query: ListQuery): Promise<Page<Artifact>>;
   readArtifact(sessionId: string, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   stageInputArtifact(request: WriteRequest<{ name: string; mediaType: string; size: number; contentDigest: string; content: Uint8Array }>): Promise<Operation>;
@@ -61,15 +69,17 @@ export type PlatformObservation =
   | { type: 'session'; ref: NativeSessionRef; session: Session }
   | { type: 'turn'; ref: NativeSessionRef; turn: Turn; connectionGeneration?:number }
   | { type: 'message'; ref: NativeSessionRef; message: Message; connectionGeneration?: number }
-  | { type: 'interaction'; ref: NativeSessionRef; interaction: Interaction }
+  | { type: 'interaction'; ref: NativeSessionRef; interaction: Interaction; responseEvidence?: ResponseEvidence }
   | { type: 'event'; ref: NativeSessionRef; event: Event; connectionGeneration?:number };
 /** Core holds the session dispatch lock through provider submission. Provider calls
  * assertCurrent immediately before the SDK/socket write; throw aborts submission.
  * External native clients are outside this lock and still require native arbitration. */
-export interface DispatchGuard { expectedControlGeneration: number; expectedConnectionGeneration: number | null; assertCurrent(): void }
+export interface DispatchGuard { operationId?: string; expectedControlGeneration: number; expectedConnectionGeneration: number | null; assertCurrent(): void }
 export type PlatformInputBlock = {type:'text'; text:string} | {type:'artifact'; artifactId:string; contentVersion:string; name:string; mediaType:string; content:Uint8Array};
 export interface PlatformPort {
   readonly provider: Provider;
+  /** Whether persisted control needs to be re-established with this adapter. */
+  requiresControlRecovery?(ref: NativeSessionRef): boolean;
   candidateGeneration?():number|null;
   listCandidateIds?(cursor:string|null,limit:number):Promise<{items:string[];nextCursor:string|null;partial?:boolean}>;
   readCandidateMetadata?(id:string):Promise<CandidateMetadata>;
@@ -94,6 +104,7 @@ export interface PlatformPort {
   onObservation(listener: (observation: PlatformObservation) => void): () => void;
   listProjectFiles?(ref:NativeSessionRef, directory:string, showHidden:boolean):Promise<DirectoryListing>;
   selectProjectFiles?(ref:NativeSessionRef, args:string):Promise<Artifact[]>;
+  findRegisteredReplyFiles?(ref: NativeSessionRef, blocks: readonly import('./contracts.js').ContentBlock[]): Artifact[];
   listArtifacts(ref: NativeSessionRef): Promise<Artifact[]>;
   readArtifact(ref: NativeSessionRef, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   listModels(ref: NativeSessionRef): Promise<ModelOption[]>;

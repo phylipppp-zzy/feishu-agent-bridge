@@ -71,3 +71,149 @@ for (const hasArchive of [false,true]) test(`archive capability matches base and
   if(hasArchive){const receipt:any=await channel.handle(env('archive'),button.value);await core.dispatch(receipt.operationId);assert.equal(calls,1);assert.ok(seenGuard);const external={...ref,nativeSessionId:'external'};await assert.rejects(port.archive!(external,true,{expectedControlGeneration:0,expectedConnectionGeneration:null,assertCurrent(){throw Error('guard must not be called');}}),(e:any)=>e.code==='unsupported');assert.equal(calls,1);}
  }finally{channel.close();core.close();store.close();await port.close();await rm(dir,{recursive:true,force:true});}
 });
+
+for (const registered of [0, 1, 3, 4]) {
+  test(`reply artifact matching uses exact project paths and returns at most 3 of ${registered}`, async () => {
+    const { pathToFileURL } = await import('node:url');
+    const dir = await mkdtemp(join(tmpdir(), 'reply-matches-'));
+    const project = join(dir, 'project');
+    const registry = new ArtifactRegistry({});
+    const ref = { provider: 'codex' as const, hostId: 'h', serviceId: 's', nativeSessionId: 'n' };
+    const other = { ...ref, nativeSessionId: 'other' };
+    try {
+      for (const folder of ['outputs', 'docs', 'same-name']) await mkdir(join(project, folder), { recursive: true });
+      registry.setRoots(ref, [project, dir]);
+      registry.setRoots(other, [project]);
+      registry.setProjectRoot(ref, project);
+      const paths = ['outputs/eval_summary.md', 'docs/report.pdf', 'docs/third.txt', 'docs/fourth.txt'];
+      const files = [];
+      for (const [index, path] of paths.entries()) {
+        await writeFile(join(project, path), 'version one');
+        if (index < registered) files.push(await registry.register(nativeRefKey(ref), join(project, path)));
+        else await registry.register(nativeRefKey(other), join(project, path));
+      }
+      await writeFile(join(project, 'same-name/report.pdf'), 'different path');
+      await registry.register(nativeRefKey(ref), join(project, 'same-name/report.pdf'));
+      await writeFile(join(dir, 'outside.md'), 'outside');
+      await registry.register(nativeRefKey(ref), join(dir, 'outside.md'));
+      if (files[0]) {
+        await writeFile(join(project, paths[0]!), 'latest');
+        files[0] = await registry.register(nativeRefKey(ref), join(project, paths[0]!));
+      }
+      const links = [
+        '..' + '/outside.md', 'https://example.test/same-name/report.pdf', 'missing/report.pdf',
+        '`outputs/eval_summary.md`', 'docs/report.pdf', pathToFileURL(join(project, paths[2]!)).href,
+        `[another](${pathToFileURL(join(project, paths[3]!)).href.replace('file:', 'localfile:')})`,
+      ];
+      const matches = registry.findRegisteredReplyFiles(ref, [{ type: 'text', text: links.join(' ') }]);
+      assert.deepEqual(matches.map(file => file.artifactId), files.slice(0, 3).map(file => file.artifactId));
+      if (files[0]) assert.equal(matches[0]!.contentVersion, files[0].contentVersion);
+      if (files[3]) {
+        const explicit = registry.findRegisteredReplyFiles(ref, [
+          { type: 'text', text: links.join(' ') },
+          { type: 'artifact', artifactId: files[3].artifactId, contentVersion: 'old-version' },
+        ]);
+        assert.deepEqual(explicit.map(file => file.artifactId), [files[3], files[0], files[1]].map(file => file!.artifactId));
+        assert.equal(explicit[0]!.contentVersion, files[3].contentVersion);
+      }
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+test('asynchronous artifact registration patches the completed reply in place without another push', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const { UnifiedRuntime } = await import('../src/unified/runtime.js');
+  const { encodeCard } = await import('../src/unified/feishu-card-wire.js');
+  const dir = await mkdtemp(join(tmpdir(), 'reply-artifact-race-'));
+  const project = join(dir, 'project');
+  await mkdir(project);
+  const ref = { provider: 'codex' as const, hostId: 'h', serviceId: 's', nativeSessionId: 'n' };
+  const session: Session = { sessionId: 's', native: ref, title: 'artifact race', project, status: 'idle', revision: 0,
+    capabilities: Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config']
+      .map(key => [key, { status: 'available' }])) as Session['capabilities'],
+    control: { serviceId: 's', owner: 'owner', input: 'available', generation: 1, operationId: null, reason: null } };
+  let emit!: (observation: PlatformObservation) => void;
+  let releaseRead!: () => void;
+  const wait = new Promise<void>(resolve => { releaseRead = resolve; });
+  const registry = new ArtifactRegistry({});
+  registry.setRoots(ref, [project]);
+  registry.setProjectRoot(ref, project);
+  await writeFile(join(project, 'report.md'), 'utf-8 正文');
+  const errors: unknown[] = [];
+  const port = new EnrichedPort({
+    provider: 'codex', onObservation: (listener: typeof emit) => { emit = listener; return () => {}; },
+    hasActiveNativeSession: () => true,
+    read: async () => { await wait; return { session, messages: [], interactions: [] }; },
+    listArtifacts: async () => [],
+  } as unknown as PlatformPort, new LocalCatalog([]), registry, error => errors.push(error));
+  const sends: Array<{ id: string; card: any }> = [];
+  const updates: Array<{ id: string; card: any }> = [];
+  const pushes: string[] = [];
+  const files: Buffer[] = [];
+  const runtime = new UnifiedRuntime({
+    coreDb: join(dir, 'core'), channelDb: join(dir, 'channel'), allowedDestinations: ['topic'],
+    ownerOpenId: 'owner', hostId: 'h', codexServiceId: 's', claudeServiceId: 'c',
+    claudeStateDir: join(dir, 'claude'), codexEndpoint: 'ws://127.0.0.1:1234', intervalMs: 100,
+  }, {
+    send: async (_d, card) => { const id = `card-${sends.length + 1}`; sends.push({ id, card }); return id; },
+    update: async (_d, id, card) => { updates.push({ id, card }); },
+    sendText: async (_d, text) => { pushes.push(text); },
+    sendFile: async (_d, _name, bytes) => { files.push(Buffer.from(bytes)); },
+  }, [port]);
+  const env = (eventId: string) => ({ eventId, destination: 'topic', identity: { source: 'feishu', subject: 'owner' } });
+  try {
+    runtime.store.insertSession(session);
+    await runtime.channel.handle(env('bind'), { action: 'bind', sessionId: 's' });
+    await runtime.channel.sync('topic');
+    await runtime.core.observe({ type: 'connection', ref, connectionGeneration: 1 });
+    await runtime.flushInteractive();
+    sends.length = 0;
+    const turn = { turnId: 't', sessionId: 'n', inputId: null, model: null, outputIds: [], startedAt: new Date().toISOString(), endedAt: null };
+    await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1, turn: { ...turn, status: 'running' } });
+    const message = { messageId: 'm', sessionId: 'n', turnId: 't', role: 'assistant' as const,
+      sequence: 1, revision: 1, final: false, source: 'codex',
+      blocks: [{ type: 'text' as const, text: '准备报告' }] };
+    emit({ type: 'message', ref, connectionGeneration: 1, message });
+    await runtime.flushInteractive();
+    assert.equal(sends[0]?.card.template, 'blue');
+    t.mock.timers.tick(120_000);
+    emit({ type: 'message', ref, connectionGeneration: 1, message: { ...message, final: true, revision: 2,
+      blocks: [{ type: 'text', text: '[报告](report.md)' }] } });
+    await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1, turn: { ...turn, status: 'completed' } });
+    await runtime.flushInteractive();
+    t.mock.timers.tick(1500);
+    await runtime.flushInteractive();
+    assert.equal(pushes.length, 1);
+    assert.equal(updates.at(-1)?.card.template, 'green');
+    assert.deepEqual(updates.at(-1)?.card.actions, []);
+    const title = updates.at(-1)!.card.title;
+    const getSnapshot = runtime.core.getSnapshot.bind(runtime.core);
+    runtime.core.getSnapshot = async id => {
+      const snapshot = await getSnapshot(id);
+      return { ...snapshot, value: { ...snapshot.value, turnProgress: { timing: [], tools: [] } } };
+    };
+    releaseRead();
+    await port.drain();
+    await runtime.flushInteractive();
+    t.mock.timers.tick(1500);
+    await runtime.flushInteractive();
+    const last = updates.at(-1)!;
+    assert.equal(last.id, sends[0]!.id);
+    assert.equal(last.card.template, 'green');
+    assert.equal(last.card.title, title);
+    assert.equal(sends.length, 1);
+    assert.equal(pushes.length, 1);
+    assert.equal(files.length, 0);
+    assert.deepEqual(errors, []);
+    assert.ok([sends[0]!, ...updates].every(({ card }) => (encodeCard(card) as { schema: string }).schema === '2.0'));
+    const button = last.card.actions[0];
+    assert.equal(button.label, '发送文件：report.md');
+    assert.equal(button.value.action, 'file');
+    await runtime.channel.handle(env('send-file'), button.value);
+    assert.deepEqual(files, [Buffer.from('utf-8 正文', 'utf8')]);
+  } finally {
+    releaseRead();
+    await runtime.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

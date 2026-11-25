@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,rmSync } from 'node:fs';
+import { mkdirSync,mkdtempSync,rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { UnifiedRuntime, validateRuntimeConfig } from '../src/unified/runtime.js';
+import { UnifiedRuntime, validateRuntimeConfig, type RuntimeConfig } from '../src/unified/runtime.js';
 import { parseFeishuText,parseFeishuAction } from '../src/unified/feishu-codec.js';
 import type { Capabilities, Interaction, Session } from '../src/unified/contracts.js';
+import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import { runtimeApprovalScope } from '../src/unified/codex-approval.js';
+import { evaluateApproval, resolveApprovalFacts } from '../src/unified/approval-policy.js';
 
 async function bindInteractive(runtime:UnifiedRuntime, envelope:{eventId:string;destination:string;identity:{source:string;subject:string}}, sessionId:string) {
  await runtime.handleTrusted(envelope,{action:'bind',sessionId,mode:'interactive'}); await runtime.tick();
@@ -16,30 +19,173 @@ const caps=Object.fromEntries(['view','send','queue','steer','answer','approve',
 for (const provider of ['claude','codex'] as const) test(`runtime simulated ${provider}: message and question answer`,async()=>{
   const dir=mkdtempSync(join(tmpdir(),'unified-runtime-'));const config={coreDb:join(dir,'core'),channelDb:join(dir,'channel'),ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',claudeServiceId:'c',codexServiceId:'x',claudeStateDir:join(dir,'state'),codexEndpoint:'ws://127.0.0.1:1234',intervalMs:100};
   const sent:any[]=[];const deliveries=new Map<string,string>();const port={async send(_d:string,c:any,id:string){sent.push(c);const m=`m${sent.length}`;deliveries.set(id,m);return m;},async update(_d:string,_m:string,c:any){sent.push(c);},async sendFile(){},async lookupDelivery(id:string){return deliveries.has(id)?'sent' as const:'unknown' as const;},async lookupMessageId(id:string){return deliveries.get(id)??null;}};
-  const writes:string[]=[];const native:any={provider,onObservation:()=>()=>{},async input(_r:any,_m:any,_b:any,g:any){g.assertCurrent();writes.push('input');},async respond(_r:any,_i:any,_a:any,g:any){g.assertCurrent();writes.push('answer');}};
+  const writes:string[]=[];const native:any={provider,onObservation:()=>()=>{},async input(_r:any,_m:any,_b:any,g:any){g.assertCurrent();writes.push('input');return {status:'submitted',nativeReference:null};},async respond(_r:any,_i:any,_a:any,g:any){g.assertCurrent();writes.push('answer');return {status:'submitted',nativeReference:null};}};
   const runtime=new UnifiedRuntime(config,port,[native]);
   const s:Session={sessionId:'s',native:{provider,hostId:'h',serviceId:'v',nativeSessionId:'n'},project:'p',title:'demo',status:'idle',revision:0,capabilities:caps,control:{serviceId:'v',owner:'owner',input:'available',generation:1,operationId:null,reason:null}};
   const e=(id:string)=>({eventId:id,destination:'chat',identity:{source:'feishu',subject:'owner'}});
   try {runtime.store.insertSession(s);await assert.rejects(runtime.handleTrusted({...e('bad'),identity:{source:'feishu',subject:'impostor'}},parseFeishuText('/bind s')));await assert.rejects(runtime.handleTrusted({...e('bad2'),destination:'other'},parseFeishuText('/bind s')));
     await bindInteractive(runtime,e('bind'),'s');await runtime.handleTrusted(e('input'),parseFeishuText('hello'));await runtime.tick();assert.deepEqual(writes,['input']);
-    const i:Interaction={kind:'question',interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'nq',connectionGeneration:1,revision:0,status:'awaiting_answer',expiresAt:null,toolInputDigest:null,nativeResult:null,prompt:'choose',choices:['yes'],multiple:false,allowFreeText:false};runtime.store.setConnectionGeneration('s',0,1);runtime.store.insertInteraction(i);await runtime.tick();assert.ok(sent.some(c=>c.text.includes('choose')));
-    const answerAction=sent.flatMap(c=>c.actions).find(a=>a.value.action==='answer');assert.ok(answerAction);await runtime.handleTrusted(e('answer'),parseFeishuAction(answerAction.value));await runtime.tick();assert.deepEqual(writes,['input','answer']);assert.equal(runtime.health().status,'healthy');
+    const i:Interaction={kind:'question',interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'nq',connectionGeneration:1,revision:0,status:'awaiting_answer',expiresAt:null,toolInputDigest:null,nativeResult:null,prompt:'choose',choices:['yes'],multiple:false,allowFreeText:false};runtime.store.setConnectionGeneration('s',0,1);runtime.store.insertInteraction(i);await runtime.tick();const form=sent.find(c=>c.form?.questions[0]?.prompt==='choose')?.form;
+    assert.ok(form?.submittable);
+    await runtime.handleTrusted(e('answer'),parseFeishuAction({action:'answer_form',interactionId:form.interactionId,bindingId:form.bindingId,revision:form.revision,connectionGeneration:form.connectionGeneration},{q0_choice:'0'}));await runtime.tick();assert.deepEqual(writes,['input','answer']);assert.equal(runtime.health().status,'healthy');
   } finally {await runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
 test('validation is read-only and rejects unsafe configuration',()=>{assert.throws(()=>validateRuntimeConfig({coreDb:'same',channelDb:'same',ownerOpenId:'',allowedDestinations:[],hostId:'',claudeServiceId:'',codexServiceId:'',claudeStateDir:'',codexEndpoint:'http://bad',intervalMs:0}));});
 
-test('durable intake ACK precedes slow send, pending survives restart, no duplicate dispatch',async()=>{
-  const dir=mkdtempSync(join(tmpdir(),'runtime-inbox-')); const config={coreDb:join(dir,'core'),channelDb:join(dir,'channel'),ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',claudeServiceId:'c',codexServiceId:'x',claudeStateDir:join(dir,'state'),codexEndpoint:'ws://127.0.0.1:1234',intervalMs:100};
-  let release!:()=>void; const slow=new Promise<void>(r=>{release=r;});let sends=0,writes=0;let block=false;
-  const port={async send(){sends++;if(block)await slow;return 'm';},async update(){},async sendFile(){}};
-  const native:any={provider:'claude',onObservation:()=>()=>{},async input(_r:any,_m:any,_b:any,g:any){g.assertCurrent();writes++;}};
-  const session:Session={sessionId:'s',native:{provider:'claude',hostId:'h',serviceId:'v',nativeSessionId:'n'},project:'p',title:'demo',status:'idle',revision:0,capabilities:caps,control:{serviceId:'v',owner:'owner',input:'available',generation:1,operationId:null,reason:null}};
-  const e=(id:string)=>({eventId:id,destination:'chat',identity:{source:'feishu',subject:'owner'}});let r=new UnifiedRuntime(config,port,[native]);
-  try {r.store.insertSession(session);await bindInteractive(r,e('bind'),'s');
-    block=true; await r.handleTrusted(e('one'),{action:'input',mode:'new',text:'one'});const processing=r.tick();await new Promise<void>(done=>setImmediate(done));
-    const start=Date.now();await r.handleTrusted(e('two'),{action:'input',mode:'new',text:'two'});assert.ok(Date.now()-start<1000);release();await processing;
-    await r.close();r=new UnifiedRuntime(config,port,[native]);assert.deepEqual(r.channel.pendingInbox(),['two']);await r.tick();assert.equal(writes,2);await r.handleTrusted(e('two'),{action:'input',mode:'new',text:'two'});await r.tick();assert.equal(writes,2);assert.ok(sends>=3);
-  } finally {release();await r.close();rmSync(dir,{recursive:true,force:true});}
+test('runtime approval configuration requires absolute roots and account home', () => {
+  const config: RuntimeConfig = {
+    coreDb: '/runtime/core', channelDb: '/runtime/channel', ownerOpenId: 'owner',
+    allowedDestinations: ['chat'], hostId: 'h', claudeServiceId: 'c', codexServiceId: 'x',
+    claudeStateDir: '/runtime/claude', codexEndpoint: 'ws://127.0.0.1:1234', intervalMs: 100,
+  };
+  validateRuntimeConfig(config);
+  validateRuntimeConfig({ ...config, approvalPolicy: { enabled: false, extraTrustedRoots: ['/output'], extraWriteRoots: ['/explicit'], codexSharedFilesystem: false, homeDir: '/home/account' } });
+  for (const approvalPolicy of [
+    { homeDir: 'relative' }, { extraTrustedRoots: ['relative'] },
+    { homeDir: '/home/account\0other' }, { extraTrustedRoots: [1] }, { enabled: 'false' },
+    { extraWriteRoots: ['relative'] }, { codexSharedFilesystem: 'true' },
+  ]) {
+    assert.throws(() => validateRuntimeConfig({ ...config, approvalPolicy } as RuntimeConfig), /invalid (?:approval policy configuration|trusted roots)/);
+  }
+});
+
+test('runtime discovery and output roots allow reference reads while writes require session scope', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-approval-roots-'));
+  const project = join(dir, 'active'), sibling = join(dir, 'sibling'), externalOutput = join(dir, 'output');
+  try {
+    for (const path of [project, sibling, externalOutput]) mkdirSync(path);
+    const config = runtimeFixtureConfig(dir);
+    const scope = runtimeApprovalScope({ ...config, allowedProjectRoots: [dir], outputRoots: [externalOutput] });
+    for (const [kind, path, expected] of [
+      ['read', join(sibling, 'reference.ts'), 'allow_once'],
+      ['read', join(externalOutput, 'output.txt'), 'allow_once'],
+      ['write', join(sibling, 'source.ts'), 'ask'],
+      ['write', join(externalOutput, 'output.txt'), 'ask'],
+      ['write', join(project, 'output/output.txt'), 'allow_once'],
+    ] as const) {
+      assert.equal(evaluateApproval(await resolveApprovalFacts({ kind, paths: [path] }, { ...scope, project })).kind, expected, path);
+    }
+    const explicit = runtimeApprovalScope({ ...config, approvalPolicy: { extraWriteRoots: [externalOutput] } });
+    assert.equal(evaluateApproval(await resolveApprovalFacts({ kind: 'write', paths: [join(externalOutput, 'output.txt')] }, { ...explicit, project })).kind, 'allow_once');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+function runtimeFixtureConfig(dir: string): RuntimeConfig {
+  return {
+    coreDb: join(dir, 'core'), channelDb: join(dir, 'channel'), allowedDestinations: ['chat'], ownerOpenId: 'owner',
+    hostId: 'h', claudeServiceId: 'c', codexServiceId: 'x', claudeStateDir: join(dir, 'claude'),
+    codexEndpoint: 'ws://127.0.0.1:1234', intervalMs: 100,
+  };
+}
+
+test('background reports a failed binding recovery after completing the remaining work', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-binding-recovery-'));
+  let refreshes = 0;
+  const port = { async send() {}, async update() {}, async sendFile() {} };
+  const runtime = new UnifiedRuntime(runtimeFixtureConfig(dir), port, [], { refresh: async () => { refreshes++; } });
+  try {
+    runtime.channel.advanceCompleted = async () => { throw new AggregateError([Error('old card PATCH failed')]); };
+    await assert.rejects(runtime.tick(), /dispatch or synchronization failed/);
+    assert.equal(refreshes, 1);
+  } finally {
+    await runtime.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('durable intake dispatches input and approval during a blocked background refresh; restart recovers once', async () => {
+  const dir=mkdtempSync(join(tmpdir(),'runtime-inbox-'));
+  const config={coreDb:join(dir,'core'),channelDb:join(dir,'channel'),ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',claudeServiceId:'c',codexServiceId:'x',claudeStateDir:join(dir,'state'),codexEndpoint:'ws://127.0.0.1:1234',intervalMs:100};
+  let holdRefresh=false;
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve=done; });
+    return { promise, resolve };
+  };
+  const refreshEntered=deferred(), refreshRelease=deferred();
+  const patchEntered=deferred(), patchRelease=deferred();
+  const responseWritten=deferred();
+  const sent=new Map<string,ChannelCard>(), patches=new Map<string,ChannelCard>();
+  const port={
+    async send(_destination:string,card:ChannelCard) { const id='message-'+sent.size; sent.set(id,card); return id; },
+    async update(_destination:string,messageId:string,card:ChannelCard) {
+      patches.set(messageId,card);
+      if (holdRefresh && card.text.includes('等待原端确认')) {
+        patchEntered.resolve();
+        await patchRelease.promise;
+      }
+    },
+    async sendFile() {},
+  };
+  const writes:string[]=[];
+  const native:any={
+    provider:'claude',onObservation:()=>()=>{},
+    async input(_ref:any,_mode:any,blocks:any,g:any) {
+      g.assertCurrent(); writes.push(blocks[0].text);
+      return {status:'submitted',nativeReference:null};
+    },
+    async respond(_ref:any,_interaction:any,_answer:any,g:any) {
+      g.assertCurrent(); writes.push('answer'); responseWritten.resolve();
+      return {status:'submitted',nativeReference:null};
+    },
+  };
+  const session:Session={sessionId:'s',native:{provider:'claude',hostId:'h',serviceId:'v',nativeSessionId:'n'},project:dir,title:'demo',status:'idle',revision:0,capabilities:caps,control:{serviceId:'v',owner:'owner',input:'available',generation:1,operationId:null,reason:null}};
+  const e=(id:string)=>({eventId:id,destination:'chat',identity:{source:'feishu',subject:'owner'}});
+  let runtime=new UnifiedRuntime(config,port,[native],{refresh:async()=>{
+    if (holdRefresh) { refreshEntered.resolve(); await refreshRelease.promise; }
+  }});
+  try {
+    runtime.store.insertSession(session);
+    await bindInteractive(runtime,e('bind'),'s');
+    runtime.store.insertInteraction({
+      interactionId:'approve',sessionId:'s',turnId:'t',nativeRequestId:'request',connectionGeneration:0,revision:0,
+      status:'awaiting_answer',expiresAt:null,nativeResult:null,kind:'approval',tool:'Bash',action:'sudo true',
+      scope:'once',toolInputDigest:'tool',
+    });
+    await runtime.tick();
+    const card=[...sent].find(([,value])=>value.actions.some(button=>button.value.action==='answer'));
+    assert.ok(card);
+    const [cardMessageId,approvalCard]=card;
+
+    holdRefresh=true;
+    const background=runtime.tick();
+    await refreshEntered.promise;
+    await runtime.handleTrusted(e('one'),{action:'input',mode:'new',text:'one'});
+    // A direct foreground barrier runs while the background tick still waits in refresh.
+    await runtime.flushInteractive();
+    assert.deepEqual(writes,['one']);
+    const inputOp=runtime.channel.operationForEvent('one')!;
+    assert.equal(runtime.store.getOperation(inputOp.operationId).status,'accepted');
+
+    await runtime.handleTrusted({...e('answer'),cardMessageId},parseFeishuAction(approvalCard.actions[0]!.value));
+    const deadline=AbortSignal.timeout(2_000);
+    await new Promise<void>((resolve,reject)=>{
+      deadline.addEventListener('abort',()=>reject(new Error('foreground approval or card PATCH stalled')), {once:true});
+      void Promise.all([patchEntered.promise,responseWritten.promise]).then(()=>resolve());
+    });
+    assert.equal(patches.get(cardMessageId)?.actions.length,0);
+    assert.match(patches.get(cardMessageId)?.text ?? '',/已提交.*等待原端确认/);
+    const answerOp=runtime.channel.operationForEvent('answer')!;
+    assert.equal(runtime.store.getOutbox(answerOp.operationId).state,'done');
+    assert.equal(runtime.store.getOperation(answerOp.operationId).status,'accepted');
+    assert.deepEqual(writes,['one','answer']);
+
+    patchRelease.resolve(); refreshRelease.resolve();
+    await background;
+    // Model a process stopping after the inbox commit and before it notified the scheduler.
+    await runtime.channel.intake(e('two'),{action:'input',mode:'new',text:'two'});
+    await runtime.close();
+    runtime=new UnifiedRuntime(config,port,[native]);
+    assert.deepEqual(runtime.channel.pendingInbox(),['two']);
+    await runtime.tick();
+    await runtime.handleTrusted(e('two'),{action:'input',mode:'new',text:'two'});
+    await runtime.tick();
+    assert.deepEqual(writes,['one','answer','two']);
+  } finally {
+    patchRelease.resolve(); refreshRelease.resolve();
+    await runtime.close();
+    rmSync(dir,{recursive:true,force:true});
+  }
 });
 
 test('SDK image event downloads bounded verified bytes and stages them through channel to core',async()=>{
@@ -51,7 +197,7 @@ test('SDK image event downloads bounded verified bytes and stages them through c
   const png=Buffer.from([137,80,78,71,13,10,26,10,1,2]); let downloads=0;const download=async(id:string,key:string,type:string)=>{assert.equal(id,'image-id');assert.equal(key,'img-key');assert.equal(type,'image');downloads++;return Readable.from([png]);};
   try {r.store.insertSession(s);await bindInteractive(r,envelope,'s');
     await assert.rejects(receiveSdkMessage({...data,sender:{sender_type:'user',sender_id:{open_id:'other'}}},'bot','owner',new Set(['chat']),download,(e,a)=>r.handleTrusted(e,a)));assert.equal(downloads,0);
-    await receiveSdkMessage(data,'bot','owner',new Set(['chat']),download,(e,a)=>r.handleTrusted(e,a));await r.tick();assert.equal(r.channel.pendingOperations('chat').length,0);await r.tick();assert.equal(input[0].mediaType,'image/png');assert.deepEqual(Buffer.from(input[0].content),png);
+    await receiveSdkMessage(data,'bot','owner',new Set(['chat']),download,(e,a)=>r.handleTrusted(e,a));await r.tick();assert.equal(r.channel.pendingOperations('chat').length,0);assert.equal(input[0].mediaType,'image/png');assert.deepEqual(Buffer.from(input[0].content),png);
     await assert.rejects(receiveSdkMessage(data,'bot','owner',new Set(['chat']),async()=>Readable.from([Buffer.alloc(MAX_INBOUND_BYTES+1)]),async()=>{}),/exceeds limit/);
     await assert.rejects(receiveSdkMessage(data,'bot','owner',new Set(['chat']),async()=>Readable.from([Buffer.from('not image')]),async()=>{}),/unsupported resource/);
   } finally {await r.close();rmSync(dir,{recursive:true,force:true});}
@@ -97,11 +243,46 @@ test('close fences new work, shares completion, and waits for active tick and in
 });
 
 test('channel database is single-active and lock releases on close and process death',async()=>{
-  const {spawn}=await import('node:child_process');const {once}=await import('node:events') as unknown as {once:(emitter:any,event:string)=>Promise<any[]>};const dir=mkdtempSync(join(tmpdir(),'runtime-lock-'));const config={coreDb:join(dir,'core'),channelDb:join(dir,'channel'),ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',claudeServiceId:'c',codexServiceId:'x',claudeStateDir:join(dir,'state'),codexEndpoint:'ws://127.0.0.1:1234',intervalMs:100};const port={async send(){return 'm';},async update(){},async sendFile(){}};let first=new UnifiedRuntime(config,port,[]);
-  try {assert.throws(()=>new UnifiedRuntime({...config,coreDb:join(dir,'other')},port,[]),/already active/);await first.close();first=new UnifiedRuntime(config,port,[]);await first.close();
-    const source=`import {UnifiedRuntime} from './src/unified/runtime.ts'; const c=${JSON.stringify(config)};new UnifiedRuntime(c,{async send(){return 'm'},async update(){},async sendFile(){}},[]);process.stdout.write('ready\\n');setInterval(()=>{},1000);`;
-    const child=spawn(process.execPath,['--import','tsx','--input-type=module','-e',source],{cwd:process.cwd(),stdio:['ignore','pipe','pipe']});const [chunk]=await once(child.stdout,'data');assert.match(String(chunk),/ready/);assert.throws(()=>new UnifiedRuntime({...config,coreDb:join(dir,'other')},port,[]),/already active/);child.kill('SIGKILL');await once(child,'exit');first=new UnifiedRuntime(config,port,[]);await first.close();
-  }finally{await first.close();rmSync(dir,{recursive:true,force:true});}
+  const {spawn}=await import('node:child_process');
+  const {closeSync,openSync,readFileSync}=await import('node:fs');
+  const {setTimeout:delay}=await import('node:timers/promises');
+  const dir=mkdtempSync(join(tmpdir(),'runtime-lock-'));
+  const config={coreDb:join(dir,'core'),channelDb:join(dir,'channel'),ownerOpenId:'owner',allowedDestinations:['chat'],hostId:'h',claudeServiceId:'c',codexServiceId:'x',claudeStateDir:join(dir,'state'),codexEndpoint:'ws://127.0.0.1:1234',intervalMs:100};
+  const port={async send(){return 'm';},async update(){},async sendFile(){}};
+  let first=new UnifiedRuntime(config,port,[]);
+  try {
+    assert.throws(()=>new UnifiedRuntime({...config,coreDb:join(dir,'other')},port,[]),/already active/);
+    await first.close();
+    first=new UnifiedRuntime(config,port,[]);
+    await first.close();
+    const source=`import {UnifiedRuntime} from './src/unified/runtime.ts'; import {writeSync} from 'node:fs'; const c=${JSON.stringify(config)};new UnifiedRuntime(c,{async send(){return 'm'},async update(){},async sendFile(){}},[]);writeSync(1,'ready');setInterval(()=>{},1000);`;
+    const output=join(dir,'worker-ready');
+    const fd=openSync(output,'w');
+    const child=spawn(process.execPath,['--import','tsx','--input-type=module','-e',source],{cwd:process.cwd(),stdio:['ignore',fd,'inherit']});
+    closeSync(fd);
+    const exited=new Promise<void>((resolve,reject)=>{
+      child.once('error',reject);
+      child.once('exit',()=>resolve());
+    });
+    try {
+      const ready=async()=>{
+        const deadline=Date.now()+10_000;
+        while (readFileSync(output,'utf8')!=='ready') {
+          if (Date.now()>=deadline) throw new Error('lock worker did not report readiness');
+          await delay(20);
+        }
+      };
+      await Promise.race([ready(),exited.then(()=>{throw new Error('lock worker exited before readiness');})]);
+      assert.throws(()=>new UnifiedRuntime({...config,coreDb:join(dir,'other')},port,[]),/already active/);
+    } finally {
+      child.kill('SIGKILL');
+      await exited;
+    }
+    first=new UnifiedRuntime(config,port,[]);
+  } finally {
+    await first.close();
+    rmSync(dir,{recursive:true,force:true});
+  }
 });
 
 test('deferred image cannot cross destination rebind',async()=>{
@@ -204,4 +385,195 @@ test('read-only rejection is durable and does not starve later authorized work',
   assert.deepEqual(r.channel.pendingInbox(),[]);assert.equal(writes,0);assert.ok(sent.some(x=>x.title==='操作未执行'));assert.equal(sent.filter(x=>x.title==='会话历史').length,2);assert.equal(r.health().status,'healthy');
   await r.close();r=new UnifiedRuntime(config,port,[native]);await r.handleTrusted(e('bad'),bad);await r.handleTrusted(e('after-restart'),{action:'history'});await r.tick();assert.deepEqual(r.channel.pendingInbox(),[]);assert.equal(writes,0);assert.equal(sent.filter(x=>x.title==='操作未执行').length,1);assert.equal(sent.filter(x=>x.title==='会话历史').length,3);
  }finally{await r.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+for (const provider of ['claude', 'codex', 'agy'] as const) {
+  test(`${provider} tool-only progress wakes only its topic, then preserves the completed card and schema`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+    const { ToolProgressTracker } = await import('../src/unified/tool-progress.js');
+    const { encodeCard } = await import('../src/unified/feishu-card-wire.js');
+    const dir = mkdtempSync(join(tmpdir(), 'runtime-tool-progress-'));
+    const sent: Array<{ destination: string; id: string; card: ChannelCard }> = [];
+    const patches: Array<{ destination: string; id: string; card: ChannelCard }> = [];
+    const pushed: string[] = [];
+    let dispatches = 0;
+    let uploads = 0;
+    const port = {
+      async send(destination: string, card: ChannelCard) {
+        const id = `m${sent.length + 1}`;
+        sent.push({ destination, id, card });
+        return id;
+      },
+      async update(destination: string, id: string, card: ChannelCard) { patches.push({ destination, id, card }); },
+      async sendText(_destination: string, text: string) { pushed.push(text); },
+      async sendFile() { uploads++; },
+    };
+    const native: any = { provider, onObservation: () => () => {}, input: async () => { dispatches++; } };
+    const runtime = new UnifiedRuntime({ ...runtimeFixtureConfig(dir), allowedDestinations: ['chat', 'other'] }, port, [native]);
+    const ref = { provider, hostId: 'h', serviceId: 'v', nativeSessionId: 'native' };
+    const session: Session = { sessionId: 's', native: ref, project: dir, title: 'progress', status: 'idle', revision: 0,
+      capabilities: caps, control: { serviceId: 'v', owner: 'owner', input: 'available', generation: 1, operationId: null, reason: null } };
+    const bind = (destination: string, sessionId: string) => runtime.channel.handle({
+      eventId: `bind-${destination}`, destination, identity: { source: 'feishu', subject: 'owner' },
+    }, { action: 'bind', sessionId });
+    try {
+      runtime.store.insertSession(session);
+      runtime.store.insertSession({ ...session, sessionId: 'other', native: { ...ref, nativeSessionId: 'other-native' } });
+      await bind('chat', 's');
+      await bind('other', 'other');
+      await runtime.channel.sync('chat');
+      await runtime.channel.sync('other');
+      await runtime.core.observe({ type: 'connection', ref, connectionGeneration: 1 });
+      await runtime.flushInteractive();
+      sent.length = 0;
+      const turns = { turnId: 't', sessionId: 'native', inputId: null, model: null, outputIds: [],
+        startedAt: new Date().toISOString(), endedAt: null };
+      await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1, turn: { ...turns, status: 'running' } });
+      await runtime.flushInteractive();
+      assert.equal(sent.length, 0);
+      const subscriptions: string[] = [];
+      const subscribe = runtime.core.subscribeEvents.bind(runtime.core);
+      runtime.core.subscribeEvents = async (id, ...args) => { subscriptions.push(id); return subscribe(id, ...args); };
+      const tracker = new ToolProgressTracker();
+      const tool = (callId: string, phase: 'running' | 'succeeded' | 'failed') => tracker.observe(ref, 1, 't', callId, phase,
+        { tool: 'Bash', summary: 'Bash · pytest' })!;
+      await runtime.core.observe(tool('1', 'running'));
+      await runtime.flushInteractive();
+      const first = sent[0]!;
+      assert.equal(first.destination, 'chat');
+      assert.equal(first.card.template, 'blue');
+      assert.equal(first.card.text, '正在处理…');
+      assert.equal(first.card.schema, '2.0');
+      assert.match(first.card.executionLog!.runningNote!, /Bash · pytest/);
+      const wire = encodeCard(first.card) as { schema: string; body: { elements: Array<Record<string, unknown>> } };
+      assert.equal(wire.schema, '2.0');
+      const panel = wire.body.elements.find(element => element.tag === 'collapsible_panel');
+      assert.equal(panel?.expanded, false);
+      assert.match(JSON.stringify(panel), /执行记录（1 项）/);
+      assert.deepEqual((await runtime.core.getSnapshot('s')).value.messages, []);
+      assert.deepEqual(subscriptions, ['s']);
+      await runtime.core.observe(tool('2', 'running'));
+      await runtime.core.observe(tool('1', 'succeeded'));
+      await runtime.flushInteractive();
+      assert.equal(patches.length, 0);
+      t.mock.timers.tick(1499);
+      await runtime.flushInteractive();
+      assert.equal(patches.length, 0);
+      t.mock.timers.tick(1);
+      await runtime.flushInteractive();
+      assert.equal(patches.length, 1);
+      assert.deepEqual(patches[0]!.card.executionLog!.lines, ['✓ Bash · pytest', '⏳ Bash · pytest']);
+      t.mock.timers.tick(13_500);
+      await runtime.flushInteractive();
+      assert.match(patches.at(-1)!.card.title, /用时 15秒/);
+      await runtime.core.observe(tool('2', 'failed'));
+      await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1,
+        turn: { ...turns, status: 'completed', startedAt: null, endedAt: new Date().toISOString() } });
+      await runtime.flushInteractive();
+      t.mock.timers.tick(1500);
+      await runtime.flushInteractive();
+      assert.equal(patches.at(-1)!.card.template, 'green');
+      assert.equal(patches.at(-1)!.card.executionLog!.failedCount, 1);
+      assert.ok(patches.every(patch => patch.destination === 'chat' && patch.id === first.id && patch.card.schema === '2.0'));
+      assert.equal(sent.length, 1);
+      assert.equal(dispatches + uploads + pushed.length, 0);
+      const after = patches.length;
+      const reads = subscriptions.length;
+      t.mock.timers.tick(30_000);
+      await runtime.flushInteractive();
+      assert.equal(patches.length, after);
+      assert.equal(subscriptions.length, reads, 'completion removes the heartbeat');
+      await runtime.close();
+      t.mock.timers.tick(30_000);
+      assert.equal(subscriptions.length, reads);
+    } finally {
+      await runtime.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('runtime coalesces assistant deltas per session and drains the tail without delaying final observations', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-delta-wake-'));
+  const port = { async send() { return 'm'; }, async update() {}, async sendFile() {} };
+  const native: any = { provider: 'codex', onObservation: () => () => {} };
+  const runtime = new UnifiedRuntime({ ...runtimeFixtureConfig(dir), allowedDestinations: ['chat', 'other'] }, port, [native]);
+  const ref = { provider: 'codex' as const, hostId: 'h', serviceId: 'v', nativeSessionId: 'n' };
+  const otherRef = { ...ref, nativeSessionId: 'other-native' };
+  const session: Session = { sessionId: 's', native: ref, project: dir, title: 'stream', status: 'idle', revision: 0,
+    capabilities: caps, control: { serviceId: 'v', owner: 'owner', input: 'available', generation: 1, operationId: null, reason: null } };
+  const updates: string[] = [];
+  const otherUpdates: string[] = [];
+  const nextImmediate = () => new Promise<void>(resolve => setImmediate(resolve));
+  const turn = { turnId: 't', sessionId: 'n', inputId: null, model: null, outputIds: [], startedAt: null, endedAt: null };
+  const message = (revision: number, final = false, messageId = 'reply', target = ref) => runtime.core.observe({
+    type: 'message', ref: target, connectionGeneration: 1, message: { messageId, sessionId: target.nativeSessionId, turnId: 't',
+      role: 'assistant', blocks: [{ type: 'text', text: String(revision) }], sequence: 1, revision, final, source: 'codex' } });
+  try {
+    runtime.store.insertSession(session);
+    runtime.store.insertSession({ ...session, sessionId: 'other', native: otherRef });
+    for (const [destination, sessionId] of [['chat', session.sessionId], ['other', 'other']] as const) {
+      await runtime.channel.handle({ eventId: `bind-${destination}`, destination, identity: { source: 'feishu', subject: 'owner' } },
+        { action: 'bind', sessionId });
+    }
+    await runtime.core.observe({ type: 'connection', ref, connectionGeneration: 1 });
+    await runtime.core.observe({ type: 'connection', ref: otherRef, connectionGeneration: 1 });
+    await runtime.flushInteractive();
+    runtime.channel.sync = async destination => {
+      const snapshot = (await runtime.core.getSnapshot(destination === 'chat' ? 's' : 'other')).value;
+      const message = snapshot.messages.at(-1);
+      const block = message?.blocks[0];
+      const status = snapshot.turns?.[0]?.status;
+      const received = destination === 'chat' ? updates : otherUpdates;
+      received.push(`${block?.type === 'text' ? block.text : ''}${message?.final ? ' final' : ''}${status ? ` ${status}` : ''}`);
+    };
+    await message(1);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1']);
+    for (let revision = 2; revision <= 10; revision++) {
+      await message(revision);
+      await nextImmediate();
+    }
+    await message(1, false, 'other-reply', otherRef);
+    await nextImmediate();
+    assert.deepEqual(otherUpdates, ['1']);
+    t.mock.timers.tick(349);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1']);
+    t.mock.timers.tick(1);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1', '10']);
+
+    await message(11);
+    await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1,
+      turn: { ...turn, status: 'completed', endedAt: new Date().toISOString() } });
+    await nextImmediate();
+    assert.deepEqual(updates, ['1', '10', '11 completed']);
+    await message(12);
+    await nextImmediate();
+    await message(13);
+    await message(14, true);
+    await nextImmediate();
+    assert.deepEqual(updates, ['1', '10', '11 completed', '12 completed', '14 final completed']);
+    t.mock.timers.tick(350);
+    await nextImmediate();
+    assert.equal(updates.length, 5, 'urgent wakes consume queued deltas');
+
+    await message(15, false, 'next-reply');
+    await nextImmediate();
+    await message(16, false, 'next-reply');
+    await runtime.flushInteractive();
+    assert.equal(updates.at(-1), '16 completed');
+    await message(17, false, 'next-reply');
+    await runtime.close();
+    assert.equal(updates.at(-1), '17 completed');
+    const afterClose = updates.length;
+    t.mock.timers.tick(350);
+    await nextImmediate();
+    assert.equal(updates.length, afterClose);
+  } finally {
+    await runtime.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -1,22 +1,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { CodexTransport, type SocketFactory } from '../src/unified/codex-transport.js';
 import { CodexAdapter } from '../src/unified/codex-adapter.js';
+import { codexFilesystemProof } from '../src/unified/codex-approval.js';
+import { interactionCard } from '../src/unified/feishu-cards.js';
 import type { DispatchGuard, PlatformObservation } from '../src/unified/adapter.js';
 import type { Interaction, NativeSessionRef } from '../src/unified/contracts.js';
 class FakeSocket extends EventTarget {
   readyState = 0; sent: any[] = [];
-  send(raw: string) { const m = JSON.parse(raw); this.sent.push(m); if (m.method === 'initialize') queueMicrotask(() => this.message({ id: m.id, result: {} })); if (m.method === 'thread/resume') queueMicrotask(() => this.message({id:m.id,result:{thread:{id:m.params.threadId,cwd:'/work',status:{type:'idle'}}}})); }
+  constructor(private readonly cwd = '/work', private readonly rollout?: string) { super(); }
+  send(raw: string) { const m = JSON.parse(raw); this.sent.push(m); this.dispatchEvent(new MessageEvent('sent', { data: m })); if (m.method === 'initialize') queueMicrotask(() => this.message({ id: m.id, result: {} })); if (m.method === 'thread/resume') queueMicrotask(() => this.message({id:m.id,result:{thread:{id:m.params.threadId,cwd:this.cwd,path:this.rollout,status:{type:'idle'}}}})); }
   close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
   open() { this.readyState = 1; this.dispatchEvent(new Event('open')); }
   message(value: unknown) { this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(value) })); }
+  response(id: string): Promise<unknown> {
+    return new Promise(resolve => {
+      const listener = (event: Event) => {
+        const data = (event as MessageEvent).data;
+        if (data.id !== id || !('result' in data)) return;
+        this.removeEventListener('sent', listener);
+        resolve(data.result);
+      };
+      this.addEventListener('sent', listener);
+    });
+  }
 }
 const errorCode = (code: string) => (e: unknown) => (e as { code?: string }).code === code;
 const ref: NativeSessionRef = { provider: 'codex', hostId: 'h', serviceId: 's', nativeSessionId: 't' };
 const guard: DispatchGuard = { expectedConnectionGeneration: 1, expectedControlGeneration: 1, assertCurrent() {} };
-function setup() { const sockets: FakeSocket[] = []; const factory = (() => { const s = new FakeSocket(); sockets.push(s); queueMicrotask(() => s.open()); return s; }) as unknown as SocketFactory; const transport = new CodexTransport('ws://127.0.0.1:1', factory, 100); const adapter = new CodexAdapter(transport, 'h', 's'); const events: PlatformObservation[] = []; adapter.onObservation(e => { events.push(e); }); return { sockets, transport, adapter, events }; }
+function setup(project?: string, options?: ConstructorParameters<typeof CodexAdapter>[3], rollout?: string) { const sockets: FakeSocket[] = []; const factory = (() => { const s = new FakeSocket(project, rollout); sockets.push(s); queueMicrotask(() => s.open()); return s; }) as unknown as SocketFactory; const transport = new CodexTransport('ws://127.0.0.1:1', factory, 100); const adapter = new CodexAdapter(transport, 'h', 's', options); const events: PlatformObservation[] = []; adapter.onObservation(e => { events.push(e); }); return { sockets, transport, adapter, events }; }
 const question = { id: 7, method: 'item/tool/requestUserInput', params: { threadId: 't', turnId: 'turn', questions: [{ id: 'q1', question: 'Pick', options: [{ label: 'A' }, { label: 'B' }] }, { id: 'q2', question: 'Why' }] } };
 const lastInteraction = (events: PlatformObservation[]): Interaction => { const e = events.at(-1); assert.equal(e?.type, 'interaction'); return (e as Extract<PlatformObservation, { type: 'interaction' }>).interaction; };
+function nextInteraction(adapter: CodexAdapter): Promise<Interaction> {
+  return new Promise(resolve => {
+    const off = adapter.onObservation(event => {
+      if (event.type !== 'interaction') return;
+      off();
+      resolve(event.interaction);
+    });
+  });
+}
 test('disconnect makes in-flight outcome unknown without replay', async () => { const { sockets, transport } = setup(); await transport.connect(); const p = transport.request('thread/start', {}); sockets[0]!.close(); await assert.rejects(p, errorCode('outcome_unknown')); await transport.connect(); assert.deepEqual(sockets[1]!.sent.map(x => x.method), ['initialize', 'initialized']); transport.close(); });
 test('multiple questions and multiple answers use native schema and await resolved', async () => {
   const { sockets, transport, adapter, events } = setup(); await transport.connect(); await adapter.resume(ref); sockets[0]!.message(question); const i = lastInteraction(events); assert.equal(i.kind, 'question_group'); if (i.kind !== 'question_group') throw Error(); assert.equal(i.questions[0]!.multiple, null);
@@ -33,9 +59,210 @@ test('old connection, wrong session, stale guard and incomplete answers cannot w
   sockets[0]!.close(); await transport.connect(); sockets[1]!.message(question); await assert.rejects(adapter.respond(ref, i, answer, guard), errorCode('interaction_expired')); transport.close();
 });
 test('single approval deny is scoped and guard checked before write', async () => {
-  const { sockets, transport, adapter, events } = setup(); await transport.connect(); await adapter.resume(ref); sockets[0]!.message({ id: 'r', method: 'item/commandExecution/requestApproval', params: { threadId: 't', turnId: 'x', command: 'true' } }); const i = lastInteraction(events);
+  const { sockets, transport, adapter } = setup(); await transport.connect(); await adapter.resume(ref);
+  sockets[0]!.message({ method: 'turn/started', params: { threadId: 't', turn: { id: 'x', status: 'inProgress' } } });
+  const observed = nextInteraction(adapter);
+  sockets[0]!.message({ id: 'r', method: 'item/commandExecution/requestApproval', params: { threadId: 't', turnId: 'x', command: 'sudo true' } });
+  const i = await observed;
   await assert.rejects(adapter.respond(ref, i, { kind: 'approval', decision: 'allow', scope: 'other' }, guard), errorCode('invalid_request'));
   await adapter.respond(ref, i, { kind: 'approval', decision: 'deny', scope: 'this_request' }, guard); assert.deepEqual(sockets[0]!.sent.at(-1), { id: 'r', result: { decision: 'decline' } }); transport.close();
+});
+test('Codex automatically answers only current-turn approvals with confirmed ordinary targets', { timeout: 2_000 }, async () => {
+  const project = await mkdtemp(join(tmpdir(), 'codex-approval-'));
+  const homeDir = join(project, 'account');
+  const protectedFile = join(homeDir, 'projects/projtool/README.md');
+  const { sockets, transport, adapter, events } = setup(project, {
+    approvalPolicy: { allowedRoots: [project], homeDir },
+  });
+  try {
+    await mkdir(join(project, 'src'));
+    await mkdir(join(project, '.git'));
+    await mkdir(dirname(protectedFile), { recursive: true });
+    await mkdir(join(project, 'nested', 'deep', '.codex'), { recursive: true });
+    await writeFile(join(project, 'nested', 'deep', '.codex', 'hooks.json'), '{}');
+    await symlink(tmpdir(), join(project, 'escape'));
+    await transport.connect();
+    await adapter.resume(ref);
+    const socket = sockets[0]!;
+    const start = (threadId: string, id: string) => socket.message({
+      method: 'turn/started', params: { threadId, turn: { id, status: 'inProgress' } },
+    });
+    start('t', 'ours');
+    start('unrelated', 'ours');
+    const command = { method: 'item/commandExecution/requestApproval', params: {
+      threadId: 't', turnId: 'ours', command: 'git status -sb && rg -n "ok" src | head -n 2',
+    } };
+    socket.message({ ...command, id: 'foreign', params: { ...command.params, threadId: 'unrelated' } });
+    socket.message({ ...command, id: 'wrong-turn', params: { ...command.params, turnId: 'other' } });
+    const reply = socket.response('command');
+    socket.message({ ...command, id: 'command' });
+    socket.message({ ...command, id: 'command' });
+    assert.deepEqual(await reply, { decision: 'accept' });
+    assert.equal(socket.sent.filter(request => request.id === 'command').length, 1);
+    assert.equal(socket.sent.some(request => ['foreign', 'wrong-turn'].includes(request.id)), false);
+    for (const [id, script, decision] of [
+      ['shell-string', `/bin/bash -lc '${command.params.command}'`, 'accept'],
+      ['shell-argv', ['/usr/bin/bash', '-c', command.params.command], 'accept'],
+      ['shell-escaped-quote', String.raw`/bin/bash -lc 'rg -n '\''ok'\'' src'`, 'accept'],
+      ['shell-blocked', `/bin/bash -lc 'echo x > ${protectedFile}'`, 'decline'],
+    ] as const) {
+      const response = socket.response(id);
+      socket.message({ ...command, id, params: { ...command.params, command: script, kind: 'command',
+        itemId: id, environmentId: null, startedAtMs: 0, additionalPermissions: null,
+        proposedExecpolicyAmendment: null, availableDecisions: ['accept', 'decline'],
+      } });
+      assert.deepEqual(await response, { decision });
+    }
+
+    const approval = (id: string, itemId: string, fields: Record<string, unknown> = {}) => socket.message({
+      id, method: 'item/fileChange/requestApproval', params: { threadId: 't', turnId: 'ours', itemId, ...fields },
+    });
+    const itemStarted = (id: string, path: string) => socket.message({
+      method: 'item/started', params: {
+        threadId: 't', turnId: 'ours', item: { id, type: 'fileChange', changes: [{ path }] },
+      },
+    });
+    itemStarted('safe', 'src/example.ts');
+    const safe = socket.response('file-safe');
+    approval('file-safe', 'safe');
+    assert.deepEqual(await safe, { decision: 'accept' });
+    for (const alias of ['grantRoot', 'grant_root']) {
+      const nested = socket.response(alias);
+      approval(alias, 'safe', { [alias]: join(project, 'src') });
+      assert.deepEqual(await nested, { decision: 'accept' });
+    }
+    const blocked = socket.response('file-blocked');
+    approval('file-blocked', 'blocked-item', { changes: [{ path: protectedFile }] });
+    assert.deepEqual(await blocked, { decision: 'decline' });
+    for (const [id, fields] of [
+      ['grant-projtool', { grantRoot: dirname(protectedFile) }],
+      ['grant-nested-protected', { grantRoot: join(project, 'nested') }],
+      ['protected-file-outside-grant', { grantRoot: '/tmp', changes: [{ path: protectedFile }] }],
+      ['protected-alias-other-grant', { grantRoot: '/tmp', grant_root: dirname(protectedFile) }],
+      ['protected-with-extra-fields', { grantRoot: dirname(protectedFile), permissions: { write: ['/tmp'] } }],
+      ['protected-with-unknown-change', { changes: [{ path: protectedFile, extra: true }] }],
+    ] as const) {
+      const response = socket.response(id);
+      approval(id, 'safe', fields);
+      assert.deepEqual(await response, { decision: 'decline' });
+    }
+    const extraBlocked = socket.response('extended-deny');
+    socket.message({ ...command, id: 'extended-deny', params: {
+      ...command.params, command: `echo x > ${protectedFile}`, environmentId: 'foreign', cwd: 'unverified',
+      additionalPermissions: { fileSystem: { write: ['/tmp'] } }, networkApprovalContext: { host: 'example.invalid' },
+      availableDecisions: ['acceptForSession', 'cancel'],
+    } });
+    assert.deepEqual(await extraBlocked, { decision: 'cancel' });
+    assert.equal(events.filter(event => event.type === 'interaction').length, 0);
+    itemStarted('protected-paper', join(homeDir, 'papers/draft.tex'));
+    for (const [item, reason] of [['missing', /完整参数/], ['protected-paper', /论文/]] as const) {
+      const observed = nextInteraction(adapter);
+      approval(`file-${item}`, item);
+      const interaction = await observed;
+      assert.equal(interaction.kind, 'approval');
+      if (interaction.kind === 'approval') assert.match(interaction.action, reason);
+    }
+    const confirm = async (id: string, trigger: () => void) => {
+      const observed = nextInteraction(adapter);
+      trigger();
+      assert.equal((await observed).kind, 'approval');
+      assert.equal(socket.sent.some(request => request.id === id), false);
+    };
+    for (const [id, fields] of [
+      ['grant-ancestor', { grantRoot: dirname(project) }],
+      ['grant-outside', { grant_root: '/tmp' }],
+      ['grant-protected', { grantRoot: join(project, '.git') }],
+      ['grant-symlink', { grantRoot: join(project, 'escape') }],
+      ['grant-invalid', { grantRoot: { path: join(project, 'src') } }],
+      ['unknown-scope', { permissions: { fileSystem: { write: ['/tmp'] } } }],
+      ['unknown-change', { changes: [{ path: 'src/example.ts', grants: ['/tmp'] }] }],
+    ] as const) await confirm(id, () => approval(id, 'safe', fields));
+    for (const [id, fields] of [
+      ['extra-outer-word', { command: '/bin/bash -lc git status' }],
+      ['extra-argv-word', { command: ['/bin/bash', '-lc', 'git status', 'unused'] }],
+      ['outer-redirect', { command: `/bin/bash -lc 'git status' > src/log.txt` }],
+      ['additive-command', { additionalPermissions: { fileSystem: { write: ['/tmp'] } } }],
+      ['outside-cwd', { cwd: '/tmp', command: 'rg ok src' }],
+    ] as const) await confirm(id, () => socket.message({ ...command, id, params: { ...command.params, ...fields } }));
+
+    const constrained = nextInteraction(adapter);
+    socket.message({ ...command, id: 'session-only', params: { ...command.params, availableDecisions: ['acceptForSession', 'cancel'] } });
+    const interaction = await constrained;
+    assert.deepEqual(interactionCard(interaction).actions.map(action => action.label), ['拒绝']);
+    assert.match(interactionCard(interaction).text, /未提供单次允许/);
+    await assert.rejects(adapter.respond(ref, interaction, { kind: 'approval', decision: 'allow', scope: 'this_request' }, guard), errorCode('invalid_request'));
+    assert.equal(socket.sent.some(request => request.id === 'session-only'), false);
+    await adapter.respond(ref, interaction, { kind: 'approval', decision: 'deny', scope: 'this_request' }, guard);
+    assert.deepEqual(socket.sent.at(-1), { id: 'session-only', result: { decision: 'cancel' } });
+  } finally {
+    transport.close();
+    await rm(project, { recursive: true, force: true });
+  }
+});
+test('remote Codex approvals stay pending for a human when the matching local path is trusted', { timeout: 2_000 }, async () => {
+  const project = await mkdtemp(join(tmpdir(), 'codex-remote-approval-'));
+  const { sockets, transport, adapter } = setup(project, {
+    approvalPolicy: { enabled: true, readRoots: [project] },
+    proveSharedFilesystem: codexFilesystemProof('wss://codex.example.test', undefined),
+  });
+  try {
+    await transport.connect();
+    await adapter.resume(ref);
+    const socket = sockets[0]!;
+    socket.message({ method: 'turn/started', params: { threadId: 't', turn: { id: 'remote', status: 'inProgress' } } });
+    const observed = nextInteraction(adapter);
+    socket.message({
+      id: 'remote-command', method: 'item/commandExecution/requestApproval',
+      params: { threadId: 't', turnId: 'remote', command: 'cat README.md', cwd: project },
+    });
+    const interaction = await observed;
+    assert.equal(interaction.kind, 'approval');
+    assert.equal(socket.sent.some(request => request.id === 'remote-command'), false);
+    await adapter.respond(ref, interaction, { kind: 'approval', decision: 'allow', scope: 'this_request' }, guard);
+    assert.deepEqual(socket.sent.at(-1), { id: 'remote-command', result: { decision: 'accept' } });
+  } finally {
+    transport.close();
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test('loopback Codex requires rollout proof from the known native thread', { timeout: 5_000 }, async () => {
+  const project = await mkdtemp(join(tmpdir(), 'codex-filesystem-proof-'));
+  const directory = join(project, 'catalog');
+  const rollout = join(directory, 'rollout.jsonl');
+  const outside = join(project, 'other.jsonl');
+  const endpoint = 'ws://127.0.0.1:1234';
+  const sources = [{ directory, provider: 'codex' as const, hostId: 'h', serviceId: 's' }];
+  try {
+    await mkdir(directory);
+    await writeFile(rollout, '');
+    await writeFile(outside, '');
+    await symlink(outside, join(directory, 'escape.jsonl'));
+    for (const [native, shared, accepts] of [
+      [undefined, undefined, false], [outside, undefined, false], [join(directory, 'escape.jsonl'), undefined, false],
+      [join(directory, 'missing.jsonl'), undefined, false], [rollout, undefined, true], [rollout, false, false],
+      [undefined, true, true],
+    ] as const) {
+      const { sockets, transport, adapter } = setup(project, { proveSharedFilesystem: codexFilesystemProof(endpoint, shared, sources) }, native);
+      try {
+        await transport.connect();
+        await adapter.resume(ref);
+        const socket = sockets[0]!;
+        socket.message({ method: 'turn/started', params: { threadId: 't', turn: { id: 'turn', status: 'inProgress' } } });
+        const result = accepts ? socket.response('approval') : nextInteraction(adapter);
+        socket.message({ id: 'approval', method: 'item/commandExecution/requestApproval', params: {
+          threadId: 't', turnId: 'turn', command: 'cat README.md',
+        } });
+        if (accepts) assert.deepEqual(await result, { decision: 'accept' });
+        else {
+          assert.match((await result as Extract<Interaction, { kind: 'approval' }>).action, /共享本机文件系统/);
+          assert.equal(socket.sent.some(request => request.id === 'approval'), false);
+        }
+      } finally { transport.close(); }
+    }
+    assert.equal(await codexFilesystemProof('codex-proxy://default', false)(undefined), true);
+    assert.equal(await codexFilesystemProof('wss://codex.example.test', true)(undefined), true);
+  } finally { await rm(project, { recursive: true, force: true }); }
 });
 test('normalized message and turn observations include native reference', async () => {
   const { sockets, transport, events } = setup(); await transport.connect(); sockets[0]!.message({ method: 'turn/started', params: { threadId: 't', turn: { id: 'turn', status: 'inProgress' } } }); const turn = events.at(-1); assert.equal(turn?.type, 'turn'); assert.deepEqual(turn?.ref, ref);
@@ -100,3 +327,32 @@ for (const completedBeforeAck of [false, true]) {
     }
   });
 }
+
+for (const exitCode of [0, 1]) test(`Codex tool lifecycle and native turn times, exit=${exitCode}`, async () => {
+  const { sockets, transport, adapter, events } = setup();
+  try {
+    await transport.connect();
+    await adapter.resume(ref);
+    const emit = (method: string, data: object) => sockets[0]!.message({ method, params: { threadId: 't', ...data } });
+    const startedAt = 1_780_000_000;
+    emit('turn/started', { turn: { id: 'tool-turn', status: 'inProgress', startedAt } });
+    const item = { id: 'tool-item', type: 'commandExecution', command: 'npm test --secret=hidden',
+      aggregatedOutput: 'stdout and stderr' };
+    emit('item/started', { turnId: 'tool-turn', item });
+    emit('item/started', { turnId: 'tool-turn', item });
+    emit('item/completed', { turnId: 'tool-turn', item: { ...item, exitCode } });
+    emit('item/started', { turnId: 'tool-turn', item });
+    const endedAtMs = startedAt * 1000 + 120_001;
+    emit('turn/completed', { turn: { id: 'tool-turn', status: 'completed', endedAtMs, startedAtMs: -1 } });
+    const tools = events.flatMap(o => o.type === 'event' && o.event.type === 'tool.updated' ? [o] : []);
+    assert.deepEqual(tools.map(o => o.event.data), [
+      { turnId: 'tool-turn', callId: 'tool-item', phase: 'running', tool: 'Bash', summary: 'Bash · npm test' },
+      { turnId: 'tool-turn', callId: 'tool-item', phase: exitCode ? 'failed' : 'succeeded', tool: 'Bash', summary: 'Bash · npm test' },
+    ]);
+    assert.ok(tools.every(o => o.connectionGeneration === transport.generation));
+    const turns = events.flatMap(o => o.type === 'turn' ? [o.turn] : []);
+    assert.equal(turns[0]?.startedAt, new Date(startedAt * 1000).toISOString());
+    assert.equal(turns[1]?.endedAt, new Date(endedAtMs).toISOString());
+    assert.equal(turns[1]?.startedAt, null);
+  } finally { transport.close(); }
+});

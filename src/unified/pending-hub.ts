@@ -12,6 +12,7 @@ export {
   type PendingPage,
   type PendingQuery,
   type PendingSourceProvider,
+  type PendingSubmitNotifications,
   type PendingSubmitPayload,
   type PendingSubmitResult,
   type SubmitDecisionPayload,

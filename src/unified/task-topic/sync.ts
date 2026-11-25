@@ -1,11 +1,13 @@
+import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from '../adapter.js';
 import { payloadDigest, type Interaction, type Message, type Provider } from '../contracts.js';
 import { providerTitlePrefix, type ChannelCard } from '../feishu-cards.js';
 import type { FeishuPort } from '../feishu-channel.js';
+import { aggregateTurnAssistantMessage, formatCardReplyBody } from '../turn-reply.js';
 import { taskInteractionCard } from './cards.js';
 import { deliverTaskCard } from './drain.js';
-import { getBindingRow, getTargetRow } from './schema.js';
+import { getBindingRow, getTargetRow, runTransaction } from './schema.js';
 import {
   targetBindingScope,
   TaskChannelError,
@@ -22,13 +24,14 @@ export interface TaskSyncDeps {
   port: FeishuPort;
   authorize: TaskAuthorize;
   streamThrottleMs: number;
+  withInteractionLock?: (key: string, run: () => Promise<void>) => Promise<void>;
   renderStreamMessage?: (
     binding: BindingRow,
     target: TargetRow,
     scope: string,
     message: Message,
     turnCompleted?: boolean,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
 }
 
 export async function verifySyncTarget(
@@ -69,7 +72,7 @@ export async function renderTaskStreamMessage(
   scope: string,
   message: Message,
   turnCompleted = false,
-): Promise<void> {
+): Promise<boolean> {
   const sequence = Number.isSafeInteger(message.sequence) ? message.sequence : 0;
   const turnKey = message.turnId || message.messageId;
   const guard = () => verifySyncTarget(deps, binding, target);
@@ -77,59 +80,47 @@ export async function renderTaskStreamMessage(
 
   const row = deps.db
     .prepare(
-      'SELECT card_id, revision, updated_at, final, message_id, latest_sequence FROM task_stream_cards_v1 WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND turn_key = ?',
+      'SELECT card_id, revision, updated_at, message_id, latest_sequence FROM task_stream_cards_v1 WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND turn_key = ?',
     )
     .get(binding.task_id, target.target_id, target.target_generation, target.session_id, turnKey) as
     | {
         card_id: string | null;
         revision: number;
         updated_at: number;
-        final: number;
         message_id: string;
         latest_sequence: number;
       }
     | undefined;
 
-  if (row && (sequence < row.latest_sequence || (row.message_id !== message.messageId && sequence === row.latest_sequence))) {
-    return;
+  if (row && sequence < row.latest_sequence) {
+    return row.card_id !== null;
   }
   if (
-    row &&
+    row?.card_id &&
     row.message_id === message.messageId &&
-    ((row.final && !message.final) || (row.revision >= message.revision && !turnCompleted))
+    row.revision >= message.revision && !turnCompleted
   ) {
-    return;
+    return true;
   }
-  if (row && !message.final && Date.now() - row.updated_at < deps.streamThrottleMs) {
-    if (row.message_id !== message.messageId) {
-      deps.db
-        .prepare(
-          'UPDATE task_stream_cards_v1 SET message_id = ?, latest_sequence = ?, revision = 0, final = 0 WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND turn_key = ?',
-        )
-        .run(
-          message.messageId,
-          sequence,
-          binding.task_id,
-          target.target_id,
-          target.target_generation,
-          target.session_id,
-          turnKey,
-        );
-    }
-    return;
+  if (row && !message.final && !turnCompleted && Date.now() - row.updated_at < deps.streamThrottleMs) {
+    return false;
   }
 
   const label = providerTitlePrefix(target.provider);
   const body = message.blocks
-    .map((b) => (b.type === 'text' ? b.text : `[文件 ${b.artifactId}]`))
+    .map((b) => (b.type === 'text' ? b.text : `[文件 ${escapeCardMarkdown(b.artifactId)}]`))
     .join('\n');
-  const title = message.final
-    ? turnCompleted
-      ? `${label} · 回复 · 本轮已完成`
-      : `${label} · 回复`
-    : `${label} · 回复中`;
-  const text = `来源: ${label} (${target.target_id})\n${[...body].slice(0, 3000).join('')}`;
-  const card: ChannelCard = { title, text, actions: [] };
+  const title = turnCompleted ? `${label} · 回复 · 本轮已完成` : message.final ? `${label} · 回复` : `${label} · 回复中`;
+  const preview = formatCardReplyBody(`来源: ${label} (${target.target_id})\n${body}`);
+  const card: ChannelCard = { title, text: preview.text, actions: [] };
+  if (preview.truncated) {
+    const current = getBindingRow(deps.db, binding.task_id)!;
+    card.actions.push({ label: '发送完整正文 (.txt)', value: {
+      action: 'full_reply', messageId: message.messageId, taskId: binding.task_id,
+      rootGeneration: binding.root_generation, activeRevision: current.active_revision,
+      targetId: target.target_id, targetGeneration: target.target_generation, sessionId: target.session_id,
+    } });
+  }
 
   await guard();
   if (!row) {
@@ -174,7 +165,7 @@ export async function renderTaskStreamMessage(
           cardId,
           message.revision,
           Date.now(),
-          Number(message.final),
+          Number(message.final || turnCompleted),
           message.messageId,
           sequence,
           binding.task_id,
@@ -184,10 +175,11 @@ export async function renderTaskStreamMessage(
           turnKey,
         );
     }
-    return;
+    return Boolean(cardId) ||
+      deps.db.prepare('SELECT state FROM task_deliveries_v1 WHERE delivery_id = ?').get(deliveryId)?.state === 'sent';
   }
 
-  if (!row.card_id) return;
+  if (!row.card_id) return false;
   const updateId = `task-stream-update:${payloadDigest([
     scope,
     binding.destination,
@@ -205,7 +197,8 @@ export async function renderTaskStreamMessage(
       )
       .run(updateId, binding.task_id, target.target_id).changes
   ) {
-    return;
+    const prior = deps.db.prepare('SELECT state FROM task_deliveries_v1 WHERE delivery_id = ?').get(updateId);
+    return prior?.state === 'sent';
   }
   await guard();
   await deps.port.update(binding.destination, row.card_id, card, updateId, guard);
@@ -218,7 +211,7 @@ export async function renderTaskStreamMessage(
     .run(
       message.revision,
       Date.now(),
-      Number(message.final),
+      Number(message.final || turnCompleted),
       message.messageId,
       sequence,
       binding.task_id,
@@ -227,9 +220,28 @@ export async function renderTaskStreamMessage(
       target.session_id,
       turnKey,
     );
+  return true;
 }
 
 export async function renderTaskInteraction(
+  deps: TaskSyncDeps,
+  binding: BindingRow,
+  target: TargetRow,
+  interaction: Interaction,
+  controlGeneration: number,
+): Promise<void> {
+  const render = async () => {
+    const current = await deps.service.getInteraction(interaction.interactionId);
+    if (current.sessionId !== target.session_id) return;
+    await renderCurrentTaskInteraction(deps, binding, target, current, controlGeneration);
+  };
+  if (!deps.withInteractionLock) return render();
+  return deps.withInteractionLock(payloadDigest([
+    binding.task_id, target.target_id, target.target_generation, interaction.interactionId,
+  ]), render);
+}
+
+async function renderCurrentTaskInteraction(
   deps: TaskSyncDeps,
   binding: BindingRow,
   target: TargetRow,
@@ -263,11 +275,15 @@ export async function renderTaskInteraction(
   }
 
   const latestBinding = getBindingRow(deps.db, binding.task_id) ?? binding;
+  const operation = interaction.status === 'awaiting_answer'
+    ? undefined
+    : await deps.service.getResponseOperation?.(interaction.interactionId);
   const card = taskInteractionCard(
     toBinding(latestBinding),
     toTarget(target),
     interaction,
     controlGeneration,
+    operation,
   );
   const signature = payloadDigest(card);
   if (row && row.revision > interaction.revision) return;
@@ -378,6 +394,7 @@ export async function syncSingleTaskTarget(
   target: TargetRow,
 ): Promise<void> {
   const scope = targetBindingScope(binding, target);
+  const key = [binding.task_id, target.target_id, target.target_generation, target.session_id] as const;
   const guard = () => verifySyncTarget(deps, binding, target);
   const renderStream = (
     b: BindingRow,
@@ -409,136 +426,96 @@ export async function syncSingleTaskTarget(
     await renderTaskInteraction(deps, binding, target, interaction, sessionForCards.control.generation);
   }
 
-  const cursorRow = deps.db
-    .prepare(
-      'SELECT cursor FROM task_cursors_v1 WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND binding_scope = ?',
-    )
-    .get(binding.task_id, target.target_id, target.target_generation, target.session_id, scope) as
-    | { cursor: string }
-    | undefined;
+  const readCursor = deps.db.prepare(`SELECT cursor FROM task_cursors_v1
+    WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND binding_scope = ?`);
+  const previousCursor = readCursor.get(...key, scope)?.cursor as string | undefined;
 
-  let cursor = cursorRow?.cursor;
-  let expired = false;
+  const events = previousCursor === undefined ? undefined
+    : await deps.service.subscribeEvents(target.session_id, previousCursor, 100);
+  await guard();
+  const snapshot = await deps.service.getSnapshot(target.session_id);
+  await guard();
+  for (const interaction of snapshot.value.interactions) {
+    await renderTaskInteraction(
+      deps, binding, target, interaction, snapshot.value.session.control.generation,
+    );
+  }
 
-  if (cursor) {
-    const events = await deps.service.subscribeEvents(target.session_id, cursor, 100);
-    await guard();
+  const messages = snapshot.value.messages.filter(message => message.sessionId === target.session_id);
+  if (events) {
+    const baseline = new Map((deps.db.prepare(`SELECT message_id, revision FROM task_baseline_messages_v1
+      WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ?`)
+      .all(...key) as Array<{ message_id: string; revision: number }>).map(row => [row.message_id, row.revision]));
+    const known = new Map((deps.db.prepare(`SELECT message_id, revision FROM task_known_messages_v1
+      WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ?`)
+      .all(...key) as Array<{ message_id: string; revision: number }>).map(row => [row.message_id, row.revision]));
+    const replies = new Map<string, Message[]>();
+    const byId = new Map<string, Message>();
+    for (const message of messages) {
+      if (message.role !== 'assistant' || (baseline.get(message.messageId) ?? -1) >= message.revision) continue;
+      byId.set(message.messageId, message);
+      const turnKey = message.turnId || message.messageId;
+      const items = replies.get(turnKey) ?? [];
+      items.push(message);
+      replies.set(turnKey, items);
+    }
+
+    const completed = new Set(snapshot.value.turns?.filter(turn => turn.status === 'completed').map(turn => turn.turnId));
+    const candidates = new Set<string>();
+    const isUnknown = (message: Message) => (known.get(message.messageId) ?? -1) < message.revision;
     if (events.status === 'events') {
-      const snapshot = await deps.service.getSnapshot(target.session_id);
-      await guard();
-      for (const interaction of snapshot.value.interactions) {
-        await renderTaskInteraction(
-          deps,
-          binding,
-          target,
-          interaction,
-          snapshot.value.session.control.generation,
-        );
-      }
       for (const event of events.events) {
-        await guard();
         if (event.type === 'message.updated') {
-          const msg = snapshot.value.messages.find(
-            (m) => m.messageId === event.objectId && m.role === 'assistant',
-          );
-          if (!msg) continue;
-          const known = deps.db
-            .prepare(
-              'SELECT revision FROM task_known_messages_v1 WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND message_id = ?',
-            )
-            .get(binding.task_id, target.target_id, target.target_generation, target.session_id, msg.messageId) as
-            | { revision: number }
-            | undefined;
-          if (known && known.revision >= msg.revision) continue;
-          await renderStream(binding, target, scope, msg);
-          if (msg.final) {
-            deps.db
-              .prepare(
-                'INSERT OR REPLACE INTO task_known_messages_v1(task_id, target_id, target_generation, session_id, message_id, revision) VALUES (?, ?, ?, ?, ?, ?)',
-              )
-              .run(
-                binding.task_id,
-                target.target_id,
-                target.target_generation,
-                target.session_id,
-                msg.messageId,
-                msg.revision,
-              );
-          }
+          const message = byId.get(event.objectId);
+          if (message && isUnknown(message)) candidates.add(message.turnId || message.messageId);
         } else if (event.type === 'turn.updated') {
-          const data = event.data && typeof event.data === 'object' ? (event.data as Record<string, unknown>) : {};
-          if (data.status === 'completed') {
+          const data = event.data as { status?: string; turnId?: string } | undefined;
+          if (data?.status === 'completed') {
             const turnId = typeof data.turnId === 'string' ? data.turnId : event.objectId;
-            const finalMsg = snapshot.value.messages
-              .filter((m) => m.turnId === turnId && m.role === 'assistant' && m.final)
-              .sort((a, b) => b.sequence - a.sequence)[0];
-            if (finalMsg) {
-              await renderStream(binding, target, scope, finalMsg, true);
-            }
+            completed.add(turnId);
+            candidates.add(turnId);
           }
         }
       }
-      cursor = events.cursor;
+      // Throttling can outlast the event that caused it. Revisit undelivered
+      // revisions on existing cards even when the next sync has no new events.
+      const cards = deps.db.prepare(`SELECT turn_key FROM task_stream_cards_v1
+        WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND card_id IS NOT NULL`)
+        .all(...key) as Array<{ turn_key: string }>;
+      for (const { turn_key } of cards) {
+        if (replies.get(turn_key)?.some(isUnknown)) candidates.add(turn_key);
+      }
     } else {
-      cursor = undefined;
-      expired = true;
+      for (const [turnKey, items] of replies) {
+        if (items.some(isUnknown)) candidates.add(turnKey);
+      }
     }
-  }
 
-  if (!cursor) {
-    const snapshot = await deps.service.getSnapshot(target.session_id);
-    await guard();
-    for (const msg of snapshot.value.messages) {
-      const known = deps.db
-        .prepare(
-          'SELECT revision FROM task_known_messages_v1 WHERE task_id = ? AND target_id = ? AND target_generation = ? AND session_id = ? AND message_id = ?',
-        )
-        .get(binding.task_id, target.target_id, target.target_generation, target.session_id, msg.messageId) as
-        | { revision: number }
-        | undefined;
-      if (expired && msg.role === 'assistant' && (!known || known.revision < msg.revision)) {
-        await renderStream(binding, target, scope, msg);
-      }
-      if (!expired || msg.final) {
-        deps.db
-          .prepare(
-            'INSERT OR REPLACE INTO task_known_messages_v1(task_id, target_id, target_generation, session_id, message_id, revision) VALUES (?, ?, ?, ?, ?, ?)',
-          )
-          .run(
-            binding.task_id,
-            target.target_id,
-            target.target_generation,
-            target.session_id,
-            msg.messageId,
-            msg.revision,
-          );
+    const remember = deps.db.prepare(`INSERT INTO task_known_messages_v1 VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id, target_id, target_generation, session_id, message_id)
+      DO UPDATE SET revision = MAX(revision, excluded.revision)`);
+    for (const turnKey of candidates) {
+      const items = replies.get(turnKey);
+      if (!items) continue;
+      const reply = aggregateTurnAssistantMessage(items, turnKey)!;
+      if (await renderStream(binding, target, scope, reply, completed.has(turnKey))) {
+        await guard();
+        for (const item of items) remember.run(...key, item.messageId, item.revision);
       }
     }
-    for (const interaction of snapshot.value.interactions) {
-      await renderTaskInteraction(
-        deps,
-        binding,
-        target,
-        interaction,
-        snapshot.value.session.control.generation,
-      );
-    }
-    cursor = snapshot.cursor;
   }
 
   await guard();
-  deps.db
-    .prepare(
-      'INSERT OR REPLACE INTO task_cursors_v1(task_id, target_id, target_generation, session_id, cursor, binding_scope) VALUES (?, ?, ?, ?, ?, ?)',
-    )
-    .run(
-      binding.task_id,
-      target.target_id,
-      target.target_generation,
-      target.session_id,
-      cursor,
-      scope,
-    );
+  const cursor = events?.status === 'events' ? events.cursor : snapshot.cursor;
+  runTransaction(deps.db, () => {
+    if (readCursor.get(...key, scope)?.cursor !== previousCursor) return;
+    if (!events) {
+      const baseline = deps.db.prepare('INSERT OR IGNORE INTO task_baseline_messages_v1 VALUES (?, ?, ?, ?, ?, ?)');
+      for (const message of messages) baseline.run(...key, message.messageId, message.revision);
+    }
+    deps.db.prepare('INSERT OR REPLACE INTO task_cursors_v1 VALUES (?, ?, ?, ?, ?, ?)')
+      .run(...key, cursor, scope);
+  });
 }
 
 export async function syncAllTaskTargets(

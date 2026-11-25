@@ -155,6 +155,13 @@ export type TaskChannelAction = (
       sessionId?: string;
     }
   | {
+      action: 'full_reply';
+      targetId?: string;
+      targetGeneration?: number;
+      sessionId?: string;
+      messageId: string;
+    }
+  | {
       action: 'file';
       targetId?: string;
       targetGeneration?: number;
@@ -177,6 +184,7 @@ export type TaskChannelAction = (
 
 export interface TaskTopicChannelOptions {
   streamThrottleMs?: number;
+  onInteractionChanged?: (sessionId: string, interactionId: string) => void;
 }
 
 export class TaskChannelError extends Error {

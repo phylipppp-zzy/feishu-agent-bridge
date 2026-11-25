@@ -46,7 +46,14 @@ test('current turn keeps its model and quota, approval and close continue to wor
   await f.port.input(f.ref,'new',[{type:'text',text:'test'}],f.guard); await q.nextMessage(1);
   await f.port.updateSettings(f.ref,{model:'b',preferences:{reasoningEffort:'max'}},f.guard);
   q.emit({type:'rate_limit_event',rate_limit_info:{status:'allowed_warning',rateLimitType:'five_hour'}});
-  const pending=q.ask('Bash',{command:'test'}); await new Promise(r=>setImmediate(r));
+  const approval = new Promise<void>(resolve => {
+    const off = f.port.onObservation(event => {
+      if (event.type !== 'interaction') return;
+      off();
+      resolve();
+    });
+  });
+  const pending=q.ask('Bash',{command:'sudo true'}); await approval;
   assert.ok(events.some(x=>x.type==='interaction')); q.result([]); await new Promise(r=>setImmediate(r));
   assert.ok(events.some(x=>x.type==='event' && x.event.type==='provider.usage_limit'));
   assert.equal(events.filter(x=>x.type==='turn').at(-1).turn.model,'a');

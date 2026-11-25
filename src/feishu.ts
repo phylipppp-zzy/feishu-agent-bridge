@@ -98,6 +98,7 @@ async function streamToBuffer(stream: Readable, maxBytes = Number.MAX_SAFE_INTEG
 export function parseIncoming(
   data: Parameters<NonNullable<Lark.EventHandles["im.message.receive_v1"]>>[0],
   botOpenId: string,
+  preserveTextWhitespace = false,
 ): IncomingFeishuMessage | null {
   if (data.sender.sender_type === "app" || data.sender.sender_type === "bot") return null;
   const openId = data.sender.sender_id?.open_id;
@@ -118,7 +119,7 @@ export function parseIncoming(
     ...(data.message.parent_id ? { parentId: data.message.parent_id } : {}),
     senderOpenId: openId,
     mentionedBot,
-    text: text.trim(),
+    text: preserveTextWhitespace ? text : text.trim(),
     imageKeys: imageKey ? [imageKey] : post.imageKeys,
   };
 }
@@ -134,7 +135,8 @@ export function parseCardAction(data: Lark.RawCardActionEvent): IncomingCardActi
   // callback spellings so cards remain forward compatible with Card 2.0.
   const rawAction = (source as unknown as { action?: Record<string, unknown> }).action ?? {};
   const rawForm = rawAction.form_value ?? rawAction.formValue;
-  const formValues = rawForm && typeof rawForm === "object" ? rawForm as Record<string, unknown> : {};
+  const formValues = rawForm && typeof rawForm === "object" && !Array.isArray(rawForm)
+    ? rawForm as Record<string, unknown> : {};
   const rawEventId = typeof raw.event_id === "string" ? raw.event_id : typeof raw.uuid === "string" ? raw.uuid : "";
   const eventId = rawEventId || `card:${diagnosticId(JSON.stringify({ messageId: event.messageId, chatId: event.chatId, operator: event.operator.openId, action: value.action, value, formValues }))}`;
   const parsed = {

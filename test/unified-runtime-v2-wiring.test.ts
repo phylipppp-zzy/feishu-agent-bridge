@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DispatchGuard, PlatformObservation, PlatformPort } from '../src/unified/adapter.js';
 import { ArtifactRegistry } from '../src/unified/artifact-registry.js';
+import { ClaudeAdapter } from '../src/unified/claude-adapter.js';
+import { CodexAdapter } from '../src/unified/codex-adapter.js';
+import { isLocalCodexEndpoint } from '../src/unified/codex-approval.js';
 import {
   payloadDigest,
   type Answer,
@@ -25,7 +28,7 @@ import {
   type RuntimeConfig,
 } from '../src/unified/runtime.js';
 import { StoreError } from '../src/unified/store.js';
-import { parseFeishuText } from '../src/unified/feishu-codec.js';
+import { parseFeishuAction, parseFeishuText } from '../src/unified/feishu-codec.js';
 
 const ALL_CAPS = Object.fromEntries(
   ['view', 'send', 'queue', 'steer', 'answer', 'approve', 'interrupt', 'handoff', 'files', 'config'].map(
@@ -304,6 +307,54 @@ test('validateRuntimeConfig checks optional watchHub/pendingHub/decisionSync and
   }
 });
 
+test('live runtime wires Codex approval to explicit or verified local filesystem scope', async t => {
+  for (const endpoint of ['codex-proxy://default', 'ws://localhost:1', 'wss://127.0.0.1', 'ws://[::1]:1']) {
+    assert.equal(isLocalCodexEndpoint(endpoint), true, endpoint);
+  }
+  for (const endpoint of ['ws://localhost.example.test:1', 'wss://192.0.2.1', 'codex-proxy://localhost', 'invalid']) {
+    assert.equal(isLocalCodexEndpoint(endpoint), false, endpoint);
+  }
+  const seen = new Map<string, { approvalPolicy: { enabled: boolean }; proveSharedFilesystem?: (path: unknown) => Promise<boolean> }>();
+  for (const prototype of [CodexAdapter.prototype, ClaudeAdapter.prototype]) {
+    const original = prototype.onObservation;
+    t.mock.method(prototype, 'onObservation', function (
+      this: CodexAdapter | ClaudeAdapter, listener: (observation: PlatformObservation) => void,
+    ) {
+      seen.set(this.provider, Reflect.get(this, 'options'));
+      return original.call(this, listener);
+    });
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'runtime-v2-approval-'));
+  try {
+    const base = makeBaseIntegratedConfig(dir);
+    const rollout = join(dir, 'codex-logs', 'rollout.jsonl');
+    writeFileSync(rollout, '');
+    for (const [codexEndpoint, enabled, shared, withRollout, withoutRollout] of [
+      ['wss://codex.example.test', true, undefined, false, false],
+      ['wss://codex.example.test', true, true, true, true],
+      ['ws://127.0.0.1:1', true, undefined, true, false],
+      ['ws://127.0.0.1:1', false, false, false, false],
+    ] as const) {
+      seen.clear();
+      const live = await createLiveRuntime({
+        ...base, codexEndpoint, approvalPolicy: { enabled, ...(shared === undefined ? {} : { codexSharedFilesystem: shared }) },
+      }, { appId: 'cli_test', appSecret: 'sec_test' }, join(dir, 'sdk.sqlite'));
+      try {
+        const codex = seen.get('codex');
+        assert.ok(codex?.proveSharedFilesystem);
+        assert.equal(codex.approvalPolicy.enabled, enabled);
+        assert.equal(await codex.proveSharedFilesystem(rollout), withRollout);
+        assert.equal(await codex.proveSharedFilesystem(undefined), withoutRollout);
+        assert.equal(seen.get('claude')?.approvalPolicy.enabled, enabled);
+      } finally {
+        await live.close();
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('omitted or disabled T1/T2/N1/N2/D1 flags produce zero side effects and zero extra SQLite files', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'runtime-v2-off-'));
   try {
@@ -341,6 +392,13 @@ test('omitted or disabled T1/T2/N1/N2/D1 flags produce zero side effects and zer
         parseFeishuText('/help'),
       );
       await direct.tick();
+      for (const [cmd,title] of [['/pending','待处理汇总'],['/ops','待完成操作']] as const) {
+        await direct.handleTrusted({eventId:`evt-${cmd}`,destination:'chat-main',identity:OWNER},parseFeishuText(cmd));
+        await direct.flushInteractive();
+        assert.equal(fake.sent.at(-1)?.card.title,title);
+      }
+      assert.match(fake.sent.find(s => s.card.title === '待处理汇总')!.card.text,/当前未启用/);
+      assert.deepEqual(parseFeishuAction({action:'pending'}),{action:'pending'});
       assert.equal(existsSync(join(dir, 'watch-hub.sqlite')), false);
       assert.equal(existsSync(join(dir, 'pending-hub.sqlite')), false);
       assert.equal(existsSync(join(dir, 'decision-sync.sqlite')), false);
@@ -629,9 +687,26 @@ test('opt-in T1/T2/N1/N2/D1 joint workflow across claude + codex + agy and clean
       assert.ok(intRef.source_card_message_id);
       assert.ok(intRef.hub_card_message_id);
       const taskSourceCardsForAgy = fake.sent.filter(
-        (s) => s.destination === 'topic:task-joint-1' && s.card.title.includes('审批'),
+        (s) => s.destination === 'topic:task-joint-1' && s.card.title.includes('⚠️ 需人工确认'),
       );
       assert.equal(taskSourceCardsForAgy.length, 1);
+
+      for (const destination of ['chat-main', pendingRoot.topicDestination!, binding.destination]) {
+        const result = await runtime.handleTrusted({eventId:`pending:${destination}`,destination,identity:OWNER},parseFeishuText('/pending'));
+        assert.equal((result as {total:number}).total,2);
+        const sent = fake.sent.at(-1)!;
+        assert.equal(sent.destination,destination);
+        if (destination === binding.destination) {
+          assert.match(sent.card.text,/2 项待处理/);
+          assert.deepEqual(sent.card.actions.map(a => a.label),['打开待处理汇总话题']);
+          assert.match(sent.card.actions[0]!.url!,/openthreadid=th-pending-hub/);
+        } else {
+          assert.match(sent.card.title,/待处理.*汇总（共 2 项）/);
+        }
+      }
+      await assert.rejects(runtime.handleTrusted(
+        {eventId:'foreign-pending',destination:'topic:unknown',identity:OWNER},parseFeishuText('/pending'),
+      ),(e:unknown) => (e as {code?:string}).code === 'unauthorized');
 
       // Ordinary text in PendingHub topic NEVER approves anything
       const chatRes = (await runtime.handleTrusted(
@@ -644,7 +719,7 @@ test('opt-in T1/T2/N1/N2/D1 joint workflow across claude + codex + agy and clean
 
       // Answer agy approval through PendingHub -> withdraws BOTH task topic card and hub card
       await runtime.handleTrusted(
-        { eventId: 'card:hub-ans-agy', destination: pendingRoot.topicDestination!, identity: OWNER },
+        { eventId: 'card:hub-ans-agy', destination: pendingRoot.topicDestination!, identity: OWNER, cardMessageId: intRef.hub_card_message_id! },
         {
           action: 'answer',
           entry: 'hub',
@@ -656,6 +731,7 @@ test('opt-in T1/T2/N1/N2/D1 joint workflow across claude + codex + agy and clean
           toolInputDigest: approvalDigest,
         } as never,
       );
+      await runtime.flushInteractive();
       assert.equal(agy.responds.length, 1);
       assert.equal(runtime.pendingHub!.getRef('interaction:int-agy-joint')?.card_active, 0);
       assert.ok(

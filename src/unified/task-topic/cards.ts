@@ -1,10 +1,12 @@
-import type { Interaction } from '../contracts.js';
+import type { Interaction, Operation } from '../contracts.js';
 import {
   interactionCard,
+  interactionStatusText,
   providerDisplayLabel,
   providerTitlePrefix,
   type ChannelCard,
 } from '../feishu-cards.js';
+import { escapeCardMarkdown } from '../feishu-card-wire.js';
 import { questionForm } from '../feishu-question-forms.js';
 import {
   interactionFormBindingId,
@@ -22,11 +24,11 @@ export function taskPanelCard(
     .map((t) => {
       const marker = t.targetId === binding.activeTargetId ? '【当前输入】' : '【已挂载】';
       const mode = t.accessMode === 'interactive' ? '可交互' : '只读';
-      return `${marker} ${providerTitlePrefix(t.native.provider)} (${t.targetId}) · ${mode} · gen=${t.targetGeneration}`;
+      return `${marker} ${providerTitlePrefix(t.native.provider)} (${escapeCardMarkdown(t.targetId)}) · ${mode}`;
     });
   const text = [
-    `任务: ${binding.taskId} (rev=${binding.taskRevision}, activeRev=${binding.activeRevision})`,
-    `当前输入目标: ${active ? `${providerTitlePrefix(active.native.provider)} (${active.targetId})` : '未指定'}`,
+    `任务: ${escapeCardMarkdown(binding.taskId)}`,
+    `当前输入目标: ${active ? `${providerTitlePrefix(active.native.provider)} (${escapeCardMarkdown(active.targetId)})` : '未指定'}`,
     ...(lines.length ? lines : ['暂无已挂载目标']),
   ].join('\n');
   const actions: ChannelCard['actions'] = targets
@@ -49,9 +51,10 @@ export function taskInteractionCard(
   target: TaskTargetRecord,
   interaction: Interaction,
   controlGeneration = 0,
+  operation?: Operation | null,
 ): ChannelCard {
   const readOnly = target.accessMode === 'read_only';
-  const baseCard = interactionCard(interaction, readOnly);
+  const baseCard = interactionCard(interaction, readOnly, operation);
   const label = providerTitlePrefix(target.native.provider);
   const stamp = {
     taskId: binding.taskId,
@@ -63,21 +66,34 @@ export function taskInteractionCard(
     controlGeneration,
   };
   const card: ChannelCard = {
+    ...baseCard,
     title: `${label} · ${baseCard.title}`,
-    text: `来源: ${providerDisplayLabel(target.native.provider)} (${target.targetId})\n${baseCard.text}`,
+    text: `来源: ${providerDisplayLabel(target.native.provider)} (${escapeCardMarkdown(target.targetId)})`,
     actions: baseCard.actions.map((a) => ({
       ...a,
       value: { ...a.value, ...stamp },
     })),
   };
-  if (interaction.kind !== 'approval') {
+  if (interaction.kind === 'approval') {
+    card.text += `\n\n${baseCard.text}`;
+  } else {
+    card.schema = '2.0';
+    card.actions = [];
+    if (interaction.status === 'resolved' || operation?.status === 'completed') {
+      card.title = baseCard.title;
+      card.text = `来源: ${providerDisplayLabel(target.native.provider)} (${target.targetId})\n\n${baseCard.text}`;
+      return card;
+    }
+    if (readOnly) card.text += '\n此话题为只读。请在原终端答复。';
+    const statusText = interactionStatusText(interaction, operation);
     card.form = questionForm(
       interaction,
       interactionFormBindingId(target.taskId, target.targetId, target.targetGeneration),
-      readOnly,
+      readOnly || !!statusText,
       Date.now(),
       stamp,
     );
+    if (statusText) card.form.statusText = statusText;
   }
   return card;
 }

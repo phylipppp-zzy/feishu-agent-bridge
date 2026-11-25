@@ -4,6 +4,7 @@ import type {
   PlatformInputBlock,
   PlatformObservation,
 } from '../adapter.js';
+import type { ApprovalScope } from '../approval-policy.js';
 import type {
   AgyCatalog,
   AgyDiscoveredSession,
@@ -17,12 +18,14 @@ import type {
   Message,
   ModelOption,
   NativeSessionRef,
+  ResponseEvidence,
   Session,
   Turn,
 } from '../contracts.js';
 import { contractError } from '../errors.js';
 import { textAttachmentBlock } from '../text-attachment.js';
 import { imageMediaType } from '../../image-media.js';
+import { isPlaceholderAgyTitle } from './catalog-summaries.js';
 
 export const AGY_REASONING_EFFORTS: readonly AgyEffortLevel[] = [
   'low',
@@ -59,7 +62,7 @@ export const readCaps: Capabilities = {
   answer: unsupported('discovered agy session is read-only until attached'),
   approve: unsupported('discovered agy session is read-only until attached'),
   interrupt: unsupported('discovered agy session is read-only until attached'),
-  handoff: unsupported('agy ACP does not support live terminal handoff'),
+  handoff: unsupported('discovered agy session is read-only until attached'),
   files: available,
   config: unsupported('discovered agy session is read-only until attached'),
 };
@@ -72,7 +75,7 @@ export const liveCaps: Capabilities = {
   answer: available,
   approve: available,
   interrupt: available,
-  handoff: unsupported('agy ACP does not support live terminal handoff'),
+  handoff: available,
   files: available,
   config: available,
 };
@@ -98,20 +101,31 @@ export type ActiveTurnState = {
   assistantSequence: number | null;
   assistantRevision: number;
   assistantText: string;
+  needsParagraphBreak?: boolean;
+  lastChunkMessageId?: string;
   assistantFinalized: boolean;
   interrupted: boolean;
   inProgressToolCalls: Set<string>;
+  toolCalls: Map<string, Obj>;
+  fullToolCalls: Set<string>;
+  approvalRequestIds: Map<string, string | null>;
 };
 
 export type PendingAgyRequest = {
   rpcId: string | number;
   generation: number;
+  turnId: string;
   toolCallId: string | null;
   interaction: Interaction;
-  allowOptionId: string;
-  denyOptionId: string;
+  allowOptionId: string | null;
+  denyOptionId: string | null;
   propertyTypes: Record<string, string>;
   answer: Answer | null;
+  operationId: string | null;
+  answerDigest: string | null;
+  submission: 'writing' | 'submitted' | null;
+  executed: boolean;
+  closedSource: string | null;
 };
 
 export type ListSnapshot = {
@@ -136,22 +150,27 @@ export interface AdapterContext {
   readonly catalog: AgyCatalog;
   readonly hostId: string;
   readonly serviceId: string;
+  readonly approvalPolicy?: ApprovalScope;
   readonly active: Set<string>;
   readonly controlEpoch: Map<string, number>;
   readonly knownSessions: Map<string, LiveSessionMeta>;
   readonly activeTurns: Map<string, ActiveTurnState>;
   readonly sessionTurns: Map<string, Map<string, Turn>>;
   readonly liveMessages: Map<string, Message[]>;
+  readonly preLiveTranscriptIds: Map<string, Set<string>>;
   readonly requests: Map<string, PendingAgyRequest>;
   readonly listSnapshots: Map<string, ListSnapshot>;
   readonly recentDiscovery: Map<string, RecentDiscoveryState>;
   readonly existingSnapshots: Map<string, ExistingSnapshotState>;
+  readonly acpTitles: Map<string, string>;
+  acpTitlesExpiresAt?: number;
+  acpTitlesRefresh?: Promise<void>;
   isClosed(): boolean;
   nextSequence(): number;
   ref(id: string): NativeSessionRef;
   check(ref: NativeSessionRef): string;
   emit(observation: PlatformObservation): void;
-  emitInteraction(interaction: Interaction): void;
+  emitInteraction(interaction: Interaction, evidence?: ResponseEvidence): void;
   buildSession(
     id: string,
     summary: AgyDiscoveredSession | null,
@@ -172,7 +191,8 @@ export const ack = (nativeReference: string | null = null): PlatformAcknowledgem
 });
 
 export function isGenericAgyTitle(title: string | undefined, sessionId: string): boolean {
-  return isGenericSessionTitle(title) || title?.trim() === `Antigravity 会话 · ${sessionId.slice(0, 8)}`;
+  return isGenericSessionTitle(title) ||
+    (title !== undefined && (isPlaceholderAgyTitle(title) || title.trim() === `Antigravity 会话 · ${sessionId.slice(0, 8)}`));
 }
 
 /** Strip trailing effort suffix (e.g. `-xhigh`, `-tiered-xhigh`) before passing model ID to CLI/ACP. */

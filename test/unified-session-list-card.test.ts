@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {sessionListCard} from '../src/unified/session-list-card.js';
+import {parseFeishuAction, parseFeishuText} from '../src/unified/feishu-codec.js';
 import {CodexAdapter} from '../src/unified/codex-adapter.js';
 import {ClaudeAdapter} from '../src/unified/claude-adapter.js';
 import {mkdtempSync,rmSync} from 'node:fs';
@@ -12,7 +13,16 @@ test('list card shows safe titles and one readonly entry, omitting unknown metad
  const a=item('internal-a',''),b=item('internal-b','中'.repeat(60)),c=item('internal-c','不可查看'),d=item('internal-d','跨日');b.updatedAt='2026-11-16T10:00:00.000Z'; d.updatedAt='2026-11-16T20:30:00.000Z'; c.capabilities={view:{status:'temporarily_unavailable',reason:'unknown'}} as Session['capabilities'];
  const card=sessionListCard([a,b,c,d],{topicUrls:new Map([['internal-b','https://example.test/topic']]),nextCursor:'cursor'});
  assert.match(card.text,/未命名会话/);assert.match(card.text,/中{41}…/);assert.match(card.text,/最近活动 2026-11-16 18:00 北京/);assert.match(card.text,/最近活动 2026-11-17 04:30 北京/);assert.doesNotMatch(card.text,/internal|native-/);assert.match(card.text,/暂不可查看/);
- assert.deepEqual(card.actions,[{label:'1',value:{action:'bind',sessionId:'internal-a',mode:'read_only'}},{label:'2',value:{},url:'https://example.test/topic'},{label:'4',value:{action:'bind',sessionId:'internal-d',mode:'read_only'}},{label:'下一页',value:{action:'list',cursor:'cursor'}}]);assert.deepEqual(sessionListCard(Array.from({length:5},(_,i)=>item(`id-${i}`,`title-${i}`))).actions.map(action=>action.label),['1','2','3','4','5']);assert.throws(()=>sessionListCard(Array(6).fill(a)),/five/);
+ assert.deepEqual(card.actions,[{label:'1 · 接入',value:{action:'bind',sessionId:'internal-a',mode:'read_only'}},{label:'2 · 打开',value:{},url:'https://example.test/topic'},{label:'4 · 接入',value:{action:'bind',sessionId:'internal-d',mode:'read_only'}},{label:'下一页',value:{action:'list',cursor:'cursor'}}]);assert.deepEqual(sessionListCard(Array.from({length:5},(_,i)=>item(`id-${i}`,`title-${i}`))).actions.map(action=>action.label),['1 · 接入','2 · 接入','3 · 接入','4 · 接入','5 · 接入']);assert.throws(()=>sessionListCard(Array(6).fill(a)),/five/);
+});
+for (const search of [undefined, 'project', 'codex'] as const) test(`provider filters preserve only explicit search (${search ?? 'none'})`, () => {
+ const card = sessionListCard([], { provider: 'codex', providerFilters: true, nextCursor: 'next', ...(search ? { search } : {}) });
+ assert.deepEqual(card.actions.map(action => action.value), [
+  { action: 'list', provider: 'codex', cursor: 'next', ...(search ? {search} : {}), ...(search === 'codex' ? {explicitSearch:true} : {}) },
+  ...['all', 'codex', 'claude', 'agy'].map(provider => ({ action: 'list', provider, ...(search ? {search} : {}), ...(search === provider ? {explicitSearch:true} : {}) })),
+ ]);
+ assert.deepEqual(parseFeishuAction(card.actions[2]!.value), { action:'list', provider:'codex', ...(search ? {search} : {}) });
+ assert.deepEqual(parseFeishuText('/sessions codex'), { action:'list', search:'codex' });
 });
 test('native list metadata maps verified timestamps and titles',async()=>{
  const transport:any={connected:true,generation:1,request:async()=>({data:[{id:'x',cwd:'/p',name:'名称',status:{type:'idle'},updatedAt:1700000000},{id:'y',cwd:'/p',name:'',status:{type:'idle'},updatedAt:Infinity}],nextCursor:null})};

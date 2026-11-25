@@ -652,6 +652,7 @@ test('Item 3b & Item 4: FeishuSdkPort populates cardMessageId, races card.action
       };
       const parsed = parseSdkCardCallback(rawEvt, 'owner', (c, m) => sdk.callbackDestination(c, m))!;
       assert.equal(parsed.envelope.cardMessageId, sentMsgId);
+      assert.deepEqual(parsed.action, { action: 'list', provider: 'codex' });
 
       const seenEnvelopes: any[] = [];
       await handleSdkCardCallback(
@@ -741,7 +742,7 @@ test('Item 3b & Item 4: FeishuSdkPort populates cardMessageId, races card.action
       // 1. list with cardMessageId updates in-place
       await channel.handle(
         { eventId: 'c-list', destination: 'chat', identity: { source: 'feishu', subject: 'owner' }, cardMessageId: 'om_list_1' },
-        { action: 'list', provider: 'codex', search: 'codex' },
+        { action: 'list', provider: 'codex' },
       );
       assert.equal(sent.length, sentBefore);
       assert.equal(updated.at(-1)?.messageId, 'om_list_1');
