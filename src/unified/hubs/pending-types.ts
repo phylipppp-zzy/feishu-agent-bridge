@@ -44,6 +44,7 @@ export interface PendingHubOptions {
     destination: string;
     messageId: string;
   }) => boolean;
+  shouldDeliverSource?: (item: PendingItemView) => boolean;
   now?: () => number;
 }
 

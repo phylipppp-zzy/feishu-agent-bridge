@@ -241,6 +241,7 @@ export class UnifiedRuntime {
               shouldRefreshSource: ({destination,sessionId,interactionId,messageId}) =>
                 !this.channel.ownsInteractionCard(destination,sessionId,interactionId,messageId)
                 && !this._taskChannel?.ownsInteractionCard(destination,sessionId,interactionId,messageId),
+              shouldDeliverSource: (item) => item.provider === 'decision',
               resolveTopicLink: async (sessionId, hubDest) => {
                 if (this._taskChannel && this.port.topicLinkForTask) {
                   const sourceDest = this._pendingHub?.getSourceDestination(sessionId);

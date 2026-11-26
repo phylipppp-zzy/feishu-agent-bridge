@@ -74,7 +74,16 @@ export class FeishuInteractionCards {
     const remember=()=>this.db.prepare('INSERT OR REPLACE INTO channel_interaction_view VALUES (?,?,?,?)').run(destination,sessionId,interaction.interactionId,signature);
     const id = `interaction:${payloadDigest([scope,destination,sessionId,interaction.interactionId,interaction.revision,signature])}`;
     if (row) {
-      if (!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) { if (await this.port.lookupDelivery?.(id) === 'sent') { await guard(); this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id); this.db.prepare('UPDATE channel_interaction_cards SET revision=?,binding_scope=? WHERE destination=? AND session_id=? AND interaction_id=?').run(interaction.revision,scope,destination,sessionId,interaction.interactionId); remember(); } return; }
+      if (!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {
+        const previous = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(id) as {state:string}|undefined;
+        if (previous?.state === 'sent' || await this.port.lookupDelivery?.(id) === 'sent') {
+          await guard();
+          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);
+          this.db.prepare('UPDATE channel_interaction_cards SET revision=?,binding_scope=? WHERE destination=? AND session_id=? AND interaction_id=?').run(interaction.revision,scope,destination,sessionId,interaction.interactionId);
+          remember();
+          return;
+        }
+      }
       await guard();
       await this.port.update(destination,row.message_id,this.channel.stamp(destination,view),id,guard); await guard();
       this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);

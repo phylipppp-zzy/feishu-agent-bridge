@@ -140,27 +140,121 @@ function shorten(value: string, size: number, suffix: string): string {
 
 const toolLabels: Record<string, string> = {
   bash: '执行命令', command: '执行命令', execute: '执行命令', run: '执行命令', run_command: '执行命令',
-  file_change: '修改文件', edit: '编辑文件', multiedit: '编辑文件', write: '写入文件',
-  write_to_file: '写入文件', replace_file_content: '编辑文件', multi_replace_file_content: '编辑文件',
-  notebookedit: '编辑笔记本', read: '读取文件', view_file: '读取文件', glob: '查找文件', grep: '搜索内容',
+  file_change: '修改文件', edit: '编辑文件', edit_file: '编辑文件', multiedit: '编辑文件', write: '写入文件',
+  write_file: '写入文件', write_to_file: '写入文件', replace_file_content: '编辑文件', multi_replace_file_content: '编辑文件',
+  notebookedit: '编辑笔记本', read: '读取文件', read_file: '读取文件', view_file: '读取文件',
+  list_dir: '查看目录', glob: '查找文件', find_by_name: '查找文件', grep: '搜索内容', grep_search: '搜索内容',
+  search_web: '网页搜索', read_url_content: '读取网页', manage_task: '任务管理', schedule: '定时任务',
+  send_message: '发送消息', invoke_subagent: '调用子代理', generate_image: '生成图像',
 };
 
-export function formatApprovalAction(tool: string, action: string, scope: string): {
-  toolLabel: string; text: string;
-} {
-  const toolName = stripCardMentions(tool).trim().split(/\s+/u)[0] ?? '';
+const DETAIL_WRAPPER_KEYS = new Set([
+  'sessionUpdate', 'toolCallId', 'status', 'kind', 'reason', 'rawInput',
+  'args', 'input', 'params', 'locations', 'content', 'type', 'name', 'title',
+]);
+
+function formatEntryValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? shorten(trimmed, 400, '…') : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    const serialized = JSON.stringify(value);
+    if (!serialized || serialized === '{}' || serialized === '[]') return null;
+    return shorten(serialized, 400, '…');
+  } catch {
+    return null;
+  }
+}
+
+function formatStructuredEntries(obj: Record<string, unknown> | undefined, skip?: ReadonlySet<string>): string[] {
+  if (!obj) return [];
+  const entries: string[] = [];
+  let omitted = 0;
+  for (const [k, v] of Object.entries(obj)) {
+    if (skip?.has(k)) continue;
+    const formatted = formatEntryValue(v);
+    if (!formatted) continue;
+    if (entries.length >= 12) {
+      omitted += 1;
+      continue;
+    }
+    entries.push(`${k}: ${formatted}`);
+  }
+  if (omitted > 0) entries.push(`…（其余 ${omitted} 项已省略）`);
+  return entries;
+}
+
+function extractMcpToolName(detail?: Record<string, unknown>): string | undefined {
+  if (!detail) return undefined;
+  const fields = [detail, record(detail.args), record(detail.input), record(detail.params), record(detail.rawInput)];
+  for (const field of fields) {
+    if (!field) continue;
+    if (nonblank(field.ToolName)) return field.ToolName.trim();
+    if (nonblank(field.toolName)) return field.toolName.trim();
+  }
+  return undefined;
+}
+
+function approvalFallbackSummary(detail: Record<string, unknown>): string {
+  const fields = [detail, record(detail.args), record(detail.input), record(detail.params), record(detail.rawInput)];
+  const server = fields
+    .map(f => (nonblank(f?.ServerName) ? f.ServerName : nonblank(f?.serverName) ? f.serverName : nonblank(f?.server) ? f.server : undefined)?.trim())
+    .find(Boolean);
+  const mcpTool = extractMcpToolName(detail);
+  const uri = fields
+    .map(f => (nonblank(f?.Uri) ? f.Uri : nonblank(f?.uri) ? f.uri : undefined)?.trim())
+    .find(Boolean);
+  const mcpArgs = fields.map(f => record(f?.Arguments) ?? record(f?.arguments)).find(Boolean);
+  if (mcpTool || server || uri) {
+    const baseHeader = [server, mcpTool].filter(Boolean).join(' / ');
+    const header = uri ? (baseHeader ? `${baseHeader} (${uri})` : uri) : baseHeader;
+    return [header, ...formatStructuredEntries(mcpArgs)].filter(Boolean).join('\n');
+  }
+  const header = nonblank(detail.title) ? detail.title.trim() : nonblank(detail.name) ? detail.name.trim() : '';
+  const payload = record(detail.args) ?? record(detail.input) ?? record(detail.params) ?? record(detail.rawInput);
+  if (payload) {
+    const lines = formatStructuredEntries(payload);
+    if (lines.length) return [header, ...lines].filter(Boolean).join('\n');
+  }
+  const directLines = formatStructuredEntries(detail, DETAIL_WRAPPER_KEYS);
+  return [header, ...directLines].filter(Boolean).join('\n');
+}
+
+function resolveApprovalToolLabel(tool: string, detail?: Record<string, unknown>): string {
+  const stripped = stripCardMentions(tool).trim();
+  const toolName = stripped.split(/\s+/u)[0] ?? '';
   const key = toolName.toLowerCase();
-  const toolLabel = Object.hasOwn(toolLabels, key) ? toolLabels[key]! : shorten(toolName, 24, '…') || '工具操作';
+  if (Object.hasOwn(toolLabels, key)) return toolLabels[key]!;
+  const mcpTool = extractMcpToolName(detail) ?? stripped.match(/^MCP\s+Tool\s+(\S+)/iu)?.[1];
+  if (mcpTool) return `MCP · ${shorten(stripCardMentions(mcpTool).trim(), 20, '…')}`;
+  if (nonblank(detail?.name)) {
+    const detailKey = detail.name.trim().toLowerCase();
+    if (Object.hasOwn(toolLabels, detailKey)) return toolLabels[detailKey]!;
+  }
+  return shorten(toolName, 24, '…') || '工具操作';
+}
+
+export function formatApprovalAction(tool: string, action: string, scope: string): {
+  toolLabel: string; compactTarget: string; text: string;
+} {
   const { detail, prefix } = parseApprovalAction(action);
+  const toolLabel = resolveApprovalToolLabel(tool, detail);
   const reason = [detail && prefix, detail?.reason].filter(nonblank).map(stripCardMentions)
     .find(value => /\p{Script=Han}/u.test(value))
     ?? '原端要求人工确认此操作。';
-  const target = detail ? approvalTargets(detail).join('\n') : prefix;
-  const summary = shorten(stripCardMentions(target), 2000, '\n…（其余内容已省略）')
+  const rawTargets = detail ? approvalTargets(detail).join('\n') : prefix;
+  const target = rawTargets || (detail ? approvalFallbackSummary(detail) : '');
+  const cleanTarget = stripCardMentions(target);
+  const compactTarget = cleanTarget.split('\n').map(line => line.trim()).find(Boolean) ?? '';
+  const summary = shorten(cleanTarget, 2000, '\n…（其余内容已省略）')
     .replace(/`{3,}/gu, run => [...run].join('\u200b')) || '原端未提供可展示的操作详情。';
   const duration = scope === 'session' || scope === 'allow_always' ? '本会话内同类操作' : '仅本次操作';
   return {
     toolLabel,
+    compactTarget,
     text: [
       `**拦截原因**：${escapeCardMarkdown(shorten(reason.replace(/\s+/gu, ' ').trim(), 600, '…'))}`,
       `**操作内容**：\n\`\`\`\n${summary}\n\`\`\``,

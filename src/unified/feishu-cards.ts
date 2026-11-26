@@ -1,6 +1,6 @@
 import type { QuestionForm } from './feishu-question-forms.js';
 import type { Interaction, Operation, Provider, Session } from './contracts.js';
-import { formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { compactCardField, formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 
 export function providerDisplayLabel(provider: Provider): string {
@@ -128,7 +128,18 @@ export function interactionCard(
     else if (operation?.status === 'completed' || (i.status === 'resolved' && answer)) { title = '审批 · 已确认'; template = 'green'; }
     else if (i.status === 'resolved') { title = '审批 · 已处理'; template = 'grey'; }
     else if (status) title = '审批 · 等待原端确认';
-    const originalNote = awaiting && i.allowedDecisions?.length === 0 ? '请在原端处理此审批。' : '';
+    if (!awaiting) {
+      const compactTarget = view.compactTarget
+        ? `\`${compactCardField(view.compactTarget, 80).replace(/`/gu, "'")}\``
+        : '';
+      const compactText = [
+        escapeCardMarkdown(view.toolLabel),
+        compactTarget,
+        status,
+      ].filter(Boolean).join(' · ');
+      return { title, template, format: 'markdown', text: compactText, actions };
+    }
+    const originalNote = i.allowedDecisions?.length === 0 ? '请在原端处理此审批。' : '';
     return { title, template, format: 'markdown', text: [view.text, status, readOnly ? readonlyNote : originalNote].filter(Boolean).join('\n\n'), actions };
   }
   const resolved = i.status === 'resolved' || operation?.status === 'completed';
