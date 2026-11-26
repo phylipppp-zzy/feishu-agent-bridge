@@ -572,8 +572,18 @@ export async function readSessionSnapshot(
   await refreshAcpSessionTitles(ctx);
   let transcriptMessages: Message[] = [];
   let createdAt: string | undefined;
+  let incompleteTranscript: string | undefined;
   try {
     const transcript = await ctx.catalog.readTranscript(id);
+    const malformed = transcript.parseErrors > 0;
+    const isActive = ctx.active.has(id) && ctx.transport.connected;
+    if (
+      (malformed && !isActive) ||
+      (transcript.messages.length === 0 && (malformed || transcript.truncatedTrailingLine ||
+        (transcript.steps.length === 0 && transcript.warnings?.length)))
+    ) {
+      incompleteTranscript = transcript.warnings?.join('; ') || 'transcript has no complete messages';
+    }
     transcriptMessages = transcript.messages.map((m, i) =>
       normalizeTranscriptMessage(id, m, i + 1),
     );
@@ -630,10 +640,9 @@ export async function readSessionSnapshot(
         },
       },
     });
-    if (!ctx.active.has(id)) {
-      throw contractError('temporarily_unavailable', `failed to read transcript for ${id}: ${message}`);
-    }
+    throw contractError('temporarily_unavailable', `failed to read transcript for ${id}: ${message}`);
   }
+  if (incompleteTranscript) throw contractError('temporarily_unavailable', `incomplete transcript for ${id}: ${incompleteTranscript}`);
 
   const live = ctx.liveMessages.get(id) ?? [];
   const historyVisible = visibleTranscript(ctx, id, transcriptMessages, live);
@@ -643,7 +652,6 @@ export async function readSessionSnapshot(
     sequence: Math.max(m.sequence, baseSeq + idx + 1),
   }));
 
-  const isActive = ctx.active.has(id) && ctx.transport.connected;
   const session = ctx.buildSession(id, summary, liveMeta, createdAt);
   const turns = [...(ctx.sessionTurns.get(id)?.values() ?? [])].map(t => ({ ...t }));
   const interactions = [...ctx.requests.values()]
@@ -655,7 +663,7 @@ export async function readSessionSnapshot(
     messages: [...historyVisible, ...mergedLive],
     turns,
     interactions,
-    ...(isActive ? { connectionGeneration: ctx.transport.connectionGeneration } : {}),
+    ...(ctx.transport.connected ? { connectionGeneration: ctx.transport.connectionGeneration } : {}),
   };
 }
 

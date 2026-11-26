@@ -24,6 +24,7 @@ const PENDING_QUERY_PROVIDERS = new Set(['all', 'claude', 'codex', 'agy', 'decis
 const WAVE2_BINDING_EXEMPT_ACTIONS = new Set([
   'bind',
   'list',
+  'agy_status',
   'new_help',
   'new_provider',
   'new_pick',
@@ -135,6 +136,7 @@ function parseAction(value: unknown): RuntimeTrustedAction {
       if (draftToken(value.t) && counter(value.r) && counter(value.i)) return {action:'new_pick',t:value.t,r:value.r,i:value.i};
       break;
     case 'pending':
+    case 'agy_status':
     case 'pending_open': return {action:value.action};
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
@@ -283,7 +285,7 @@ export const KNOWN_BRIDGE_COMMANDS: ReadonlySet<string> = new Set([
   '/attach', '/stop', '/cancel', '/control', '/settings', '/notifications', '/archive',
   '/create', '/answer', '/queue', '/steer', '/', '/status', '/menu', '/panel', '/ls',
   '/deliver', '/export', '/history', '/file', '/files', '/models', '/pending', '/ops',
-  '/health', '/quota', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
+  '/health', '/quota', '/agy', '/agy-status', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
 ]);
 
 export function isBridgeCommand(command: string): boolean {
@@ -456,6 +458,9 @@ export function parseFeishuText(text: string, options?: { passthroughUnknownSlas
     case '/ops': if (!parts.length) return {action:'pending'}; break;
     case '/health': return {action:'health'};
     case '/quota': if (!parts.length) return {action:'quota'}; break;
+    case '/agy':
+    case '/agy-status':
+      return parts.length ? {action:'command_error',command,rawText:input} : {action:'agy_status'};
     case '/rename': {
       const title = rawTail.trim();
       if (title) return {action:'rename',title};

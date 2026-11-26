@@ -456,7 +456,10 @@ export class AgyAdapter implements PlatformPort {
     const mode = this.transport.defaultMode;
     if (!mode || !this.transport.connected || !isRecord(res)) return;
     if (isRecord(res.modes)) {
-      await this.transport.request('session/set_mode', { sessionId, modeId: mode }).catch(() => {});
+      await this.transport.request('session/set_mode', { sessionId, modeId: mode }).catch(err => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[agy] session/set_mode(${mode}) failed for ${sessionId}: ${msg}`);
+      });
       return;
     }
     if (Array.isArray(res.configOptions)) {
@@ -464,7 +467,10 @@ export class AgyAdapter implements PlatformPort {
       if (modeConfigId) {
         await this.transport
           .request('session/set_config_option', { sessionId, configId: modeConfigId, value: mode })
-          .catch(() => {});
+          .catch(err => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`[agy] session/set_config_option(${modeConfigId}=${mode}) failed for ${sessionId}: ${msg}`);
+          });
       }
     }
   }
@@ -1087,15 +1093,8 @@ export class AgyAdapter implements PlatformPort {
 
     this.controlChanges.add(id);
     try {
-      // Some ACP versions omit session/close. Only clear timeout lock if session/close is confirmed.
-      let closeConfirmed = false;
-      try {
-        await this.transport.request('session/close', { sessionId: id });
-        closeConfirmed = true;
-      } catch {}
-      if (closeConfirmed) {
-        this.lockedSessions.delete(id);
-      }
+      await this.transport.request('session/close', { sessionId: id });
+      this.lockedSessions.delete(id);
       if (this.active.delete(id)) {
         this.lastActivityAt.delete(id);
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);

@@ -4,6 +4,7 @@ import type { Artifact, Capabilities, ControlState, EventSubscription, Interacti
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
+export interface AttachOptions { allowQuarantineRecovery?: boolean; stillAuthorized?: () => boolean | Promise<boolean> }
 export type { ResponseEvidence } from './contracts.js';
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
@@ -13,7 +14,7 @@ export interface UnifiedService {
   inspectUnknownCreateCandidates?(identity:{source:string;subject:string},destination:string,operationId:string,query:{cursor?:string;nativeId?:string}):Promise<{items:CandidateMetadata[];nextCursor:string|null;partial:boolean}>;
   getSession(sessionId: string): Promise<Session>;
   capabilities(sessionId: string): Promise<Capabilities>;
-  attachSession(request: WriteRequest<{ provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' }>): Promise<Operation>;
+  attachSession(request: WriteRequest<{ provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' }>, options?: AttachOptions): Promise<Operation>;
   detachSession(request: WriteRequest<Record<string, never>>): Promise<Operation>;
   createSession(request: WriteRequest<{ provider: Provider; project: string; model: string | null }>): Promise<Operation>;
   readHistory(sessionId: string, query: ListQuery): Promise<Page<Message>>;

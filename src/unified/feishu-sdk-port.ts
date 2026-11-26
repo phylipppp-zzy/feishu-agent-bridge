@@ -19,6 +19,8 @@ import {attachmentDisplayName,decodeTextAttachment,MAX_TEXT_ATTACHMENT_BYTES} fr
 import { BindingExpired } from './topic-title-sync.js';
 import type { Readable } from 'node:stream';
 
+const ROOTLESS_TASK_READ_COMMANDS = new Set(['/help', '/health', '/sessions', '/quota', '/agy', '/agy-status']);
+
 class ResourceRejected extends Error {}
 class UnsupportedInboundFile extends ResourceRejected {
   constructor() { super('unsupported resource type'); }
@@ -683,14 +685,14 @@ export class FeishuSdkPort implements FeishuPort {
     if(!m.mentionedBot&&!inTopic&&!isMainSlash)return null;
     return {m,thread,inTopic,isMainSlash};
   }
-  private rootlessTaskWritePending(data:MessageEvent,botId:string):boolean {const info=this.parseEligibleMessage(data,botId);if(!info||info.inTopic)return false;if(data.message.message_type==='text'&&['/help','/health','/sessions','/quota'].includes(info.m.text))return false;return !!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(info.m.chatId);}
+  private rootlessTaskWritePending(data:MessageEvent,botId:string):boolean {const info=this.parseEligibleMessage(data,botId);if(!info||info.inTopic)return false;if(data.message.message_type==='text'&&ROOTLESS_TASK_READ_COMMANDS.has(info.m.text))return false;return !!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(info.m.chatId);}
   /** Block only ambiguous writes while a task root creation has no resolved route. */
   private async guideTaskPending(data:MessageEvent,botId:string,unknownRoot=false):Promise<boolean> {
     const info=this.parseEligibleMessage(data,botId);if(!info)return false;
     const {m,thread}=info;
     if(!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId))return false;
     const ids=[m.rootId,m.parentId,thread].filter((v):v is string=>!!v),hasRoot=ids.length>0;if(hasRoot&&!unknownRoot)return false;if(hasRoot&&ids.some(id=>!!this.db.prepare('SELECT 1 FROM sdk_topic_routes r LEFT JOIN sdk_message_routes m ON m.destination=r.destination WHERE r.chat_id=? AND (r.root_id=? OR r.thread_id=? OR m.message_id=?) LIMIT 1').get(m.chatId,id,id,id)))return false;
-    if(!hasRoot&&data.message.message_type==='text'&&['/help','/health','/sessions','/quota'].includes(m.text))return false;
+    if(!hasRoot&&data.message.message_type==='text'&&ROOTLESS_TASK_READ_COMMANDS.has(m.text))return false;
     const id=`task-pending-guidance:${m.messageId}`;if(!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(id).changes)return true;if(this.closing)throw new Error('SDK port closing');
     if(!this.db.prepare("SELECT 1 FROM sdk_task_creations_v1 WHERE chat_id=? AND state NOT IN ('active','closed','rejected') LIMIT 1").get(m.chatId))return true;
     const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:m.chatId,msg_type:'interactive',content:JSON.stringify(encodeCard({title:'任务提示',text:'任务话题待核查，写入暂不可用。',actions:[]},'1.0'))}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('guidance outcome unknown');this.remember(id,response.data.message_id,m.chatId,'1.0');return true;

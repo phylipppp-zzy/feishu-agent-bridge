@@ -396,7 +396,7 @@ test('extractAgyUserInput and readAgyTranscript resolve USER_INPUT, PLANNER_RESP
           created_at: '2026-11-22T12:00:01Z',
           content: `<USER_REQUEST>\n${fullUserPrompt}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nhost=linux\n</ADDITIONAL_METADATA>`,
         },
-        // Duplicate step_index=3 in transcript_full.jsonl: last row must win.
+        // Duplicate step_index=3 in transcript_full.jsonl: prefer the row matching the compact step.
         {
           step_index: 3,
           source: 'MODEL',
@@ -536,6 +536,87 @@ test('extractAgyUserInput and readAgyTranscript resolve USER_INPUT, PLANNER_RESP
     assert.equal(fbResult.usedFullFallback, true);
     assert.equal(fbResult.messages.length, 1);
     assert.equal(fbResult.messages[0]!.text, '仅存在 transcript_full.jsonl 时的回退正文');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('readAgyTranscript resolves truncated fields across duplicate full transcript rows', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agy-transcript-duplicates-'));
+  try {
+    const conversationId = 'conv-duplicate-steps';
+    const logsDir = join(dir, conversationId, '.system_generated', 'logs');
+    await mkdir(logsDir, { recursive: true });
+
+    const base = { type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE' };
+    const aligned = { ...base, step_index: 7, created_at: '2026-11-22T12:00:01Z' };
+    const shifted = { ...base, step_index: 8, created_at: '2026-11-22T12:00:02Z' };
+    const compactOnly = { ...base, step_index: 9, created_at: '2026-11-22T12:00:03Z' };
+    const timestampMatch = { ...base, step_index: 10, created_at: '2026-11-22T12:00:04Z' };
+    const metadataMatch = { ...base, step_index: 11, created_at: '2026-11-22T12:00:05Z' };
+    const numericTs = { ...base, step_index: 12, created_at: Date.parse('2026-11-22T12:00:06Z') };
+    await writeFile(join(logsDir, 'transcript.jsonl'), jsonl(
+      { ...aligned, content: 'Aligned …', truncated_fields: ['content'] },
+      { ...shifted, content: 'Shifted …', thinking: 'Partial', truncated_fields: ['content', 'thinking'] },
+      { ...compactOnly, content: 'Retain this prefix\n<truncated 20 bytes>', truncated_fields: ['content'] },
+      { ...timestampMatch, content: 'Timestamp prefix', truncated_fields: ['content', 'thinking'] },
+      { ...metadataMatch, content: 'Metadata prefix', truncated_fields: ['content', 'thinking'] },
+      { ...numericTs, content: 'Numeric prefix\n<truncated 20 bytes>', truncated_fields: ['content'] },
+    ));
+    await writeFile(join(logsDir, 'transcript_full.jsonl'), jsonl(
+      { ...aligned, content: 'Aligned full reply' },
+      { ...shifted, created_at: '2026-11-22T12:30:00Z', content: 'Different reply', thinking: 'Different reasoning' },
+      { ...compactOnly, created_at: '2026-11-22T12:00:03.000001Z', content: 'Another reply within the same millisecond' },
+      { ...shifted, content: 'Shifted full reply', thinking: 'Complete reasoning' },
+      { ...metadataMatch, source: 'SYSTEM', status: 'GENERATING', content: 'Earlier reply', thinking: 'Earlier reasoning' },
+      { ...shifted, content: ' ', thinking: null },
+      { ...shifted, content: 'Shifted', thinking: 'Partial', truncated_fields: ['content', 'thinking'] },
+      { ...shifted, type: 'USER_INPUT', content: 'Incompatible row with duplicate index', thinking: 'Wrong type' },
+      { ...shifted },
+      { ...aligned, content: 'Another reply with the same index' },
+      { ...compactOnly, content: '' },
+      { ...compactOnly, created_at: undefined, content: 'Unverified reply without a timestamp' },
+      { ...timestampMatch, created_at: undefined, content: 'Reply without a timestamp' },
+      { ...timestampMatch, thinking: 'Reasoning from the matching timestamp' },
+      { ...metadataMatch, thinking: 'Reasoning from the matching source and status' },
+      { ...numericTs, created_at: Date.parse('2026-11-22T12:05:00Z'), content: 'Conflicting numeric timestamp reply' },
+    ));
+
+    const result = await readAgyTranscript(conversationId, { brainDir: dir });
+    assert.deepEqual(result.messages.map(message => ({
+      text: message.text,
+      thinking: message.thinking,
+      resolvedFromFull: message.resolvedFromFull,
+      final: message.final,
+    })), [
+      { text: 'Aligned full reply', thinking: null, resolvedFromFull: true, final: true },
+      { text: 'Shifted full reply', thinking: 'Complete reasoning', resolvedFromFull: true, final: true },
+      { text: 'Retain this prefix', thinking: null, resolvedFromFull: false, final: false },
+      { text: 'Timestamp prefix', thinking: 'Reasoning from the matching timestamp', resolvedFromFull: true, final: false },
+      { text: 'Metadata prefix', thinking: 'Reasoning from the matching source and status', resolvedFromFull: true, final: false },
+      { text: 'Numeric prefix', thinking: null, resolvedFromFull: false, final: false },
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('transcript readers surface filesystem failures while retaining alternate-header fallback', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'agy-transcript-errors-'));
+  try {
+    const conversationId = 'conv-unreadable-transcript';
+    const invalidBrainDir = join(dir, 'not-a-directory');
+    await writeFile(invalidBrainDir, ' ');
+    await assert.rejects(readAgyTranscript(conversationId, { brainDir: invalidBrainDir }), { code: 'ENOTDIR' });
+
+    const logsDir = join(dir, conversationId, '.system_generated', 'logs');
+    const compactPath = join(logsDir, 'transcript.jsonl');
+    const fullPath = join(logsDir, 'transcript_full.jsonl');
+    await mkdir(compactPath, { recursive: true });
+    await assert.rejects(readAgyTranscriptCreatedAt(conversationId, { brainDir: dir }), /non-regular/);
+
+    await writeFile(fullPath, jsonl({ created_at: '2026-11-22T12:00:00Z' }));
+    assert.equal(await readAgyTranscriptCreatedAt(conversationId, { brainDir: dir }), '2026-11-22T12:00:00.000Z');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

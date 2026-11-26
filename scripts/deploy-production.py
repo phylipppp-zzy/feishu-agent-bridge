@@ -209,9 +209,11 @@ rt['outputRoots'] = [
     '/data/zhangzy/outputs',
     '/ssd/zhangzy/scratch',
 ]
-rt['approvalPolicy'] = {'enabled': False}
+rt.setdefault('approvalPolicy', {'enabled': False})
 rt['autoTakeControlOnInput'] = True
+rt['autoResumeOnRestart'] = True
 agy = rt.setdefault('agy', {})
+agy['binPath'] = '/home/zhangzy/.local/bin/agy'
 agy['processPerSession'] = True
 agy['defaultMode'] = 'auto'
 agy['addDirs'] = ['/ssd/zhangzy', '/data/zhangzy']

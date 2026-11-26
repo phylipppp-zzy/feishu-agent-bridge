@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { UnifiedStore, StoreError } from '../src/unified/store.js';
-import { answerDigest, type Capabilities, type Interaction, type ResolveInteraction, type Session } from '../src/unified/contracts.js';
+import { UnifiedStore, StoreError, recoveryReleaseConfirmed } from '../src/unified/store.js';
+import { answerDigest, type Capabilities, type Interaction, type ResolveInteraction, type Session, type Turn } from '../src/unified/contracts.js';
 
 const caps = Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config'].map(k => [k, {status:'available'}])) as Capabilities;
 const session: Session = { sessionId:'s', native:{provider:'codex',hostId:'h',serviceId:'svc',nativeSessionId:'native'}, project:'p', title:'t', status:'idle', revision:0, capabilities:caps, control:{serviceId:'svc',owner:'x',input:'available',generation:1,operationId:null,reason:null} };
@@ -39,6 +39,55 @@ function child(path: string, id: string, mode = 'answer'): Promise<string> {
 if (process.env.STORE_WORKER === '1') {
   const store = new UnifiedStore(process.env.STORE_PATH!); try { if (process.env.STORE_MODE === 'claim') console.log(store.claimOutbox('a') ? 'claimed' : 'blocked'); else if (process.env.STORE_MODE === 'switch') { store.setConnectionGeneration('s',1,2); console.log('switched'); } else { store.resolveInteraction(request(process.env.STORE_ID!)); console.log('won'); } } catch (e) { console.log(e instanceof StoreError ? e.detail.code : 'unexpected'); } finally { store.close(); }
 } else {
+  test('legacy turns migrate in place and step IDs are scoped to their session', () => {
+    const {dir,path,store} = setup();
+    const other: Session = {...session,sessionId:'other',native:{...session.native,nativeSessionId:'other-native'},
+      status:'read_only',control:{...session.control,owner:null,input:'unavailable'}};
+    const turn = (sessionId:string,step:number,status:Turn['status']):Turn => ({
+      sessionId,turnId:`step-${step}`,status,inputId:null,startedAt:null,endedAt:null,model:null,outputIds:[],
+    });
+    const original = [turn('s',0,'running'),turn('s',1,'completed')];
+    try {
+      store.insertSession(other);
+      for (const value of original) store.putTurn(value);
+    } finally { store.close(); }
+
+    try {
+      const legacy = new DatabaseSync(path);
+      try {
+        legacy.exec(`BEGIN IMMEDIATE;
+          ALTER TABLE turns RENAME TO turns_current;
+          CREATE TABLE turns(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), value TEXT NOT NULL);
+          INSERT INTO turns SELECT id,session_id,value FROM turns_current ORDER BY rowid;
+          DROP TABLE turns_current;
+          CREATE INDEX turns_by_session ON turns(session_id);
+          COMMIT;`);
+      } finally { legacy.close(); }
+
+      const migrated = new UnifiedStore(path);
+      const isolated = [turn('other',0,'failed'),turn('other',1,'interrupted')];
+      try {
+        assert.deepEqual(migrated.listTurns('s'),original);
+        migrated.putTurn(turn('other',0,'running'));
+        migrated.baselineReadonlyTurns('other',isolated);
+        assert.deepEqual(migrated.listTurns('other'),isolated);
+        assert.deepEqual(migrated.listTurns('s'),original);
+        migrated.putTurn(turn('s',0,'completed'));
+      } finally { migrated.close(); }
+
+      const reopened = new UnifiedStore(path);
+      try {
+        assert.deepEqual(reopened.listTurns('s'),[turn('s',0,'completed'),original[1]]);
+        assert.deepEqual(reopened.listTurns('other'),isolated);
+        const raw = new DatabaseSync(path,{readOnly:true});
+        try {
+          assert.equal(raw.prepare('PRAGMA user_version').get()?.user_version,2);
+          assert.deepEqual(raw.prepare('PRAGMA foreign_key_check').all(),[]);
+          assert.ok(raw.prepare('PRAGMA index_list(turns)').all().some(index=>index.name==='turns_by_session'));
+        } finally { raw.close(); }
+      } finally { reopened.close(); }
+    } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
   test('cross-process answer CAS; native terminal result is authoritative and survives reopen', async () => {
     const {dir,path,store} = setup(); store.close();
     try { const results = await Promise.all([child(path,'one'),child(path,'two')]); assert.equal(results.filter(x => x === 'won').length,1); assert.equal(results.filter(x => x === 'stale_revision').length,1);
@@ -58,6 +107,75 @@ if (process.env.STORE_WORKER === '1') {
       reopened.setConnectionGeneration('s',1,2); code(() => reopened.recordNativeResult('i',1,'42',{status:'accepted',source:'old',answer:null}),'interaction_expired');
       const next = {...session,revision:1,control:{...session.control,generation:2}}; reopened.updateSession(next,0,1); code(() => reopened.registerOperation({ ...request('x').context, expectedRevision:1 },'send',{}),'control_conflict'); reopened.close();
     } finally { rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('connection generation seed includes the highest persisted quarantine', () => {
+    const {dir,path,store} = setup();
+    try {
+      assert.equal(store.maxConnectionGeneration(),1);
+      store.quarantineRecovery('s',recoveryReleaseConfirmed,8);
+      assert.equal(store.connectionGeneration('s'),1);
+      assert.equal(store.maxConnectionGeneration(),8);
+      const reopened = new UnifiedStore(path);
+      try {
+        assert.equal(reopened.maxConnectionGeneration(),8);
+        reopened.setConnectionGeneration('s',1,9);
+        assert.equal(reopened.maxConnectionGeneration(),9);
+      } finally { reopened.close(); }
+    } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+  test('same-generation recovery expires absent requests and fences stale response delivery', () => {
+    const {dir,store} = setup();
+    try {
+      const fixture = (id: string): Interaction => ({...interaction,interactionId:id,nativeRequestId:`native-${id}`});
+      const absentPending = fixture('absent-pending');
+      const absentClaimed = fixture('absent-claimed');
+      const absentSent = fixture('absent-sent');
+      const awaiting = fixture('awaiting');
+      const unsent = fixture('unsent');
+      const sent = fixture('sent');
+      for (const value of [absentPending,absentClaimed,absentSent,awaiting,unsent,sent]) store.insertInteraction(value);
+      for (const value of [absentPending,absentClaimed,absentSent,unsent,sent]) {
+        store.resolveInteraction({...request(value.interactionId),interactionId:value.interactionId});
+      }
+      for (const id of ['absent-claimed','absent-sent','sent']) assert.equal(store.claimOutbox(id),true);
+      for (const id of ['absent-sent','sent']) store.acceptResponseSubmission(id);
+      store.quarantineRecovery('s',recoveryReleaseConfirmed);
+      const context = request('recovery').context;
+      const attached = {...session,status:'waiting_question' as const,control:{...session.control,generation:2}};
+      const payload = {...session.native,mode:'interactive'};
+      const observed = {messages:[],interactions:[awaiting,unsent,sent,fixture('new'),{...interaction,status:'expired' as const}]};
+      const before = store.snapshot('s');
+      code(() => store.attachSession(context,attached,payload,1,{
+        ...observed,interactions:[...observed.interactions,{...fixture('wrong-generation'),connectionGeneration:2}],
+      },true),'interaction_expired');
+      assert.deepEqual(store.snapshot('s'),before);
+      assert.equal(store.recoveryQuarantined('s'),true);
+      assert.equal(store.getOutbox('absent-claimed').state,'in_flight');
+      assert.equal(store.getOutbox('absent-pending').state,'pending');
+
+      assert.equal(store.attachSession(context,attached,payload,1,observed,true).status,'completed');
+      assert.equal(store.recoveryQuarantined('s'),false);
+      assert.equal(store.connectionGeneration('s'),1);
+      assert.deepEqual(Object.fromEntries(store.snapshot('s').value.interactions.map(value => [value.interactionId,value.status])),{
+        i:'expired','absent-pending':'expired','absent-claimed':'expired','absent-sent':'expired',
+        awaiting:'awaiting_answer',unsent:'awaiting_answer',sent:'answer_pending_delivery',new:'awaiting_answer',
+      });
+      for (const id of ['absent-pending','unsent']) {
+        assert.equal(store.getOutbox(id).state,'cancelled');
+        assert.equal(store.getOperation(id).status,'failed');
+      }
+      assert.equal(store.getOutbox('absent-claimed').state,'unknown');
+      assert.equal(store.getOperation('absent-claimed').status,'unknown');
+      for (const id of ['absent-claimed','absent-sent']) assert.equal(store.getInteraction(id).nativeResult?.status,'unknown');
+      for (const id of ['absent-sent','sent']) {
+        assert.equal(store.getOutbox(id).state,'done');
+        assert.equal(store.getOperation(id).status,'accepted');
+      }
+      const retry = request('retry');
+      assert.equal(store.resolveInteraction({...retry,interactionId:'unsent',context:{
+        ...retry.context,expectedRevision:2,controlGeneration:2,
+      }}).status,'received');
+    } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
   });
   test('a local response receipt and a correlated native result advance separate durable states', () => {
     for (const early of [false,true]) {
@@ -268,5 +386,34 @@ if (process.env.STORE_WORKER === '1') {
       assert.equal(timing.liveStartSequence, null);
       assert.equal(timing.liveEndSequence, null);
     } finally { store.close(); rmSync(dir, {recursive:true, force:true}); }
+  });
+
+  test('read-only baseline terminalizes existing timing without recording live completion', () => {
+    const {dir,path,store} = setup();
+    try {
+      const startedAt = '2026-01-01T00:00:00.000Z';
+      const endedAt = '2026-01-01T00:02:00.000Z';
+      const running: Turn = {sessionId:'s',turnId:'t',status:'running',inputId:null,startedAt,endedAt:null,model:null,outputIds:[]};
+      store.observeTurn(running,Date.parse(startedAt));
+      const runningTiming = store.snapshot('s').value.turnProgress!.timing[0]!;
+      const current = store.getSession('s');
+      store.updateSession({...current,status:'read_only',revision:current.revision+1,
+        control:{...current.control,input:'unavailable',owner:null}},current.revision,current.control.generation);
+      const checkpoint = store.snapshot('s').cursor;
+      const completed: Turn = {...running,status:'completed',endedAt};
+      const historical: Turn = {...completed,turnId:'historical'};
+      store.baselineReadonlyTurns('s',[completed,historical]);
+      const snapshot = store.snapshot('s');
+      assert.equal(snapshot.cursor,checkpoint);
+      assert.deepEqual(snapshot.value.turns,[completed,historical]);
+      assert.deepEqual(snapshot.value.turnProgress!.timing,[{
+        ...runningTiming,endedMs:Date.parse(endedAt),liveEndSequence:null,
+      }]);
+      const raw = new DatabaseSync(path,{readOnly:true});
+      try {
+        const row = raw.prepare('SELECT terminal FROM turn_progress_timing WHERE session_id=? AND turn_id=?').get('s','t');
+        assert.equal(row?.terminal,1);
+      } finally { raw.close(); }
+    } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
   });
 }

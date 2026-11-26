@@ -1,4 +1,4 @@
-import { constants, existsSync } from 'node:fs';
+import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
@@ -145,10 +145,10 @@ async function readRegularFileWithinRoot(
     let offset = 0;
     while (offset < stat.size) {
       const { bytesRead } = await handle.read(buf, offset, stat.size - offset, offset);
-      if (!bytesRead) break;
+      if (!bytesRead) throw new Error(`transcript changed while reading: ${filePath}`);
       offset += bytesRead;
     }
-    return buf.subarray(0, offset);
+    return buf;
   } finally {
     await handle.close();
   }
@@ -183,10 +183,10 @@ async function readTailWithinRoot(
     let offset = 0;
     while (offset < toRead) {
       const { bytesRead } = await handle.read(buf, offset, toRead - offset, startOffset + offset);
-      if (!bytesRead) break;
+      if (!bytesRead) throw new Error(`transcript changed while reading: ${filePath}`);
       offset += bytesRead;
     }
-    let slice = buf.subarray(0, offset);
+    let slice = buf;
     if (startOffset > 0) {
       const firstNewline = slice.indexOf(0x0a);
       slice = firstNewline >= 0 ? slice.subarray(firstNewline + 1) : Buffer.alloc(0);
@@ -203,11 +203,21 @@ async function resolveTranscriptSessionDir(
 ): Promise<string | null> {
   const brainDirs = resolveAgyBrainDirs(options);
   for (const brainDir of brainDirs) {
-    if (!existsSync(brainDir)) continue;
-    const canonicalBrainDir = await realpath(brainDir);
+    let canonicalBrainDir: string;
+    try {
+      canonicalBrainDir = await realpath(brainDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
     const sessionDir = join(canonicalBrainDir, conversationId);
-    if (!existsSync(sessionDir)) continue;
-    const sessionInfo = await lstat(sessionDir);
+    let sessionInfo;
+    try {
+      sessionInfo = await lstat(sessionDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
     if (sessionInfo.isSymbolicLink() || !sessionInfo.isDirectory()) {
       throw new Error(`refusing non-directory or symlinked session brain dir: ${sessionDir}`);
     }
@@ -242,17 +252,17 @@ async function readFileHeaderWithinRoot(
   const handle = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile()) return null;
+    if (!stat.isFile()) throw new Error(`file invalid: ${filePath}`);
     const toRead = Math.min(stat.size, maxHeaderBytes);
     if (toRead <= 0) return Buffer.alloc(0);
     const buf = Buffer.allocUnsafe(toRead);
     let offset = 0;
     while (offset < toRead) {
       const { bytesRead } = await handle.read(buf, offset, toRead - offset, offset);
-      if (!bytesRead) break;
+      if (!bytesRead) throw new Error(`transcript changed while reading: ${filePath}`);
       offset += bytesRead;
     }
-    return buf.subarray(0, offset);
+    return buf;
   } finally {
     await handle.close();
   }
@@ -281,11 +291,13 @@ export async function readAgyTranscriptCreatedAt(
     join(canonicalSessionDir, '.system_generated', 'logs', 'transcript_full.jsonl'),
   ];
 
+  let firstReadError: unknown;
   for (const filePath of candidates) {
     let buf: Buffer | null;
     try {
       buf = await readFileHeaderWithinRoot(filePath, canonicalSessionDir, maxHeaderBytes);
-    } catch {
+    } catch (err) {
+      firstReadError ??= err;
       continue;
     }
     if (!buf || buf.length === 0) continue;
@@ -317,6 +329,7 @@ export async function readAgyTranscriptCreatedAt(
       break;
     }
   }
+  if (firstReadError !== undefined) throw firstReadError;
   return null;
 }
 
@@ -346,13 +359,13 @@ function splitCompleteJsonlLines(text: string): { lines: string[]; truncatedTrai
 }
 
 interface FullTranscriptIndex {
-  byStepIndex: Map<number, Record<string, unknown>>;
+  byStepIndex: Map<number, Record<string, unknown>[]>;
   byLine: Array<Record<string, unknown> | null>;
 }
 
 function buildFullTranscriptIndex(text: string): FullTranscriptIndex {
   const { lines } = splitCompleteJsonlLines(text);
-  const byStepIndex = new Map<number, Record<string, unknown>>();
+  const byStepIndex: FullTranscriptIndex['byStepIndex'] = new Map();
   const byLine: Array<Record<string, unknown> | null> = [];
   for (const line of lines) {
     const trimmed = line.trim();
@@ -365,7 +378,11 @@ function buildFullTranscriptIndex(text: string): FullTranscriptIndex {
       if (isPlainRecord(parsed)) {
         byLine.push(parsed);
         const step = nonNegIntOrNull(parsed.step_index);
-        if (step !== null) byStepIndex.set(step, parsed);
+        if (step !== null) {
+          const rows = byStepIndex.get(step);
+          if (rows) rows.push(parsed);
+          else byStepIndex.set(step, [parsed]);
+        }
       } else {
         byLine.push(null);
       }
@@ -374,6 +391,74 @@ function buildFullTranscriptIndex(text: string): FullTranscriptIndex {
     }
   }
   return { byStepIndex, byLine };
+}
+
+function hasFullField(candidate: Record<string, unknown>, field: string): boolean {
+  if (!Object.prototype.hasOwnProperty.call(candidate, field)) return false;
+  if (Array.isArray(candidate.truncated_fields) && candidate.truncated_fields.includes(field)) return false;
+  const value = candidate[field];
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (field === 'content' || field === 'thinking') return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (isPlainRecord(value)) return Object.keys(value).length > 0;
+  return value !== null && value !== undefined;
+}
+
+function findFullTranscriptRow(
+  index: FullTranscriptIndex,
+  row: Record<string, unknown>,
+  stepIndex: number | null,
+  lineNumber: number | undefined,
+  fields: string[],
+  createdAt: string | null,
+): Record<string, unknown> | undefined {
+  const compareMetadataValue = (expected: unknown, actual: unknown) => {
+    if (typeof expected !== 'string' || !expected.trim() || typeof actual !== 'string' || !actual.trim()) return 0;
+    return actual === expected ? 1 : -1;
+  };
+  const compareTimestamp = (candidateCreatedAt: unknown) => {
+    const raw = compareMetadataValue(row.created_at, candidateCreatedAt);
+    if (raw !== 0) return raw;
+    if (row.created_at === undefined || row.created_at === null || candidateCreatedAt === undefined || candidateCreatedAt === null) return 0;
+    const parsedCandidate = parseAgyTimestamp(candidateCreatedAt);
+    if (createdAt && parsedCandidate) return createdAt === parsedCandidate ? 1 : -1;
+    return 0;
+  };
+  const compatible = (candidate: Record<string, unknown>) =>
+    (typeof row.type !== 'string' || typeof candidate.type !== 'string' || row.type === candidate.type) &&
+    compareTimestamp(candidate.created_at) >= 0;
+  const byLine = lineNumber === undefined ? undefined : index.byLine[lineNumber];
+  const candidates = stepIndex !== null ? index.byStepIndex.get(stepIndex) ?? [] : byLine ? [byLine] : [];
+  const needsContent = fields.includes('content');
+  // Reused step indexes can point to distinct replies. Establish the match before considering field coverage.
+  const ranked = candidates.filter(compatible).map((candidate, position) => {
+    const availableFields = fields.filter(field => hasFullField(candidate, field));
+    const hasContent = needsContent && availableFields.includes('content');
+    return {
+      candidate,
+      position,
+      timestampMatch: compareTimestamp(candidate.created_at),
+      sourceStatusMatch: compareMetadataValue(row.source, candidate.source) +
+        compareMetadataValue(row.status, candidate.status),
+      typeModelMatch: compareMetadataValue(row.type, candidate.type) +
+        compareMetadataValue(row.model, candidate.model),
+      completeLineMatch: Number(candidate === byLine && availableFields.length === fields.length),
+      hasContent: Number(hasContent),
+      fieldCount: availableFields.length,
+      contentLength: hasContent && typeof candidate.content === 'string' ? candidate.content.trim().length : 0,
+    };
+  });
+  ranked.sort((a, b) =>
+    b.timestampMatch - a.timestampMatch ||
+    b.sourceStatusMatch - a.sourceStatusMatch ||
+    b.typeModelMatch - a.typeModelMatch ||
+    b.completeLineMatch - a.completeLineMatch ||
+    b.hasContent - a.hasContent ||
+    b.fieldCount - a.fieldCount ||
+    b.contentLength - a.contentLength ||
+    b.position - a.position,
+  );
+  return ranked[0]?.candidate;
 }
 
 /**
@@ -610,23 +695,18 @@ export async function readAgyTranscript(
     if (truncatedFields.length > 0 && !usedFullFallback) {
       const idx = await loadFullIndex();
       if (idx) {
-        const candidate =
-          stepIndex !== null ? idx.byStepIndex.get(stepIndex) : idx.byLine[lineNumber] ?? undefined;
-        if (
-          candidate &&
-          (typeof row.type !== 'string' || typeof candidate.type !== 'string' || candidate.type === row.type)
-        ) {
-          for (const field of truncatedFields) {
-            if (
-              field !== '__proto__' &&
-              field !== 'constructor' &&
-              field !== 'prototype' &&
-              Object.prototype.hasOwnProperty.call(candidate, field) &&
-              candidate[field] !== undefined
-            ) {
+        const fields = truncatedFields.filter(field =>
+          field !== '__proto__' && field !== 'constructor' && field !== 'prototype',
+        );
+        const candidate = findFullTranscriptRow(
+          idx, row, stepIndex, primaryTailDegraded ? undefined : lineNumber, fields, createdAt,
+        );
+        if (candidate) {
+          for (const field of fields) {
+            if (hasFullField(candidate, field)) {
               row[field] = candidate[field];
               resolvedFromFull = true;
-              if (field === 'content' && typeof candidate[field] === 'string') contentResolvedFromFull = true;
+              if (field === 'content') contentResolvedFromFull = true;
             }
           }
         }
