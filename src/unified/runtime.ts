@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
-import { realpathSync, existsSync, readFileSync } from 'node:fs';
+import { realpathSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { HistoryArchive } from './history-archive.js';
 import type { MigrationManifest } from './migration.js';
@@ -780,6 +780,9 @@ export class UnifiedRuntime {
     if(idleMs<=600_000) return this.config.intervalMs;
     return Math.min(15000,this.config.intervalMs*3);
   }
+  notifyChannelProgress(destination: string): void {
+    if (!this.closing && !this.closed) this.interactive.notifyChannelProgress(destination);
+  }
   wake():void {
     this.lastActivityAt=Date.now();
     if(!this.polling || this.closing || this.closed) return;
@@ -923,8 +926,22 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   const isMetadataTimeoutError=(err:unknown):boolean=>/^(?:old (?:codex |agy )?(?:scan|read) timed out|metadata read timed out|provider list timed out|source proof timed out)$/i.test(errorText(err).trim());
   const autoTimeoutStreaks=new Map<string,number>();
   const refreshTimeoutStreaks=new Map<string,number>();
+  const agyBrainDir = agyEnabled ? config.agy?.brainDir : undefined;
+  const lastTranscriptStat = new Map<string, string>();
+  const scannedAssistantMessages = new Map<string, number>();
+  const agyTranscriptSignature = (nativeSessionId: string): string | null => {
+    if (!agyBrainDir || !nativeSessionId || nativeSessionId.includes('/') || nativeSessionId.includes('..')) return null;
+    const logsDir = join(agyBrainDir, nativeSessionId, '.system_generated', 'logs');
+    let compact = '';
+    let full = '';
+    try { const st = statSync(join(logsDir, 'transcript.jsonl')); compact = `${st.mtimeMs}:${st.size}`; } catch {}
+    try { const st = statSync(join(logsDir, 'transcript_full.jsonl')); full = `${st.mtimeMs}:${st.size}`; } catch {}
+    return compact || full ? `${compact}|${full}` : null;
+  };
+  let fastAgyTimer: ReturnType<typeof setInterval> | undefined;
+  let fastRefreshing = false;
   let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null; let agyAutoCursor:string|null=null; const recentCursors:Record<Provider,string|null>={codex:null,claude:null,agy:null}; const scopeByProvider:Record<Provider,Array<{root:string;watermark:number}>>={codex:[],claude:[],agy:[]}; const localCodexClock=isLocalCodexEndpoint(config.codexEndpoint);
-  try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,canInspectCandidate:(native,project)=>{try{return native.provider==='codex'&&native.hostId===config.hostId&&native.serviceId===config.codexServiceId&&sources.some(x=>x.provider==='codex'&&x.hostId===native.hostId&&x.serviceId===native.serviceId)&&isAbsolute(project)&&projects.some(root=>inside(realpathSync(project),root))}catch{return false}},allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,allowedProjectRoots:config.allowedProjectRoots,cleanup:()=>{stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
+  try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,canInspectCandidate:(native,project)=>{try{return native.provider==='codex'&&native.hostId===config.hostId&&native.serviceId===config.codexServiceId&&sources.some(x=>x.provider==='codex'&&x.hostId===native.hostId&&x.serviceId===native.serviceId)&&isAbsolute(project)&&projects.some(root=>inside(realpathSync(project),root))}catch{return false}},allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,allowedProjectRoots:config.allowedProjectRoots,cleanup:()=>{if(fastAgyTimer){clearInterval(fastAgyTimer);fastAgyTimer=undefined;}stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
       let autoFailed=false;
       const handleAutoFailure=(key:string,err:unknown):void=>{if(isPendingContentionError(err))return;if(isMetadataTimeoutError(err)){const next=(autoTimeoutStreaks.get(key)??0)+1;autoTimeoutStreaks.set(key,next);if(next<3)return;}autoFailed=true;};
       try {await r.channel.applyPendingAutoBaselines();} catch {autoFailed=true;}
@@ -980,10 +997,30 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
       const boundIds=new Set(r.channel.bindingsForRestore().map(binding=>binding.sessionId));
       if(r.taskChannel) for(const b of r.taskChannel.listActiveBindings()) for(const t of r.taskChannel.listTargets(b.taskId)) boundIds.add(t.sessionId);
       const candidates=r.store.listSessions().filter(s=>!r.store.isDetached(s.sessionId) && !isMissingReadonlyProject(s) && !(s.status==='read_only' && s.control.input!=='available' && r.isProviderUnavailable(s.native.provider)) && trusted(s) && (boundIds.has(s.sessionId) || s.control.input==='available'));
+      const changedPriority: Session[] = [];
+      if (agyBrainDir) {
+        for (const s of candidates) {
+          if (s.native.provider !== 'agy' || s.status !== 'read_only' || s.control.input === 'available') continue;
+          const sig = agyTranscriptSignature(s.native.nativeSessionId);
+          if (!sig) continue;
+          const prev = lastTranscriptStat.get(s.sessionId);
+          if (prev !== undefined && prev !== sig) {
+            changedPriority.push(s);
+            if (changedPriority.length >= 6) break;
+          } else if (prev === undefined) {
+            lastTranscriptStat.set(s.sessionId, sig);
+          }
+        }
+      }
       const count=Math.min(2,candidates.length), start=candidates.length ? refreshOffset%candidates.length : 0; let refreshFailed=false;
       refreshOffset=candidates.length ? (start+count)%candidates.length : 0;
+      const batch: Session[] = [...changedPriority];
+      const seenBatch = new Set(batch.map(s => s.sessionId));
       for(let index=0;index<count;index++) {
-        const session=candidates[(start+index)%candidates.length]!;
+        const s=candidates[(start+index)%candidates.length]!;
+        if(!seenBatch.has(s.sessionId)) { batch.push(s); seenBatch.add(s.sessionId); }
+      }
+      for(const session of batch) {
         if(isMissingReadonlyProject(session)) continue;
         if(session.status==='read_only' && session.control.input!=='available' && r.isProviderUnavailable(session.native.provider)) continue;
         try {
@@ -994,6 +1031,10 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
           try {
             refreshed = await r.core.refreshReadOnlySession(session.sessionId);
             refreshTimeoutStreaks.delete(session.sessionId);
+            if (session.native.provider === 'agy') {
+              const sig = agyTranscriptSignature(session.native.nativeSessionId);
+              if (sig) lastTranscriptStat.set(session.sessionId, sig);
+            }
           } catch(err) {
             if(isMissingReadonlySessionError(session,err)) {
               // Native session file no longer exists on disk; do not poison core health.
@@ -1016,9 +1057,17 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
             // Best-effort read-only incremental catch-up for terminal turns.
           }
         }
-        if(refreshed) for(const binding of baselines) if(!r.channel.hasPendingAutoBaseline(binding.destination,session.sessionId)) await r.channel.baselineReadonlyHistory(binding.destination,session.sessionId);
+        if(refreshed) {
+          for(const binding of baselines) if(!r.channel.hasPendingAutoBaseline(binding.destination,session.sessionId)) await r.channel.baselineReadonlyHistory(binding.destination,session.sessionId);
+          for(const binding of r.channel.bindingsForRestore()) if(binding.sessionId===session.sessionId) r.notifyChannelProgress(binding.destination);
+        }
         { const snapshot=await r.core.getSnapshot(session.sessionId);
-          for(const m of snapshot.value.messages) if(m.role==='assistant') for(const block of m.blocks) if(block.type==='text') for(const root of registry.getRoots(session.native)) for(const link of await localFileLinks(block.text.replace(/\]\(localfile:\/\/\//g,'](file:///'),session.project,root)) { try { await registry.register(nativeRefKey(session.native),link.path); } catch {} }
+          const prevScanned = scannedAssistantMessages.get(session.sessionId) ?? 0;
+          if (refreshed || snapshot.value.messages.length > prevScanned) {
+            const slice = refreshed ? snapshot.value.messages.slice(Math.max(0, prevScanned - 2)) : snapshot.value.messages.slice(prevScanned);
+            for(const m of slice) if(m.role==='assistant') for(const block of m.blocks) if(block.type==='text') for(const root of registry.getRoots(session.native)) for(const link of await localFileLinks(block.text.replace(/\]\(localfile:\/\/\//g,'](file:///'),session.project,root)) { try { await registry.register(nativeRefKey(session.native),link.path); } catch {} }
+            scannedAssistantMessages.set(session.sessionId, snapshot.value.messages.length);
+          }
         }
         } catch(err) { if(!isMissingReadonlySessionError(session,err)) refreshFailed=true; }
       }
@@ -1028,6 +1077,57 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     }});
   } catch(error) {stateLock.exec('ROLLBACK');stateLock.close();await Promise.all(ports.map(p=>p.close()));throw error;}
   activeRuntime=runtime;
+  if (agyBrainDir) {
+    fastAgyTimer = setInterval(() => {
+      if (fastRefreshing || !runtime.acceptsBackgroundWork() || runtime.isProviderUnavailable('agy')) return;
+      fastRefreshing = true;
+      void (async () => {
+        try {
+          const bindings = runtime.channel.bindingsForRestore();
+          const boundMap = new Map<string, string[]>();
+          for (const b of bindings) {
+            if (b.accessMode !== 'read_only') continue;
+            const list = boundMap.get(b.sessionId) ?? [];
+            list.push(b.destination);
+            boundMap.set(b.sessionId, list);
+          }
+          for (const [sessionId, destinations] of boundMap) {
+            if (!runtime.acceptsBackgroundWork()) break;
+            let session: Session;
+            try { session = runtime.store.getSession(sessionId); } catch { continue; }
+            if (session.native.provider !== 'agy' || session.status !== 'read_only' || session.control.input === 'available') continue;
+            if (runtime.store.isDetached(sessionId) || isMissingReadonlyProject(session) || !trusted(session)) continue;
+            const sig = agyTranscriptSignature(session.native.nativeSessionId);
+            if (!sig) continue;
+            const prev = lastTranscriptStat.get(sessionId);
+            if (prev === undefined) {
+              lastTranscriptStat.set(sessionId, sig);
+              continue;
+            }
+            if (prev === sig) continue;
+            lastTranscriptStat.set(sessionId, sig);
+            try {
+              configure(session);
+              const refreshed = await runtime.core.refreshReadOnlySession(sessionId);
+              if (refreshed) {
+                for (const dest of destinations) {
+                  if (!runtime.channel.readonlyHydrated(dest, sessionId) && !runtime.channel.hasPendingAutoBaseline(dest, sessionId)) {
+                    await runtime.channel.baselineReadonlyHistory(dest, sessionId);
+                  }
+                  runtime.notifyChannelProgress(dest);
+                }
+              }
+            } catch {
+              // Best-effort fast lane; main poll loop handles retries and health reporting.
+            }
+          }
+        } finally {
+          fastRefreshing = false;
+        }
+      })();
+    }, 1500);
+    fastAgyTimer.unref?.();
+  }
   const initProviders: readonly Provider[] = agyEnabled ? ['codex','claude','agy'] : ['codex','claude'];
   try {for(const provider of initProviders){const sourceKey=provider==='codex' ? payloadDigest([config.hostId,config.codexServiceId,config.codexEndpoint,sources.filter(s=>s.provider==='codex').map(s=>s.directory).sort()]) : provider==='claude' ? payloadDigest([config.hostId,config.claudeServiceId,sources.filter(s=>s.provider==='claude').map(s=>s.directory).sort()]) : payloadDigest([config.hostId,config.agy!.serviceId,config.agy!.summariesDbPath ?? null,config.agy!.brainDir ?? null,sources.filter(s=>s.provider==='agy').map(s=>s.directory).sort()]);scopeByProvider[provider]=runtime.channel.configureAutoScopeWatermarks(config.autoMirror?.enabled ? config.autoMirror.destination! : null,sourceKey,[...new Set(projects)].sort(),provider==='codex'?Math.floor(Date.now()/1000):Date.now(),provider);} await registry.load(); for(const s of runtime.store.listSessions()) { if(isMissingReadonlyProject(s)) continue; if(pin(s)) configure(s); } return runtime; } catch(error) {await runtime.close();throw error;}
 }
