@@ -75,8 +75,9 @@ async function toolProgress(ctx) {
       tool('list', 'succeeded', 'git status');
       tool('lint', 'running', 'npm run lint');
       tool('compare', 'running', 'git diff');
+      const patchIntervalMs = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 1500;
       await ctx.tick();
-      await delay(1520);
+      await delay(patchIntervalMs + 20);
       await ctx.tick();
       const current = ctx.wire.messages.get(cardId);
       const { card } = current;
@@ -84,9 +85,9 @@ async function toolProgress(ctx) {
       trace.observe('工具状态批次到达后的同卡更新', {
         patches: current.patchCount - prior.patchCount, intervalMs: patchDelayMs,
       });
-      trace.check('五项工具状态合并为一次 PATCH，相隔至少 1500ms', () => {
+      trace.check(`五项工具状态合并为一次 PATCH，相隔至少 ${patchIntervalMs}ms`, () => {
         assert.equal(current.patchCount - prior.patchCount, 1);
-        assert.ok(patchDelayMs >= 1500, `卡片更新间隔为 ${patchDelayMs}ms`);
+        assert.ok(patchDelayMs >= patchIntervalMs, `卡片更新间隔为 ${patchDelayMs}ms`);
       });
       trace.check('并行状态在折叠面板外，两个成功及一个失败在默认折叠的执行记录内', () => {
         assert.match(card.bodyText, /⏳ 正在执行：Bash · git diff（另有 1 项并行）/);
@@ -125,7 +126,8 @@ async function toolProgress(ctx) {
       tool('compare', 'succeeded', 'git diff');
       ctx.emitText(topic, complete, { messageId, final: true });
       await ctx.finish(topic);
-      await delay(1520);
+      const patchIntervalMs = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 1500;
+      await delay(patchIntervalMs + 20);
       await ctx.tick();
       const card = ctx.wire.messages.get(cardId).card;
       trace.check('同一张卡已转为绿色完成态，写出全部八段正文', () => {

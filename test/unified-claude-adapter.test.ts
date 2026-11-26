@@ -655,22 +655,24 @@ test('approval facts resolve shell effects, symbolic links, and effective Git pu
       [{ kind: 'write', paths: [join(homeDir, '.ssh/config')] }, scope, 'ask'],
       [{ kind: 'write', paths: [join(homeDir, '.config/settings')] }, scope, 'ask'],
     ];
-    for (const [request, context, expected] of cases) {
-      const actual = evaluateApproval(await resolveApprovalFacts(request, context));
-      assert.equal(actual.kind, expected, `${JSON.stringify([request, context])} yielded ${JSON.stringify(actual)}`);
+    for (let i = 0; i < cases.length; i += 16) {
+      await Promise.all(cases.slice(i, i + 16).map(async ([request, context, expected]) => {
+        const actual = evaluateApproval(await resolveApprovalFacts(request, context));
+        assert.equal(actual.kind, expected, `${JSON.stringify([request, context])} yielded ${JSON.stringify(actual)}`);
+      }));
     }
     const push = async (command: string) => evaluateApproval(await resolveApprovalFacts({ kind: 'command', command }, scope));
     const reviewed = await branch('reviewed', 'account/reviews/blind draft.txt');
     await git('update-ref', 'refs/heads/removed', await commitTree(await gitValue('write-tree'), '-p', reviewed));
     await git('update-ref', 'refs/tags/reviewed-tag', reviewed);
-    for (const command of [
+    await Promise.all([
       'git push origin main', 'git push origin missing', 'git push origin reviewed', 'git push origin +removed:main', 'git push origin main removed',
       'git push origin tag reviewed-tag', 'git push origin --tags', 'git push origin --all',
       'git push origin "refs/heads/*:refs/heads/*"',
-    ]) {
+    ].map(async command => {
       const decision = await push(command);
       assert.ok(decision.kind === 'deny' && /reviews\/.*保密盲审/.test(decision.reason), command);
-    }
+    }));
     await git('config', 'remote.origin.push', 'removed:refs/heads/main');
     assert.equal((await push('git push origin')).kind, 'deny');
     await git('config', '--unset-all', 'remote.origin.push');

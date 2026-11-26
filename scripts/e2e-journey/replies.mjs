@@ -17,11 +17,14 @@ function visibleWrites(ctx, topic, type) {
     (!type || message.type === type)).map(({ message }) => message);
 }
 
+const PATCH_INTERVAL_MS = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 1500;
+const REJECTION_RETRY_MS = Number(process.env.FEISHU_REJECTION_RETRY_MS) > 0 ? Number(process.env.FEISHU_REJECTION_RETRY_MS) : 3000;
+
 async function waitForPatchWindow(ctx, topic) {
   const previous = ctx.cards(topic).findLast(({ card }) => /进行中/.test(card.title));
   if (!previous) return;
   // This wait is real wall time and remains visible in the step latency.
-  const wait = Date.parse(previous.updatedAt) + 1510 - Date.now();
+  const wait = Date.parse(previous.updatedAt) + PATCH_INTERVAL_MS + 10 - Date.now();
   if (wait > 0) await delay(wait);
   await ctx.tick();
 }
@@ -236,7 +239,7 @@ async function longReplies(ctx) {
     });
     await trace.step('10.4 等待 3 秒退避，重试 PATCH 时注入 230099', async () => {
       wire.fault('im.message.patch', 230099);
-      await delay(3050);
+      await delay(REJECTION_RETRY_MS + 50);
       await ctx.tick();
       trace.check('两次 API 拒绝后原卡片以纯文本更新，完整正文和终态均保留', () => {
         const attempts = wire.calls.slice(failureOffset).filter(call =>

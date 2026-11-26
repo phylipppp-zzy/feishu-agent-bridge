@@ -8,10 +8,17 @@ import { aggregateTurnAssistantMessage } from './turn-reply.js';
 import { completionText, replyText, turnProgressCard } from './turn-progress-card.js';
 import { timestampMs, type TurnTiming, type TurnToolCounts } from './turn-progress-store.js';
 
+function positiveEnvMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export const LONG_TURN_NOTICE_MS = 120_000;
-const PATCH_INTERVAL_MS = 1500;
+const PATCH_INTERVAL_MS = positiveEnvMs('FEISHU_PATCH_INTERVAL_MS', 1500);
 const HEARTBEAT_MS = 15_000;
-const REJECTION_RETRY_MS = 3_000;
+const REJECTION_RETRY_MS = positiveEnvMs('FEISHU_REJECTION_RETRY_MS', 3_000);
 
 type BindingKey = [destination: string, sessionId: string, scope: string];
 type SlotKey = [...BindingKey, turnId: string];

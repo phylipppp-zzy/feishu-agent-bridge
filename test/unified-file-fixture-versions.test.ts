@@ -57,7 +57,7 @@ test('TestLaneRuntime operator.sock file-v2 exposes distinct artifact buttons an
  const sdkPath=join(dir,'sdk'),laneDir=join(dir,'lane'),channelPath=join(dir,'channel');
  const v1Hash=createHash('sha256').update('TEST fixture\n').digest('hex');
  const v2Hash=createHash('sha256').update('TEST fixture 第二版本\n').digest('hex');
- const operatorScript=fileURLToPath(new URL('../scripts/test-lane-operator.mjs',import.meta.url));
+ const operatorScript=fileURLToPath(new URL(import.meta.url.includes('/dist/test/')?'../../scripts/test-lane-operator.mjs':'../scripts/test-lane-operator.mjs',import.meta.url));
  const sdk=new FeishuSdkPort({appId:'app',appSecret:'fake'},sdkPath,new Set(['chat']),'owner');
  let seq=0,uploads=0,prod=0;
  const chats=new Map<string,string>();

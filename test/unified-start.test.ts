@@ -5,8 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { liveRuntimeLifecycle } from '../src/unified/runtime.js';
-// @ts-expect-error JavaScript candidate entry has no declaration.
-import { main } from '../scripts/unified-start.mjs';
+const startEntryUrl = new URL(
+  import.meta.url.includes('/dist/test/') ? '../../scripts/unified-start.mjs' : '../scripts/unified-start.mjs',
+  import.meta.url,
+).href;
+const { main } = await import(startEntryUrl) as { main: (argv: string[], deps?: Record<string, unknown>) => Promise<number> };
 
 test('entry is opt-in, validates without secrets, and closes on signal', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'unified-entry-'));
