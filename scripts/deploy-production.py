@@ -184,9 +184,6 @@ RestartSec=5
 TimeoutStopSec=30
 KillMode=mixed
 UMask=0077
-NoNewPrivileges=true
-RestrictSUIDSGID=true
-ProtectSystem=full
 [Install]
 WantedBy=default.target
 """
