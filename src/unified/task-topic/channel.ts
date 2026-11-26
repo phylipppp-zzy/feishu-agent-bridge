@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from '../adapter.js';
-import type { Identity, Message, NativeSessionRef, Operation, Provider } from '../contracts.js';
+import type { ChannelInputScope, Identity, Message, NativeSessionRef, Operation, Provider } from '../contracts.js';
 import type { FeishuPort, TrustedEnvelope } from '../feishu-channel.js';
 import type { TaskTopicToken } from '../task-topic-store.js';
 import { drainTaskEventLocked } from './drain.js';
@@ -10,6 +10,7 @@ import {
   getBindingRow,
   getBindingRowByDestination,
   getTargetRow,
+  taskInputScope,
   runTransaction,
 } from './schema.js';
 import {
@@ -50,6 +51,7 @@ export class TaskTopicChannel {
   private readonly interactionLocks = new Map<string, Promise<void>>();
   private readonly streamThrottleMs: number;
   private closed = false;
+  private readonly unregisterInputScope: (() => void) | undefined;
 
   constructor(
     private readonly service: UnifiedService,
@@ -72,11 +74,14 @@ export class TaskTopicChannel {
       this.ownsDb = false;
     }
     ensureTaskTopicSchema(this.db);
+    const unregister = service.registerInputScopeValidator?.((scope,id) => this.isCurrentInputScope(scope,id));
+    if (typeof unregister === 'function') this.unregisterInputScope = unregister;
   }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.unregisterInputScope?.();
     if (this.ownsDb) this.db.close();
   }
 
@@ -124,6 +129,15 @@ export class TaskTopicChannel {
   getBindingByDestination(destination: string): TaskBindingRecord | null {
     const row = getBindingRowByDestination(this.db, destination);
     return row ? toBinding(row) : null;
+  }
+
+  isCurrentInputScope(scope: ChannelInputScope, sessionId: string): boolean {
+    const binding = getBindingRowByDestination(this.db,scope.destination);
+    if (!binding || binding.state !== 'active' || binding.owner_source !== scope.ownerSource ||
+        binding.owner_subject !== scope.ownerSubject) return false;
+    const targets = this.db.prepare("SELECT * FROM task_targets_v1 WHERE task_id=? AND session_id=? AND state='active' AND access_mode='interactive'")
+      .all(binding.task_id,sessionId) as unknown as TargetRow[];
+    return targets.some(target => taskInputScope(binding,target).bindingScope === scope.bindingScope);
   }
 
   getTarget(taskId: string, targetId: string): TaskTargetRecord | null {

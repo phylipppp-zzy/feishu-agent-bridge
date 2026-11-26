@@ -22,13 +22,23 @@ export interface Message { messageId: string; sessionId: string; turnId: string;
 export interface CandidateMetadata { native:NativeSessionRef; project:string; status:string; historyVerified:false; observedAt:string; connectionGeneration:number }
 export interface Artifact { artifactId: string; sessionId: string; name: string; mediaType: string; size: number; contentVersion: string; relativePath?: string }
 export type OperationStatus = 'received' | 'queued' | 'accepted' | 'completed' | 'failed' | 'unknown';
-export type OperationResult = {kind:'session'; sessionId:string} | {kind:'artifact'; artifactId:string; contentVersion:string} | {kind:'turn'; turnId:string; status:'completed'|'failed'|'interrupted'};
+export type StopRejection = 'no_running_turn' | 'ambiguous_running_turn';
+export type OperationResult = {kind:'stopRejected'; reason:StopRejection} | {kind:'queueCancellation'; cancelled:number} | {kind:'session'; sessionId:string} | {kind:'artifact'; artifactId:string; contentVersion:string} | {kind:'turn'; turnId:string; status:'completed'|'failed'|'interrupted'};
 export interface Operation { operationId: string; idempotencyKey: string; targetId: string; action: string; payloadDigest: string; status: OperationStatus; revision: Revision; error: ContractError | null; result?: OperationResult }
 export type InteractionStatus = 'awaiting_answer' | 'answer_pending_delivery' | 'resolved' | 'expired' | 'cancelled';
 export interface InteractionBase { interactionId: string; sessionId: string; turnId: string; nativeRequestId: string; connectionGeneration: number; revision: Revision; status: InteractionStatus; expiresAt: string | null; toolInputDigest: string | null; nativeResult: NativeResult | null }
 export type Interaction = InteractionBase & ({ kind: 'question'; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean } | { kind: 'approval'; tool: string; action: string; scope: string; toolInputDigest: string; allowedDecisions?: readonly ('allow' | 'deny')[] } | { kind: 'question_group'; questions: Array<{ id: string; prompt: string; choices: string[]; multiple: boolean | null; allowFreeText: boolean }> });
-export type NativeResult = { status: 'accepted'; source: string; answer: Answer | null } | { status: 'unknown'; source: string } | { status: 'rejected'; reason: string };
+export type NativeResult = { status: 'accepted'; source: string; answer: Answer | null; disposition?: 'skipped' } | { status: 'unknown'; source: string } | { status: 'rejected'; reason: string };
 export type Answer = { kind: 'question'; values: string[] } | { kind: 'approval'; decision: 'allow' | 'deny'; scope: string } | { kind: 'question_group'; answers: Record<string, string[]> };
+export const DECLINED_ANSWER_MARKER = '[已跳过/取消]';
+export function questionDeclineAction(answer: Answer | null): 'decline' | 'cancel' | null {
+  if (!answer || answer.kind === 'approval') return null;
+  const action = (answer as Answer & {action?: unknown}).action;
+  if (action === 'decline' || action === 'cancel') return action;
+  const values = answer.kind === 'question' ? [answer.values] : Object.values(answer.answers ?? {});
+  return values.length > 0 && values.every(list =>
+    Array.isArray(list) && list.length === 1 && list[0] === DECLINED_ANSWER_MARKER) ? 'decline' : null;
+}
 export interface ResponseEvidence {
   operationId: string;
   interactionId: string;
@@ -38,6 +48,12 @@ export interface ResponseEvidence {
 }
 export interface ResolveInteraction { context: WriteContext; interactionId: string; expectedConnectionGeneration: number; answer: Answer; toolInputDigest: string | null }
 export interface SubmitInput { context: WriteContext; mode: 'new' | 'queue' | 'steer'; blocks: ContentBlock[]; requiredTurnId?: string; expectedConnectionGeneration?: number; channelScope?: ChannelInputScope }
+export function shouldAutoQueueInput(session: Session): boolean {
+  return session.capabilities?.queue?.status === 'available' && (
+    session.status === 'waiting_approval' || session.status === 'waiting_question' ||
+    (session.status === 'running' && session.capabilities?.steer?.status !== 'available')
+  );
+}
 export interface Event { schemaVersion: typeof SCHEMA_VERSION; eventId: string; sessionId: string; objectId: string; objectRevision: Revision; sequence: number; type: string; occurredAt: string; receivedAt: string; operationId: string | null; cursor: string; data: unknown }
 export interface TurnResidual { status:'running'|'none'|'unknown'; count:number|null; observedAt:string|null; complete:boolean; reason:string }
 export interface Page<T> { items: T[]; nextCursor: string | null; unavailableProviders?:Provider[]; partialFailure?:boolean }
@@ -50,15 +66,21 @@ export type Validation<T> = { ok: true; value: T } | { ok: false; error: Contrac
 const fail = (message: string): Validation<never> => ({ ok: false, error: contractError('invalid_request', message) });
 const nonempty = (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0;
 const counter = (x: unknown): x is number => Number.isSafeInteger(x) && (x as number) >= 0;
+function validChannelScope(scope: ChannelInputScope, identity: Identity): boolean {
+  return !!scope && typeof scope === 'object' && !Array.isArray(scope) &&
+    nonempty(scope.destination) && nonempty(scope.bindingScope) &&
+    scope.ownerSource === identity.source && scope.ownerSubject === identity.subject;
+}
 export function validateWriteContext(x: WriteContext): Validation<WriteContext> {
   if (!x || !nonempty(x.operationId) || !nonempty(x.idempotencyKey) || !nonempty(x.targetId) || !counter(x.expectedRevision) || !counter(x.controlGeneration) || !x.identity || !nonempty(x.identity.subject) || !nonempty(x.identity.source)) return fail('invalid write context');
+  if (x.channelScope !== undefined && !validChannelScope(x.channelScope,x.identity)) return fail('invalid channel scope');
   return { ok: true, value: x };
 }
 export function validateSubmitInput(x: SubmitInput): Validation<SubmitInput> {
   const context = validateWriteContext(x?.context); if (!context.ok) return context;
   if (!['new', 'queue', 'steer'].includes(x.mode) || !Array.isArray(x.blocks) || x.blocks.length === 0 || !x.blocks.every(b => b && (b.type === 'text' ? nonempty(b.text) : b.type === 'artifact' && nonempty(b.artifactId) && nonempty(b.contentVersion)))) return fail('invalid input blocks or mode');
   if (x.mode === 'steer' && (!nonempty(x.requiredTurnId) || !counter(x.expectedConnectionGeneration))) return fail('steer requires a captured turn and connection generation');
-  if (x.channelScope && (!nonempty(x.channelScope.destination) || !nonempty(x.channelScope.bindingScope) || !nonempty(x.channelScope.ownerSource) || !nonempty(x.channelScope.ownerSubject) || x.channelScope.ownerSource!==x.context.identity.source || x.channelScope.ownerSubject!==x.context.identity.subject)) return fail('invalid channel scope');
+  if (x.channelScope !== undefined && !validChannelScope(x.channelScope,x.context.identity)) return fail('invalid channel scope');
   if (x.context.channelScope && payloadDigest(x.context.channelScope) !== payloadDigest(x.channelScope ?? null)) return fail('channel scope mismatch');
   return { ok: true, value: x };
 }

@@ -8,8 +8,17 @@ test('SDK send and update await the binding guard before contacting Feishu',asyn
 });
 
 test('legacy stop selects exactly one running turn and panel aliases do not send model input',async()=>{
- const {parseFeishuText}=await import('../src/unified/feishu-codec.js');const x=setup();try{await x.channel.handle(x.e('bind'),{action:'bind',sessionId:'A'});x.interactive();let turns:any[]=[];let interrupted='';(x.core as any).getWorkState=async()=>({runningTurns:turns,queuedInputs:[],canArchive:false});(x.core as any).interruptTurn=async(req:any)=>{interrupted=req.payload.turnId;return {operationId:'o',idempotencyKey:'i',targetId:'A',action:'interruptTurn',payloadDigest:'d',status:'received',revision:0,error:null}};
- for(const alias of ['/','/menu','/status']) assert.equal(parseFeishuText(alias).action,'panel');assert.equal(parseFeishuText('/stop').action,'legacy_stop');assert.equal(parseFeishuText('/stop t 1 2').action,'stop');await x.channel.handle(x.e('none'),parseFeishuText('/stop'));assert.equal(interrupted,'');turns=[{turnId:'t'},{turnId:'t2'}];await x.channel.handle(x.e('many'),parseFeishuText('/stop'));assert.equal(interrupted,'');turns=[{turnId:'only'}];await x.channel.handle(x.e('one'),parseFeishuText('/stop'));assert.equal(interrupted,'only');assert.throws(()=>parseFeishuText('/mode something'));
+ const {parseFeishuText}=await import('../src/unified/feishu-codec.js');const x=setup();try{await x.channel.handle(x.e('bind'),{action:'bind',sessionId:'A'});x.interactive();const store=x.core.store;
+ const turn=(turnId:string,status:'running'|'completed'='running')=>({turnId,sessionId:'A',status,inputId:null,startedAt:null,endedAt:null,model:null,outputIds:[]});
+ for(const alias of ['/','/menu','/status']) assert.equal(parseFeishuText(alias).action,'panel');
+ const stop=parseFeishuText('/stop');assert.equal(stop.action,'legacy_stop');assert.equal(parseFeishuText('/stop t 1 2').action,'stop');
+ assert.deepEqual(await x.channel.handle(x.e('none'),stop),{status:'rejected',reason:'no_running_turn'});
+ store.putTurn(turn('t'));store.putTurn(turn('t2'));
+ assert.deepEqual(await x.channel.handle(x.e('many'),stop),{status:'rejected',reason:'ambiguous_running_turn'});
+ store.putTurn(turn('t','completed'));store.putTurn(turn('t2','completed'));store.putTurn(turn('only'));
+ const operation=await x.channel.handle(x.e('one'),stop) as {operationId:string};
+ assert.deepEqual(store.getOutbox(operation.operationId).payload,{turnId:'only'});
+ assert.throws(()=>parseFeishuText('/mode something'));
  }finally{x.done();}
 });
 

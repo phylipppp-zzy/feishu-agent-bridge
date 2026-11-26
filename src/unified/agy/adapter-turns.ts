@@ -5,6 +5,7 @@ import type { AgyAcpNotification, AgyServerRequest } from '../agy-transport.js';
 import {
   answerDigest,
   payloadDigest,
+  questionDeclineAction,
   type Answer,
   type Interaction,
   type Message,
@@ -19,7 +20,6 @@ import {
   convertSchemaValue,
   DEFAULT_PROMPT_IDLE_TIMEOUT_MS,
   DEFAULT_WAKEUP_IDLE_MS,
-  ELICITATION_SKIP_SENTINEL,
   extractSchemaChoices,
   extractTextFromUpdateContent,
   findEffortConfigId,
@@ -29,7 +29,6 @@ import {
   schemaAllowsFreeText,
   type ActiveTurnState,
   type AdapterContext,
-  type AgyElicitationAction,
   type Obj,
   type PendingAgyRequest,
 } from './adapter-types.js';
@@ -154,7 +153,7 @@ function finalizeWakeupTurn(
         receivedAt: endedAt,
         operationId: null,
         cursor: String(seq),
-        data: { reason: failureReason, wakeup: true },
+        data: { reason: failureReason, wakeup: true, outcomeUnknown: true },
       },
     });
   }
@@ -264,7 +263,7 @@ function ensureWakeupTurn(
 
 function safeRespondServerRejection(
   ctx: AdapterContext,
-  req: AgyServerRequest,
+  req: Pick<AgyServerRequest, 'generation' | 'rpcId' | 'method'>,
   reason: string,
   rpcCode = -32000,
   elicitationAction: 'decline' | 'cancel' = 'decline',
@@ -488,7 +487,7 @@ export function handlePromptFailed(
       cursor: String(seq),
       data: {
         reason: message,
-        ...(isOutcomeUnknown ? { outcomeUnknown: true, sessionLocked } : {}),
+        ...(isOutcomeUnknown ? { outcomeUnknown: true, sessionLocked } : { definiteFailure: true }),
         ...(turnState.cancelRequested ? { cancelRequested: true } : {}),
       },
     },
@@ -521,15 +520,17 @@ function observeToolExecution(
       req.interaction.status !== 'answer_pending_delivery' || req.closedSource ||
       req.answer?.kind !== 'approval' || req.answer.decision !== 'allow') return;
   req.executed = true;
-  if (req.submission === 'submitted') publishToolExecution(ctx, req);
+  if (req.submission === 'submitted') publishResponseResolution(ctx, req, 'agy_tool_execution');
 }
 
-function publishToolExecution(ctx: AdapterContext, req: PendingAgyRequest): void {
+function publishResponseResolution(ctx: AdapterContext, req: PendingAgyRequest, source: string): void {
+  const skipped = questionDeclineAction(req.answer) !== null;
   req.interaction = {
     ...req.interaction,
     status: 'resolved',
     revision: req.interaction.revision + 1,
-    nativeResult: { status: 'accepted', source: 'agy_tool_execution', answer: req.answer },
+    nativeResult: { status: 'accepted', source, answer: skipped ? null : req.answer,
+      ...(skipped ? {disposition:'skipped' as const} : {}) },
   };
   const { interactionId, nativeRequestId } = req.interaction;
   ctx.emitInteraction(req.interaction, req.operationId && req.answerDigest ? {
@@ -556,6 +557,16 @@ function publishRequestClosure(ctx: AdapterContext, req: PendingAgyRequest): voi
 const maxFullToolCalls = 128;
 const toolSummaryFields = ['toolCallId', 'title', 'kind', 'name', 'toolName', 'status'];
 const terminalToolStatuses = new Set(['completed', 'failed', 'cancelled']);
+const maxRecentTerminalTools = 4096;
+function rememberTerminalTool(ctx: AdapterContext, sessionId: string, toolCallId: string): void {
+  const recent = ctx.recentTerminalTools;
+  if (!recent) return;
+  const ids = recent.get(sessionId) ?? new Set<string>();
+  ids.delete(toolCallId);
+  ids.add(toolCallId);
+  if (ids.size > maxRecentTerminalTools) ids.delete(ids.values().next().value!);
+  recent.set(sessionId, ids);
+}
 type ToolCallCheck = { latest: Obj; count: number };
 // Full inputs otherwise disappear when a terminal update arrives during classification.
 const inFlightToolChecks = new WeakMap<ActiveTurnState, Map<string, ToolCallCheck>>();
@@ -585,7 +596,7 @@ function releaseToolCall(ctx: AdapterContext, sessionId: string, turn: ActiveTur
   for (const req of ctx.requests.values()) {
     if (req.toolCallId === toolCallId && req.interaction.sessionId === sessionId && req.turnId === turn.turnId &&
         req.generation === turn.generation && (req.interaction.status === 'awaiting_answer' ||
-          req.interaction.status === 'answer_pending_delivery' && req.submission === 'writing')) return;
+          req.interaction.status === 'answer_pending_delivery' && req.submission === 'writing' && !req.closedSource)) return;
   }
   compactToolCall(turn, toolCallId, turn.toolCalls.get(toolCallId)!);
 }
@@ -657,18 +668,24 @@ export function handleAcpNotification(
     return;
   }
 
-  if (
-    kind === 'tool_call_update' &&
-    isString(update.toolCallId)
-  ) {
+  if ((kind === 'tool_call' || kind === 'tool_call_update') && isString(update.toolCallId) &&
+      ctx.recentTerminalTools?.get(sessionId)?.has(update.toolCallId)) return;
+
+  if (kind === 'tool_call_update') {
     const isTerminal = isString(update.status) && terminalToolStatuses.has(update.status);
     const currentTurn = ctx.activeTurns.get(sessionId);
-    const canConsumeResidual =
-      !currentTurn || (!currentTurn.toolCalls.has(update.toolCallId) && (isTerminal || update.status !== 'pending'));
-    if (
-      canConsumeResidual &&
-      matchResidualToolCall(ctx, sessionId, notification.generation, update.toolCallId, isTerminal)
-    ) {
+    const toolCallId = update.toolCallId;
+    if (isString(toolCallId)) {
+      const canConsumeResidual =
+        !currentTurn || (!currentTurn.toolCalls.has(toolCallId) && (isTerminal || update.status !== 'pending'));
+      if (canConsumeResidual &&
+          matchResidualToolCall(ctx,sessionId,notification.generation,toolCallId,isTerminal)) {
+        if (isTerminal) rememberTerminalTool(ctx,sessionId,toolCallId);
+        return;
+      }
+    }
+    if (isTerminal && !currentTurn) {
+      if (isString(toolCallId)) rememberTerminalTool(ctx,sessionId,toolCallId);
       return;
     }
   }
@@ -680,6 +697,10 @@ export function handleAcpNotification(
   const turnState =
     ctx.activeTurns.get(sessionId) ?? ensureWakeupTurn(ctx, sessionId, notification.generation);
   if (!turnState || turnState.generation !== notification.generation) return;
+  const toolCallId = (kind === 'tool_call' || kind === 'tool_call_update') && isString(update.toolCallId)
+    ? update.toolCallId : null;
+  const previous = toolCallId ? turnState.toolCalls.get(toolCallId) : undefined;
+  if (isString(previous?.status) && terminalToolStatuses.has(previous.status)) return;
   turnState.lastActivityAt = Date.now();
   if (turnState.isWakeup) {
     scheduleWakeupFinalize(ctx, sessionId, turnState);
@@ -687,9 +708,7 @@ export function handleAcpNotification(
 
   if (kind === 'tool_call' || kind === 'tool_call_update') {
     if (turnState.assistantText) turnState.needsParagraphBreak = true;
-    const toolCallId = isString(update.toolCallId) ? update.toolCallId : null;
     if (toolCallId) {
-      const previous = turnState.toolCalls.get(toolCallId);
       const checking = inFlightToolChecks.get(turnState)?.get(toolCallId);
       const call = mergeAgyToolCall(checking?.latest ?? previous, update);
       if (checking) checking.latest = call;
@@ -700,6 +719,7 @@ export function handleAcpNotification(
       }
       const terminal = isString(call.status) && terminalToolStatuses.has(call.status);
       if (terminal) {
+        rememberTerminalTool(ctx,sessionId,toolCallId);
         turnState.inProgressToolCalls.delete(toolCallId);
       } else {
         turnState.inProgressToolCalls.add(toolCallId);
@@ -722,7 +742,20 @@ export function handleAcpNotification(
         const observation = tracker.observe(ref, turnState.generation, turnState.turnId, toolCallId, progress.phase, progress.detail);
         if (observation) ctx.emit(observation);
       }
-      if (terminal) releaseToolCall(ctx, sessionId, turnState, toolCallId);
+      if (terminal) {
+        for (const req of ctx.requests.values()) {
+          if (req.interaction.kind !== 'approval' || req.interaction.sessionId !== sessionId ||
+              req.turnId !== turnState.turnId || req.generation !== turnState.generation ||
+              req.toolCallId !== toolCallId || req.executed ||
+              (req.interaction.status !== 'awaiting_answer' && req.interaction.status !== 'answer_pending_delivery')) continue;
+          if (req.interaction.status === 'awaiting_answer') {
+            safeRespondServerRejection(ctx, {...req, method:'session/request_permission'}, 'Tool call has already ended');
+          }
+          req.closedSource ??= 'agy_tool_call_terminal';
+          if (req.submission !== 'writing') publishRequestClosure(ctx, req);
+        }
+        releaseToolCall(ctx, sessionId, turnState, toolCallId);
+      }
       if (turnState.fullToolCalls.size > maxFullToolCalls) {
         for (const id of turnState.fullToolCalls) {
           releaseToolCall(ctx, sessionId, turnState, id);
@@ -808,6 +841,14 @@ export async function handleAcpServerRequest(
     return;
   }
 
+  if (req.method === 'session/request_permission') {
+    const toolCall = isRecord(p.toolCall) ? p.toolCall : {};
+    const recent = ctx.recentTerminalTools?.get(sessionId);
+    if ([toolCall.toolCallId,p.toolCallId].some(id => isString(id) && recent?.has(id))) {
+      safeRespondServerRejection(ctx,req,'Tool call has already ended');
+      return;
+    }
+  }
   const turn = ctx.activeTurns.get(sessionId) ?? ensureWakeupTurn(ctx, sessionId, req.generation);
   if (!turn || turn.generation !== req.generation) {
     safeRespondServerRejection(ctx, req, 'Session turn is unavailable for server request', -32000);
@@ -849,6 +890,13 @@ export async function handleAcpServerRequest(
   if (req.method === 'session/request_permission') {
     const requestedCall = isRecord(p.toolCall) ? p.toolCall : {};
     const callIds = new Set([requestedCall.toolCallId, p.toolCallId].filter(isString));
+    if ([...callIds].some(id => {
+      const status = turn.toolCalls.get(id)?.status;
+      return isString(status) && terminalToolStatuses.has(status);
+    })) {
+      safeRespondServerRejection(ctx, req, 'Tool call has already ended');
+      return;
+    }
     const toolCallId = callIds.size === 1 ? [...callIds][0]! : null;
     let checks = inFlightToolChecks.get(turn);
     const previous = toolCallId ? checks?.get(toolCallId)?.latest ?? turn.toolCalls.get(toolCallId) : undefined;
@@ -926,6 +974,13 @@ export async function handleAcpServerRequest(
     }
     if (!stillCurrent()) {
       safeRespondServerRejection(ctx, req, 'Session turn ended during permission classification', -32000);
+      return;
+    }
+    const latestStatus = toolCallId ? turn.toolCalls.get(toolCallId)?.status : undefined;
+    if ((isString(latestStatus) && terminalToolStatuses.has(latestStatus)) ||
+        (isString(toolCall.status) && terminalToolStatuses.has(toolCall.status))) {
+      safeRespondServerRejection(ctx, req, 'Tool call has already ended', -32000);
+      if (toolCallId) releaseToolCall(ctx, sessionId, turn, toolCallId);
       return;
     }
     if (decision.kind === 'allow_once' && compacted) {
@@ -1102,6 +1157,7 @@ export function handleTransportDisconnect(
 
   const previouslyActive = [...ctx.active];
   ctx.active.clear();
+  ctx.recentTerminalTools?.clear();
   for (const id of previouslyActive) {
     ctx.controlEpoch.set(id, (ctx.controlEpoch.get(id) ?? 0) + 1);
     const summary = ctx.catalog.get(id);
@@ -1147,7 +1203,7 @@ export function handleTransportDisconnect(
         receivedAt: now,
         operationId: null,
         cursor: String(seq),
-        data: { reason },
+        data: { reason, outcomeUnknown: true },
       },
     });
     const turn: Turn = {
@@ -1203,7 +1259,7 @@ export async function respondToInteraction(
   }
 
   let result: unknown;
-  const elicitAction = (answer as Answer & { action?: AgyElicitationAction }).action;
+  const elicitAction = questionDeclineAction(answer);
   const rejectInvalidAnswer = (message: string): never => {
     if (
       guard.operationId &&
@@ -1247,23 +1303,8 @@ export async function respondToInteraction(
     (current.kind === 'question' && answer.kind === 'question') ||
     (current.kind === 'question_group' && answer.kind === 'question_group')
   ) {
-    const isQuestionSkipSentinel =
-      answer.kind === 'question' &&
-      Array.isArray(answer.values) &&
-      answer.values.length === 1 &&
-      answer.values[0] === ELICITATION_SKIP_SENTINEL;
-    const isGroupSkipSentinel =
-      answer.kind === 'question_group' &&
-      isRecord(answer.answers) &&
-      Object.values(answer.answers).length > 0 &&
-      Object.values(answer.answers).every(
-        vals => Array.isArray(vals) && vals.length === 1 && vals[0] === ELICITATION_SKIP_SENTINEL,
-      );
-
-    if (elicitAction === 'decline' || elicitAction === 'cancel') {
+    if (elicitAction) {
       result = { action: elicitAction };
-    } else if (isQuestionSkipSentinel || isGroupSkipSentinel) {
-      result = { action: 'decline' };
     } else if (
       current.kind === 'question' &&
       answer.kind === 'question' &&
@@ -1355,10 +1396,13 @@ export async function respondToInteraction(
       scheduleWakeupFinalize(ctx, id, activeTurn);
     }
   }
-  if (req.executed) publishToolExecution(ctx, req);
-  else if (req.closedSource) {
-    // Let the dispatch persist its local receipt before applying the weak close.
+  if (req.closedSource) {
+    // Let dispatch persist the transport receipt before closing the interaction without native confirmation.
     setImmediate(() => publishRequestClosure(ctx, req));
+  } else if (req.executed) publishResponseResolution(ctx, req, 'agy_tool_execution');
+  else if (req.interaction.kind !== 'approval' ||
+      (answer.kind === 'approval' && answer.decision === 'deny')) {
+    publishResponseResolution(ctx, req, 'agy_response_write');
   } else ctx.emitInteraction(req.interaction);
   return ack();
 }

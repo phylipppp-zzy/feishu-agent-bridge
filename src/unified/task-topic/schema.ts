@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import type { ChannelInputScope } from '../contracts.js';
 import type { BindingRow, TargetRow } from './types.js';
 
 export function ensureTaskTopicSchema(db: DatabaseSync): void {
@@ -144,6 +145,20 @@ export function getBindingRowByDestination(db: DatabaseSync, destination: string
   return db
     .prepare('SELECT * FROM task_bindings_v1 WHERE destination = ?')
     .get(destination) as BindingRow | undefined;
+}
+
+export function taskInputScope(binding: BindingRow, target: TargetRow): ChannelInputScope {
+  return {
+    destination:binding.destination,
+    bindingScope:JSON.stringify([binding.task_id,binding.root_generation,target.target_id,target.target_generation]),
+    ownerSource:binding.owner_source,
+    ownerSubject:binding.owner_subject,
+  };
+}
+
+export function firstMountedTargets(db: DatabaseSync, taskId: string): TargetRow[] {
+  return db.prepare("SELECT * FROM task_targets_v1 WHERE task_id = ? AND state = 'active' ORDER BY rowid LIMIT 2")
+    .all(taskId) as unknown as TargetRow[];
 }
 
 export function getTargetRow(db: DatabaseSync, taskId: string, targetId: string): TargetRow | undefined {

@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from '../adapter.js';
 import {
   payloadDigest,
+  shouldAutoQueueInput,
   type Identity,
   type Interaction,
   type Operation,
@@ -26,7 +27,7 @@ import {
 import { replyText } from '../turn-progress-card.js';
 import { readTurnReply } from '../turn-reply.js';
 import { taskPanelCard } from './cards.js';
-import { getBindingRow, getTargetRow } from './schema.js';
+import { firstMountedTargets, getBindingRow, getTargetRow, taskInputScope } from './schema.js';
 import {
   interactionFormBindingId,
   TaskChannelError,
@@ -41,7 +42,7 @@ import {
 } from './types.js';
 
 const REJECTED_OPERATION_ACTIONS: Readonly<Record<string, string>> = {
-  input: 'submitInput', attachment: 'submitInput', stop: 'interruptTurn',
+  input: 'submitInput', attachment: 'submitInput', stop: 'interruptTurn', legacy_stop: 'interruptTurn',
   settings: 'updateSessionSettings', cancel: 'cancelQueuedInput', control: 'requestControl',
   answer: 'resolveInteraction', answer_form: 'resolveInteraction',
 };
@@ -144,7 +145,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       return { ok: false, status: 'expired', reason: 'task_binding_changed' };
     }
 
-    if ((a.action === 'panel' || a.action === 'help' || (a as { action: string }).action === 'command_error') && row.target_id === '') {
+    if ((a.action === 'panel' || a.action === 'help' || a.action === 'legacy_stop' || (a as { action: string }).action === 'command_error') && row.target_id === '') {
       const allowed = await deps.authorize(e.identity, e.destination, null);
       if (!allowed) return { ok: false, status: 'rejected', reason: 'unauthorized' };
       return { ok: true, binding, target: null };
@@ -190,6 +191,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
     'answer_form',
     'attachment',
     'stop',
+    'legacy_stop',
     'settings',
     'cancel',
   ]);
@@ -350,6 +352,17 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
     return finalize('completed', { status: 'rejected', reason: a.reason });
   }
 
+  if (a.action === 'legacy_stop' && !check.target) {
+    const claim = deps.db.prepare("UPDATE task_inbox_scope_v1 SET state = 'unknown' WHERE event_id = ? AND state = 'received'").run(eventId);
+    if (!claim.changes) return {status:'unknown'};
+    const mounted = firstMountedTargets(deps.db,row.task_id);
+    const reason = mounted.length ? 'no_active_target' : 'no_mounted_target';
+    await deliverTaskCard(deps,e.destination,row.task_id,null,{
+      title:'中断回复',text:mounted.length ? '请先在任务面板选择要中断的目标。' : '当前任务还没有挂载会话。',actions:[],
+    },`${eventId}:stop-target`);
+    return finalize('rejected',{status:'rejected',reason});
+  }
+
   const target = check.target!;
   const session = await deps.service.getSession(row.session_id);
   const afterSession = await verifyCapturedTarget();
@@ -424,22 +437,18 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
     };
   };
 
+  const channelScope = taskInputScope(check.binding,target);
   try {
     let result: unknown;
     if (a.action === 'input') {
-      const effectiveMode =
-        a.mode === 'new' &&
-        session.status === 'running' &&
-        session.capabilities?.steer?.status !== 'available' &&
-        session.capabilities?.queue?.status === 'available'
-          ? 'queue'
-          : a.mode;
+      const effectiveMode = a.mode === 'new' && shouldAutoQueueInput(session) ? 'queue' : a.mode;
       const op = await deps.service.submitInput({
         context: makeContext(
           session.revision,
           effectiveMode === 'steer' ? payload.steer_control_generation! : session.control.generation,
         ),
         mode: effectiveMode,
+        channelScope,
         blocks: [{ type: 'text', text: a.text }],
         ...(effectiveMode === 'steer'
           ? {
@@ -450,9 +459,11 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       });
       result = op;
     } else if (a.action === 'swarm') {
+      const mode = shouldAutoQueueInput(session) ? 'queue' : 'new';
       const op = await deps.service.submitInput({
         context: makeContext(session.revision, session.control.generation),
-        mode: 'new',
+        mode,
+        channelScope,
         blocks: [{ type: 'text', text: a.rawText }],
       });
       result = op;
@@ -477,9 +488,21 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         toolInputDigest: null,
       });
       result = op;
+    } else if (a.action === 'legacy_stop') {
+      const stopped = await deps.service.stopOrCancelQueued({...makeContext(session.revision,session.control.generation),channelScope},async () => {
+        const current = await verifyCapturedTarget();
+        if (!current.ok || current.target?.access_mode !== 'interactive') throw new TaskChannelError('control_conflict','task target changed');
+      });
+      if (!('operationId' in stopped)) {
+        const text = 'cancelled' in stopped ? `已取消排队中的 ${stopped.cancelled} 条输入`
+          : stopped.reason === 'ambiguous_running_turn' ? '此目标有多个进行中的回复，请选择要中断的轮次。' : '此目标当前没有可中断的回复。';
+        await deliverTaskCard(deps,e.destination,row.task_id,row.target_id,{title:'中断回复',text,actions:[]},`${eventId}:stop`);
+        return finalize(stopped.status,stopped);
+      }
+      result = stopped;
     } else if (a.action === 'stop') {
       const op = await deps.service.interruptTurn({
-        context: makeContext(a.revision, a.controlGeneration),
+        context: {...makeContext(a.revision, a.controlGeneration),channelScope},
         payload: { turnId: a.turnId },
       });
       result = op;
@@ -497,19 +520,14 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
       result = op;
     } else if (a.action === 'attachment') {
       const att = a as Extract<TaskChannelAction, { action: 'attachment' }> & { localPath?: string; size?: number };
-      const effectiveMode =
-        att.mode === 'new' &&
-        session.status === 'running' &&
-        session.capabilities?.steer?.status !== 'available' &&
-        session.capabilities?.queue?.status === 'available'
-          ? 'queue'
-          : att.mode;
+      const effectiveMode = att.mode === 'new' && shouldAutoQueueInput(session) ? 'queue' : att.mode;
       if (att.mediaType === 'application/pdf' && att.localPath) {
         const byteSize = att.size ?? att.content.byteLength;
         const promptText = `用户上传了 PDF 附件：${att.name}（${byteSize} 字节）\n本地路径：${att.localPath}\n请使用 read_file 读取该文件。`;
         result = await deps.service.submitInput({
           context: makeContext(session.revision, session.control.generation),
           mode: effectiveMode,
+          channelScope,
           blocks: [{ type: 'text', text: promptText }],
         });
       } else {
@@ -527,6 +545,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         if (stageOp.result?.kind === 'artifact') {
           const refreshed = await deps.service.getSession(row.session_id);
           const submitId = `task-attach:${eventId}`;
+          const mode = att.mode === 'new' && shouldAutoQueueInput(refreshed) ? 'queue' : att.mode;
           result = await deps.service.submitInput({
             context: {
               operationId: submitId,
@@ -536,7 +555,8 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
               controlGeneration: refreshed.control.generation,
               identity: e.identity,
             },
-            mode: effectiveMode,
+            mode,
+            channelScope,
             blocks: [
               {
                 type: 'artifact',
@@ -718,6 +738,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
     return finalize('completed', result);
   } catch (error) {
     const detail =
+      error instanceof TaskChannelError ? {code:error.code} :
       error && typeof error === 'object' && 'detail' in error
         ? (error as { detail?: { code?: string } }).detail
         : undefined;
@@ -728,6 +749,7 @@ export async function drainTaskEventLocked(deps: TaskDrainDeps, eventId: string)
         'stale_revision',
         'control_conflict',
         'unsupported',
+        'temporarily_unavailable',
         'interaction_expired',
         'unauthorized',
         'invalid_request',

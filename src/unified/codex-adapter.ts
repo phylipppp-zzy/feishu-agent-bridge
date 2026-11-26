@@ -3,7 +3,7 @@ import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
-import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
+import { answerDigest, payloadDigest, questionDeclineAction, type ResponseEvidence, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
 import { contractError } from './errors.js';
 import { CodexTransport } from './codex-transport.js';
 import type { ApprovalScope, GateDecision } from './approval-policy.js';
@@ -11,7 +11,7 @@ import { codexApprovalChoices, evaluateCodexApproval } from './codex-approval.js
 
 type Obj = Record<string, any>;
 type ApprovalChoices = ReturnType<typeof codexApprovalChoices>;
-type NativeRequest = { id: string | number; generation: number; interaction: Interaction; operationId?: string; approvalChoices?: ApprovalChoices };
+type NativeRequest = { id: string | number; generation: number; interaction: Interaction; operationId?: string; declined?: {answerDigest:string}; approvalChoices?: ApprovalChoices };
 type ChangePaths = { paths: string[]; complete: boolean };
 type ApprovalTurn = { id: string; generation: number; changes: Map<string, ChangePaths> };
 type CodexAdapterOptions = { approvalPolicy?: ApprovalScope; proveSharedFilesystem?: (path: unknown) => Promise<boolean> };
@@ -89,7 +89,9 @@ export class CodexAdapter implements PlatformPort {
   }
   onObservation(listener: (event: PlatformObservation) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private emit(event: PlatformObservation): void { for (const fn of this.listeners) fn(event); }
-  private emitInteraction(interaction: Interaction): void { this.emit({ type: 'interaction', interaction, ref: this.ref(interaction.sessionId) } as PlatformObservation); }
+  private emitInteraction(interaction: Interaction, responseEvidence?: ResponseEvidence): void {
+    this.emit({type:'interaction',interaction,ref:this.ref(interaction.sessionId),...(responseEvidence ? {responseEvidence} : {})});
+  }
   private key(generation: number, id: string | number): string { return `${generation}:${typeof id}:${id}`; }
   private session(t: Obj): Session {
     if (!t || typeof t !== 'object' || !isString(t.id) || typeof t.cwd !== 'string' || !t.status || typeof t.status.type !== 'string') return invalidNative();
@@ -192,8 +194,16 @@ export class CodexAdapter implements PlatformPort {
       }
       const id = this.nativeIndex.get(key); const req = id && this.requests.get(id);
       if (req && req.interaction.sessionId === thread && req.interaction.status !== 'expired') {
-        req.interaction = { ...req.interaction, status: 'resolved', revision: req.interaction.revision + 1, nativeResult: { status: 'accepted', source: 'unknown', answer: null } };
-        this.nativeIndex.delete(key); this.answeredRequests.add(key); this.emitInteraction(req.interaction);
+        const {interactionId,nativeRequestId,connectionGeneration} = req.interaction;
+        const evidence: ResponseEvidence | undefined = req.declined && req.operationId
+          ? {operationId:req.operationId,interactionId,nativeRequestId,connectionGeneration,answerDigest:req.declined.answerDigest}
+          : undefined;
+        req.interaction = { ...req.interaction, status:'resolved', revision:req.interaction.revision + 1,
+          nativeResult: req.declined
+            ? {status:'accepted',source:'codex_question_declined',answer:null,disposition:'skipped'}
+            : {status:'accepted',source:'unknown',answer:null},
+        };
+        this.nativeIndex.delete(key); this.answeredRequests.add(key); this.emitInteraction(req.interaction,evidence);
       } return;
     }
     if (typeof m.id === 'string' || typeof m.id === 'number') {
@@ -380,17 +390,22 @@ export class CodexAdapter implements PlatformPort {
     if (!this.active.has(id) || !this.transport.connected) throw contractError('control_conflict');
     if (interaction.nativeRequestId !== i.nativeRequestId || interaction.connectionGeneration !== i.connectionGeneration || interaction.kind !== i.kind || interaction.toolInputDigest !== i.toolInputDigest || interaction.status !== 'awaiting_answer') throw contractError('stale_revision');
     let result: unknown;
-    if (i.kind === 'question_group' && answer.kind === 'question_group' && Object.keys(answer.answers).length === i.questions.length && i.questions.every(q => Array.isArray(answer.answers[q.id]) && answer.answers[q.id]!.length > 0 && answer.answers[q.id]!.every(v => typeof v === 'string' && v.trim()) && new Set(answer.answers[q.id]).size === answer.answers[q.id]!.length)) result = { answers: Object.fromEntries(i.questions.map(q => [q.id, { answers: answer.answers[q.id] }])) };
+    const declined = i.kind === 'question_group' && answer.kind === 'question_group' && questionDeclineAction(answer) !== null;
+    if (declined) result = {answers:{}};
+    else if (i.kind === 'question_group' && answer.kind === 'question_group' && Object.keys(answer.answers).length === i.questions.length && i.questions.every(q => Array.isArray(answer.answers[q.id]) && answer.answers[q.id]!.length > 0 && answer.answers[q.id]!.every(v => typeof v === 'string' && v.trim()) && new Set(answer.answers[q.id]).size === answer.answers[q.id]!.length)) result = { answers: Object.fromEntries(i.questions.map(q => [q.id, { answers: answer.answers[q.id] }])) };
     else if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope && ['allow', 'deny'].includes(answer.decision)) {
       const decision = req.approvalChoices?.[answer.decision];
       if (!decision) throw contractError('invalid_request', 'native request does not offer this decision');
       result = { decision };
     }
     else throw contractError('invalid_request');
-    guard.assertCurrent(); req.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 };
+    guard.assertCurrent();
     this.transport.respond(req.id, result);
+    if (req.interaction !== i) return ack();
+    req.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 };
     if (guard.operationId) req.operationId = guard.operationId;
-    if (req.interaction.status === 'answer_pending_delivery') this.emitInteraction(req.interaction);
+    if (declined) req.declined = {answerDigest:answerDigest(answer)};
+    this.emitInteraction(req.interaction);
     return ack();
   }
   async listArtifacts(_ref: NativeSessionRef): Promise<Artifact[]> { throw contractError('unsupported'); }

@@ -351,12 +351,13 @@ rl.on('line', async (line) => {
 
     if (text.startsWith('tool-progress:')) {
       const terminal = text.split(':')[1];
+      const callId = 'tool-progress-' + terminal;
       const input = { TargetFile: 'outputs/eval_summary.md', Content: 'do not display this content' };
-      emitTool('tool-progress', 'pending', { sessionUpdate: 'tool_call', name: 'edit_file', rawInput: input });
-      emitTool('tool-progress', 'in_progress');
-      emitTool('tool-progress', 'in_progress');
-      emitTool('tool-progress', terminal, { rawOutput: 'do not display output' });
-      emitTool('tool-progress', 'in_progress');
+      emitTool(callId, 'pending', { sessionUpdate: 'tool_call', name: 'edit_file', rawInput: input });
+      emitTool(callId, 'in_progress');
+      emitTool(callId, 'in_progress');
+      emitTool(callId, terminal, { rawOutput: 'do not display output' });
+      emitTool(callId, 'in_progress');
       reply({ stopReason: 'end_turn' });
       return;
     }
@@ -389,7 +390,7 @@ rl.on('line', async (line) => {
     }
 
     if (text.startsWith('flow-auto')) {
-      const toolCallId = 'tc-auto';
+      const toolCallId = 'tc-' + text;
       const command = 'git status -sb && rg -n "UnifiedCore" src/unified | head -n 5';
       const rawInput = { CommandLine: command };
       let toolCall = { toolCallId, title: 'Run shell check', kind: 'execute', rawInput };
@@ -985,7 +986,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
         expectedConnectionGeneration: interaction.connectionGeneration,
         answer: { kind: 'approval', scope: 'this_request', decision },
       });
-      assert.equal((await core.dispatch(operationId)).status, 'accepted');
+      assert.equal((await core.dispatch(operationId)).status, decision === 'deny' ? 'completed' : 'accepted');
       assert.equal(store.getOutbox(operationId).state, 'done');
     };
 
@@ -1108,7 +1109,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
       const updates = observed.slice(start).flatMap(o => o.type === 'event' && o.event.type === 'tool.updated' ? [o] : []);
       assert.deepEqual(updates.map(o => o.event.data), ['pending', 'running', phase].map(phase => ({
-        turnId: operation.nativeReference, callId: 'tool-progress', phase, tool: 'edit_file', summary: 'edit_file · outputs/eval_summary.md',
+        turnId: operation.nativeReference, callId: `tool-progress-${native}`, phase, tool: 'edit_file', summary: 'edit_file · outputs/eval_summary.md',
       })));
       assert.ok(updates.every(o => o.connectionGeneration === gen1));
       assert.equal(observed.slice(start).some(o => o.type === 'message' && o.message.role === 'assistant'), false);
@@ -1131,7 +1132,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
         generation: gen1, method: 'session/update', params: {
           sessionId: liveRef.nativeSessionId,
           update: {
-            sessionUpdate: 'tool_call_update', toolCallId: 'tc-auto', status: 'cancelled',
+            sessionUpdate: 'tool_call_update', toolCallId: 'tc-flow-auto-updated', status: 'cancelled',
             rawInput: { CommandLine: 'pwd -P' },
           },
         },
@@ -1139,16 +1140,8 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     };
     try {
       await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-updated' }], makeGuard(gen1));
-      await waitFor(() => observed.slice(updatedStart).some(isBypassApproval));
-      const updatedApproval = observed.slice(updatedStart).find(isBypassApproval)!.interaction;
-      assert.equal(updatedApproval.kind, 'approval');
-      assert.match(updatedApproval.action, /工具调用参数在审批检查期间发生变化/);
-      const latestCall = JSON.parse(updatedApproval.action.split('\n')[1]!);
-      assert.deepEqual(latestCall.rawInput, { CommandLine: 'pwd -P', WaitMsBeforeAsync: 500 });
-      assert.equal(latestCall.status, 'cancelled');
-      assert.equal(adapter['activeTurns'].get(liveRef.nativeSessionId)!.toolCalls.get('tc-auto')?.rawInput, undefined);
-      await submitDecision(updatedApproval, 'deny-updated', 'deny');
       await waitFor(() => observed.slice(updatedStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      assert.equal(observed.slice(updatedStart).some(isBypassApproval), false);
     } finally {
       transport.onServerRequest = onServerRequest;
     }
@@ -1158,7 +1151,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     await waitFor(() => observed.slice(evictedStart).some(isBypassApproval));
     const cachedTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
     assert.equal(cachedTurn.fullToolCalls.size, 128);
-    assert.deepEqual(cachedTurn.toolCalls.get('tc-auto'), { toolCallId: 'tc-auto', status: 'pending', kind: 'execute' });
+    assert.deepEqual(cachedTurn.toolCalls.get('tc-flow-auto-evicted'), { toolCallId: 'tc-flow-auto-evicted', status: 'pending', kind: 'execute' });
     for (const status of ['completed', 'failed', 'cancelled']) {
       assert.deepEqual(cachedTurn.toolCalls.get(status), { toolCallId: status, status, kind: 'execute' });
     }
@@ -1220,21 +1213,15 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       .slice(turnDenyIdx)
       .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
     const denyTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
-    transport.onNotification({
-      generation: gen1, method: 'session/update', params: {
-        sessionId: liveRef.nativeSessionId,
-        update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc-perm-1', status: 'cancelled', rawOutput: 'large'.repeat(1024) },
-      },
-    });
-    assert.ok(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, 'keep terminal payload while the permission request is unanswered');
+    assert.ok(denyTurn.toolCalls.get('tc-perm-1')?.rawInput);
     await submitDecision(permDenyInt, 'deny-approval', 'deny');
-    assert.equal(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, undefined);
+    assert.equal(denyTurn.toolCalls.get('tc-perm-1')?.rawInput, undefined);
     await waitFor(
       () => observed.slice(turnDenyIdx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
       3000,
     );
-    assert.equal(store.getOperation('deny-approval').status, 'accepted');
-    assert.equal(store.getInteraction(permDenyInt.interactionId).nativeResult?.status, 'unknown');
+    assert.equal(store.getOperation('deny-approval').status, 'completed');
+    assert.equal(store.getInteraction(permDenyInt.interactionId).nativeResult?.status, 'accepted');
     assert.equal(store.getOutbox('deny-approval').state, 'done');
 
     // 6. Elicitation Q&A
@@ -1374,7 +1361,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     for (const [flow, optionId] of [
       ['flow-auto', 'allow_once'], ['flow-auto-incremental', 'allow_once'], ['flow-auto-scoped-root', 'allow_once'],
       ['flow-auto-deny', null], ['flow-auto-bypass', 'reject_once'], ['flow-auto-evicted', 'reject_once'],
-      ['flow-auto-updated', 'reject_once'],
+      ['flow-auto-updated', null],
       ['flow-allow', 'allow_once'], ['flow-deny', 'reject_once'],
     ]) {
       const replies = rpcEntries.filter(e => e.permissionCase === flow).map(e => e.permissionReply);

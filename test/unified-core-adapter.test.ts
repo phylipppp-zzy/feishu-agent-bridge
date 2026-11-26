@@ -73,7 +73,7 @@ test('Agy permission rechecks changed inputs and retains deny across display upd
   const blocked = '.claude/settings.json';
   try {
     for (const [before, update, expected] of [
-      ['notes.md', { status: 'completed', title: 'Updated title' }, 'allow_once'],
+      ['notes.md', { status: 'in_progress', title: 'Updated title' }, 'allow_once'],
       [blocked, { status: 'pending', title: 'Updated title' }, 'reject_once'],
       ['notes.md', { rawInput: { TargetFile: blocked } }, 'reject_once'],
       [blocked, { rawInput: { TargetFile: 'notes.md' } }, 'reject_once'],

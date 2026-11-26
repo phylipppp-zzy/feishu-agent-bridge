@@ -194,7 +194,16 @@ export class UnifiedRuntime {
             conversationsDir: defaultAgyConversationsDir(agyConfig?.brainDir),
           }),
         }); } catch(error) { this.core.close(); throw error; }
-        this.core.validateSteerScope=(scope,sessionId)=>owner({source:scope.ownerSource,subject:scope.ownerSubject}) && (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) && this.channel.isCurrentSteerScope(scope,sessionId);
+        this.core.validateSteerScope = (scope,sessionId) => {
+          if (!owner({source:scope.ownerSource,subject:scope.ownerSubject})) return false;
+          const task = this._taskChannel;
+          if (task?.getBindingByDestination(scope.destination)) {
+            if (this.port.lookupTaskTopic && !this.port.lookupTaskTopic(scope.destination,scope.ownerSubject)) return false;
+            return task.isCurrentInputScope(scope,sessionId);
+          }
+          return (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) &&
+            this.channel.isCurrentSteerScope(scope,sessionId);
+        };
         const showAutoTitles = config.autoMirror?.showTitles === true;
         this.core.presentSession=session=>(!showAutoTitles && this.channel.isAutoPrivateTitle(session.native)) ? {...session,title:`${providerTitlePrefix(session.native.provider)} 会话 · ${payloadDigest(session.native).slice(0,8)}`} : session;
         try {

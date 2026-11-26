@@ -8,6 +8,21 @@ const capabilities = Object.fromEntries(
   ['view', 'send', 'queue', 'steer', 'answer', 'approve', 'interrupt', 'handoff', 'files', 'config']
     .map(name => [name, { status: 'available' }]),
 );
+const readOnly = { status: 'unsupported', reason: 'read-only session' };
+function capabilitiesFor(provider, active, released = false) {
+  const native = { ...capabilities };
+  if (provider !== 'codex') {
+    native.steer = { status: 'unsupported', reason: 'steer is available only for Codex' };
+    native.queue = { status: 'unsupported', reason: 'queue is coordinated by unified core' };
+    if (provider === 'claude') native.files = { status: 'unsupported', reason: 'Claude SDK port does not support this capability' };
+  }
+  if (provider === 'codex') native.files = { status: 'unsupported', reason: 'not implemented by this port' };
+  if (!active) {
+    if (!released) native.handoff = readOnly;
+    for (const name of ['send','queue','steer','answer','approve','interrupt','config']) native[name] = readOnly;
+  }
+  return native;
+}
 const now = () => new Date().toISOString();
 const nativeAck = nativeReference => ({ status: 'submitted', nativeReference });
 
@@ -38,7 +53,7 @@ export class JourneyProvider {
       native: { provider: this.provider, hostId: this.hostId, serviceId: this.serviceId, nativeSessionId: id },
       sessionId: id, project, title, createdAt: now(), updatedAt: now(), revision: 0,
       status: active ? 'idle' : 'read_only',
-      capabilities,
+      capabilities: capabilitiesFor(this.provider, active),
       control: { serviceId: this.serviceId, owner: active ? this.serviceId : null, input: active ? 'available' : 'unavailable',
         generation: 1, operationId: null, reason: null },
     };
@@ -80,6 +95,7 @@ export class JourneyProvider {
     const { session } = state;
     this.resumes.push(ref);
     state.session = { ...session, status: 'idle', revision: session.revision + 1,
+      capabilities: capabilitiesFor(this.provider, true),
       control: { ...session.control, owner: this.serviceId, input: 'available',
         generation: session.control.generation + 1, reason: null } };
     return { ...nativeAck(ref.nativeSessionId), createdSession: structuredClone(state.session),
@@ -88,6 +104,7 @@ export class JourneyProvider {
 
   async input(ref, mode, blocks, guard, turnId) {
     guard.assertCurrent();
+    assert.ok(this.provider === 'codex' || mode !== 'steer', `${this.provider} does not support steer`);
     const text = blocks.filter(block => block.type === 'text').map(block => block.text).join('\n');
     const id = mode === 'steer' ? turnId : this.nextId('turn');
     this.inputs.push({ ref, mode, text, blocks: structuredClone(blocks), turnId: id });
@@ -223,6 +240,7 @@ export class JourneyProvider {
     }
     const { session } = this.state(ref);
     this.emit({ type: 'session', ref, session: { ...session, status: 'read_only', revision: session.revision + 1,
+      capabilities: capabilitiesFor(this.provider, false, true),
       control: { ...session.control, owner: null, input: 'unavailable',
         generation: session.control.generation + 1, reason: 'subscription released' } } });
     return nativeAck('unsubscribed');

@@ -292,14 +292,22 @@ export function formatApprovalAction(tool: string, action: string, scope: string
   const reason = [detail && prefix, detail?.reason].filter(nonblank).map(stripCardMentions)
     .find(value => /\p{Script=Han}/u.test(value))
     ?? '原端要求人工确认此操作。';
-  const rawTargets = detail ? approvalTargets(detail).join('\n') : prefix;
+  const targets = detail ? approvalTargets(detail) : [prefix];
+  const rawTargets = targets.join('\n');
   const fallback = !rawTargets && detail ? approvalFallbackSummary(detail, tool) : null;
   const target = rawTargets || fallback?.summary || '';
   const cleanTarget = stripCardMentions(target);
-  const compactTarget = stripCardMentions(fallback?.compactTarget ?? '')
-    .split('\n').map(line => line.trim()).find(Boolean)
-    ?? cleanTarget.split('\n').map(line => line.trim()).find(Boolean)
-    ?? '';
+  const compactSource = stripCardMentions(fallback?.compactTarget ?? targets[0] ?? '').trim();
+  const lineCount = compactSource.split(/\r\n?|\n/u).length;
+  let compactTarget = compactSource;
+  if (lineCount > 1) {
+    const suffix = `（${lineCount} 行）`;
+    const characters = [...compactSource.replace(/\s+/gu, ' ')];
+    const limit = 80 - [...suffix].length;
+    const preview = characters.length <= limit ? characters.join('')
+      : `${characters.slice(0, limit - 13).join('')}…${characters.slice(-12).join('')}`;
+    compactTarget = preview + suffix;
+  }
   const summary = shorten(cleanTarget, 2000, '\n…（其余内容已省略）')
     .replace(/`{3,}/gu, run => [...run].join('\u200b')) || '原端未提供可展示的操作详情。';
   const duration = scope === 'session' || scope === 'allow_always' ? '本会话内同类操作' : '仅本次操作';

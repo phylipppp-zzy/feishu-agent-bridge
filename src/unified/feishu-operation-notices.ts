@@ -9,7 +9,7 @@ import { sessionModelPage } from './feishu-channel-lists.js';
 import { BindingExpired, ReadAuthorizationRevoked } from './topic-title-sync.js';
 
 export const SUPPRESSED_COMPLETED_ACTIONS = new Set([
-  'submitInput', 'resolveInteraction', 'attachSession', 'createSession', 'cancelQueuedInput',
+  'submitInput', 'resolveInteraction', 'attachSession', 'createSession', 'cancelQueuedInput', 'cancelQueuedInputs', 'stopOrCancelQueued',
   'requestControl', 'releaseControl', 'archiveSession', 'updateSessionSettings',
 ]);
 
