@@ -45,6 +45,7 @@ export interface PendingHubOptions {
     messageId: string;
   }) => boolean;
   shouldDeliverSource?: (item: PendingItemView) => boolean;
+  discoverCliNotices?: () => Promise<PendingCliNotice[]>;
   now?: () => number;
 }
 
@@ -57,6 +58,7 @@ export interface PendingQuery {
 }
 
 export interface PendingInteractionItem {
+  readonlyNotice?: never;
   refId: string;
   category: 'question' | 'approval';
   provider: Provider;
@@ -75,6 +77,7 @@ export interface PendingInteractionItem {
 }
 
 export interface PendingDecisionItem {
+  readonlyNotice?: never;
   refId: string;
   category: 'business_decision' | 'execution_auth';
   provider: 'decision';
@@ -90,7 +93,28 @@ export interface PendingDecisionItem {
   sourceTopicUrl: string | null;
 }
 
-export type PendingItemView = PendingInteractionItem | PendingDecisionItem;
+export interface PendingCliNotice {
+  provider: Provider;
+  nativeSessionId: string;
+  title: string;
+  summary: string;
+  project?: string | null;
+  sourceSessionId?: string | null;
+  sourceTopicUrl?: string | null;
+}
+
+export interface PendingCliNoticeItem extends PendingCliNotice {
+  refId: `cli_notice:${Provider}:${string}`;
+  kind: 'cli_notice';
+  category: 'approval';
+  readonlyNotice: true;
+  sourceSessionId: string | null;
+  sourceDestination: null;
+  sourceTopicUrl: string | null;
+  expiresAt: null;
+}
+
+export type PendingItemView = PendingInteractionItem | PendingDecisionItem | PendingCliNoticeItem;
 
 export interface PendingPage {
   items: PendingItemView[];
@@ -151,6 +175,14 @@ export type PendingSubmitPayload =
   | SubmitInteractionPayload
   | SubmitQuestionFormPayload
   | SubmitDecisionPayload;
+
+export interface SubmitCliNoticePayload {
+  kind: 'cli_notice';
+  refId: string;
+}
+
+export const isCliNoticeRefId = (value: unknown): boolean =>
+  typeof value === 'string' && value.startsWith('cli_notice:');
 
 /** Runtime callbacks enqueue work after durable acceptance. Direct callers may await it. */
 export interface PendingSubmitNotifications {

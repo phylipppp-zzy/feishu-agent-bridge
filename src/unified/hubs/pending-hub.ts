@@ -30,6 +30,7 @@ import {
   DEFAULT_PENDING_TOPIC_TITLE,
   PENDING_HUB_SCHEMA_SQL,
   fail,
+  isCliNoticeRefId,
   mapPendingRootRow,
   nonempty,
   type PendingEnvelope,
@@ -37,6 +38,8 @@ import {
   type PendingHubPort,
   type PendingHubRoot,
   type PendingHubTextResult,
+  type PendingDecisionItem,
+  type PendingInteractionItem,
   type PendingItemView,
   type PendingPage,
   type PendingQuery,
@@ -45,6 +48,7 @@ import {
   type PendingSubmitNotifications,
   type PendingSubmitPayload,
   type PendingSubmitResult,
+  type SubmitCliNoticePayload,
 } from './pending-types.js';
 
 /**
@@ -71,6 +75,7 @@ export class PendingHub {
   private readonly now: () => number;
   private readonly shouldRefreshSource: PendingHubOptions['shouldRefreshSource'];
   private readonly shouldDeliverSource: PendingHubOptions['shouldDeliverSource'];
+  private readonly discoverCliNotices: PendingHubOptions['discoverCliNotices'];
   private readonly refLocks = new Map<string, Promise<void>>();
   private summaryLock = Promise.resolve();
   private rootCreation: Promise<PendingHubRoot> | undefined;
@@ -97,6 +102,7 @@ export class PendingHub {
     this.now = options.now ?? (() => Date.now());
     this.shouldRefreshSource = options.shouldRefreshSource;
     this.shouldDeliverSource = options.shouldDeliverSource;
+    this.discoverCliNotices = options.discoverCliNotices;
 
     this.db = new DatabaseSync(options.dbPath);
     this.db.exec(PENDING_HUB_SCHEMA_SQL);
@@ -377,6 +383,7 @@ export class PendingHub {
       service: this.service,
       decisionStore: this.decisionStore,
       boundSources,
+      discoverCliNotices: this.discoverCliNotices,
       resolveSourceLink: (sessionId) => this.resolveSourceLink(sessionId, hubDest),
     }, now);
   }
@@ -473,7 +480,7 @@ export class PendingHub {
     }
   }
 
-  private async currentItem(item: PendingItemView, nowMs: number): Promise<PendingItemView | null> {
+  private async currentItem(item: PendingInteractionItem | PendingDecisionItem, nowMs: number): Promise<PendingItemView | null> {
     if (item.provider === 'decision') {
       const decision = this.findDecision(item.decisionId);
       return decision && isActionableDecision(decision, nowMs)
@@ -496,13 +503,15 @@ export class PendingHub {
 
   private async deliverActionableItem(item: PendingItemView, hubDest: string, hubBindingId: string): Promise<void> {
     const existing = this.getRef(item.refId);
-    const itemRevision = item.provider !== 'decision' ? item.revision : item.version;
-    const itemConnGen = item.provider !== 'decision' ? item.connectionGeneration : null;
+    const itemRevision = item.readonlyNotice
+      ? existing ? existing.revision + (existing.card_active ? 0 : 1) : 1
+      : item.provider === 'decision' ? item.version : item.revision;
+    const itemConnGen = item.readonlyNotice || item.provider === 'decision' ? null : item.connectionGeneration;
 
     let sourceCardMessageId = existing?.source_card_message_id ?? null;
     let hubCardMessageId = existing?.hub_card_message_id ?? null;
 
-    const deliverSource = !this.shouldDeliverSource || this.shouldDeliverSource(item);
+    const deliverSource = !item.readonlyNotice && (!this.shouldDeliverSource || this.shouldDeliverSource(item));
     if (item.sourceDestination && deliverSource) {
       const sourceCard = this.renderHubItemCard(item, 'source', hubBindingId);
       if (!sourceCardMessageId) {
@@ -550,8 +559,8 @@ export class PendingHub {
         item.provider,
         item.sourceSessionId,
         item.sourceDestination,
-        item.category === 'question' || item.category === 'approval' ? item.interactionId : null,
-        item.category === 'business_decision' || item.category === 'execution_auth' ? item.decisionId : null,
+        !item.readonlyNotice && item.provider !== 'decision' ? item.interactionId : null,
+        item.provider === 'decision' ? item.decisionId : null,
         itemRevision,
         itemConnGen,
         sourceCardMessageId,
@@ -584,6 +593,18 @@ export class PendingHub {
       .all('答复已提交，等待原端确认', '答复结果未知，请查看原会话', '已提交答复，等待确认回执') as unknown as PendingRefRow[];
     for (const ref of tracked) {
       if (candidateIds.has(ref.ref_id)) continue;
+      if (isCliNoticeRefId(ref.ref_id)) {
+        const reason = '终端已无待审批信号';
+        const result = await this.withRefLock(ref.ref_id, () =>
+          this.updateRefCards(this.getRef(ref.ref_id)!, reason, ref.revision, {
+            title: '【终端待审批 · 提醒已撤回】',
+            template: 'grey',
+            text: `${reason}。`,
+            actions: [],
+          }));
+        if (result.hubUpdated) withdrawnRefs.push(ref.ref_id);
+        continue;
+      }
       const result = ref.interaction_id
         ? await this.refreshInteractionRef(ref.interaction_id, nowMs)
         : await this.refreshDecisionRef(ref.decision_id!, nowMs);
@@ -592,6 +613,11 @@ export class PendingHub {
 
     for (const candidate of candidates) {
       await this.withRefLock(candidate.refId, async () => {
+        if (candidate.readonlyNotice) {
+          await this.deliverActionableItem(candidate, hubDest, hubBindingId);
+          active.push(candidate);
+          return;
+        }
         const item = await this.currentItem(candidate, nowMs);
         if (item) {
           await this.deliverActionableItem(item, hubDest, hubBindingId);
@@ -790,11 +816,11 @@ export class PendingHub {
     };
   }
 
-  async submitFromHub(envelope: PendingEnvelope, payload: PendingSubmitPayload): Promise<PendingSubmitResult> {
+  async submitFromHub(envelope: PendingEnvelope, payload: PendingSubmitPayload | SubmitCliNoticePayload): Promise<PendingSubmitResult> {
     return this.submitAnswer('hub', envelope, payload);
   }
 
-  async submitFromSource(envelope: PendingEnvelope, payload: PendingSubmitPayload): Promise<PendingSubmitResult> {
+  async submitFromSource(envelope: PendingEnvelope, payload: PendingSubmitPayload | SubmitCliNoticePayload): Promise<PendingSubmitResult> {
     return this.submitAnswer('source', envelope, payload);
   }
 
@@ -806,9 +832,14 @@ export class PendingHub {
   async submitAnswer(
     entryPoint: 'hub' | 'source',
     envelope: PendingEnvelope,
-    payload: PendingSubmitPayload,
+    payload: PendingSubmitPayload | SubmitCliNoticePayload,
     notifications?: PendingSubmitNotifications,
   ): Promise<PendingSubmitResult> {
+    if (payload.kind === 'cli_notice' ||
+        isCliNoticeRefId(payload.kind === 'decision' ? payload.decisionId : payload.interactionId) ||
+        ('refId' in payload && isCliNoticeRefId(payload.refId))) {
+      fail('unsupported', '终端待审批卡片仅作提醒，请在电脑终端中处理');
+    }
     return executePendingSubmit(
       {
         rootKey: this.rootKey,

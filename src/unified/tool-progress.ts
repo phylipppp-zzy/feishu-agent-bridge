@@ -28,7 +28,10 @@ export function nativeTimestamp(value: unknown, unit: 'auto' | 'ms' = 'auto'): s
   return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null;
 }
 
-const short = (value: string, limit: number): string => value.length <= limit ? value : value.slice(0, limit - 1) + '…';
+function short(value: string, limit: number): string {
+  const chars = [...value];
+  return chars.length <= limit ? value : chars.slice(0, limit - 1).join('') + '…';
+}
 const toolName = (name: unknown): string =>
   typeof name === 'string' && /^[\w.:-]{1,48}$/.test(name) ? name : 'tool';
 const inputObject = (input: unknown): Record<string, unknown> =>
@@ -106,6 +109,10 @@ function summarizeSpecialTool(tool: string, data: Record<string, unknown>): stri
       const role = safeLabel(data.Role ?? data.TypeName, 36);
       return `🤖 派发子代理${role ? `：${role}` : ''}`;
     }
+    case 'manage_subagents':
+      return '🤖 管理子代理';
+    case 'send_message':
+      return '🤖 通知子代理';
     case 'run_workflow': {
       const desc = safeLabel(data.Description, 40);
       return `⚙️ 运行工作流${desc ? `：${desc}` : ''}`;
@@ -113,7 +120,25 @@ function summarizeSpecialTool(tool: string, data: Record<string, unknown>): stri
     case 'schedule':
       return '⏰ 设置定时/等待任务';
     case 'call_mcp_tool': {
-      const mcpTool = safeLabel(data.ToolName ?? data.tool_name, 40);
+      const name = data.ToolName ?? data.tool_name;
+      const server = data.ServerName ?? data.server_name;
+      if (server === 'codex-bridge_codex' || typeof name === 'string' && name.startsWith('codex_')) {
+        const { tier, action, job_id: jobId } = inputObject(data.Arguments ?? data.arguments);
+        const safeTier = tier === 'sol' || tier === 'astra' || tier === 'astra-deep' || tier === 'luna' ? tier : '';
+        const labels: Record<string, string> = {
+          codex_engineer: '工程实现',
+          codex_review: '代码审查',
+          codex_followup: '续接会话',
+          codex_lookup: '低成本检索',
+          codex_status: '状态查询',
+        };
+        const label = name === 'codex_job' ? (action === 'wait' ? '等待作业' : action === 'cancel' ? '取消作业' : '查询作业') :
+          typeof name === 'string' && Object.hasOwn(labels, name) ? labels[name] : '工具调用';
+        const job = typeof jobId === 'string' && /^(?:(?:job-(?:\d{8}-\d{6}-)?)?[a-f\d]{8}|[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i.test(jobId)
+          ? ` …${jobId.slice(-8)}` : '';
+        return `⚡ Codex MCP (${[safeTier, label].filter(Boolean).join(' · ')}${job})`;
+      }
+      const mcpTool = safeLabel(name, 40);
       return `🔌 MCP${mcpTool ? `：${mcpTool}` : ''}`;
     }
     case 'ask_question':
@@ -142,7 +167,7 @@ export function readToolProgress(value: unknown): ToolProgress | undefined {
   if (typeof turnId !== 'string' || !turnId || turnId.length > 512 ||
       typeof callId !== 'string' || !callId || callId.length > 512 ||
       !phases.includes(phase as ToolPhase) || typeof tool !== 'string' || toolName(tool) !== tool ||
-      typeof summary !== 'string' || !summary || summary.length > 120 || /[\p{Cc}\p{Cf}]/u.test(summary)) return;
+      typeof summary !== 'string' || !summary || [...summary].length > 120 || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(summary)) return;
   return { turnId, callId, phase: phase as ToolPhase, tool, summary };
 }
 
@@ -157,7 +182,8 @@ export class ToolProgressTracker {
     const key = JSON.stringify([ref.nativeSessionId, generation, turnId, callId]);
     const prior = this.calls.get(key);
     if (prior && (isTerminalTool(prior.phase) && phase !== prior.phase || prior.phase === 'running' && phase === 'pending')) return;
-    const description = !detail || prior && detail.summary === detail.tool &&
+    const genericMcp = detail?.tool === 'call_mcp_tool' && detail.summary === '🔌 MCP' && prior?.tool === detail.tool;
+    const description = !detail || genericMcp || prior && detail.summary === detail.tool &&
       (prior.tool !== 'tool' || detail.tool === 'tool') ? prior : detail;
     const data = readToolProgress({
       turnId, callId, phase, tool: description?.tool ?? 'tool', summary: description?.summary ?? 'tool',

@@ -8,7 +8,7 @@ import {
   syncTopicRootTitle,
   topicRootCard,
 } from '../src/unified/topic-title-sync.js';
-import { summarizeTool } from '../src/unified/tool-progress.js';
+import { readToolProgress, summarizeTool, ToolProgressTracker, type ToolProgress } from '../src/unified/tool-progress.js';
 import { turnProgressCard } from '../src/unified/turn-progress-card.js';
 import { parseFeishuText } from '../src/unified/feishu-codec.js';
 import { encodeCard } from '../src/unified/feishu-card-wire.js';
@@ -100,7 +100,7 @@ test('Swarm, subagent, thinking, and wakeup progress cards render clear Chinese 
   assert.equal(summarizeTool('swarm_wait', { since: 10 }).summary, '🐝 Swarm 等待成员回报');
   assert.equal(summarizeTool('post_message', { text: 'hi' }).summary, '🐝 Swarm 协作板发帖');
   assert.equal(summarizeTool('invoke_subagent', { Role: 'Codebase Auditor' }).summary, '🤖 派发子代理：Codebase Auditor');
-  assert.equal(summarizeTool('call_mcp_tool', { ToolName: 'codex_engineer' }).summary, '🔌 MCP：codex_engineer');
+  assert.equal(summarizeTool('call_mcp_tool', { ToolName: 'codex_engineer' }).summary, '⚡ Codex MCP (工程实现)');
 
   const swarmCard = turnProgressCard({
     provider: 'agy',
@@ -112,8 +112,8 @@ test('Swarm, subagent, thinking, and wakeup progress cards render clear Chinese 
     files: [],
     turnId: 't1',
   });
-  assert.equal(swarmCard.text, '🐝 Swarm 多代理协作进行中…');
-  assert.match(swarmCard.executionLog?.runningNote ?? '', /🐝 Swarm 协作中：等待成员回报/);
+  assert.equal(swarmCard.text, '**子代理与 Codex 状态**\n- ⏳ 🐝 Swarm 等待成员回报（进行中）');
+  assert.equal(swarmCard.executionLog?.runningNote, '⏳ 🐝 Swarm 等待成员回报');
 
   const thinkingCard = turnProgressCard({
     provider: 'agy',
@@ -139,6 +139,87 @@ test('Swarm, subagent, thinking, and wakeup progress cards render clear Chinese 
   });
   assert.match(wakeupCard.title, /后台唤醒进行中/);
   assert.equal(wakeupCard.text, '🤖 后台异步唤醒处理中…');
+});
+
+test('Codex MCP progress uses only allowlisted metadata and recognizes delegation helpers', () => {
+  const actions = {
+    codex_engineer: '工程实现', codex_review: '代码审查', codex_followup: '续接会话',
+    codex_lookup: '低成本检索', codex_status: '状态查询',
+  };
+  for (const [ToolName, label] of Object.entries(actions)) {
+    assert.equal(summarizeTool('call_mcp_tool', {
+      ServerName: 'codex-bridge_codex', ToolName,
+      Arguments: { tier: 'astra-deep', prompt: 'private prompt', api_key: 'secret token' },
+    }).summary, `⚡ Codex MCP (astra-deep · ${label})`);
+  }
+  for (const [action, label] of Object.entries({ wait: '等待作业', query: '查询作业', cancel: '取消作业' })) {
+    assert.equal(summarizeTool('call_mcp_tool', {
+      server_name: 'codex-bridge_codex', tool_name: 'codex_job',
+      arguments: { action, tier: 'private prompt', job_id: 'job-20261125-175934-314ddb40' },
+    }).summary, `⚡ Codex MCP (${label} …314ddb40)`);
+  }
+  assert.equal(summarizeTool('call_mcp_tool', {
+    ServerName: 'codex-bridge_codex', ToolName: 'unrecognized', Arguments: { tier: 'secret', job_id: 'sk-credentials' },
+  }).summary, '⚡ Codex MCP (工具调用)');
+  assert.equal(summarizeTool('call_mcp_tool', { ToolName: 'lookup_paper' }).summary, '🔌 MCP：lookup_paper');
+  assert.equal(summarizeTool('manage_subagents', {}).summary, '🤖 管理子代理');
+  assert.equal(summarizeTool('send_message', { message: 'private prompt' }).summary, '🤖 通知子代理');
+});
+
+test('turn progress shows the latest eight delegated calls before the main reply', () => {
+  const tool = (callId: string, phase: ToolProgress['phase'], name: string, input: unknown = {}): ToolProgress =>
+    ({ turnId: 't1', callId, phase, ...summarizeTool(name, input) });
+  const tools = [
+    ...Array.from({ length: 8 }, (_, i) => tool(`child-${i}`, 'succeeded', 'invoke_subagent', { Role: `Auditor ${i}` })),
+    tool('child-live', 'running', 'invoke_subagent', { Role: 'Astra Auditor' }),
+    tool('mcp', 'running', 'call_mcp_tool', { ToolName: 'codex_review', Arguments: { tier: 'astra' } }),
+    tool('ordinary', 'succeeded', 'call_mcp_tool', { ToolName: 'lookup_paper' }),
+  ];
+  const state = { provider: 'agy', status: 'running', schema: '2.0', message: undefined, tools, duration: null, files: [] } as const;
+  const card = turnProgressCard(state);
+  const lines = card.text.split('\n');
+  assert.equal(lines.length, 9);
+  assert.deepEqual(lines.slice(0, 4), [
+    '**子代理与 Codex 状态**',
+    '- ⏳ ⚡ Codex MCP \\(astra · 代码审查\\)（进行中）',
+    '- ⏳ 🤖 派发子代理：Astra Auditor（进行中）',
+    '- ✓ 🤖 派发子代理：Auditor 7（已完成）',
+  ]);
+  assert.doesNotMatch(card.text, /Auditor [01]|lookup_paper/);
+  assert.equal(card.executionLog?.runningNote, '⏳ ⚡ Codex MCP (astra · 代码审查)（另有 1 项并行）');
+  const reply = turnProgressCard({ ...state, message: {
+    messageId: 'reply', sessionId: 'session', turnId: 't1', role: 'assistant',
+    final: false, revision: 1, sequence: 1, source: 'agy', blocks: [{ type: 'text', text: '主回复已开始' }],
+  } });
+  assert.equal(reply.text, '主回复已开始');
+  assert.equal(reply.executionLog?.count, tools.length);
+  const completed = turnProgressCard({ ...state, status: 'completed' });
+  assert.doesNotMatch(completed.text, /子代理与 Codex 状态/);
+  assert.equal(completed.executionLog?.runningNote, undefined);
+});
+
+test('tool tracker keeps the Codex MCP summary when completion omits the tool input', () => {
+  const tracker = new ToolProgressTracker();
+  const ref = makeSession().native;
+  const detail = summarizeTool('call_mcp_tool', { ToolName: 'codex_review', Arguments: { tier: 'astra' } });
+  tracker.observe(ref, 1, 'turn', 'mcp', 'running', detail);
+  const generic = summarizeTool('call_mcp_tool', {});
+  assert.equal(generic.summary, '🔌 MCP');
+  assert.equal(tracker.observe(ref, 1, 'turn', 'mcp', 'running', generic), undefined);
+  const done = tracker.observe(ref, 1, 'turn', 'mcp', 'succeeded', generic);
+  assert.ok(done?.type === 'event');
+  assert.deepEqual(done.event.data, { turnId: 'turn', callId: 'mcp', phase: 'succeeded', ...detail });
+});
+
+test('summary limits count Unicode code points and never split an emoji', () => {
+  const role = 'a'.repeat(34) + '🐝🐝🐝';
+  const summary = summarizeTool('invoke_subagent', { Role: role }).summary;
+  assert.equal(summary, `🤖 派发子代理：${'a'.repeat(34)}🐝…`);
+  assert.equal([...summary].every(char => !/\p{Cs}/u.test(char)), true);
+  const fields = { turnId: 'turn', callId: 'tool', phase: 'running', tool: 'tool' };
+  assert.ok(readToolProgress({ ...fields, summary: '🐝'.repeat(120) }));
+  assert.equal(readToolProgress({ ...fields, summary: '🐝'.repeat(121) }), undefined);
+  assert.equal(readToolProgress({ ...fields, summary: String.fromCharCode(0xd83d) }), undefined);
 });
 
 test('parseFeishuText supports /rename <title> and rejects empty /rename', () => {

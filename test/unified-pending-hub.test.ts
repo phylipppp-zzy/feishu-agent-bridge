@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import fsPromises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+import os, { tmpdir } from 'node:os';
+import { dirname, join, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { DispatchGuard, PlatformPort } from '../src/unified/adapter.js';
 import {
@@ -17,8 +19,10 @@ import {
 } from '../src/unified/contracts.js';
 import { DecisionSyncStore } from '../src/unified/decision-sync.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import { readWaitingClaudePresence } from '../src/unified/hubs/pending-discovery.js';
 import { PendingHub, type PendingHubPort } from '../src/unified/pending-hub.js';
 import { UnifiedCore } from '../src/unified/service.js';
+import { createIntegratedRuntime, UnifiedRuntime, type RuntimeConfig } from '../src/unified/runtime.js';
 import { StoreError, UnifiedStore } from '../src/unified/store.js';
 
 const hasCode = (expected: string) => (err: unknown) =>
@@ -87,6 +91,253 @@ function createFakePendingPort() {
 
   return { port, sends, updates, get topicCalls() { return topicCalls; } };
 }
+
+test('runtime Pending Hub delivers read-only CLI reminders, retracts stale signals and reuses cards', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-cli-'));
+  const directory = join(root, 'presence');
+  mkdirSync(directory);
+  const fake = createFakePendingPort();
+  const runtime = new UnifiedRuntime({
+    coreDb: join(root, 'core.sqlite'), channelDb: join(root, 'channel.sqlite'),
+    ownerOpenId: 'owner-1', allowedDestinations: ['chat-1'], hostId: 'host-1',
+    claudeServiceId: 'svc-claude', codexServiceId: 'svc-codex', claudeStateDir: root,
+    allowedProjectRoots: [root],
+    catalogSources: [{ provider: 'claude', hostId: 'host-1', serviceId: 'svc-claude', directory: root }],
+    codexEndpoint: 'codex-proxy://default', intervalMs: 100, approvalPolicy: { enabled: false },
+    pendingHub: { enabled: true, destination: 'chat-1' },
+  }, { ...fake.port, async sendFile() {} }, []);
+  t.after(async () => {
+    await runtime.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const hub = runtime.pendingHub!;
+  const unknownId = 'standalone-cli';
+  const controlled = makeSession('claude', 'controlled');
+  const agy = { ...makeSession('agy', 'external', { readOnly: true }), status: 'waiting_approval' as const };
+  runtime.store.insertSession(controlled);
+  runtime.store.insertSession(agy);
+  const presence = (sessionId: string, state: string, overrides: Record<string, unknown> = {}) =>
+    writeFileSync(join(directory, `${sessionId}.json`), JSON.stringify({
+      version: 1, state, sessionId, pid: process.pid, cwd: root, at: Date.now(),
+      event: 'Notification', notificationType: 'permission_prompt', ...overrides,
+    }));
+  const claudeRef = `cli_notice:claude:${unknownId}`;
+  const agyRef = `cli_notice:agy:${agy.native.nativeSessionId}`;
+  presence(unknownId, 'waiting');
+  presence(controlled.native.nativeSessionId, 'waiting');
+  presence('too-old-cli', 'waiting', { at: Date.now() - 11 * 60_000 });
+  presence('reused-pid-cli', 'waiting', { pidStartTime: '0' });
+  presence('dead-pid-cli', 'waiting', { pid: 2147483647 });
+  presence('running-cli', 'running');
+
+  assert.deepEqual(await hub.sync(), { activeCount: 2, withdrawnRefs: [] });
+  const list = await hub.listPending({ category: 'approval' });
+  assert.deepEqual(list.items.map(item => item.refId), [agyRef, claudeRef]);
+  assert.ok(list.items.every(item => item.readonlyNotice && item.kind === 'cli_notice'));
+  const agyCard = fake.sends.find(({ card }) => card.title.includes(agy.title))!;
+  const claudeCard = fake.sends.find(({ card }) => card.title.startsWith('【终端待审批 · 仅提醒 · Claude'))!;
+  assert.ok(agyCard && claudeCard);
+  for (const { card, destination } of [agyCard, claudeCard]) {
+    assert.equal(destination, 'topic:pending-hub-1');
+    assert.equal(card.template, 'orange');
+    assert.match(card.text, /工作目录：.*\n.*\n⚠️ 请在电脑终端中处理该审批/);
+    assert.ok(card.actions.every(action => action.label === '跳回源话题' && action.url && !Object.keys(action.value).length));
+  }
+  assert.equal(agyCard.card.actions.length, 1);
+  assert.deepEqual(claudeCard.card.actions, []);
+  assert.ok(fake.sends.find(({ card }) => card.title.startsWith('待处理汇总'))!.card.text.includes('终端待审批 · 仅提醒'));
+  const envelope = { eventId: 'forged', destination: 'topic:pending-hub-1', identity: { source: 'feishu', subject: 'owner-1' } };
+  await assert.rejects(hub.submitFromHub(envelope, { kind: 'cli_notice', refId: claudeRef }), hasCode('unsupported'));
+  await assert.rejects(hub.submitFromSource(envelope, {
+    kind: 'interaction', interactionId: agyRef, sourceSessionId: agy.sessionId, revision: 1, connectionGeneration: 1,
+    answer: { kind: 'approval', decision: 'allow', scope: 'this_request' }, toolInputDigest: null,
+  }), hasCode('unsupported'));
+
+  runtime.store.updateSession({ ...agy, status: 'idle', revision: agy.revision + 1 }, agy.revision, agy.control.generation);
+  presence(unknownId, 'running');
+  assert.deepEqual(await hub.sync(), { activeCount: 0, withdrawnRefs: [agyRef, claudeRef] });
+  for (const notice of [agyCard, claudeCard]) {
+    const patch = fake.updates.find(({ messageId }) => messageId === notice.messageId)!;
+    assert.equal(patch.card.title, '【终端待审批 · 提醒已撤回】');
+    assert.deepEqual(patch.card.actions, []);
+  }
+  assert.match(fake.updates.at(-1)!.card.text, /当前没有待处理事项/);
+  assert.deepEqual(await hub.sync(), { activeCount: 0, withdrawnRefs: [] });
+
+  presence(unknownId, 'waiting');
+  assert.equal((await hub.sync()).activeCount, 1);
+  assert.equal(hub.getRef(claudeRef)!.hub_card_message_id, claudeCard.messageId);
+  assert.equal(fake.updates.findLast(({ messageId }) => messageId === claudeCard.messageId)!.card.template, 'orange');
+  presence(unknownId, 'waiting', { at: Date.now() - 11 * 60_000 });
+  assert.deepEqual(await hub.sync(), { activeCount: 0, withdrawnRefs: [claudeRef] });
+});
+
+test('Claude presence skips old mtimes before reading JSON and supports synthetic scan clocks', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-cli-mtime-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = Date.now();
+  const writePresence = (sessionId: string, at: number, mtime: number) => {
+    const path = join(root, `${sessionId}.json`);
+    writeFileSync(path, JSON.stringify({
+      version: 1, state: 'waiting', sessionId, pid: process.pid, at,
+      event: 'Notification', notificationType: 'permission_prompt',
+    }));
+    utimesSync(path, mtime / 1000, mtime / 1000);
+    return path;
+  };
+  const futureScan = now + 30 * 60_000;
+  writePresence('old-on-disk', futureScan - 100, now - 11 * 60_000);
+  const recentPath = writePresence('fresh-on-disk', futureScan - 100, now);
+  const readMock = t.mock.method(fsPromises, 'readFile');
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual((await readWaitingClaudePresence([root], futureScan)).map(record => record.sessionId), ['fresh-on-disk']);
+    assert.deepEqual(readMock.mock.calls.map(call => call.arguments[0]), [recentPath]);
+
+    readMock.mock.resetCalls();
+    const earlyScan = now - 60 * 60_000;
+    const historicalPath = writePresence('early-clock', earlyScan - 100, earlyScan - 100);
+    assert.deepEqual((await readWaitingClaudePresence([root], earlyScan)).map(record => record.sessionId), ['early-clock']);
+    assert.ok(readMock.mock.calls.some(call => call.arguments[0] === historicalPath));
+  } finally {
+    readMock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('Claude permission presence shares integrated authorization and isolates the host default directory', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-cli-authority-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const defaultDir = join(home, '.local', 'state', 'feishu-claude-bridge', 'presence');
+  const actualHome = os.homedir();
+  const hostHome = actualHome === tmpdir() || actualHome.startsWith(tmpdir() + sep)
+    ? join(dirname(tmpdir()), 'feishu-test-host-home') : actualHome;
+  const hostDefaultDir = join(hostHome, '.local', 'state', 'feishu-claude-bridge', 'presence');
+  const stateDir = join(root, 'configured');
+  const configuredDir = join(stateDir, 'presence');
+  const project = join(root, 'project');
+  const outside = join(root, 'outside');
+  for (const path of [defaultDir, configuredDir, project, outside]) mkdirSync(path, { recursive: true });
+  symlinkSync(outside, join(project, 'escape'));
+  const now = Date.now();
+  const presence = (dir: string, sessionId: string, overrides: Record<string, unknown> = {}) =>
+    writeFileSync(join(dir, `${sessionId}.json`), JSON.stringify({
+      version: 1, state: 'waiting', sessionId, pid: process.pid, cwd: project, at: now - 100,
+      event: 'Notification', notificationType: 'permission_prompt', ...overrides,
+    }));
+  presence(configuredDir, 'configured-session');
+  presence(defaultDir, 'default-session');
+  presence(defaultDir, 'kind-session', { notificationType: null, kind: 'permission_request' });
+  presence(configuredDir, 'question-session', { notificationType: 'elicitation_dialog' });
+  presence(configuredDir, 'idle-session', { notificationType: 'idle_prompt' });
+  presence(configuredDir, 'input-session', { notificationType: 'agent_needs_input' });
+  presence(configuredDir, 'inconsistent-event', { event: 'Stop' });
+  presence(configuredDir, 'outside-session', { cwd: join(project, 'escape') });
+  presence(configuredDir, 'missing-project', { cwd: join(project, 'removed') });
+  presence(configuredDir, 'unreadable-record');
+  presence(configuredDir, 'updated-session', { at: now - 200 });
+  presence(defaultDir, 'updated-session', { state: 'running', at: now - 50 });
+
+  const config: RuntimeConfig = {
+    coreDb: join(root, 'core.sqlite'), channelDb: join(root, 'channel.sqlite'),
+    artifactStatePath: join(root, 'artifacts.json'), ownerOpenId: 'owner-1',
+    allowedDestinations: ['chat-1'], hostId: 'host-1', claudeServiceId: 'svc-claude',
+    codexServiceId: 'svc-codex', claudeStateDir: stateDir, codexEndpoint: 'codex-proxy://default',
+    intervalMs: 100, allowedProjectRoots: [project], outputRoots: [],
+    catalogSources: [{ provider: 'claude', directory: stateDir, hostId: 'host-1', serviceId: 'svc-claude' }],
+    pendingHub: { enabled: true, destination: 'chat-1' }, approvalPolicy: { enabled: false },
+  };
+  const fake = createFakePendingPort();
+  const port = { ...fake.port, async sendFile() {} };
+  const readFile = fsPromises.readFile;
+  const readdir = fsPromises.readdir;
+  let defaultScans = 0;
+  const homeMock = t.mock.method(os, 'homedir', () => home);
+  const readMock = t.mock.method(fsPromises, 'readFile', (...args: Parameters<typeof readFile>) => {
+    if (args[0] === join(configuredDir, 'unreadable-record.json')) {
+      return Promise.reject(Object.assign(new Error('unreadable'), { code: 'EACCES' }));
+    }
+    return readFile(...args);
+  });
+  const scanMock = t.mock.method(fsPromises, 'readdir', (...args: Parameters<typeof readdir>) => {
+    if (args[0] === defaultDir) defaultScans++;
+    return readdir(...args);
+  });
+  const pathMock = t.mock.method(fsPromises, 'realpath');
+  syncBuiltinESMExports();
+  const refs = async (options: RuntimeConfig, integrated = true) => {
+    const runtime = integrated ? await createIntegratedRuntime(options, port, []) : new UnifiedRuntime(options, port, []);
+    try {
+      return (await runtime.pendingHub!.listPending()).items.map(item => item.refId);
+    } finally {
+      await runtime.close();
+    }
+  };
+  try {
+    assert.deepEqual(await refs(config), [
+      'cli_notice:claude:configured-session', 'cli_notice:claude:default-session', 'cli_notice:claude:kind-session',
+    ]);
+    assert.equal(defaultScans, 1);
+    homeMock.mock.mockImplementation(() => hostHome);
+    assert.deepEqual(await refs(config), ['cli_notice:claude:configured-session', 'cli_notice:claude:updated-session']);
+    assert.ok(pathMock.mock.calls.every(call => call.arguments[0] !== hostDefaultDir), 'host presence is never opened');
+    homeMock.mock.mockImplementation(() => home);
+    assert.deepEqual(await refs({ ...config, allowedProjectRoots: [] }), []);
+    assert.deepEqual(await refs({ ...config, catalogSources: [] }), []);
+    await assert.rejects(refs({ ...config, catalogSources: [
+      { ...config.catalogSources![0]!, serviceId: 'different-service' },
+    ] }), /catalog source namespace does not match runtime configuration/);
+    const { catalogSources: _sources, ...withoutSources } = config;
+    assert.deepEqual(await refs(withoutSources, false), []);
+
+    rmSync(configuredDir, { recursive: true, force: true });
+    assert.deepEqual(await refs(config), ['cli_notice:claude:default-session', 'cli_notice:claude:kind-session']);
+    symlinkSync(defaultDir, configuredDir);
+    const scansBeforeAlias = defaultScans;
+    assert.deepEqual(await refs(config), ['cli_notice:claude:default-session', 'cli_notice:claude:kind-session']);
+    assert.equal(defaultScans - scansBeforeAlias, 1, 'canonical aliases are scanned once');
+  } finally {
+    homeMock.mock.restore();
+    readMock.mock.restore();
+    scanMock.mock.restore();
+    pathMock.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('historical Pending Hub bindings do not rediscover excluded or detached read-only sessions', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-cli-bound-'));
+  const store = new UnifiedStore(join(root, 'core.sqlite'));
+  const excluded = makeSession('codex', 'excluded', { readOnly: true });
+  const detached = makeSession('codex', 'detached', { readOnly: true });
+  const owner = { source: 'feishu', subject: 'owner-1' };
+  const fake = createFakePendingPort();
+  let allowExcluded = true;
+  const core = new UnifiedCore(store, [], () => true, undefined, undefined,
+    session => allowExcluded || session.sessionId !== excluded.sessionId);
+  const hub = new PendingHub({ dbPath: join(root, 'hub.sqlite'), service: core, port: fake.port,
+    owner, destination: 'chat-1' });
+  t.after(() => {
+    hub.close();
+    core.close();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  store.insertSession({ ...excluded, status: 'waiting_approval' });
+  store.insertSession(detached);
+  store.detachTracking({ operationId: 'detach', idempotencyKey: 'detach', identity: owner,
+    targetId: detached.sessionId, expectedRevision: detached.revision, controlGeneration: detached.control.generation });
+  store.updateSession({ ...detached, status: 'waiting_approval', revision: 2 }, 1, detached.control.generation);
+  for (const session of [excluded, detached]) hub.bindSourceSession(session.sessionId, `topic:${session.sessionId}`);
+
+  const ref = `cli_notice:codex:${excluded.native.nativeSessionId}`;
+  assert.deepEqual(await hub.sync(), { activeCount: 1, withdrawnRefs: [] });
+  assert.deepEqual((await hub.listPending()).items.map(item => item.refId), [ref]);
+  allowExcluded = false;
+  assert.deepEqual(await hub.sync(), { activeCount: 0, withdrawnRefs: [ref] });
+  assert.deepEqual((await hub.listPending()).items, []);
+});
 
 function createProviderPorts() {
   const respondCalls: Array<{ provider: Provider; interactionId: string; answer: unknown }> = [];

@@ -14,6 +14,7 @@ export interface PresenceRecord {
   event: string;
   state: PresenceState;
   notificationType: string | null;
+  kind?: string;
   message: string | null;
   transcriptPath: string | null;
   cwd: string | null;
@@ -31,9 +32,11 @@ export function parsePresence(raw: string): PresenceRecord | null {
   const text = (item: unknown) => typeof item === "string" && item ? item : null;
   const sessionId = text(value.sessionId);
   const state = text(value.state);
+  const kind = text(value.kind);
   if (!sessionId || !/^[A-Za-z0-9-]{8,80}$/.test(sessionId) || !state || !STATES.has(state) || typeof value.at !== "number") return null;
   return {
     sessionId, event: text(value.event) ?? "", state: state as PresenceState, notificationType: text(value.notificationType), message: text(value.message),
+    ...(kind ? { kind } : {}),
     transcriptPath: text(value.transcriptPath), cwd: text(value.cwd), pid: typeof value.pid === "number" ? value.pid : null,
     pidStartTime: text(value.pidStartTime), at: value.at,
   };

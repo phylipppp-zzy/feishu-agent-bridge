@@ -4,6 +4,7 @@ import { contractError } from './errors.js';
 import type { FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { verifiedMessageAppLink } from './feishu-message-link.js';
 import { pendingHubDisabledCard } from './help-cards.js';
+import { isCliNoticeRefId } from './hubs/pending-types.js';
 import type { PendingHub, PendingSubmitPayload } from './pending-hub.js';
 import type { RuntimeInteractive } from './runtime-interactive.js';
 import type { RuntimeTrustedAction } from './runtime.js';
@@ -81,6 +82,9 @@ export function handlePendingAction(routes: PendingRoutes, envelope: TrustedEnve
     ...(action.freeText !== undefined ? {freeText:action.freeText} : {}),
     ...(action.rawUtterance !== undefined ? {rawUtterance:action.rawUtterance} : {}),
   });
+  if ((action.action === 'answer' || action.action === 'answer_form') && isCliNoticeRefId(action.interactionId)) {
+    return hub.submitAnswer(entry ?? 'hub', envelope, { kind: 'cli_notice', refId: action.interactionId });
+  }
   if ((action.action === 'answer' || action.action === 'answer_form') && (entry || meta.bindingId === hubBindingId || inHubTopic)) {
     return (async () => {
       const sourceSessionId = typeof meta.sourceSessionId === 'string' && meta.sourceSessionId.trim()
