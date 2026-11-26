@@ -94,6 +94,13 @@ export class TurnCardDelivery {
         PRIMARY KEY(destination,session_id,binding_scope,turn_id));
     `);
   }
+  isBaselinedMessage(key: BindingKey, messageId: string, revision: number): boolean {
+    const row = this.db.prepare(`SELECT revision FROM channel_turn_baseline_messages
+      WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?`)
+      .get(...key, messageId) as { revision: number } | undefined;
+    return Boolean(row && Number(row.revision) >= revision);
+  }
+
   close(): void {
     this.closed = true;
     for (const { timer } of this.timers.values()) clearTimeout(timer);

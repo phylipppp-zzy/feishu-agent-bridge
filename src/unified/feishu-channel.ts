@@ -875,12 +875,48 @@ export class FeishuChannel {
     const remember = this.db.prepare('INSERT OR REPLACE INTO channel_known_messages VALUES (?,?,?,?)');
     const known = this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?');
     const unseen = (m: Message) => Number((known.get(destination,sessionId,m.messageId) as {revision:number}|undefined)?.revision ?? -1) < m.revision;
+    const isCliReadonly = (session: Session) => this.accessMode(destination) === 'read_only' || session.status === 'read_only';
+    const deliverCliPrompts = async (session: Session, candidates: readonly Message[]) => {
+      if (!isCliReadonly(session) || !candidates.length) return;
+      const ordered = [...candidates].sort((a, b) => a.sequence - b.sequence || a.messageId.localeCompare(b.messageId));
+      for (const message of ordered) {
+        if (message.role !== 'user' || !message.final || !unseen(message)) continue;
+        if (this.turnCards.isBaselinedMessage(scopeKey, message.messageId, message.revision)) {
+          remember.run(destination, sessionId, message.messageId, message.revision);
+          continue;
+        }
+        const rawText = message.blocks
+          .map(block => (block.type === 'text' ? block.text : `[附件 ${block.artifactId}]`))
+          .join('\n')
+          .trim();
+        if (!rawText) {
+          remember.run(destination, sessionId, message.messageId, message.revision);
+          continue;
+        }
+        const chars = [...rawText];
+        const body = chars.length > 1500 ? `${chars.slice(0, 1480).join('').trimEnd()}…（完整内容见 /history）` : rawText;
+        const deliveryId = `cli-prompt:${payloadDigest([scope, destination, sessionId, message.messageId])}`;
+        await syncGuard();
+        if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
+          if (this.port.sendText) {
+            await this.port.sendText(destination, `💻 CLI 指令：\n${body}`, deliveryId, syncGuard);
+          } else {
+            await this.port.send(destination, this.stampCard(destination, { title: '💻 CLI 指令', text: body, format: 'plain', actions: [] }), deliveryId, syncGuard);
+          }
+          await syncGuard();
+          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
+        }
+        remember.run(destination, sessionId, message.messageId, message.revision);
+      }
+    };
     if (cursor) {
       const events = await this.service.subscribeEvents(sessionId,cursor,100); await syncGuard();
       if (events.status === 'events') {
         const snapshot=await this.service.getSnapshot(sessionId); await syncGuard();
         for (const i of snapshot.value.interactions) await this.interactionCards.render(destination,sessionId,i.interactionId,scope,allowWaiting);
         const messageIds = new Set(events.events.filter(event => event.type === 'message.updated').map(event => event.objectId));
+        const userMessages = snapshot.value.messages.filter(message => message.role === 'user' && messageIds.has(message.messageId) && unseen(message));
+        await deliverCliPrompts(snapshot.value.session, userMessages);
         const messages = snapshot.value.messages.filter(message => message.role === 'assistant' && messageIds.has(message.messageId) && unseen(message));
         await this.turnCards.sync(scopeKey, snapshot.value, events.events, messages, allowedPush);
         await syncGuard();
@@ -929,6 +965,9 @@ export class FeishuChannel {
       const snapshot = await this.service.getSnapshot(sessionId); await syncGuard();
       await syncTitle(snapshot.value.session);
       if (expiredFrom === undefined) this.turnCards.baseline(scopeKey,snapshot.cursor);
+      if (expiredFrom !== undefined) {
+        await deliverCliPrompts(snapshot.value.session, snapshot.value.messages.filter(m => m.role === 'user' && unseen(m)));
+      }
       await this.turnCards.sync(scopeKey, snapshot.value, [], snapshot.value.messages.filter(m =>
         m.role === 'assistant' && (expiredFrom !== undefined ? unseen(m) : !m.final &&
           snapshot.value.turnProgress?.timing.some(t => t.turnId === m.turnId && t.liveStartSequence !== null && t.liveEndSequence === null))),
