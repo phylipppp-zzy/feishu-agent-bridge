@@ -281,8 +281,28 @@ export class TurnCardDelivery {
     if (pending) {
       const receipt = await this.deliveryState(pending.view.delivery);
       await guard();
-      if (receipt === 'unknown') return false;
-      if (receipt === 'sent') {
+      if (receipt === 'unknown') {
+        const canRetryIdempotentPatch =
+          cardId !== null &&
+          !pending.replaced &&
+          isTerminalTurn(pending.view.status ?? undefined) &&
+          (pending.attempts ?? 0) < 3;
+        if (!canRetryIdempotentPatch) return false;
+        if (pending.retryAfter > Date.now()) {
+          this.schedule(key, pending.retryAfter);
+          return false;
+        }
+        const nextAttempt = (pending.attempts ?? 0) + 1;
+        const retryDelivery = `${finalId}:patch-retry-${nextAttempt}`;
+        const nextPending: CardAttempt = {
+          ...pending,
+          attempts: nextAttempt,
+          retryAfter: Date.now() + Math.min(20_000, 5_000 * 2 ** (nextAttempt - 1)),
+          view: { ...pending.view, delivery: retryDelivery },
+        };
+        this.saveAttempt(key, nextPending);
+        pending = nextPending;
+      } else if (receipt === 'sent') {
         if (!cardId || pending.replaced) {
           cardId = await this.port.lookupMessageId?.(pending.view.delivery) ?? null;
           await guard();

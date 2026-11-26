@@ -193,7 +193,7 @@ async function longReplies(ctx) {
       trace.check('预览符合线协议，保留首尾，且省略提示位于成对围栏之外', () => {
         assert.equal(Buffer.byteLength(ultra), 26_000);
         assert.ok(Buffer.byteLength(ultraCard.content) < 30_000);
-        const body = ultraCard.card.raw.body.elements[0].content;
+        const body = ultraCard.card.raw.body.elements.filter(el => el.tag === 'markdown').map(el => el.content).join('\n\n');
         assert.match(body, /^HEAD_ANCHOR/);
         assert.match(body, /TAIL_ANCHOR$/);
         assert.match(body, /\n```\n\n> .*已省略[^\n]*\n\n```\n/);

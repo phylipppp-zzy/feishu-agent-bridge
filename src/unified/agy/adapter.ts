@@ -787,6 +787,7 @@ export class AgyAdapter implements PlatformPort {
         sessionId: id,
         isWaitingForUser: () =>
           turnState.inProgressToolCalls.size > 0 ||
+          turnState.awaitingAsyncWakeup === true ||
           this.pendingRequests(id).some(
             p => p.interaction.status === 'awaiting_answer' || p.submission === 'writing',
           ),

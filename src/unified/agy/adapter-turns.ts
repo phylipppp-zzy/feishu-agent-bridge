@@ -571,6 +571,14 @@ function compactToolCall(turn: ActiveTurnState, toolCallId: string, call: Obj): 
 
 const toolProgress = new WeakMap<ActiveTurnState, ToolProgressTracker>();
 const thinkingPhaseActive = new WeakSet<ActiveTurnState>();
+const ASYNC_WAKEUP_TOOLS = new Set([
+  'swarm_wait',
+  'swarm',
+  'invoke_subagent',
+  'run_workflow',
+  'schedule',
+  'call_mcp_tool',
+]);
 
 function releaseToolCall(ctx: AdapterContext, sessionId: string, turn: ActiveTurnState, toolCallId: string): void {
   if (!turn.fullToolCalls.has(toolCallId)) return;
@@ -702,6 +710,9 @@ export function handleAcpNotification(
       }
       const progress = agyToolProgress(call, ctx.knownSessions.get(sessionId)?.cwd, kind === 'tool_call');
       if (progress) {
+        if (ASYNC_WAKEUP_TOOLS.has(progress.detail.tool)) {
+          turnState.awaitingAsyncWakeup = true;
+        }
         let tracker = toolProgress.get(turnState);
         if (!tracker) { tracker = new ToolProgressTracker(); toolProgress.set(turnState, tracker); }
         if (thinkingPhaseActive.delete(turnState)) {

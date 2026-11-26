@@ -113,16 +113,70 @@ function header(card: ChannelCard) {
   };
 }
 
+const MAX_V2_MARKDOWN_CHUNK_CHARS = 5500;
+
+function splitMarkdownForV2(text: string): string[] {
+  if (text.length <= MAX_V2_MARKDOWN_CHUNK_CHARS) return [text];
+  // Group into atomic blocks (paragraphs or complete fenced code blocks).
+  const blocks: string[] = [];
+  const lines = text.split('\n');
+  let cur: string[] = [];
+  let openFence: string | null = null;
+  const flushBlock = () => {
+    const joined = cur.join('\n').trim();
+    if (joined) blocks.push(joined);
+    cur = [];
+  };
+  for (const line of lines) {
+    const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(line);
+    if (fenceMatch) {
+      const marker = fenceMatch[1]!;
+      if (!openFence) openFence = marker;
+      else if (line.trim().startsWith(openFence[0]!.repeat(openFence.length))) openFence = null;
+    }
+    if (!openFence && line.trim() === '') {
+      flushBlock();
+      continue;
+    }
+    cur.push(line);
+  }
+  flushBlock();
+  if (blocks.length <= 1) return [text];
+
+  const chunks: string[] = [];
+  let buf: string[] = [];
+  let bufLen = 0;
+  for (const block of blocks) {
+    const addLen = block.length + (buf.length ? 2 : 0);
+    if (buf.length > 0 && bufLen + addLen > MAX_V2_MARKDOWN_CHUNK_CHARS) {
+      chunks.push(buf.join('\n\n'));
+      buf = [block];
+      bufLen = block.length;
+    } else {
+      buf.push(block);
+      bufLen += addLen;
+    }
+  }
+  if (buf.length) chunks.push(buf.join('\n\n'));
+  return chunks.length ? chunks : [text];
+}
+
+function pushMarkdownChunks(elements: unknown[], text: string): void {
+  for (const chunk of splitMarkdownForV2(text)) {
+    elements.push(markdown(chunk));
+  }
+}
+
 function markdownElementsV2(text: string): unknown[] {
   const cleaned = stripCardMentions(text);
   const ranges = findDetailsOutsideFences(cleaned);
-  if (!ranges.length) return [markdown(cleaned)];
+  if (!ranges.length) return splitMarkdownForV2(cleaned).map(chunk => markdown(chunk));
   const elements: unknown[] = [];
   let lastIndex = 0;
   let panelIndex = 0;
   for (const range of ranges) {
     const before = cleaned.slice(lastIndex, range.start).trim();
-    if (before) elements.push(markdown(before));
+    if (before) pushMarkdownChunks(elements, before);
     const inner = range.inner;
     const summaryMatch = SUMMARY_TAG_RE.exec(inner);
     const title = summaryMatch?.[1]?.trim() || '展开详情';
@@ -134,12 +188,12 @@ function markdownElementsV2(text: string): unknown[] {
       element_id: `details_${panelIndex++}`,
       expanded: false,
       header: { title: markdown(title) },
-      elements: body ? [markdown(body)] : [],
+      elements: body ? splitMarkdownForV2(body).map(chunk => markdown(chunk)) : [],
     });
     lastIndex = range.end;
   }
   const after = cleaned.slice(lastIndex);
-  if (after.trim()) elements.push(markdown(after.trim()));
+  if (after.trim()) pushMarkdownChunks(elements, after.trim());
   return elements;
 }
 

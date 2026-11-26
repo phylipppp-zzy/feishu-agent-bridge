@@ -11,6 +11,8 @@ import {
 import { summarizeTool } from '../src/unified/tool-progress.js';
 import { turnProgressCard } from '../src/unified/turn-progress-card.js';
 import { parseFeishuText } from '../src/unified/feishu-codec.js';
+import { encodeCard } from '../src/unified/feishu-card-wire.js';
+import { DEFAULT_PROMPT_IDLE_TIMEOUT_MS } from '../src/unified/agy/adapter-types.js';
 import type { Session } from '../src/unified/contracts.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
 import type { FeishuPort } from '../src/unified/feishu-channel.js';
@@ -142,4 +144,22 @@ test('Swarm, subagent, thinking, and wakeup progress cards render clear Chinese 
 test('parseFeishuText supports /rename <title> and rejects empty /rename', () => {
   assert.deepEqual(parseFeishuText('/rename 论文实验对比'), { action: 'rename', title: '论文实验对比' });
   assert.throws(() => parseFeishuText('/rename   '), /invalid or unsupported command/);
+});
+
+test('long V2 markdown replies split across paragraph boundaries without breaking fenced code blocks', () => {
+  assert.equal(DEFAULT_PROMPT_IDLE_TIMEOUT_MS, 60 * 60_000);
+  const paraA = '第一段分析内容：' + '甲'.repeat(3000);
+  const paraB = '第二段完整结论：' + '乙'.repeat(3000);
+  const card = encodeCard({
+    schema: '2.0',
+    title: 'Antigravity · 已完成',
+    template: 'green',
+    text: `${paraA}\n\n${paraB}`,
+    actions: [],
+  }) as { schema?: string; body?: { elements?: Array<{ tag?: string; content?: string }> } };
+  assert.equal(card.schema, '2.0');
+  const mdElements = (card.body?.elements ?? []).filter(el => el.tag === 'markdown');
+  assert.equal(mdElements.length, 2);
+  assert.ok(mdElements[0]!.content!.includes('第一段分析内容'));
+  assert.ok(mdElements[1]!.content!.includes('第二段完整结论'));
 });
