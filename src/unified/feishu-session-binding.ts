@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from './adapter.js';
-import type { Operation, Session, WriteContext } from './contracts.js';
+import { shouldAutoQueueInput, type Operation, type Session, type WriteContext } from './contracts.js';
 import { operationCard, sessionCard, type ChannelCard } from './feishu-cards.js';
 import type { Authorize, AuthorizeBindingAdmin, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { needsOperationNotice, operationFromReceipt, pendingSessionAuthorization } from './feishu-operation-notices.js';
@@ -11,6 +11,7 @@ import { deriveTitleFromInputBlocks, isGenericSessionTitle } from './session-tit
 import { BindingExpired, ReadAuthorizationRevoked, recordNewTopicRootTitle, topicRootCard } from './topic-title-sync.js';
 
 type AccessMode = 'read_only' | 'interactive';
+type UpgradeInputMode = 'new' | 'queue' | 'steer';
 type Guard = () => Promise<void>;
 type Reply = (card: ChannelCard, suffix?: string) => Promise<string | void>;
 type BindingRow = { session_id: string; owner_source: string; owner_subject: string; access_mode: AccessMode };
@@ -213,7 +214,7 @@ export class FeishuSessionBinding {
     scope: string,
     guard: Guard,
     reply: Reply,
-    pendingInput?: { text: string; mode: 'new' | 'steer' },
+    pendingInput?: { text: string; mode: UpgradeInputMode },
   ): Promise<unknown> {
     const { destination } = e;
     const existing = this.ownerRow(destination);
@@ -228,46 +229,70 @@ export class FeishuSessionBinding {
     await this.checkOwner(e,destination,existing);
     await guard();
 
-    if (existing?.access_mode === 'interactive' && session.control.input === 'available' && session.status !== 'read_only') {
+    const context = this.channel.context(e,`new:${destination}`,0,0);
+    if (existing?.access_mode === 'interactive' && this.interactiveReady(session)) {
+      if (pendingInput?.text.trim()) {
+        return this.submitUpgradeInput(context.operationId,e,session,scope,pendingInput);
+      }
       if (e.cardMessageId) {
-        const opId = this.channel.context(e,`new:${destination}`,0,0).operationId;
-        this.rememberDelivery(opId,destination,session,scope,e,sessionCard(session,'interactive'));
-        await this.flushDeliveries(opId);
+        this.rememberDelivery(context.operationId,destination,session,scope,e,sessionCard(session,'interactive'));
+        await this.flushDeliveries(context.operationId);
       }
       return { status:'completed', sessionId, accessMode:'interactive', destination };
     }
 
-    const matching = this.db.prepare(`${pendingQuery} WHERE p.destination=? AND p.session_id=? AND p.state='pending'
-      AND p.kind='session' AND p.mode='interactive' AND s.scope=?
-      AND json_extract(a.envelope,'$.identity.source')=? AND json_extract(a.envelope,'$.identity.subject')=? ORDER BY p.rowid
-    `).all(destination,sessionId,scope,e.identity.source,e.identity.subject) as PendingRow[];
-    for (const prior of matching) {
-      const op = await this.readOperation(prior.operation_id);
-      await guard();
-      if (op && op.status !== 'failed') {
-        if (e.cardMessageId && e.cardMessageId !== (JSON.parse(prior.envelope) as TrustedEnvelope).cardMessageId) {
-          this.db.prepare('INSERT OR IGNORE INTO channel_binding_attach_cards VALUES (?,?,?)')
-            .run(prior.operation_id,e.cardMessageId,JSON.stringify(e));
+    const hasInput = !!pendingInput?.text.trim();
+    if (!hasInput) {
+      const matching = this.db.prepare(`${pendingQuery} WHERE p.destination=? AND p.session_id=? AND p.state='pending'
+        AND p.kind='session' AND p.mode='interactive' AND s.scope=?
+        AND json_extract(a.envelope,'$.identity.source')=? AND json_extract(a.envelope,'$.identity.subject')=? ORDER BY p.rowid
+      `).all(destination,sessionId,scope,e.identity.source,e.identity.subject) as PendingRow[];
+      for (const prior of matching) {
+        const op = await this.readOperation(prior.operation_id);
+        await guard();
+        if (op && op.status !== 'failed') {
+          if (e.cardMessageId && e.cardMessageId !== (JSON.parse(prior.envelope) as TrustedEnvelope).cardMessageId) {
+            this.db.prepare('INSERT OR IGNORE INTO channel_binding_attach_cards VALUES (?,?,?)')
+              .run(prior.operation_id,e.cardMessageId,JSON.stringify(e));
+          }
+          return op;
         }
-        return op;
       }
     }
 
-    const context = this.channel.context(e,`new:${destination}`,0,0);
     this.recordPending(context.operationId,e,sessionId,'session','interactive');
-    if (pendingInput?.text.trim()) {
+    if (pendingInput && hasInput) {
       this.db.prepare('INSERT OR REPLACE INTO channel_upgrade_pending_inputs VALUES (?,?,?,?,?,?)')
         .run(context.operationId, destination, sessionId, pendingInput.text, pendingInput.mode, JSON.stringify(e));
     }
     const n = session.native;
+    const stillAuthorized = async () => {
+      try {
+        await guard();
+        if (!await this.authorize(e.identity,destination,sessionId)) return false;
+        await this.checkOwner(e,destination,this.ownerRow(destination));
+        return scope === this.channel.scope(destination);
+      } catch (error) {
+        if (error instanceof BindingExpired || error instanceof ReadAuthorizationRevoked) return false;
+        throw error;
+      }
+    };
+    const rejectLostAuthorization = () => {
+      this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
+      this.completePending(context.operationId);
+      return scope === this.channel.scope(destination)
+        ? {status:'rejected',reason:'unauthorized'}
+        : {status:'expired',reason:'binding_changed'};
+    };
     let op: Operation;
     try {
       op = await this.service.attachSession({
         context,
         payload:{provider:n.provider,hostId:n.hostId,serviceId:n.serviceId,nativeSessionId:n.nativeSessionId,mode:'interactive'},
-      });
+      }, { allowQuarantineRecovery: !pendingInput, stillAuthorized });
     } catch (error) {
       this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
+      if (!await stillAuthorized()) return rejectLostAuthorization();
       const fault = error as {detail?: Operation['error']; code?: string; message?: string} | null;
       const code = fault?.detail?.code ?? fault?.code ?? 'temporarily_unavailable';
       const detailMessage = typeof fault?.detail?.message === 'string' ? fault.detail.message.trim()
@@ -282,13 +307,22 @@ export class FeishuSessionBinding {
         this.completePending(context.operationId);
         return {status:'rejected',reason:code,message:detailMessage};
       }
+      const isQuarantineConflict = code === 'control_conflict' && /quarantine|recovery/i.test(detailMessage);
       const reason = code === 'unauthorized' ? '当前账号没有接入权限。'
         : code === 'outcome_unknown' ? '原端接入结果未确认，请先核对会话状态。'
-        : '原端暂时无法完成接入，请刷新会话状态。';
-      await this.showOutcome(e,{title:'接入未完成',text:reason,actions:[]},'attach-error',guard,reply);
+        : code === 'control_conflict'
+          ? isQuarantineConflict
+            ? '会话处于恢复隔离。请点击「一键接入并续聊」重试。若提示需要新连接，请先让原端重新连接。'
+            : '会话控制状态已变化。请刷新会话状态后重试接入。'
+          : '原端暂时无法完成接入，请刷新会话状态。';
+      const detail = code === 'control_conflict' && detailMessage !== code ? detailMessage : '';
+      const text = detail ? `${reason}\n${detail}` : reason;
+      const actions = isQuarantineConflict ? [{ label: '一键接入并续聊', value: { action: 'upgrade' } }] : [];
+      await this.showOutcome(e,{title:'接入未完成',text,format:'plain',actions},'attach-error',guard,reply);
       this.completePending(context.operationId);
-      return {status:'rejected',reason:code};
+      return {status:'rejected',reason:code,...(detail ? {message:detail} : {})};
     }
+    if (!await stillAuthorized()) return rejectLostAuthorization();
     if (op.status === 'failed' && typeof op.error?.message === 'string' && op.error.message.includes('本地终端 agy')) {
       this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
       const noticeDeliveryId = `${e.eventId}:external-holder`;
@@ -304,8 +338,8 @@ export class FeishuSessionBinding {
       this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
     }
     if (needsOperationNotice(op)) await this.showOutcome(e,operationCard(op),'reply',guard,reply);
-    if (pendingInput?.text.trim() && op.status === 'completed' && op.result?.kind === 'session') {
-      await this.finishSession(e, {
+    if (hasInput && op.status === 'completed' && op.result?.kind === 'session') {
+      const result = await this.finishSession(e, {
         operation_id: context.operationId,
         destination,
         session_id: sessionId,
@@ -315,6 +349,7 @@ export class FeishuSessionBinding {
         envelope: JSON.stringify(e),
         scope,
       }, op, op.result.sessionId, guard, true);
+      return operationFromReceipt(result) ?? op;
     }
     return op;
   }
@@ -444,14 +479,11 @@ export class FeishuSessionBinding {
     await guard();
     const id = `attachment-submit:${operationId}`;
     const context = {...this.channel.context(e,bound,session.revision,session.control.generation),operationId:id,idempotencyKey:id};
-    const effectiveMode =
-      pending.mode === 'new' &&
-      session.status === 'running' &&
-      session.capabilities?.steer?.status !== 'available' &&
-      session.capabilities?.queue?.status === 'available'
-        ? 'queue'
-        : (pending.mode as 'new' | 'queue' | 'steer');
-    const result = await this.service.submitInput({context,mode:effectiveMode,blocks:[{type:'artifact',artifactId:op.result.artifactId,contentVersion:op.result.contentVersion}]});
+    const effectiveMode = pending.mode === 'new' && shouldAutoQueueInput(session)
+      ? 'queue' : (pending.mode as 'new' | 'queue' | 'steer');
+    const channelScope = {destination:pending.destination,bindingScope:pending.scope,ownerSource:e.identity.source,ownerSubject:e.identity.subject};
+    const result = await this.service.submitInput({context,mode:effectiveMode,blocks:[{type:'artifact',artifactId:op.result.artifactId,contentVersion:op.result.contentVersion}],
+      channelScope});
     this.completePending(operationId);
     if (needsOperationNotice(result) || result.status === 'queued') {
       const card = operationCard(result);
@@ -576,45 +608,56 @@ export class FeishuSessionBinding {
     if (deliverNow) {
       const child = await this.advanceFirstPrompt(op.operationId);
       if (child) return child;
-      const upgradeChild = await this.advanceUpgradePendingInput(op.operationId);
-      if (upgradeChild) return upgradeChild;
+      const upgradeChild = await this.advanceUpgradePendingInput(op.operationId,finalScope);
       await this.flushDeliveries(op.operationId);
+      if (upgradeChild) return upgradeChild;
     }
     return {sessionId,accessMode:mode,destination};
   }
 
-  private async advanceUpgradePendingInput(operationId: string): Promise<Operation | null> {
+  private async advanceUpgradePendingInput(operationId: string, bindingScope: string): Promise<Operation | null> {
     const row = this.db.prepare('SELECT destination,session_id,text,mode,envelope FROM channel_upgrade_pending_inputs WHERE operation_id=?')
-      .get(operationId) as { destination: string; session_id: string; text: string; mode: string; envelope: string } | undefined;
+      .get(operationId) as { destination: string; session_id: string; text: string; mode: UpgradeInputMode; envelope: string } | undefined;
     if (!row) return null;
     this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(operationId);
     const original = JSON.parse(row.envelope) as TrustedEnvelope;
-    const binding = this.ownerRow(row.destination);
-    if (!binding || binding.session_id !== row.session_id || binding.access_mode !== 'interactive') return null;
-    if (!await this.authorize(original.identity, row.destination, row.session_id)) return null;
+    if (row.destination !== original.destination || bindingScope !== this.channel.scope(row.destination)) return null;
     const current = await this.service.getSession(row.session_id);
     if (!this.interactiveReady(current)) return null;
-    const bindingScope = this.channel.scope(row.destination);
+    return this.submitUpgradeInput(operationId,original,current,bindingScope,row);
+  }
+
+  private async submitUpgradeInput(operationId: string, original: TrustedEnvelope, current: Session, bindingScope: string,
+    input: { text: string; mode: UpgradeInputMode }): Promise<Operation | null> {
+    const { destination, identity } = original;
+    const { sessionId } = current;
+    const owned = () => {
+      const binding = this.ownerRow(destination);
+      return binding?.session_id === sessionId && binding.access_mode === 'interactive' &&
+        binding.owner_source === identity.source && binding.owner_subject === identity.subject &&
+        bindingScope === this.channel.scope(destination);
+    };
+    if (!owned() || !await this.authorize(identity,destination,sessionId) || !owned()) return null;
     const channelScope = {
-      destination: row.destination,
+      destination,
       bindingScope,
-      ownerSource: original.identity.source,
-      ownerSubject: original.identity.subject,
+      ownerSource: identity.source,
+      ownerSubject: identity.subject,
     };
     const childId = `${operationId}:auto-input`;
     const context = {
       operationId: childId,
       idempotencyKey: childId,
-      targetId: row.session_id,
+      targetId: sessionId,
       expectedRevision: current.revision,
       controlGeneration: current.control.generation,
-      identity: original.identity,
+      identity,
       channelScope,
     };
     return this.service.submitInput({
       context,
-      mode: row.mode === 'steer' ? 'steer' : 'new',
-      blocks: [{ type: 'text', text: row.text }],
+      mode: input.mode === 'steer' ? 'steer' : shouldAutoQueueInput(current) ? 'queue' : input.mode,
+      blocks: [{ type: 'text', text: input.text }],
       channelScope,
     });
   }

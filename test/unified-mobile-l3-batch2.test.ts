@@ -505,6 +505,255 @@ test('Item 2b: wake() while restoreBindings() is in flight does not overlap poll
   }
 });
 
+test('topic sync preserves interactive bindings through startup recovery and provider reconnect', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'l3b2-restore-binding-'));
+  let markStartupEntered!: () => void;
+  let resumeStartup!: () => void;
+  const entered = new Promise<void>(resolve => { markStartupEntered = resolve; });
+  const startupGate = new Promise<void>(resolve => { resumeStartup = resolve; });
+  const identity = { source: 'feishu', subject: 'owner' };
+  const config: RuntimeConfig = {
+    coreDb: join(dir, 'core.sqlite'),
+    channelDb: join(dir, 'channel.sqlite'),
+    ownerOpenId: 'owner',
+    allowedDestinations: ['chat'],
+    hostId: 'h',
+    claudeServiceId: 'c',
+    codexServiceId: 'x',
+    claudeStateDir: dir,
+    codexEndpoint: 'codex-proxy://default',
+    intervalMs: 5000,
+    autoTakeControlOnInput: true,
+  };
+  let connected = true;
+  let generation = 1;
+  let readingStartup = false;
+  let reads = 0;
+  let resumes = 0;
+  const native = { provider: 'codex' as const, hostId: 'h', serviceId: 'x', nativeSessionId: 'restore-binding' };
+  const snapshot = () => {
+    const base = makeSession('codex', native.nativeSessionId, dir, 'Restore Binding', { readOnly: !connected });
+    return { ...base, native, control: { ...base.control, serviceId: native.serviceId, generation } };
+  };
+  const codex = makeBasePort('codex', {
+    read: async () => {
+      reads++;
+      if (readingStartup) {
+        readingStartup = false;
+        markStartupEntered();
+        await startupGate;
+        throw new Error('connection lost during startup recovery');
+      }
+      return { session: snapshot(), messages: [], interactions: [], connectionGeneration: generation };
+    },
+    resume: async () => {
+      resumes++;
+      connected = true;
+      return { status: 'submitted', nativeReference: native.nativeSessionId, connectionGeneration: ++generation };
+    },
+    control: async (ref, action, guard) => {
+      assert.equal(action, 'release');
+      guard.assertCurrent();
+      connected = false;
+      generation++;
+      const released = snapshot();
+      await runtime.core.observe({ type: 'session', ref, session: {
+        ...released,
+        sessionId: native.nativeSessionId,
+        control: { ...released.control, reason: 'discovered session is read-only until attached' },
+      } });
+      return { status: 'submitted', nativeReference: 'unsubscribed' };
+    },
+  });
+  const runtime = new UnifiedRuntime(config, {
+    send: async () => 'm1',
+    update: async () => {},
+    sendFile: async () => {},
+  }, [codex]);
+  let startup: Promise<void> | undefined;
+  let reconnect: ReturnType<UnifiedRuntime['restoreProviderAfterReconnect']> | undefined;
+  try {
+    const op = await runtime.core.attachSession({
+      context: { operationId: 'seed', idempotencyKey: 'seed', targetId: 'new', expectedRevision: 0, controlGeneration: 0, identity },
+      payload: { ...native, mode: 'interactive' },
+    });
+    assert.equal(op.status, 'completed');
+    const { sessionId } = op.result as { sessionId: string };
+    const db = new DatabaseSync(config.channelDb);
+    try {
+      db.prepare('INSERT INTO channel_bindings(destination,session_id,binding_id,owner_source,owner_subject,revision,access_mode) VALUES(?,?,?,?,?,?,?)')
+        .run('chat', sessionId, 'original', identity.source, identity.subject, 1, 'interactive');
+    } finally {
+      db.close();
+    }
+    const before = runtime.channel.bindingsForRestore()[0];
+    const current = runtime.store.getSession(sessionId);
+    connected = false;
+    // A provider can report a read-only snapshot with no explanation while intent remains persisted.
+    runtime.store.updateSession({ ...snapshot(), sessionId, revision: current.revision + 1 }, current.revision, current.control.generation);
+    assert.equal(runtime.store.hasInteractiveIntent(sessionId), true);
+    reads = 0;
+    resumes = 0;
+    readingStartup = true;
+    startup = runtime.restoreBindings();
+    await entered;
+
+    runtime.setProviderReady('codex', false);
+    await runtime.tick();
+    assert.deepEqual(runtime.channel.bindingsForRestore()[0], before);
+
+    runtime.setProviderReady('codex', true);
+    reconnect = runtime.restoreProviderAfterReconnect('codex');
+    await runtime.tick();
+    assert.equal(reads, 1, 'reconnect must wait for the startup attempt for this provider');
+    assert.deepEqual(runtime.channel.bindingsForRestore()[0], before);
+
+    resumeStartup();
+    await startup;
+    assert.deepEqual(await reconnect, { restored: [sessionId], failed: [] });
+    assert.equal(resumes, 1);
+    assert.equal((await runtime.core.getSession(sessionId)).control.input, 'available');
+    assert.equal(runtime.store.recoveryQuarantined(sessionId), false);
+    assert.deepEqual(runtime.channel.bindingsForRestore()[0], before);
+    assert.equal(runtime.health().status, 'healthy');
+
+    const restored = await runtime.core.getSession(sessionId);
+    await runtime.core.releaseControl({
+      context: { operationId: 'release', idempotencyKey: 'release', targetId: sessionId, expectedRevision: restored.revision, controlGeneration: restored.control.generation, identity },
+      payload: { owner: 'owner' },
+    });
+    await runtime.tick();
+    assert.equal((await runtime.core.getOperation('release')).status, 'completed');
+    assert.equal(runtime.channel.accessMode('chat'), 'read_only');
+  } finally {
+    resumeStartup();
+    await Promise.allSettled([startup, reconnect]);
+    await runtime.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto-attach preserves queued input when recovery wins the race and after native resume', async t => {
+  for (const scenario of ['recovered during input', 'resumed normally', 'prior attach awaiting finish', 'destination revoked during resume'] as const) {
+    await t.test(scenario, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'l3b2-auto-attach-'));
+      const identity = { source: 'feishu', subject: 'owner' };
+      const config: RuntimeConfig = {
+        coreDb: join(dir, 'core.sqlite'),
+        channelDb: join(dir, 'channel.sqlite'),
+        ownerOpenId: identity.subject,
+        allowedDestinations: ['chat'],
+        hostId: 'h',
+        claudeServiceId: 'c',
+        codexServiceId: 'x',
+        claudeStateDir: dir,
+        codexEndpoint: 'codex-proxy://default',
+        intervalMs: 5000,
+        autoTakeControlOnInput: true,
+      };
+      let authorized = true;
+      let connected = false;
+      let generation = 1;
+      let resumes = 0;
+      let releases = 0;
+      const native = { provider: 'codex' as const, hostId: 'h', serviceId: 'x', nativeSessionId: 'auto-attach' };
+      const snapshot = () => {
+        const session = makeSession('codex', native.nativeSessionId, dir, 'Auto Attach', { readOnly: !connected });
+        return { ...session, native, control: { ...session.control, serviceId: native.serviceId, generation } };
+      };
+      const codex = makeBasePort('codex', {
+        read: async () => ({ session: snapshot(), messages: [], interactions: [], connectionGeneration: generation }),
+        resume: async () => {
+          resumes++;
+          connected = true;
+          if (scenario === 'destination revoked during resume') authorized = false;
+          return { status: 'submitted', nativeReference: native.nativeSessionId, connectionGeneration: ++generation };
+        },
+        control: async (_ref, action, guard) => {
+          assert.equal(action, 'release');
+          assert.equal(guard.expectedConnectionGeneration, generation);
+          guard.assertCurrent();
+          releases++;
+          connected = false;
+          return { status: 'submitted', nativeReference: 'unsubscribed' };
+        },
+      });
+      const feishu = {
+        authorizedDestination: () => authorized,
+        send: async () => 'm1',
+        update: async () => {},
+        sendFile: async () => {},
+      };
+      const runtime = new UnifiedRuntime(config, feishu, [codex]);
+      try {
+        const raced = scenario === 'recovered during input';
+        const bindingMode = raced ? 'interactive' : 'read_only';
+        const seed = await runtime.core.attachSession({
+          context: { operationId: 'seed', idempotencyKey: 'seed', targetId: 'new', expectedRevision: 0, controlGeneration: 0, identity },
+          payload: { ...native, mode: bindingMode },
+        });
+        assert.equal(seed.result?.kind, 'session');
+        const { sessionId } = seed.result;
+        const db = new DatabaseSync(config.channelDb);
+        try {
+          db.prepare('INSERT INTO channel_bindings(destination,session_id,binding_id,owner_source,owner_subject,revision,access_mode) VALUES(?,?,?,?,?,?,?)')
+            .run('chat', sessionId, 'original', identity.source, identity.subject, 1, bindingMode);
+        } finally {
+          db.close();
+        }
+        resumes = 0;
+        if (raced) {
+          const getSession = runtime.core.getSession.bind(runtime.core);
+          let firstRead = true;
+          runtime.core.getSession = async id => {
+            const session = await getSession(id);
+            if (!firstRead) return session;
+            firstRead = false;
+            return { ...session, status: 'read_only', control: { ...session.control, input: 'unavailable' } };
+          };
+        }
+        if (scenario === 'prior attach awaiting finish') {
+          await runtime.channel.handle({ eventId: 'upgrade', destination: 'chat', identity }, { action: 'upgrade' });
+          assert.equal(runtime.channel.accessMode('chat'), 'read_only');
+          assert.equal(resumes, 1);
+        }
+
+        const envelope = { eventId: 'auto-attach-input', destination: 'chat', identity };
+        const action = { action: 'input', mode: 'queue', text: 'preserve this input' } as const;
+        const receipt = await runtime.channel.handle(envelope, action);
+        assert.deepEqual(await runtime.channel.drain(envelope.eventId), receipt);
+        const queued = runtime.store.queuedInputs(sessionId);
+        if (scenario === 'destination revoked during resume') {
+          assert.deepEqual(receipt, { status: 'rejected', reason: 'unauthorized' });
+          assert.equal(resumes, 1);
+          assert.equal(releases, 1);
+          assert.equal(connected, false);
+          assert.equal(runtime.channel.accessMode('chat'), 'read_only');
+          assert.equal((await runtime.core.getSession(sessionId)).control.input, 'unavailable');
+          assert.deepEqual(queued, []);
+          return;
+        }
+        assert.equal(resumes, raced ? 0 : 1);
+        assert.equal(releases, 0);
+        assert.equal(runtime.channel.accessMode('chat'), 'interactive');
+        assert.equal(queued.length, 1);
+        assert.deepEqual((runtime.store.getOutbox(queued[0]!.inputId).payload as {blocks: unknown}).blocks,
+          [{ type: 'text', text: action.text }]);
+        const childId = queued[0]!.inputId;
+        assert.equal(runtime.channel.operationForEvent(envelope.eventId)?.operationId, childId);
+        authorized = false;
+        await runtime.core.dispatch(childId);
+        const child = await runtime.core.getOperation(childId);
+        assert.equal(child.status, 'failed');
+        assert.equal(child.error?.message, 'binding changed');
+      } finally {
+        await runtime.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test('Item 3a: listSessions scopes to requested provider, runs providers in parallel, and heals stale fallback/older titles in store', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'l3b2-list-'));
   try {

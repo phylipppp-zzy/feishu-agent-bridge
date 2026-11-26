@@ -27,6 +27,7 @@ import { UnifiedStore } from '../src/unified/store.js';
 import {
   createIntegratedRuntime,
   createLiveRuntime,
+  UnifiedRuntime,
   validateRuntimeConfig,
   type RuntimeConfig,
 } from '../src/unified/runtime.js';
@@ -350,12 +351,13 @@ rl.on('line', async (line) => {
 
     if (text.startsWith('tool-progress:')) {
       const terminal = text.split(':')[1];
+      const callId = 'tool-progress-' + terminal;
       const input = { TargetFile: 'outputs/eval_summary.md', Content: 'do not display this content' };
-      emitTool('tool-progress', 'pending', { sessionUpdate: 'tool_call', name: 'edit_file', rawInput: input });
-      emitTool('tool-progress', 'in_progress');
-      emitTool('tool-progress', 'in_progress');
-      emitTool('tool-progress', terminal, { rawOutput: 'do not display output' });
-      emitTool('tool-progress', 'in_progress');
+      emitTool(callId, 'pending', { sessionUpdate: 'tool_call', name: 'edit_file', rawInput: input });
+      emitTool(callId, 'in_progress');
+      emitTool(callId, 'in_progress');
+      emitTool(callId, terminal, { rawOutput: 'do not display output' });
+      emitTool(callId, 'in_progress');
       reply({ stopReason: 'end_turn' });
       return;
     }
@@ -388,7 +390,7 @@ rl.on('line', async (line) => {
     }
 
     if (text.startsWith('flow-auto')) {
-      const toolCallId = 'tc-auto';
+      const toolCallId = 'tc-' + text;
       const command = 'git status -sb && rg -n "UnifiedCore" src/unified | head -n 5';
       const rawInput = { CommandLine: command };
       let toolCall = { toolCallId, title: 'Run shell check', kind: 'execute', rawInput };
@@ -984,7 +986,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
         expectedConnectionGeneration: interaction.connectionGeneration,
         answer: { kind: 'approval', scope: 'this_request', decision },
       });
-      assert.equal((await core.dispatch(operationId)).status, 'accepted');
+      assert.equal((await core.dispatch(operationId)).status, decision === 'deny' ? 'completed' : 'accepted');
       assert.equal(store.getOutbox(operationId).state, 'done');
     };
 
@@ -1107,7 +1109,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       await waitFor(() => observed.slice(start).some(o => o.type === 'turn' && o.turn.status === 'completed'));
       const updates = observed.slice(start).flatMap(o => o.type === 'event' && o.event.type === 'tool.updated' ? [o] : []);
       assert.deepEqual(updates.map(o => o.event.data), ['pending', 'running', phase].map(phase => ({
-        turnId: operation.nativeReference, callId: 'tool-progress', phase, tool: 'edit_file', summary: 'edit_file · outputs/eval_summary.md',
+        turnId: operation.nativeReference, callId: `tool-progress-${native}`, phase, tool: 'edit_file', summary: 'edit_file · outputs/eval_summary.md',
       })));
       assert.ok(updates.every(o => o.connectionGeneration === gen1));
       assert.equal(observed.slice(start).some(o => o.type === 'message' && o.message.role === 'assistant'), false);
@@ -1130,7 +1132,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
         generation: gen1, method: 'session/update', params: {
           sessionId: liveRef.nativeSessionId,
           update: {
-            sessionUpdate: 'tool_call_update', toolCallId: 'tc-auto', status: 'cancelled',
+            sessionUpdate: 'tool_call_update', toolCallId: 'tc-flow-auto-updated', status: 'cancelled',
             rawInput: { CommandLine: 'pwd -P' },
           },
         },
@@ -1138,16 +1140,8 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     };
     try {
       await adapter.input(liveRef, 'new', [{ type: 'text', text: 'flow-auto-updated' }], makeGuard(gen1));
-      await waitFor(() => observed.slice(updatedStart).some(isBypassApproval));
-      const updatedApproval = observed.slice(updatedStart).find(isBypassApproval)!.interaction;
-      assert.equal(updatedApproval.kind, 'approval');
-      assert.match(updatedApproval.action, /工具调用参数在审批检查期间发生变化/);
-      const latestCall = JSON.parse(updatedApproval.action.split('\n')[1]!);
-      assert.deepEqual(latestCall.rawInput, { CommandLine: 'pwd -P', WaitMsBeforeAsync: 500 });
-      assert.equal(latestCall.status, 'cancelled');
-      assert.equal(adapter['activeTurns'].get(liveRef.nativeSessionId)!.toolCalls.get('tc-auto')?.rawInput, undefined);
-      await submitDecision(updatedApproval, 'deny-updated', 'deny');
       await waitFor(() => observed.slice(updatedStart).some(o => o.type === 'turn' && o.turn.status === 'completed'));
+      assert.equal(observed.slice(updatedStart).some(isBypassApproval), false);
     } finally {
       transport.onServerRequest = onServerRequest;
     }
@@ -1157,7 +1151,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     await waitFor(() => observed.slice(evictedStart).some(isBypassApproval));
     const cachedTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
     assert.equal(cachedTurn.fullToolCalls.size, 128);
-    assert.deepEqual(cachedTurn.toolCalls.get('tc-auto'), { toolCallId: 'tc-auto', status: 'pending', kind: 'execute' });
+    assert.deepEqual(cachedTurn.toolCalls.get('tc-flow-auto-evicted'), { toolCallId: 'tc-flow-auto-evicted', status: 'pending', kind: 'execute' });
     for (const status of ['completed', 'failed', 'cancelled']) {
       assert.deepEqual(cachedTurn.toolCalls.get(status), { toolCallId: status, status, kind: 'execute' });
     }
@@ -1219,21 +1213,15 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       .slice(turnDenyIdx)
       .find((o): o is Extract<PlatformObservation, { type: 'interaction' }> => o.type === 'interaction' && o.interaction.kind === 'approval')!.interaction;
     const denyTurn = adapter['activeTurns'].get(liveRef.nativeSessionId)!;
-    transport.onNotification({
-      generation: gen1, method: 'session/update', params: {
-        sessionId: liveRef.nativeSessionId,
-        update: { sessionUpdate: 'tool_call_update', toolCallId: 'tc-perm-1', status: 'cancelled', rawOutput: 'large'.repeat(1024) },
-      },
-    });
-    assert.ok(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, 'keep terminal payload while the permission request is unanswered');
+    assert.ok(denyTurn.toolCalls.get('tc-perm-1')?.rawInput);
     await submitDecision(permDenyInt, 'deny-approval', 'deny');
-    assert.equal(denyTurn.toolCalls.get('tc-perm-1')?.rawOutput, undefined);
+    assert.equal(denyTurn.toolCalls.get('tc-perm-1')?.rawInput, undefined);
     await waitFor(
       () => observed.slice(turnDenyIdx).some((o) => o.type === 'turn' && o.turn.status === 'completed'),
       3000,
     );
-    assert.equal(store.getOperation('deny-approval').status, 'accepted');
-    assert.equal(store.getInteraction(permDenyInt.interactionId).nativeResult?.status, 'unknown');
+    assert.equal(store.getOperation('deny-approval').status, 'completed');
+    assert.equal(store.getInteraction(permDenyInt.interactionId).nativeResult?.status, 'accepted');
     assert.equal(store.getOutbox('deny-approval').state, 'done');
 
     // 6. Elicitation Q&A
@@ -1373,7 +1361,7 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
     for (const [flow, optionId] of [
       ['flow-auto', 'allow_once'], ['flow-auto-incremental', 'allow_once'], ['flow-auto-scoped-root', 'allow_once'],
       ['flow-auto-deny', null], ['flow-auto-bypass', 'reject_once'], ['flow-auto-evicted', 'reject_once'],
-      ['flow-auto-updated', 'reject_once'],
+      ['flow-auto-updated', null],
       ['flow-allow', 'allow_once'], ['flow-deny', 'reject_once'],
     ]) {
       const replies = rpcEntries.filter(e => e.permissionCase === flow).map(e => e.permissionReply);
@@ -1387,6 +1375,196 @@ test('AgyAdapter end-to-end ACP lifecycle, read-only catalog, transcript backfil
       ),
     );
 
+    } finally {
+      core.close();
+      await adapter.close();
+      store.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AgyAdapter rejects malformed inactive history even when it contains a valid message', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-inactive-history-'));
+  try {
+    const brainDir = join(root, 'brain');
+    const dbPath = join(root, 'summaries.sqlite');
+    const ref = { provider: 'agy' as const, hostId: 'host-1', serviceId: 'agy-svc', nativeSessionId: 'agy-inactive' };
+    createSummariesDb(dbPath, [{
+      conversation_id: ref.nativeSessionId,
+      workspace_uris: JSON.stringify([pathToFileURL(root).href]),
+    }]);
+    const steps = [
+      { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Valid history' },
+    ];
+    const logsDir = join(brainDir, ref.nativeSessionId, '.system_generated', 'logs');
+    await mkdir(logsDir, { recursive: true });
+    const transcriptPath = join(logsDir, 'transcript.jsonl');
+    await writeFile(transcriptPath, jsonl(...steps) + 'invalid-json\n');
+
+    const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [root] });
+    const transport = new AgyAcpTransport({ agyBin: join(root, 'unused-agy') });
+    const adapter = new AgyAdapter(transport, catalog, ref.hostId, ref.serviceId);
+    try {
+      await assert.rejects(adapter.read(ref), { code: 'temporarily_unavailable', message: /malformed JSONL/ });
+
+      await writeFile(transcriptPath, jsonl(...steps) + '{"step_index":');
+      const snapshot = await adapter.read(ref);
+      assert.equal(snapshot.session.status, 'read_only');
+      assert.deepEqual(snapshot.messages.map(message => message.blocks), [
+        [{ type: 'text', text: 'Valid history' }],
+      ]);
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('failed AGY transcript read leaves a read-only binding baseline pending for an interactive session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-history-baseline-'));
+  try {
+    const brainDir = join(root, 'brain');
+    const dbPath = join(root, 'summaries.sqlite');
+    const binPath = join(root, 'fake-agy.mjs');
+    const nativeSessionId = 'agy-baseline';
+    const owner = { source: 'feishu', subject: 'ou_owner' };
+    const native = { provider: 'agy' as const, hostId: 'host-1', serviceId: 'agy-svc', nativeSessionId };
+    await writeFakeAgyBinary(binPath, join(root, 'rpc.jsonl'), join(root, 'drop.flag'));
+    await mkdir(brainDir);
+    createSummariesDb(dbPath, [{
+      conversation_id: nativeSessionId,
+      title: 'Agy baseline',
+      workspace_uris: JSON.stringify([pathToFileURL(root).href]),
+    }]);
+
+    const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [root] });
+    const transport = new AgyAcpTransport({ agyBin: binPath });
+    const adapter = new AgyAdapter(transport, catalog, native.hostId, native.serviceId, undefined, {
+      externalHolderDetector: () => null,
+    });
+    const { port } = createFakeFeishuPort();
+    const runtime = new UnifiedRuntime({
+      coreDb: join(root, 'core.sqlite'), channelDb: join(root, 'channel.sqlite'),
+      ownerOpenId: owner.subject, allowedDestinations: ['chat-main'], hostId: native.hostId,
+      claudeServiceId: 'claude-svc', codexServiceId: 'codex-svc', claudeStateDir: root,
+      codexEndpoint: 'codex-proxy://default', intervalMs: 60_000,
+    }, port, [adapter], { requireReadonlyHydration: true });
+    try {
+      await transport.connect();
+      const readonly = await adapter.read(native);
+      assert.equal(readonly.session.status, 'read_only');
+      assert.equal(readonly.connectionGeneration, transport.connectionGeneration);
+      const attached = await runtime.core.attachSession({
+        context: { operationId: 'attach-agy', idempotencyKey: 'attach-agy', targetId: nativeSessionId,
+          expectedRevision: 0, controlGeneration: 0, identity: owner },
+        payload: { ...native, mode: 'interactive' },
+      });
+      assert.equal(attached.result?.kind, 'session');
+      const sessionId = attached.result.sessionId;
+      assert.equal(runtime.store.getSession(sessionId).control.input, 'available');
+      runtime.channel.importMigrationBinding('agy-history', {
+        destination: 'chat-main', sessionId, bindingId: 'agy-readonly', owner,
+      });
+
+      const transcriptPath = join(brainDir, nativeSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      await mkdir(transcriptPath, { recursive: true });
+      const history = (eventId: string) => runtime.channel.handle(
+        { eventId, destination: 'chat-main', identity: owner }, { action: 'history' },
+      );
+      await assert.rejects(history('history-failed'), { code: 'temporarily_unavailable' });
+      assert.equal(runtime.channel.readonlyHydrated('chat-main', sessionId), false);
+      assert.deepEqual(runtime.store.snapshot(sessionId).value.messages, []);
+
+      await rm(transcriptPath, { recursive: true });
+      await writeFile(transcriptPath, 'invalid-json\n');
+      await assert.rejects(history('history-corrupt'), { code: 'temporarily_unavailable' });
+      assert.equal(runtime.channel.readonlyHydrated('chat-main', sessionId), false);
+      await writeFile(transcriptPath, '{"step_index":');
+      await assert.rejects(history('history-partial'), { code: 'temporarily_unavailable' });
+      assert.equal(runtime.channel.readonlyHydrated('chat-main', sessionId), false);
+
+      await writeTranscript(brainDir, nativeSessionId, [
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'Recovered history' },
+      ]);
+      await history('history-retry');
+      assert.equal(runtime.channel.readonlyHydrated('chat-main', sessionId), true);
+      assert.deepEqual(runtime.store.snapshot(sessionId).value.messages.map(message => message.blocks), [
+        [{ type: 'text', text: 'Recovered history' }],
+      ]);
+    } finally {
+      await runtime.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('AGY close failure keeps recovery quarantined and fences live history snapshots', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agy-quarantine-'));
+  try {
+    const brainDir = join(root, 'brain');
+    const dbPath = join(root, 'summaries.sqlite');
+    const binPath = join(root, 'fake-agy.mjs');
+    const native = { provider: 'agy' as const, hostId: 'host-1', serviceId: 'agy-svc', nativeSessionId: 'agy-quarantine' };
+    const identity = { source: 'feishu', subject: 'ou_owner' };
+    await writeFakeAgyBinary(binPath, join(root, 'rpc.jsonl'), join(root, 'drop.flag'));
+    await mkdir(brainDir);
+    createSummariesDb(dbPath, [{
+      conversation_id: native.nativeSessionId,
+      title: 'Agy quarantine',
+      workspace_uris: JSON.stringify([pathToFileURL(root).href]),
+    }]);
+    const catalog = new AgyCatalog({ dbPath, brainDir, allowedProjectRoots: [root] });
+    const transport = new AgyAcpTransport({ agyBin: binPath });
+    const adapter = new AgyAdapter(transport, catalog, native.hostId, native.serviceId, undefined, {
+      externalHolderDetector: () => null,
+    });
+    const store = new UnifiedStore(join(root, 'core.sqlite'));
+    const core = new UnifiedCore(store, [adapter], () => true);
+    try {
+      await transport.connect();
+      const attached = await core.attachSession({
+        context: { operationId: 'attach-agy', idempotencyKey: 'attach-agy', targetId: 'new',
+          expectedRevision: 0, controlGeneration: 0, identity },
+        payload: { ...native, mode: 'interactive' },
+      });
+      assert.equal(attached.result?.kind, 'session');
+      const sessionId = attached.result.sessionId;
+      await adapter.control(native, 'release', makeGuard(transport.connectionGeneration));
+      await waitFor(() => store.getSession(sessionId).status === 'read_only', 3000);
+
+      const request = transport.request.bind(transport);
+      let closeAttempts = 0;
+      transport.request = async (method, params, timeout) => {
+        if (method === 'session/close') {
+          closeAttempts++;
+          throw new Error('ACP transport lost session/close acknowledgement');
+        }
+        return request(method, params, timeout);
+      };
+      const read = adapter.read.bind(adapter);
+      let reads = 0;
+      let authorized = true;
+      adapter.read = async ref => {
+        const snapshot = await read(ref);
+        if (++reads === 4) authorized = false;
+        return snapshot;
+      };
+      await assert.rejects(core.restoreInteractiveWithOutcome(sessionId, identity, async () => authorized), /restore metadata changed/);
+      assert.equal(closeAttempts, 1);
+      assert.deepEqual(store.getRecoveryQuarantine(sessionId), { generation: transport.connectionGeneration, releaseConfirmed: false });
+      assert.equal(adapter.hasActiveNativeSession(native), true);
+
+      await adapter.input(native, 'new', [{ type: 'text', text: 'unverified live message' }], makeGuard(transport.connectionGeneration));
+      const snapshot = await read(native);
+      assert.ok(snapshot.messages.some(message => message.blocks.some(block => block.type === 'text' && block.text.includes('unverified live message'))));
+      assert.equal(await core.refreshReadOnlySession(sessionId), false);
+      assert.equal(await core.refreshReadOnlySession(sessionId, snapshot), false);
+      assert.equal(store.applyHistoryRefresh(store.getSession(sessionId), transport.connectionGeneration, snapshot), false);
+      assert.deepEqual(store.snapshot(sessionId).value.messages, []);
     } finally {
       core.close();
       await adapter.close();

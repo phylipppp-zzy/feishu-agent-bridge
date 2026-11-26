@@ -48,7 +48,11 @@ export function buildSessionPanel(
   const queued = work.queuedInputs;
   const actions: ChannelCard['actions'] = [];
   if (available && session.capabilities?.interrupt?.status === 'available') {
-    running.forEach((turn,index) => actions.push({label:running.length === 1 ? '中断当前回复' : `中断本轮回复 ${index+1}`,type:'primary',value:{action:'stop',turnId:turn.turnId,...base}}));
+    running.forEach((turn,index) => actions.push({
+      label:running.length === 1 ? '中断当前回复' : `中断本轮回复 ${index+1}`,
+      type:'primary',
+      value:{action:'stop',turnId:turn.turnId,...base,...(running.length === 1 ? {fallbackCurrent:true} : {})},
+    }));
   }
   if (available && session.capabilities?.queue?.status === 'available') {
     queued.forEach((item,index) => actions.push({label:queued.length === 1 ? '撤回排队' : `撤回排队 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}}));

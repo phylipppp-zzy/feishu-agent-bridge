@@ -24,6 +24,8 @@ import { AgyAdapter } from './agy-adapter.js';
 import { AgyCatalog } from './agy-catalog.js';
 import { AgyQuotaClient, type AgyQuotaSnapshot } from './agy-quota.js';
 import { AgyAcpTransport } from './agy-transport.js';
+import { defaultAgyConversationsDir } from './agy/process-guard.js';
+import { collectAgyStatusSnapshot } from './agy/session-status.js';
 import { providerTitlePrefix } from './feishu-cards.js';
 import { DecisionSyncStore } from './decision-sync.js';
 import { PendingHub, type PendingQuery } from './pending-hub.js';
@@ -57,7 +59,7 @@ export interface AgyRuntimeConfig {
 export interface WatchHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
 export interface PendingHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
 export interface DecisionSyncRuntimeConfig { enabled:boolean; dbPath?:string; markdownPath?:string; protectedReadOnlyPaths?:string[] }
-export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; approvalPolicy?:{enabled?:boolean;extraTrustedRoots?:string[];extraWriteRoots?:string[];codexSharedFilesystem?:boolean;homeDir?:string}; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string;showTitles?:boolean}; autoTakeControlOnInput?:boolean; taskTopic?:{enabled:boolean}; watchHub?:WatchHubRuntimeConfig; pendingHub?:PendingHubRuntimeConfig; decisionSync?:DecisionSyncRuntimeConfig; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
+export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; approvalPolicy?:{enabled?:boolean;extraTrustedRoots?:string[];extraWriteRoots?:string[];codexSharedFilesystem?:boolean;homeDir?:string}; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string;showTitles?:boolean}; autoTakeControlOnInput?:boolean; autoResumeOnRestart?:boolean; taskTopic?:{enabled:boolean}; watchHub?:WatchHubRuntimeConfig; pendingHub?:PendingHubRuntimeConfig; decisionSync?:DecisionSyncRuntimeConfig; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
 export type PendingHubEntry = 'hub' | 'source' | 'pending_hub';
 export type RuntimeTrustedAction =
   | ChannelAction
@@ -148,6 +150,7 @@ export function validateRuntimeConfig(c:RuntimeConfig):void {
 const resolveWatchHubDbPath=(config:RuntimeConfig):string => config.watchHub?.dbPath ?? join(dirname(resolve(config.channelDb)),'watch-hub.sqlite');
 const resolvePendingHubDbPath=(config:RuntimeConfig):string => config.pendingHub?.dbPath ?? join(dirname(resolve(config.channelDb)),'pending-hub.sqlite');
 const resolveDecisionSyncDbPath=(config:RuntimeConfig):string => config.decisionSync?.dbPath ?? join(dirname(resolve(config.channelDb)),'decision-sync.sqlite');
+const sessionRecoveryFailure = 'one or more sessions could not be restored; inspect before retry';
 
 /** The caller must ensure inbound envelopes originate from authenticated transport. */
 export class UnifiedRuntime {
@@ -159,6 +162,7 @@ export class UnifiedRuntime {
   get decisionSync():DecisionSyncStore|undefined { return this._decisionSync; }
   get taskChannel():TaskTopicChannel|undefined { return this._taskChannel; }
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
+  private readonly startupRestorations = new Map<Provider, Promise<void>>();
   private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly inFlightUnknownOpAlerts=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
   constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
@@ -173,16 +177,33 @@ export class UnifiedRuntime {
     try {
       this.store = new UnifiedStore(config.coreDb);
       try { this.core = new UnifiedCore(this.store,providers,(identity,session)=>owner(identity) && (!options.canDiscover || options.canDiscover(session)),(identity)=>owner(identity),()=>false,options.canDiscover,archive,options.canInspectCandidate);
+        this.core.onRecoveryReconciled = sessionId => this.recordRestoredSession(sessionId);
         this.restartPending=this.store.pendingOutbox();
         const allowedProjectRoots = options.allowedProjectRoots ?? config.allowedProjectRoots ?? [];
+        const agyConfig = config.agy;
         const measuredPort=new Proxy(port,{get:(target,key)=>{const value=Reflect.get(target,key); if(typeof value!=='function') return value; if(['send','sendText','update','sendFile'].includes(String(key))) return async (...args:unknown[])=>{let guardFailed=false;const last=args.length-1; if(typeof args[last]==='function') {const guard=args[last] as ()=>Promise<void>;args[last]=async()=>{try {await guard();} catch(error) {guardFailed=true;throw error;}};} try {const result=await Reflect.apply(value,target,args); try {this.channel.recordHealth('feishu_delivery',(key==='send' && !result)?'unverified':'healthy',(key==='send' && !result)?'消息回执未确认':null);} catch {} return result;} catch(error) {const e=error && typeof error==='object' ? error as {deliveryKind?:unknown;platformCode?:unknown} : {}; const rejected=e.deliveryKind==='api_rejected' && typeof e.platformCode==='number' && Number.isSafeInteger(e.platformCode); const reason=guardFailed?'发送前权限或绑定变化':rejected?`平台拒绝（代码 ${e.platformCode}）`:'投递结果未知'; const deliveryId=args[key==='send'||key==='sendText'?2:3];const isWatchDelivery=typeof deliveryId==='string' && (deliveryId.startsWith('watch-') || deliveryId.startsWith('watch:'));try {if(typeof deliveryId==='string') this.channel.recordDeliveryDiagnostic(deliveryId,guardFailed?'guard_rejected':rejected?'api_rejected':'unknown',rejected?e.platformCode as number:null);} catch {} try {this.channel.recordHealth('feishu_delivery','degraded',reason);} catch {} if(!guardFailed && !rejected && !isWatchDelivery) this.emitWatchEvent({source:'watch',objectId:`delivery:unknown:${typeof deliveryId==='string'?deliveryId:'feishu'}`,state:'alert',severity:'high',title:'飞书消息投递结果未知',summary:`飞书消息投递结果未知（${reason}），请核对目标话题是否已收到消息。`}); throw error;}}; return value.bind(target);}}); this.sendPort=measuredPort; try { this.channel = new FeishuChannel(this.core,measuredPort,async (identity,destination,sessionId)=>{ if(!owner(identity) || !(this.port.authorizedDestination?.(destination) ?? destinations.has(destination))) return false; if(!sessionId || !options.canDiscover) return true; try {return options.canDiscover(this.store.getSession(sessionId));} catch {return options.allowDiscovered?.(sessionId) ?? false;} },config.channelDb,undefined,options.requireReadonlyHydration === true,{
           ...(allowedProjectRoots[0] ? { defaultCreateProject: allowedProjectRoots[0] } : {}),
           allowedProjectRoots, enabledProviders: providers.map(port => port.provider),
           ...(config.autoTakeControlOnInput ? { autoTakeControlOnInput: true } : {}),
+          canReconcileReleasedReadonly: session => this.canReconcileReleasedReadonly(session),
           onInteractionChanged: (sessionId, interactionId) => this.interactive.notifyInteraction(sessionId, interactionId),
           onProgressWake: destination => { if (!this.closing && !this.closed) this.interactive.notifyChannelProgress(destination); },
+          readAgyStatus: () => collectAgyStatusSnapshot({
+            ...(agyConfig?.summariesDbPath !== undefined ? { summariesDbPath: agyConfig.summariesDbPath } : {}),
+            ...(agyConfig?.brainDir !== undefined ? { brainDir: agyConfig.brainDir } : {}),
+            conversationsDir: defaultAgyConversationsDir(agyConfig?.brainDir),
+          }),
         }); } catch(error) { this.core.close(); throw error; }
-        this.core.validateSteerScope=(scope,sessionId)=>owner({source:scope.ownerSource,subject:scope.ownerSubject}) && (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) && this.channel.isCurrentSteerScope(scope,sessionId);
+        this.core.validateSteerScope = (scope,sessionId) => {
+          if (!owner({source:scope.ownerSource,subject:scope.ownerSubject})) return false;
+          const task = this._taskChannel;
+          if (task?.getBindingByDestination(scope.destination)) {
+            if (this.port.lookupTaskTopic && !this.port.lookupTaskTopic(scope.destination,scope.ownerSubject)) return false;
+            return task.isCurrentInputScope(scope,sessionId);
+          }
+          return (this.port.authorizedDestination?.(scope.destination) ?? destinations.has(scope.destination)) &&
+            this.channel.isCurrentSteerScope(scope,sessionId);
+        };
         const showAutoTitles = config.autoMirror?.showTitles === true;
         this.core.presentSession=session=>(!showAutoTitles && this.channel.isAutoPrivateTitle(session.native)) ? {...session,title:`${providerTitlePrefix(session.native.provider)} 会话 · ${payloadDigest(session.native).slice(0,8)}`} : session;
         try {
@@ -709,49 +730,95 @@ export class UnifiedRuntime {
     this.core.setProviderAvailable(provider,ready);
   }
   isProviderUnavailable(provider:Provider):boolean { return this.unavailableProviders.has(provider); }
-  /** Explicit startup only; no input or new model turn is started by restoration. */
+  private canReconcileReleasedReadonly(session: Session): boolean {
+    const { native: { provider }, sessionId, revision } = session;
+    // Interactive intent persists through startup and disconnect, even when a provider reports no owner.
+    return !this.unavailableProviders.has(provider) && this.core.hasProvider(provider) &&
+      !this.store.hasInteractiveIntent(sessionId) && !this.store.recoveryQuarantined(sessionId) &&
+      this.store.getSession(sessionId).revision === revision;
+  }
+  private recordRestoredSession(sessionId: string): void {
+    this.recoveryFailedSessions.delete(sessionId);
+    if (this.recoveryFailedSessions.size === 0 && this.recoveryFailure === sessionRecoveryFailure) this.recoveryFailure = null;
+  }
+  /** Explicit startup only; auto-resumes interrupted running sessions only when config.autoResumeOnRestart is enabled. */
   restoreBindings():Promise<void> {
     if(this.baselinePreparing) return Promise.reject(new Error('baseline preparation active')); if(this.recoveryStarted) return this.recoveryStarted;
     this.recoveryStarted=(async()=>{
-      this.store.failUnreboundPending(this.restartPending);
-      const handled = new Set<string>();
-      for(const candidate of this.collectInteractiveRestoreCandidates()) {
-        if(this.closed || this.closing) return;
-        if(handled.has(candidate.sessionId) || !this.store.hasInteractiveIntent(candidate.sessionId)) continue;
-        let session: Session;
-        try { session = this.store.getSession(candidate.sessionId); } catch { continue; }
-        if(this.unavailableProviders.has(session.native.provider)) {this.recoveryFailedSessions.add(candidate.sessionId);handled.add(candidate.sessionId);continue;}
-        if(!await candidate.checkInitialAuth() || this.closed || this.closing) continue;
-        handled.add(candidate.sessionId);
-        try { await this.core.restoreInteractive(candidate.sessionId,candidate.owner,candidate.stillAuthorized); }
-        catch { this.recoveryFailedSessions.add(candidate.sessionId); this.recoveryFailure='one or more sessions could not be restored; inspect before retry'; }
+      if (this.config.autoResumeOnRestart) {
+        this.channel.pruneExpiredRestartResumeCandidates();
+        this.captureRunningSessionsForRestart();
       }
+      this.store.failUnreboundPending(this.restartPending);
+      const candidatesByProvider = new Map<Provider, ReturnType<UnifiedRuntime['collectInteractiveRestoreCandidates']>>();
+      for (const candidate of this.collectInteractiveRestoreCandidates()) {
+        if (!this.store.hasInteractiveIntent(candidate.sessionId)) continue;
+        let provider: Provider;
+        try { provider = this.store.getSession(candidate.sessionId).native.provider; } catch { continue; }
+        const candidates = candidatesByProvider.get(provider);
+        if (candidates) candidates.push(candidate);
+        else candidatesByProvider.set(provider, [candidate]);
+      }
+      for (const [provider, candidates] of candidatesByProvider) {
+        const restoration = this.restoreStartupProvider(provider, candidates)
+          .finally(() => this.startupRestorations.delete(provider));
+        this.startupRestorations.set(provider, restoration);
+      }
+      const results = await Promise.allSettled(this.startupRestorations.values());
+      if (results.some(result => result.status === 'rejected')) this.recoveryFailure='binding recovery failed; inspect before retry';
     })().catch(()=>{this.recoveryFailure='binding recovery failed; inspect before retry';});
     return this.recoveryStarted;
+  }
+  private async restoreStartupProvider(provider: Provider, candidates: ReturnType<UnifiedRuntime['collectInteractiveRestoreCandidates']>): Promise<void> {
+    const handled = new Set<string>();
+    for (const candidate of candidates) {
+      if (this.closed || this.closing) return;
+      const { sessionId, owner, stillAuthorized } = candidate;
+      if (handled.has(sessionId) || !this.store.hasInteractiveIntent(sessionId)) continue;
+      if (this.unavailableProviders.has(provider)) this.recoveryFailedSessions.add(sessionId);
+      if (this.recoveryFailedSessions.has(sessionId)) {
+        handled.add(sessionId);
+        continue;
+      }
+      if (!await candidate.checkInitialAuth() || this.closed || this.closing) continue;
+      handled.add(sessionId);
+      if (this.recoveryFailedSessions.has(sessionId)) continue;
+      try {
+        await this.core.restoreInteractive(sessionId, owner, stillAuthorized);
+        if (!this.recoveryFailedSessions.has(sessionId)) await this.maybeAutoResumeAfterRestore(sessionId);
+      } catch {
+        this.recoveryFailedSessions.add(sessionId);
+        this.recoveryFailure = sessionRecoveryFailure;
+      }
+    }
   }
   /** Retry persisted interactive intent (including runtime-disconnected and taskTopic targets) for the provider that just reconnected. */
   async restoreProviderAfterReconnect(provider:Provider):Promise<{restored:string[];failed:string[]}> {
     const restoredIds: string[] = [];
     const failedIds: string[] = [];
-    if(this.closed || this.closing) return {restored:restoredIds,failed:failedIds};
+    const startup = this.startupRestorations.get(provider);
+    if (startup) await startup.catch(() => {});
+    const unavailable = () => this.closed || this.closing || this.unavailableProviders.has(provider);
+    if(unavailable()) return {restored:restoredIds,failed:failedIds};
     const handled = new Set<string>();
     for(const candidate of this.collectInteractiveRestoreCandidates(provider)) {
-      if(this.closed || this.closing) return {restored:restoredIds,failed:failedIds};
+      if(unavailable()) return {restored:restoredIds,failed:failedIds};
       if(handled.has(candidate.sessionId) || !this.recoveryFailedSessions.has(candidate.sessionId) || !this.store.hasInteractiveIntent(candidate.sessionId)) continue;
-      if(!await candidate.checkInitialAuth()) continue;
+      if(!await candidate.checkInitialAuth() || unavailable()) continue;
       handled.add(candidate.sessionId);
       try {
         const outcome = await this.core.restoreInteractiveWithOutcome(candidate.sessionId,candidate.owner,candidate.stillAuthorized);
-        if (outcome === 'restored') {
-          this.recoveryFailedSessions.delete(candidate.sessionId);
+        if (outcome === 'restored' && !unavailable()) {
+          this.recordRestoredSession(candidate.sessionId);
           restoredIds.push(candidate.sessionId);
+          await this.maybeAutoResumeAfterRestore(candidate.sessionId);
         }
       } catch {
         failedIds.push(candidate.sessionId);
       }
     }
-    if(failedIds.length > 0) this.recoveryFailure='one or more sessions could not be restored; inspect before retry';
-    else if(this.recoveryFailedSessions.size===0 && this.recoveryFailure==='one or more sessions could not be restored; inspect before retry') this.recoveryFailure=null;
+    if(unavailable()) return {restored:restoredIds,failed:failedIds};
+    if(failedIds.length > 0) this.recoveryFailure = sessionRecoveryFailure;
     if (this.providerWasDisconnected.delete(provider)) {
       this.emitWatchEvent({
         source: provider === 'agy' ? 'agy_status' : provider === 'codex' ? 'codex_status' : 'watch',
@@ -817,8 +884,74 @@ export class UnifiedRuntime {
     void this.runPollCycle();
   }
   health():{status:'healthy'|'degraded';reason:string|null;unknownDeliveries:number;unknownInbox:number;resourceIssues:Array<{eventId:string;state:string;attempts:number;reason:string}>} { const unknownDeliveries=this.channel.pendingDeliveries().length; const unknownInbox=this.channel.unknownInbox().length; const resourceIssues=this.port.resourceIssues?.() ?? []; return {status:this.lastError || this.recoveryFailure || this.store.recoveryQuarantineCount() || unknownDeliveries || unknownInbox || resourceIssues.length ? 'degraded':'healthy',reason:this.lastError ?? this.recoveryFailure ?? (this.store.recoveryQuarantineCount() ? 'reconnect and explicitly attach quarantined sessions' : null),unknownDeliveries,unknownInbox,resourceIssues}; }
+  prepareForShutdown(): void {
+    this.captureRunningSessionsForRestart();
+  }
+  private captureRunningSessionsForRestart(): void {
+    if (!this.config.autoResumeOnRestart) return;
+    try {
+      const now = Date.now();
+      for (const binding of this.channel.bindingsForRestore()) {
+        if (binding.accessMode !== 'interactive') continue;
+        let session: Session;
+        try { session = this.store.getSession(binding.sessionId); } catch { continue; }
+        const hasRunningTurn = session.status === 'running' ||
+          this.store.listTurns(binding.sessionId).some(turn => turn.status === 'running');
+        if (!hasRunningTurn) continue;
+        this.channel.recordRestartResumeCandidate(binding.sessionId, binding.destination, binding.owner, now);
+      }
+    } catch {
+      // Best-effort snapshot before shutdown or recovery.
+    }
+  }
+  private async maybeAutoResumeAfterRestore(sessionId: string): Promise<boolean> {
+    if (!this.config.autoResumeOnRestart || this.closed || this.closing) return false;
+    const pending = this.channel.peekRestartResumeCandidate(sessionId);
+    if (!pending) return false;
+    let current: Session;
+    try { current = this.store.getSession(sessionId); } catch { return false; }
+    if (current.control.input !== 'available' || current.status !== 'idle') return false;
+    if (this.channel.accessMode(pending.destination) !== 'interactive') return false;
+    const binding = this.channel.bindingsForRestore().find(b => b.destination === pending.destination && b.sessionId === sessionId);
+    if (!binding) return false;
+    const bindingScope = JSON.stringify({
+      session_id: binding.sessionId,
+      binding_id: binding.bindingId,
+      revision: binding.revision,
+      access_mode: binding.accessMode,
+    });
+    const channelScope = {
+      destination: pending.destination,
+      bindingScope,
+      ownerSource: pending.owner.source,
+      ownerSubject: pending.owner.subject,
+    };
+    const operationId = `restart-resume:${sessionId}:${pending.interruptedAt}`;
+    try {
+      await this.core.submitInput({
+        context: {
+          operationId,
+          idempotencyKey: operationId,
+          targetId: sessionId,
+          expectedRevision: current.revision,
+          controlGeneration: current.control.generation,
+          identity: pending.owner,
+          channelScope,
+        },
+        mode: 'new',
+        blocks: [{ type: 'text', text: '服务刚刚完成重启恢复，请无感衔接刚才中断的任务继续执行并给出完整结果。' }],
+        channelScope,
+      });
+      this.channel.consumeRestartResumeCandidate(sessionId);
+      this.notifyChannelProgress(pending.destination);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   close():Promise<void> {
     if(this.closePromise) return this.closePromise;
+    this.captureRunningSessionsForRestart();
     this.closing=true; this.polling=false; this.wakePending=false; this.wakeScheduled=false;
     if(this.timer) { clearTimeout(this.timer); this.timer=undefined; }
     const running=this.running; const intakes=[...this.intakes]; const hubTasks=[...this.hubTasks];
@@ -1200,7 +1333,7 @@ export async function createLiveRuntime(config:RuntimeConfig, credentials:{appId
   return {...liveRuntimeLifecycle(runtime,transport,port,testLane,agyLifecycle),testLane};
 }
 /** Shutdown can race either network startup await; no continuation may start polling after close. */
-export function liveRuntimeLifecycle<T extends Pick<UnifiedRuntime,'handleTrusted'|'captureResourceScope'|'startPolling'|'close'> & Partial<Pick<UnifiedRuntime,'restoreBindings'|'restoreProviderAfterReconnect'|'setProviderReady'|'recordProviderConnection'>>>(runtime:T, transport:Pick<CodexTransport,'connect'|'close'> & Partial<Pick<CodexTransport,'onDisconnect'|'connected'>>, port:Pick<FeishuSdkPort,'start'|'stopReceiving'|'close'> & Partial<Pick<FeishuSdkPort,'drainTestCreates'>>, testLane?:Pick<TestLaneRuntime,'startPolling'|'startOperator'|'close'>, agy?:{transport:Pick<AgyAcpTransport,'connect'|'close'> & Partial<Pick<AgyAcpTransport,'onDisconnect'|'connected'>>;refreshQuota?:()=>Promise<void>}) {
+export function liveRuntimeLifecycle<T extends Pick<UnifiedRuntime,'handleTrusted'|'captureResourceScope'|'startPolling'|'close'> & Partial<Pick<UnifiedRuntime,'restoreBindings'|'restoreProviderAfterReconnect'|'setProviderReady'|'recordProviderConnection'|'prepareForShutdown'>>>(runtime:T, transport:Pick<CodexTransport,'connect'|'close'> & Partial<Pick<CodexTransport,'onDisconnect'|'connected'>>, port:Pick<FeishuSdkPort,'start'|'stopReceiving'|'close'> & Partial<Pick<FeishuSdkPort,'drainTestCreates'>>, testLane?:Pick<TestLaneRuntime,'startPolling'|'startOperator'|'close'>, agy?:{transport:Pick<AgyAcpTransport,'connect'|'close'> & Partial<Pick<AgyAcpTransport,'onDisconnect'|'connected'>>;refreshQuota?:()=>Promise<void>}) {
   let closing=false, started=false, closePromise:Promise<void>|undefined, timer:ReturnType<typeof setTimeout>|undefined, connecting=false, attempt=0; const previousDisconnect=transport.onDisconnect;
   let agyTimer:ReturnType<typeof setTimeout>|undefined, agyConnecting=false, agyAttempt=0; const previousAgyDisconnect=agy?.transport.onDisconnect;
   const schedule=()=>{if(closing || timer || connecting) return;const delay=Math.min(30000,1000*2**Math.min(attempt,5));timer=setTimeout(()=>{timer=undefined;void connect();},delay);timer.unref?.();};
@@ -1210,5 +1343,5 @@ export function liveRuntimeLifecycle<T extends Pick<UnifiedRuntime,'handleTruste
   const connectAgy=async()=>{if(!agy || closing || agyConnecting) return;agyConnecting=true;try {await agy.transport.connect();if(closing){await agy.transport.close().catch(()=>{});return;}if(agy.transport.connected===false) throw new Error('connection closed');agyAttempt=0;runtime.setProviderReady?.('agy',true);runtime.recordProviderConnection?.('agy',true);try {await runtime.restoreProviderAfterReconnect?.('agy');} catch {} if(!closing) void agy.refreshQuota?.().catch(()=>{});} catch {if(!closing) {runtime.recordProviderConnection?.('agy',false);agyAttempt=Math.min(agyAttempt+1,5);}} finally {agyConnecting=false;if(!closing && agyAttempt>0) scheduleAgy();}};
   if(agy && 'onDisconnect' in agy.transport) agy.transport.onDisconnect=(generation:number,reason:string)=>{try {previousAgyDisconnect?.(generation,reason);} catch {} if(!closing){runtime.setProviderReady?.('agy',false);agyAttempt=Math.max(agyAttempt,1);scheduleAgy();}};
   const closeTransports=()=>Promise.allSettled([Promise.resolve().then(()=>transport.close()),...(agy?[agy.transport.close()]:[])]);
-  return {runtime,async start(){if(closing || started) throw new Error('runtime closing or started');started=true;runtime.setProviderReady?.('codex',false);if(agy) runtime.setProviderReady?.('agy',false);try {await port.start((e,a)=>runtime.handleTrusted(e,a),e=>runtime.captureResourceScope(e));if(closing){port.stopReceiving();throw new Error('runtime closing');}runtime.startPolling();try {if(testLane){await testLane.startOperator();if(closing)throw new Error('closing');testLane.startPolling();}} catch {void testLane?.close();}if(closing)throw new Error('runtime closing');void connect();if(agy) void connectAgy();} catch(error) {await closeTransports();throw error;}},close(){if(closePromise)return closePromise;closing=true;if(timer)clearTimeout(timer);if(agyTimer)clearTimeout(agyTimer);closePromise=Promise.resolve().then(async()=>{try {try {port.stopReceiving();} finally {await closeTransports();}} finally {try {const results=await Promise.allSettled([runtime.close(),testLane?.close()]);const failed=results.find((r):r is PromiseRejectedResult=>r.status==='rejected');if(failed)throw failed.reason;} finally {try {await port.drainTestCreates?.();await closeTransports();} finally {port.close();}}}});return closePromise;}};
+  return {runtime,async start(){if(closing || started) throw new Error('runtime closing or started');started=true;runtime.setProviderReady?.('codex',false);if(agy) runtime.setProviderReady?.('agy',false);try {await port.start((e,a)=>runtime.handleTrusted(e,a),e=>runtime.captureResourceScope(e));if(closing){port.stopReceiving();throw new Error('runtime closing');}runtime.startPolling();try {if(testLane){await testLane.startOperator();if(closing)throw new Error('closing');testLane.startPolling();}} catch {void testLane?.close();}if(closing)throw new Error('runtime closing');void connect();if(agy) void connectAgy();} catch(error) {await closeTransports();throw error;}},close(){if(closePromise)return closePromise;closing=true;runtime.prepareForShutdown?.();if(timer)clearTimeout(timer);if(agyTimer)clearTimeout(agyTimer);closePromise=Promise.resolve().then(async()=>{try {try {port.stopReceiving();} finally {await closeTransports();}} finally {try {const results=await Promise.allSettled([runtime.close(),testLane?.close()]);const failed=results.find((r):r is PromiseRejectedResult=>r.status==='rejected');if(failed)throw failed.reason;} finally {try {await port.drainTestCreates?.();await closeTransports();} finally {port.close();}}}});return closePromise;}};
 }

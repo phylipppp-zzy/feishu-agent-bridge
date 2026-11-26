@@ -913,9 +913,12 @@ test('Verifier regressions: /stop settles pending perm, same-chunk wakeup isolat
     assert.equal(lockedSession.capabilities.send.status, 'temporarily_unavailable');
     assert.equal(lockedSession.capabilities.handoff.status, 'available');
 
-    // Release with failing session/close + acquire on same gen must KEEP session locked
-    await adapter.control(ref, 'release', makeGuard(gen1));
-    await adapter.control(ref, 'acquire', makeGuard(gen1));
+    // A rejected close preserves the active subscription and its timeout lock.
+    await assert.rejects(adapter.control(ref, 'release', makeGuard(gen1)), {
+      code: 'unsupported', message: 'session/close not supported',
+    });
+    assert.equal(adapter.hasActiveNativeSession(ref), true);
+    await assert.rejects(adapter.control(ref, 'acquire', makeGuard(gen1)), { code: 'busy' });
     await assert.rejects(
       adapter.input(ref, 'new', [{ type: 'text', text: 'still-locked' }], makeGuard(gen1)),
       { code: 'control_conflict' },

@@ -90,6 +90,7 @@ export type TaskChannelAction = (
       controlGeneration?: number;
       fields: Record<string, unknown>;
     }
+  | { action: 'legacy_stop' }
   | {
       action: 'stop';
       targetId?: string;

@@ -1,13 +1,25 @@
 import type { HistoryReader } from './history-port.js';
 import { randomUUID } from 'node:crypto';
-import type { PlatformInputBlock, UnifiedService, DispatchGuard, ListQuery, PlatformObservation, PlatformPort } from './adapter.js';
-import { payloadDigest, validateSubmitInput, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SessionSnapshot, type SubmitInput, type WriteContext } from './contracts.js';
+import type { AttachOptions, InputScopeValidator, PlatformInputBlock, UnifiedService, DispatchGuard, ListQuery, PlatformObservation, PlatformPort } from './adapter.js';
+import { payloadDigest, validateSubmitInput, validateWriteContext, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SessionSnapshot, type SubmitInput, type WriteContext } from './contracts.js';
 import { contractError, type ContractError } from './errors.js';
-import { responseLeaseKey, StoreError, UnifiedStore } from './store.js';
+import { recoveryReleaseConfirmed, responseLeaseKey, StoreError, UnifiedStore } from './store.js';
 
 /** Authentication is supplied by the channel; an identity string alone is never trusted. */
 export type Authorize = (identity: WriteContext['identity'], session: Session, action: string) => boolean;
 const sessionIdFor = (native: Session['native']): string => `session_${payloadDigest(native)}`;
+type AttachRequest = Parameters<UnifiedService['attachSession']>[0];
+const recoveryAttachRequired = 'recovery quarantine requires an explicit interactive attach';
+const recoveryReleaseUnknown = 'recovery verification failed; subscription release outcome unknown';
+type ResumeAttempt = { started: boolean; generation?: number };
+const confirmsRelease = (receipt: Awaited<ReturnType<PlatformPort['control']>>): boolean =>
+  receipt.status === 'submitted' && ['unsubscribed','notSubscribed','notLoaded'].includes(receipt.nativeReference ?? '');
+const isCleanPreSubscriptionRejection = (error: unknown): boolean => {
+  const code = error instanceof StoreError ? error.detail.code
+    : error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code : null;
+  return code !== null && ['control_conflict', 'busy', 'unauthorized', 'invalid_request', 'unsupported'].includes(code);
+};
 const GENERIC_SESSION_TITLE_RE = /(?:Claude|Codex|Antigravity) 会话 · [0-9a-f]{8}$/;
 const isGenericFallbackTitle = (title: string): boolean => GENERIC_SESSION_TITLE_RE.test(title.trim());
 const isMissingNativeSessionError = (error: unknown): boolean => {
@@ -63,7 +75,6 @@ type ControlObservations = {
 async function boundedProviderList(port:PlatformPort,cursor:string|null):ReturnType<PlatformPort['list']> {const prior=pendingProviderLists.get(port);if(prior && prior.cursor!==cursor) throw contractError('temporarily_unavailable','provider list already pending'); let timer:ReturnType<typeof setTimeout>|undefined;const work=prior?.work ?? Promise.resolve().then(()=>port.list(cursor,100));if(!prior){pendingProviderLists.set(port,{cursor,work});void work.finally(()=>{if(pendingProviderLists.get(port)?.work===work)pendingProviderLists.delete(port);}).catch(()=>{});}try {return await Promise.race([work,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(contractError('temporarily_unavailable','provider list timed out')),2000);})]);} finally {if(timer)clearTimeout(timer);}}
 /** Normalized core. Native transports and credentials are injected through PlatformPort. */
 export class UnifiedCore implements UnifiedService {
-  private readonly quarantinedHere = new Set<string>();
   private readonly unavailableProviders=new Set<Provider>();
   private readonly syncedSettings = new Map<string, { connectionGeneration: number; revision: number; digest: string }>();
   setProviderAvailable(provider:Provider,available:boolean):void {
@@ -94,11 +105,21 @@ export class UnifiedCore implements UnifiedService {
   private readonly controlObservations = new Map<string, ControlObservations>();
   private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
+  private readonly preResumeRecoveryFailures = new Set<string>();
   private closed=false;
-  validateSteerScope?: (scope:NonNullable<SubmitInput['channelScope']>,sessionId:string)=>boolean;
+  validateSteerScope?: InputScopeValidator;
+  private readonly localInputScopeValidators = new Set<InputScopeValidator>();
+  registerInputScopeValidator(validate: InputScopeValidator): () => void {
+    this.localInputScopeValidators.add(validate);
+    return () => { this.localInputScopeValidators.delete(validate); };
+  }
   private inputScopeCurrent(input: SubmitInput, sessionId: string): boolean {
-    return !input.channelScope || (input.mode !== 'steer' && input.mode !== 'new') ||
-      this.validateSteerScope?.(input.channelScope,sessionId) === true;
+    return this.channelScopeCurrent(input.channelScope,sessionId);
+  }
+  private channelScopeCurrent(scope: WriteContext['channelScope'], sessionId: string): boolean {
+    if (!scope) return true;
+    if (this.validateSteerScope) return this.validateSteerScope(scope,sessionId) === true;
+    return [...this.localInputScopeValidators].some(validate => validate(scope, sessionId));
   }
   onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
@@ -127,7 +148,7 @@ export class UnifiedCore implements UnifiedService {
     const session = this.store.getSession(context.targetId);
     if (!this.authorize(context.identity, session, action)) return fail('unauthorized');
     if(this.unavailableProviders.has(session.native.provider) && ['attachSession','submitInput','resolveInteraction','interruptTurn','requestControl','releaseControl','updateSessionSettings','archiveSession'].includes(action)) return fail('temporarily_unavailable','provider unavailable');
-    if (this.store.recoveryQuarantined(session.sessionId)) return fail('control_conflict','reconnect and explicitly attach to reconcile recovery quarantine');
+    if (this.store.recoveryQuarantined(session.sessionId)) return fail('control_conflict',recoveryAttachRequired);
     return session;
   }
   private serial<T>(id: string, fn: () => Promise<T>): Promise<T> {
@@ -137,6 +158,7 @@ export class UnifiedCore implements UnifiedService {
     return next;
   }
   presentSession:(session:Session)=>Session=session=>session;
+  onRecoveryReconciled?: (sessionId: string) => void;
   private present(session: Session): Session { session=this.presentSession(session); if(this.unavailableProviders.has(session.native.provider)) {const capabilities=Object.fromEntries(Object.entries(session.capabilities).map(([key,value])=>[key,key==='view'?value:{status:'temporarily_unavailable',reason:'provider unavailable'}])) as Session['capabilities'];return {...session,status:'unreachable',capabilities,control:{...session.control,input:'unavailable',reason:'provider unavailable'}};} const queue = session.status === 'read_only' ? {status:'unsupported' as const,reason:'read-only session'} : session.capabilities.send.status === 'available' && session.control.input === 'available' ? {status:'available' as const} : {status:'temporarily_unavailable' as const,reason:'input control unavailable'}; return {...session,capabilities:{...session.capabilities,queue}}; }
   clearTransientRefreshFailure(): void {
     if (this.observationFailure === 'read-only refresh failed') this.observationFailure = null;
@@ -264,8 +286,12 @@ export class UnifiedCore implements UnifiedService {
   private async refreshHistory(id:string, allowInteractive:boolean, supplied?:SessionSnapshot, bestEffort = false):Promise<boolean> {
     let current:Session|undefined;
     try {
-      current=this.store.getSession(id); if (!allowInteractive && (current.control.input === 'available' || current.status !== 'read_only')) return fail('busy','only read-only sessions can be refreshed');
-      if (this.store.isDetached(id) || this.store.recoveryQuarantined(id)) return false;
+      current=this.store.getSession(id);
+      const readonly = current.status === 'read_only' && current.control.input !== 'available';
+      if (!allowInteractive && !readonly) return fail('busy','only read-only sessions can be refreshed');
+      const quarantine = this.store.getRecoveryQuarantine(id);
+      // AGY snapshots merge disk history with live messages from the held subscription.
+      if (this.store.isDetached(id) || (quarantine && (!readonly || (current.native.provider === 'agy' && !quarantine.releaseConfirmed)))) return false;
       const generation = this.store.connectionGeneration(id);
       const observed=supplied ?? await this.port(current).read(current.native); if (payloadDigest(observed.session.native)!==payloadDigest(current.native) || observed.session.project!==current.project) return fail('invalid_request','provider returned wrong native session or project');
       if (observed.connectionGeneration !== undefined && (observed.connectionGeneration < generation || current.control.input === 'available' && observed.connectionGeneration !== generation)) return fail('control_conflict','stale connection generation');
@@ -303,51 +329,128 @@ export class UnifiedCore implements UnifiedService {
     const authorize=()=>{const op=this.store.getOperation(operationId),out=this.store.getOutbox(operationId),payload=out.payload as {provider?:unknown};if(!this.authorizeBootstrap(identity,'codex')||out.context.identity.source!==identity.source||out.context.identity.subject!==identity.subject||out.context.targetId!==`new:${destination}`||out.kind!=='createSession'||op.action!=='createSession'||op.status!=='unknown'||payload.provider!=='codex'||!this.canInspectCandidate||this.closed)throw contractError('unauthorized');};authorize();if(query.cursor&&query.nativeId)throw contractError('invalid_request');if(this.candidateFlight)throw contractError('busy');const port=this.providers.get('codex');if(!port?.readCandidateMetadata||!port.candidateGeneration||(!query.nativeId&&!port.listCandidateIds))throw contractError('unsupported');const generation=port.candidateGeneration();if(!Number.isSafeInteger(generation)||generation!<1)throw contractError('temporarily_unavailable');
     const work=(async()=>{const page=query.nativeId?{items:[query.nativeId],nextCursor:null}:await port.listCandidateIds!(query.cursor??null,5);const items:import('./contracts.js').CandidateMetadata[]=[];let partial='partial' in page&&page.partial===true;for(const id of page.items){if(port.candidateGeneration!()!==generation)throw contractError('snapshot_required');try{const key=`${generation}:${id}`;let call=this.candidateReads.get(key);if(!call){if(this.candidateReads.size>=16)throw contractError('busy');call=port.readCandidateMetadata!(id);this.candidateReads.set(key,call);const pending=call;void call.finally(()=>{if(this.candidateReads.get(key)===pending)this.candidateReads.delete(key)}).catch(()=>{});}let readTimer:ReturnType<typeof setTimeout>|undefined;let item:import('./contracts.js').CandidateMetadata;try{item=await Promise.race([call,new Promise<never>((_,reject)=>{readTimer=setTimeout(()=>reject(contractError('temporarily_unavailable')),1000)})]);}finally{if(readTimer)clearTimeout(readTimer);}if(port.candidateGeneration!()!==generation||item.connectionGeneration!==generation)throw contractError('snapshot_required');if(item.native.provider!=='codex'||item.native.nativeSessionId!==id||item.historyVerified!==false||!this.canInspectCandidate!(item.native,item.project)){partial=true;continue;}items.push(item);}catch(error){if(port.candidateGeneration!()!==generation)throw error;partial=true;}}if(port.candidateGeneration!()!==generation)throw contractError('snapshot_required');authorize();return {items,nextCursor:page.nextCursor,partial};})();this.candidateFlight=work;void work.finally(()=>{if(this.candidateFlight===work)this.candidateFlight=undefined;}).catch(()=>{});let timer:ReturnType<typeof setTimeout>|undefined;try{return await Promise.race([work,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(contractError('temporarily_unavailable','metadata query timed out')),5000);})]);}finally{if(timer)clearTimeout(timer);}
   }
-  async attachSession(request: { context: WriteContext; payload: { provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' } }): Promise<Operation> {
+  async attachSession(request: AttachRequest, options?: AttachOptions): Promise<Operation> {
+    const {mode: _mode,...ref} = request.payload;
+    return this.serial(sessionIdFor(ref), () => this.attachSessionInSerial(request, options));
+  }
+  private async attachSessionInSerial(request: AttachRequest, options: AttachOptions = {}, recoveryResume?: ResumeAttempt): Promise<Operation> {
+    const { stillAuthorized, allowQuarantineRecovery = true } = options;
+    if (stillAuthorized && !await stillAuthorized()) return fail('unauthorized','attach authorization changed');
     const {provider,hostId,serviceId,nativeSessionId}=request.payload;
     if(this.unavailableProviders.has(provider)) return fail('temporarily_unavailable','provider unavailable');
-    return this.serial(sessionIdFor({provider,hostId,serviceId,nativeSessionId}), async () => {
     const prior=this.store.findIdempotent(request.context,'attachSession',request.payload); if (prior) { if(prior.result?.kind !== 'session') return fail('outcome_unknown'); this.check({...request.context,targetId:prior.result.sessionId},'attachSession'); return prior; }
     const ref = {provider,hostId,serviceId,nativeSessionId};
     const port = this.providers.get(provider) ?? fail('temporarily_unavailable');
     const existingAttachment=this.store.findSession(ref);
-    const quarantined=existingAttachment && this.store.recoveryQuarantined(existingAttachment.sessionId);
-    if (quarantined && (request.payload.mode!=='interactive' || this.quarantinedHere.has(existingAttachment!.sessionId))) return fail('control_conflict','reconnect and explicitly attach to reconcile recovery quarantine');
-    if(!quarantined && existingAttachment && !this.store.isDetached(existingAttachment.sessionId) && ((request.payload.mode==='read_only' && existingAttachment.control.reason!=='discovered session is not attached') || (request.payload.mode==='interactive' && existingAttachment.control.input==='available' && existingAttachment.status!=='read_only'))) {
+    const quarantine=existingAttachment && this.store.getRecoveryQuarantine(existingAttachment.sessionId);
+    if (quarantine && (request.payload.mode!=='interactive' || !allowQuarantineRecovery || request.context.operationId.startsWith('restore:'))) return fail('control_conflict',recoveryAttachRequired);
+    if(!quarantine && existingAttachment && !this.store.isDetached(existingAttachment.sessionId) && ((request.payload.mode==='read_only' && existingAttachment.control.reason!=='discovered session is not attached') || (request.payload.mode==='interactive' && existingAttachment.control.input==='available' && existingAttachment.status!=='read_only'))) {
       if ((this.canDiscover && !this.canDiscover(existingAttachment)) || !this.authorize(request.context.identity,existingAttachment,'attachSession')) return fail('unauthorized');
       return this.store.reuseAttachedSession(request.context,existingAttachment,request.payload);
     }
-    let observed = await port.read(ref); if(quarantined && (!Number.isSafeInteger(observed.connectionGeneration) || observed.connectionGeneration! <= this.store.recoveryQuarantineGeneration(existingAttachment!.sessionId)!)) return fail('control_conflict','new connection required to reconcile recovery quarantine'); if (payloadDigest(observed.session.native) !== payloadDigest(ref)) return fail('invalid_request','provider returned wrong native session');
+    let observed = await port.read(ref);
+    if (payloadDigest(observed.session.native) !== payloadDigest(ref)) return fail('invalid_request','provider returned wrong native session');
     const existing = this.store.findSession(ref); if (existing && existing.project !== observed.session.project) return fail('unauthorized','session project changed'); const candidate: Session = {...observed.session, sessionId:existing?.sessionId ?? sessionIdFor(ref), native:ref};
     if ((this.canDiscover && !this.canDiscover(candidate)) || !this.authorize(request.context.identity,candidate,'attachSession')) return fail('unauthorized');
-    let resumed = false; let attached = false;
+    const readGeneration = observed.connectionGeneration;
+    // A passive session can expose its first connection generation through the resume receipt.
+    if (quarantine && readGeneration !== undefined && (!Number.isSafeInteger(readGeneration) ||
+      readGeneration < quarantine.generation || (readGeneration === quarantine.generation && !quarantine.releaseConfirmed))) {
+      return fail('control_conflict','new connection required to reconcile recovery quarantine');
+    }
+    if (stillAuthorized && !await stillAuthorized()) return fail('unauthorized','attach authorization changed');
+    let resumeAttempted = false; let resumed = false; let attached = false; let cleanResumeRejection = false;
+    let resumedGeneration: number | undefined;
     try {
-    if (request.payload.mode === 'interactive' && (provider !== 'claude' || observed.session.control.input !== 'available')) {
-      if (existing) port.seedControlGeneration?.(ref,existing.control.generation);
-      const receipt = await port.resume(ref);
-      resumed = true;
-      if (receipt.nativeReference !== nativeSessionId || !Number.isSafeInteger(receipt.connectionGeneration) || receipt.connectionGeneration! < 0) return fail('outcome_unknown','resume acknowledgement missing identity or generation');
-      observed = await port.read(ref);
-      if (payloadDigest(observed.session.native) !== payloadDigest(ref) || observed.session.project !== candidate.project || (this.canDiscover && !this.canDiscover(observed.session)) || !this.authorize(request.context.identity,{...observed.session,sessionId:candidate.sessionId},'attachSession')) return fail('unauthorized','session metadata changed during resume');
-      if (observed.connectionGeneration !== receipt.connectionGeneration || observed.session.control.input !== 'available') return fail('control_conflict','resume did not establish an interactive subscription');
-    }
-    let session: Session = {...observed.session, sessionId:candidate.sessionId, native:ref};
-    if (request.payload.mode === 'read_only') session = {...session,status:'read_only',control:{...session.control,input:'unavailable',owner:null},capabilities:Object.fromEntries(Object.entries(session.capabilities).map(([k,v]) => [k,k === 'view' ? v : {status:'unsupported',reason:'read-only attachment'}])) as Session['capabilities']};
-    if (request.payload.mode === 'interactive' && observed.session.control.input !== 'available') return fail('control_conflict');
-    if (request.payload.mode === 'interactive' && (!Number.isSafeInteger(observed.connectionGeneration) || observed.connectionGeneration! < 0)) return fail('temporarily_unavailable','connection generation unavailable');
-    if ((observed.turns ?? []).some(t=>t.sessionId!==ref.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
-    const result=this.store.attachSession(request.context,session,request.payload,request.payload.mode === 'read_only' ? null : observed.connectionGeneration ?? null,request.payload.mode === 'read_only' ? {...observed,interactions:[]} : observed); attached=true; this.syncedSettings.delete(candidate.sessionId); if(quarantined) this.store.clearRecoveryQuarantine(candidate.sessionId); return result;
+      if (request.payload.mode === 'interactive' && (quarantine || provider !== 'claude' || observed.session.control.input !== 'available')) {
+        if (existing) port.seedControlGeneration?.(ref,existing.control.generation);
+        if (quarantine) this.store.quarantineRecovery(candidate.sessionId,recoveryReleaseUnknown,readGeneration ?? quarantine.generation);
+        if (recoveryResume) {
+          if (readGeneration !== undefined && Number.isSafeInteger(readGeneration) && readGeneration >= 0) recoveryResume.generation = readGeneration;
+          recoveryResume.started = true;
+        }
+        resumeAttempted = true;
+        let receipt: Awaited<ReturnType<PlatformPort['resume']>>;
+        try {
+          receipt = await port.resume(ref);
+        } catch (error) {
+          if (isCleanPreSubscriptionRejection(error)) cleanResumeRejection = true;
+          throw error;
+        }
+        resumed = true;
+        const generation = receipt.connectionGeneration;
+        if (generation !== undefined && Number.isSafeInteger(generation) && generation >= 0) {
+          resumedGeneration = generation;
+          if (recoveryResume) recoveryResume.generation = generation;
+          if (quarantine) this.store.quarantineRecovery(candidate.sessionId,recoveryReleaseUnknown,generation);
+        }
+        if (receipt.nativeReference !== nativeSessionId || resumedGeneration === undefined) return fail('outcome_unknown','resume acknowledgement missing identity or generation');
+        if (quarantine && ((readGeneration !== undefined && resumedGeneration < readGeneration) ||
+          resumedGeneration < quarantine.generation || (resumedGeneration === quarantine.generation && !quarantine.releaseConfirmed))) {
+          return fail('control_conflict','stale recovery resume connection generation');
+        }
+        observed = await port.read(ref);
+        if (payloadDigest(observed.session.native) !== payloadDigest(ref) || observed.session.project !== candidate.project || (this.canDiscover && !this.canDiscover(observed.session)) || !this.authorize(request.context.identity,{...observed.session,sessionId:candidate.sessionId},'attachSession')) return fail('unauthorized','session metadata changed during resume');
+        if (observed.connectionGeneration !== receipt.connectionGeneration || observed.session.control.input !== 'available') return fail('control_conflict','resume did not establish an interactive subscription');
+        if (stillAuthorized && !await stillAuthorized()) return fail('unauthorized','attach authorization changed');
+      }
+      let session: Session = {...observed.session, sessionId:candidate.sessionId, native:ref};
+      if (request.payload.mode === 'read_only') session = {...session,status:'read_only',control:{...session.control,input:'unavailable',owner:null},capabilities:Object.fromEntries(Object.entries(session.capabilities).map(([k,v]) => [k,k === 'view' ? v : {status:'unsupported',reason:'read-only attachment'}])) as Session['capabilities']};
+      if (request.payload.mode === 'interactive' && observed.session.control.input !== 'available') return fail('control_conflict');
+      if (request.payload.mode === 'interactive' && (!Number.isSafeInteger(observed.connectionGeneration) || observed.connectionGeneration! < 0)) return fail('temporarily_unavailable','connection generation unavailable');
+      if ((observed.turns ?? []).some(t=>t.sessionId!==ref.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
+      const result=this.store.attachSession(request.context,session,request.payload,request.payload.mode === 'read_only' ? null : observed.connectionGeneration ?? null,request.payload.mode === 'read_only' ? {...observed,interactions:[]} : observed,!!quarantine);
+      attached=true;
+      this.syncedSettings.delete(candidate.sessionId);
+      if (quarantine && !this.store.recoveryQuarantineCount() && this.observationFailure?.startsWith('restart recovery failed; subscription')) this.observationFailure=null;
+      const retriedRecovery = request.payload.mode === 'interactive' && !recoveryResume && this.preResumeRecoveryFailures.delete(candidate.sessionId);
+      if (quarantine || retriedRecovery) {
+        this.onRecoveryReconciled?.(candidate.sessionId);
+      }
+      return result;
     } finally {
-      if (resumed && !attached) { try { await port.control(ref,'release',{expectedControlGeneration:0,expectedConnectionGeneration:observed.connectionGeneration ?? null,assertCurrent() {}}); } catch { return fail('outcome_unknown','attach failed and subscription release could not be confirmed'); } }
+      // Startup recovery owns cleanup through its final authorization and snapshot checks.
+      if (resumed && !attached && !recoveryResume) {
+        const generation = resumedGeneration ?? observed.connectionGeneration ?? null;
+        let releaseConfirmed = false;
+        let releaseFailed = false;
+        try {
+          const receipt = await port.control(ref,'release',{expectedControlGeneration:0,expectedConnectionGeneration:generation,assertCurrent() {}});
+          releaseConfirmed = confirmsRelease(receipt);
+        } catch { releaseFailed = true; }
+        const recoveryFence = quarantine && this.store.getRecoveryQuarantine(candidate.sessionId);
+        if (recoveryFence && generation !== null && generation >= recoveryFence.generation && releaseConfirmed) {
+          this.store.quarantineRecovery(candidate.sessionId,recoveryReleaseConfirmed,generation);
+        }
+        if (releaseFailed || (!releaseConfirmed && (quarantine || stillAuthorized))) {
+          if (existing && stillAuthorized && !quarantine) this.store.quarantineRecovery(candidate.sessionId,recoveryReleaseUnknown,generation ?? undefined);
+          return fail('outcome_unknown','attach failed and subscription release could not be confirmed');
+        }
+      } else if (quarantine && resumeAttempted && !resumed && !attached && !recoveryResume) {
+        const generation = readGeneration ?? quarantine.generation;
+        if (cleanResumeRejection && quarantine.releaseConfirmed) {
+          this.store.quarantineRecovery(candidate.sessionId,recoveryReleaseConfirmed,generation);
+        } else if (!cleanResumeRejection) {
+          try {
+            const receipt = await port.control(ref,'release',{expectedControlGeneration:0,expectedConnectionGeneration:generation,assertCurrent() {}});
+            const recoveryFence = this.store.getRecoveryQuarantine(candidate.sessionId);
+            if (recoveryFence && generation >= recoveryFence.generation && confirmsRelease(receipt)) {
+              this.store.quarantineRecovery(candidate.sessionId,recoveryReleaseConfirmed,generation);
+            }
+          } catch { /* Preserve original resume error and unknown release state. */ }
+        }
+      }
     }
-    });
   }
   /** The caller revalidates persisted channel authorization for this exact session across native reads. */
   async restoreInteractive(id:string, identity:WriteContext['identity'], stillAuthorized:()=>Promise<boolean>):Promise<void> {
     await this.restoreInteractiveWithOutcome(id, identity, stillAuthorized);
   }
   async restoreInteractiveWithOutcome(id:string, identity:WriteContext['identity'], stillAuthorized:()=>Promise<boolean>):Promise<'restored'|'skipped'> {
-    let attempted=false;
+    return this.serial(sessionIdFor(this.store.getSession(id).native), () => this.restoreInteractiveInSerial(id, identity, stillAuthorized));
+  }
+  private async restoreInteractiveInSerial(id:string, identity:WriteContext['identity'], stillAuthorized:()=>Promise<boolean>):Promise<'restored'|'skipped'> {
+    const resumeAttempt: ResumeAttempt = { started: false };
     try {
       if (!this.store.hasInteractiveIntent(id) || this.store.isDetached(id) || this.store.recoveryQuarantined(id) || !await stillAuthorized()) return 'skipped';
       const current=this.store.getSession(id);
@@ -361,7 +464,7 @@ export class UnifiedCore implements UnifiedService {
         this.store.updateSession(target,current.revision,current.control.generation);
       }
       const token=randomUUID();
-      attempted=true; await this.attachSession({context:{operationId:`restore:${token}`,idempotencyKey:`restore:${token}`,targetId:id,expectedRevision:target.revision,controlGeneration:target.control.generation,identity},payload:{...target.native,mode:'interactive'}});
+      await this.attachSessionInSerial({context:{operationId:`restore:${token}`,idempotencyKey:`restore:${token}`,targetId:id,expectedRevision:target.revision,controlGeneration:target.control.generation,identity},payload:{...target.native,mode:'interactive'}},{allowQuarantineRecovery:false,stillAuthorized},resumeAttempt);
       if (!await stillAuthorized()) return fail('unauthorized','restore authorization changed');
       // Re-read trusted provider output after the new generation is established.
       const restored=this.store.getSession(id), generation=this.store.connectionGeneration(id);
@@ -369,22 +472,25 @@ export class UnifiedCore implements UnifiedService {
       if (payloadDigest(snapshot.session.native)!==payloadDigest(restored.native) || snapshot.session.project!==current.project || snapshot.connectionGeneration!==generation || this.store.connectionGeneration(id)!==generation || !await stillAuthorized()) return fail('unauthorized','restore metadata changed');
       if ((snapshot.turns ?? []).some(t=>t.sessionId!==restored.native.nativeSessionId)) return fail('invalid_request','snapshot turn namespace mismatch');
       this.store.applyHistoryRefresh(restored,generation,snapshot);
+      this.preResumeRecoveryFailures.delete(id);
       return 'restored';
     } catch(error) {
-      if(attempted) {
-        // Fence observations before awaiting the release: native events have no trusted generation tag.
-        this.quarantinedHere.add(id); this.store.quarantineRecovery(id,'recovery verification failed; release pending');
+      if(resumeAttempt.started) {
+        this.preResumeRecoveryFailures.delete(id);
         const current=this.store.getSession(id), connection=this.store.connectionGeneration(id);
+        const releaseGeneration = resumeAttempt.generation ?? connection;
+        // Fence observations before awaiting the release: native events have no trusted generation tag.
+        this.store.quarantineRecovery(id,'recovery verification failed; release pending',Math.max(connection,releaseGeneration));
         let releaseConfirmed=false;
         try {
-          const receipt=await this.port(current).control(current.native,'release',{expectedControlGeneration:current.control.generation,expectedConnectionGeneration:connection,assertCurrent:()=>{const now=this.store.getSession(id); if(!this.store.recoveryQuarantined(id) || now.control.generation!==current.control.generation || this.store.connectionGeneration(id)!==connection) return fail('control_conflict','recovery release generation changed');}});
-          releaseConfirmed=receipt.status==='submitted' && ['unsubscribed','notSubscribed','notLoaded'].includes(receipt.nativeReference ?? '');
+          const receipt=await this.port(current).control(current.native,'release',{expectedControlGeneration:current.control.generation,expectedConnectionGeneration:releaseGeneration,assertCurrent:()=>{const now=this.store.getSession(id); if(!this.store.recoveryQuarantined(id) || now.control.generation!==current.control.generation || this.store.connectionGeneration(id)!==connection) return fail('control_conflict','recovery release generation changed');}});
+          releaseConfirmed=releaseGeneration >= connection && confirmsRelease(receipt);
         } catch { /* The release might have reached the provider: preserve unknown. */ }
-        this.store.quarantineRecovery(id,releaseConfirmed ? 'recovery verification failed; subscription released; reconciliation required' : 'recovery verification failed; subscription release outcome unknown');
+        this.store.quarantineRecovery(id,releaseConfirmed ? recoveryReleaseConfirmed : recoveryReleaseUnknown);
         const now=this.store.getSession(id);
         if(now.control.input==='available') { const capabilities=Object.fromEntries(Object.entries(now.capabilities).map(([key,value])=>[key,key==='view' ? value : {status:'temporarily_unavailable',reason:'recovery verification failed'}])) as Session['capabilities']; this.store.updateSession({...now,status:'read_only',revision:now.revision+1,capabilities,control:{...now.control,owner:null,input:'unavailable',generation:now.control.generation+1,reason:releaseConfirmed ? 'recovery verification failed; subscription released' : 'recovery verification failed; subscription release outcome unknown'}},now.revision,now.control.generation); }
         this.observationFailure=releaseConfirmed ? 'restart recovery failed; subscription released; reconciliation required' : 'restart recovery failed; subscription release outcome unknown';
-      } else this.observationFailure='restart recovery failed; inspect session before retry';
+      } else this.preResumeRecoveryFailures.add(id);
       throw error;
     }
   }
@@ -432,7 +538,44 @@ export class UnifiedCore implements UnifiedService {
   }
   async resolveInteraction(request: ResolveInteraction) { this.check(request.context, 'resolveInteraction'); return this.store.resolveInteraction(request); }
   async inspectTurnResidual(sessionId:string,turnId:string) {const s=this.store.getSession(sessionId);const turn=this.store.listTurns(sessionId).find(t=>t.turnId===turnId);if(!turn || turn.status!=='interrupted') return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'轮次尚未确认中断'};const port=this.port(s);if(!port.inspectTurnResidual) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'此provider未提供可信残留查询'};try {const result=await port.inspectTurnResidual(s.native,turnId); if(!['running','none','unknown'].includes(result.status) || typeof result.complete!=='boolean' || (result.count!==null && (!Number.isSafeInteger(result.count) || result.count<0)) || (result.observedAt!==null && !Number.isFinite(Date.parse(result.observedAt)))) throw Error('invalid residual result'); if(result.status==='unknown' || result.count===null || !result.observedAt) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'查询失败或连接归属不完整'}; if(!result.complete) return result.status==='running' && result.count>0 ? {...result,reason:'至少有已登记任务仍在运行；查询不完整，其他外部作业或后代未确认'} : {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'查询失败或连接归属不完整'}; if((result.status==='none' && result.count!==0) || (result.status==='running' && result.count===0)) throw Error('invalid residual count');return {...result,reason:result.status==='running'?'目标轮次已登记任务仍在运行；未知外部作业或后代未确认':'未发现目标轮次已登记残留；未知外部作业或后代未确认'};} catch {return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'残留查询不可用'};} }
-  async interruptTurn(request: { context: WriteContext; payload: { turnId: string } }) { const s = this.check(request.context, 'interruptTurn'); if (s.capabilities.interrupt.status !== 'available') return fail('unsupported'); return this.store.registerOperation(request.context, 'interruptTurn', request.payload); }
+  private checkStopScope(context: WriteContext): Session {
+    const valid = validateWriteContext(context);
+    if (!valid.ok) throw new StoreError(valid.error);
+    const session = this.check(context,'interruptTurn');
+    if (!this.channelScopeCurrent(context.channelScope,session.sessionId)) return fail('control_conflict','binding changed');
+    return session;
+  }
+  async interruptTurn(request: { context: WriteContext; payload: { turnId: string } }) {
+    const session = this.checkStopScope(request.context);
+    if (session.capabilities.interrupt.status !== 'available') return fail('unsupported');
+    return this.store.registerOperation(request.context,'interruptTurn',request.payload);
+  }
+  async stopOrCancelQueued(context: WriteContext, assertCurrent?: () => Promise<void>) {
+    this.checkStopScope(context);
+    const authorize = (action: 'interruptTurn' | 'cancelQueuedInput') => {
+      const session = this.check(context,action);
+      if (action === 'interruptTurn' && session.capabilities.interrupt.status !== 'available') return fail('unsupported');
+    };
+    const replay = this.store.findStopOrCancelQueued(context,authorize);
+    if (replay) return replay;
+    // Drain any native dispatch and its turn observations before selecting the stop target.
+    let tail: Promise<unknown> | undefined;
+    do {
+      while ((tail = this.tails.get(context.targetId))) await tail.catch(() => undefined);
+      if (assertCurrent) await assertCurrent();
+    } while (this.tails.has(context.targetId));
+    this.checkStopScope(context);
+    const settled = this.store.findStopOrCancelQueued(context,authorize);
+    if (settled) return settled;
+    const owner = randomUUID();
+    const lease = this.store.acquireDispatchLease(context.targetId,owner,Date.now(),30000);
+    if (lease === null) return fail('busy','another dispatcher owns this session');
+    try {
+      return this.store.stopOrCancelQueued(context,authorize);
+    } finally {
+      this.store.releaseDispatchLease(context.targetId,owner,lease);
+    }
+  }
   async setNotificationSubscription(request: { context: WriteContext; payload: { enabled: boolean; eventTypes: string[] } }) { this.check(request.context, 'setNotificationSubscription'); if (typeof request.payload.enabled !== 'boolean' || !Array.isArray(request.payload.eventTypes) || !request.payload.eventTypes.every(x => typeof x === 'string' && !!x)) return fail('invalid_request'); return this.store.setNotificationPreference(request.context, request.payload); }
   async detachSession(request: {context:WriteContext; payload:Record<string,never>}): Promise<Operation> { const s = this.check(request.context,'detachSession'); if (!this.mayDetach(s)) return fail('busy','other bindings not confirmed absent'); return this.store.detachTracking(request.context); }
   async stageInputArtifact(request: {context:WriteContext; payload:{name:string; mediaType:string; size:number; contentDigest:string; content:Uint8Array}}): Promise<Operation> { this.check(request.context,'stageInputArtifact'); return this.store.stageArtifact(request.context,request.payload); }
@@ -452,7 +595,11 @@ export class UnifiedCore implements UnifiedService {
   async readArtifact(sessionId: string, artifactId: string, contentVersion: string) { const s = this.store.getSession(sessionId); return this.store.stagedArtifact(sessionId,artifactId,contentVersion) ?? await this.port(s).readArtifact(s.native,artifactId,contentVersion); }
   async getConfirmedSettings(sessionId: string) { return this.store.confirmedSettings(sessionId); }
   async listModels(sessionId: string, query: ListQuery) { const s = this.store.getSession(sessionId); return page(await this.port(s).listModels(s.native),query); }
-  async health():ReturnType<UnifiedService['health']> { return [{component:'core',status:this.observationFailure || this.store.recoveryQuarantineCount() ? 'degraded' as const : 'healthy' as const,reason:this.observationFailure ?? (this.store.recoveryQuarantineCount() ? 'reconnect and explicitly attach quarantined sessions' : null),backlog:this.store.pendingOutbox().length,lastDeliveryAt:null,updatedAt:new Date().toISOString()}]; }
+  async health():ReturnType<UnifiedService['health']> {
+    const reason = this.observationFailure ?? (this.store.recoveryQuarantineCount() ? 'reconnect and explicitly attach quarantined sessions' :
+      this.preResumeRecoveryFailures.size ? 'restart recovery failed; inspect session before retry' : null);
+    return [{component:'core',status:reason ? 'degraded' : 'healthy',reason,backlog:this.store.pendingOutbox().length,lastDeliveryAt:null,updatedAt:new Date().toISOString()}];
+  }
   /** Dispatch one persisted item; unknown/in-flight work is never automatically resent. */
   async dispatch(id: string): Promise<Operation> {
     const pending = this.store.getOutbox(id);
@@ -479,7 +626,8 @@ export class UnifiedCore implements UnifiedService {
       const out = this.store.getOutbox(id);
       if (out.state !== 'pending') return this.store.getOperation(id);
       const session = this.check(out.context, out.kind);
-      if (out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));
+      if ((out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) ||
+          (out.kind === 'interruptTurn' && !this.channelScopeCurrent(out.context.channelScope,session.sessionId))) return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));
       const earlier = out.kind === 'submitInput' ? this.store.pendingOutbox(session.sessionId, 'submitInput')[0] : id;
       if (earlier !== id) return fail('busy', 'earlier input awaits dispatch');
       if (out.kind === 'submitInput') { const barrier=this.store.settingsBarrier(session.sessionId); if(barrier) return fail(barrier === 'unknown' ? 'outcome_unknown' : 'busy','settings must be reconciled before input'); }
@@ -497,7 +645,8 @@ export class UnifiedCore implements UnifiedService {
           if (!this.authorize(out.context.identity,current,out.kind) || this.store.isDetached(session.sessionId) || this.store.recoveryQuarantined(session.sessionId)) return fail('unauthorized');
           if (current.control.generation !== out.context.controlGeneration || (out.kind !== 'requestControl' && current.control.input !== 'available')) return fail('control_conflict');
           if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration) return fail('interaction_expired');
-          if (out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) return fail('control_conflict','binding changed');
+          if ((out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) ||
+              (out.kind === 'interruptTurn' && !this.channelScopeCurrent(out.context.channelScope,session.sessionId))) return fail('control_conflict','binding changed');
           if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || input.expectedConnectionGeneration!==out.connectionGeneration)return fail('interaction_expired','captured turn changed');}
           if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
           if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
@@ -542,6 +691,8 @@ export class UnifiedCore implements UnifiedService {
         if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {if(nativeReference!==(out.payload as SubmitInput).requiredTurnId)return this.store.markDeliveryUnknown(id);return this.store.completeSteer(id);}
         return this.store.acceptSubmission(id,nativeReference);
       } catch (error) {
+        // Terminal evidence may already have settled the interruption.
+        if (out.kind === 'interruptTurn' && this.store.getOutbox(id).state !== 'in_flight') return this.store.getOperation(id);
         if (!guarded && (out.kind === 'requestControl' || out.kind === 'releaseControl')) {
           const rejected = responsePrewriteError(error);
           if (rejected) return this.store.reconcileOperation(id,'failed',rejected);
@@ -549,7 +700,7 @@ export class UnifiedCore implements UnifiedService {
         const input = out.kind === 'submitInput' ? out.payload as SubmitInput : null;
         if (!guarded && error instanceof StoreError && (
             error.detail.code === 'busy' ||
-            ((input?.mode === 'steer' || (input?.mode === 'new' && input.channelScope)) &&
+            ((input?.mode === 'steer' || input?.channelScope || (out.kind === 'interruptTurn' && out.context.channelScope)) &&
               ['control_conflict','interaction_expired','unauthorized'].includes(error.detail.code))
         )) return this.store.reconcileOperation(id,'failed',error.detail);
         if (!guarded && error && typeof error === 'object' && 'code' in error) {

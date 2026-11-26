@@ -6,7 +6,7 @@ import { query, listSessions, getSessionMessages, type Query, type Options, type
 import { InputQueue } from '../claude/runner.js';
 import { imageMediaType } from '../image-media.js';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
-import { payloadDigest, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
+import { answerDigest, payloadDigest, questionDeclineAction, type ResponseEvidence, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
 import { contractError } from './errors.js';
 import { ClaudeState } from './claude-state.js';
 import { ClaudeResidualObservation } from './claude-residual.js';
@@ -14,7 +14,7 @@ import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type Appr
 import { unknown as unknownApprovalScope } from './approval-policy-paths.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
-type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; operationId?: string; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
+type Pending = { interaction: Interaction; input: Record<string, unknown>; toolId: string; operationId?: string; declined?: {answerDigest:string}; settle: (result: Awaited<ReturnType<CanUseTool>>) => void };
 type Live = { title?: string; completion?: Promise<void>; id: string; cwd: string; model: string | null; turnModel: string | null; effortOverride: boolean; generation: number; queue: InputQueue<SDKUserMessage>; query: Query; turn: string | null; interrupted: boolean; messages: Message[]; pending: Map<string, Pending>; stream: {id:string; blocks:Map<number,string>; sequence:number; revision:number; current:number|null; stopped:boolean} | null; residual:ClaudeResidualObservation };
 const retryErrors = new Set(['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error', 'unknown', 'max_output_tokens', 'cloud_credential_error']);
 const limitTypes = new Set(['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included', 'overage']);
@@ -405,7 +405,22 @@ export class ClaudeAdapter implements PlatformPort {
           this.emit({ type: 'message', ref, message: normalized, connectionGeneration: live.generation });
         }
       }
-      if (m.type === 'user' && Array.isArray(m.message?.content)) for (const b of m.message.content) if (b.type === 'tool_result') for (const p of live.pending.values()) if (p.toolId === b.tool_use_id && p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'resolved', revision: p.interaction.revision + 1, nativeResult: { status: 'unknown', source: b.is_error ? 'claude_tool_result_error' : 'claude_tool_result' } }; this.emit({ type: 'interaction', ref, interaction: p.interaction }); }
+      if (m.type === 'user' && Array.isArray(m.message?.content)) for (const b of m.message.content) {
+        if (b.type !== 'tool_result') continue;
+        for (const p of live.pending.values()) {
+          if (p.toolId !== b.tool_use_id || p.interaction.status !== 'answer_pending_delivery') continue;
+          const {interactionId,nativeRequestId,connectionGeneration} = p.interaction;
+          const responseEvidence: ResponseEvidence | undefined = p.declined && p.operationId
+            ? {operationId:p.operationId,interactionId,nativeRequestId,connectionGeneration,answerDigest:p.declined.answerDigest}
+            : undefined;
+          p.interaction = { ...p.interaction, status:'resolved', revision:p.interaction.revision + 1,
+            nativeResult: p.declined
+              ? {status:'accepted',source:'claude_question_declined',answer:null,disposition:'skipped'}
+              : {status:'unknown',source:b.is_error ? 'claude_tool_result_error' : 'claude_tool_result'},
+          };
+          this.emit({type:'interaction',ref,interaction:p.interaction,...(responseEvidence ? {responseEvidence} : {})});
+        }
+      }
       if (m.type === 'result' && live.turn && !this.closed && this.lives.get(live.id)===live) { const turn: Turn = { turnId: live.turn, sessionId: live.id, status: live.interrupted ? 'interrupted' : m.subtype === 'success' && !m.is_error ? 'completed' : 'failed', inputId: null, startedAt: null, endedAt: new Date().toISOString(), model: live.turnModel, outputIds: [] }; live.turn = null; live.interrupted = false; this.emit({ type: 'turn', ref, turn,connectionGeneration:live.generation }); }
     } } catch (error) { const exitCode = error && typeof error === 'object' && 'exitCode' in error && Number.isSafeInteger((error as {exitCode:unknown}).exitCode) ? (error as {exitCode:number}).exitCode : null; streamFailure = {kind:'sdk_stream_error',exitCode}; } finally { const current=!this.closed && this.lives.get(live.id)===live;if (this.lives.get(live.id) === live) this.lives.delete(live.id); if (live.turn && current) { const failure = streamFailure ?? {kind:'sdk_stream_closed_without_result',exitCode:null}; const now = new Date().toISOString(); this.emit({type:'event',ref,connectionGeneration:live.generation,event:{schemaVersion:1,eventId:randomUUID(),sessionId:live.id,objectId:live.turn,objectRevision:0,sequence:++this.sequence,type:'adapter.stream_failed',occurredAt:now,receivedAt:now,operationId:null,cursor:String(this.sequence),data:failure}}); this.emit({type:'turn',ref,connectionGeneration:live.generation,turn:{turnId:live.turn,sessionId:live.id,status:'failed',inputId:null,startedAt:null,endedAt:now,model:live.turnModel,outputIds:[]}}); live.turn=null; }  for (const p of live.pending.values()) if (p.interaction.status === 'awaiting_answer' || p.interaction.status === 'answer_pending_delivery') { p.interaction = { ...p.interaction, status: 'expired', revision: p.interaction.revision + 1, nativeResult: p.interaction.status === 'answer_pending_delivery' ? { status: 'unknown', source: 'connection_closed' } : null }; p.settle({ behavior: 'deny', message: 'connection closed' }); this.emit({ type: 'interaction', ref, interaction: p.interaction }); } }
   }
@@ -442,9 +457,18 @@ export class ClaudeAdapter implements PlatformPort {
   async inspectTurnResidual(ref:NativeSessionRef,turnId:string) {const id=this.check(ref);const live=this.lives.get(id);if(this.closed||!live||!this.owned.get(id))return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'外部或已断开会话没有当前可信任务观察'};return live.residual.inspect(turnId);}
   async interrupt(ref: NativeSessionRef, turnId: string, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard); if (live.turn !== turnId) throw contractError('stale_revision'); guard.assertCurrent(); live.interrupted = true; await live.query.interrupt(); return ack(turnId); }
   async respond(ref: NativeSessionRef, interaction: Interaction, answer: Answer, guard: DispatchGuard): Promise<PlatformAcknowledgement> { const live = this.active(ref, guard), p = live.pending.get(interaction.interactionId), i = p?.interaction; if (!p || !i || i.status !== 'awaiting_answer' || i.connectionGeneration !== interaction.connectionGeneration || i.connectionGeneration !== guard.expectedConnectionGeneration) throw contractError('interaction_expired'); if (i.revision !== interaction.revision || i.toolInputDigest !== interaction.toolInputDigest || i.nativeRequestId !== interaction.nativeRequestId) throw contractError('stale_revision'); let result: Awaited<ReturnType<CanUseTool>>;
-    if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope) result = answer.decision === 'allow' ? { behavior: 'allow', updatedInput: p.input } : { behavior: 'deny', message: 'Denied by user' };
+    const declined = i.kind === 'question_group' && answer.kind === 'question_group' && questionDeclineAction(answer) !== null;
+    if (declined) result = {behavior:'deny',message:'User declined to answer'};
+    else if (i.kind === 'approval' && answer.kind === 'approval' && answer.scope === i.scope) result = answer.decision === 'allow' ? { behavior: 'allow', updatedInput: p.input } : { behavior: 'deny', message: 'Denied by user' };
     else if (i.kind === 'question_group' && answer.kind === 'question_group' && Object.keys(answer.answers).length === i.questions.length && i.questions.every(q => Array.isArray(answer.answers[q.id]) && answer.answers[q.id]!.length && (q.multiple || answer.answers[q.id]!.length === 1) && answer.answers[q.id]!.every(x => typeof x === 'string' && x.trim()))) { const questions = p.input.questions as Array<{ question: string }>; result = { behavior: 'allow', updatedInput: { ...p.input, answers: Object.fromEntries(i.questions.map((q, n) => [questions[n]!.question, answer.answers[q.id]!.join(', ')])) } }; } else throw contractError('invalid_request');
-    guard.assertCurrent(); p.interaction = { ...i, status: 'answer_pending_delivery', revision: i.revision + 1 }; p.settle(result); if (guard.operationId) p.operationId = guard.operationId; this.emit({ type: 'interaction', ref, interaction: p.interaction }); return ack(); }
+    guard.assertCurrent();
+    p.interaction = {...i,status:'answer_pending_delivery',revision:i.revision + 1};
+    if (guard.operationId) p.operationId = guard.operationId;
+    if (declined) p.declined = {answerDigest:answerDigest(answer)};
+    p.settle(result);
+    this.emit({type:'interaction',ref,interaction:p.interaction});
+    return ack();
+  }
   async listArtifacts(ref: NativeSessionRef): Promise<Artifact[]> { this.check(ref); throw contractError('unsupported'); }
   async readArtifact(ref: NativeSessionRef, _id: string, _version: string): Promise<Uint8Array> { this.check(ref); throw contractError('unsupported'); }
   async listModels(ref: NativeSessionRef): Promise<Array<{ id: string; label: string; reasoningEfforts?: string[] }>> {

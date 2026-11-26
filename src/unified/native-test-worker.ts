@@ -11,7 +11,7 @@ export class NativeTestWorker {
   constructor(path:string,scope:string,sessionId:string,private readonly transport:NativeTestTransport,private readonly owner:string='owner',private readonly provider:Provider='claude') {
     if(!sessionId)throw contractError('invalid_request');this.sessionId=sessionId;this.ledger=new NativeTestLedger(path,scope);const self=this;
     this.service=new Proxy({} as UnifiedService,{get(_target,key){
-      if(typeof key==='symbol'||['then','eventWatermark','getMessage','findRegisteredReplyFiles'].includes(key))return undefined;
+      if(typeof key==='symbol'||['then','eventWatermark','getMessage','findRegisteredReplyFiles','registerInputScopeValidator'].includes(key))return undefined;
       if(key==='hasProvider')return (p:Provider)=>p===self.provider;
       if(key==='getSession')return (id:string)=>self.session(id);
       if(key==='getSnapshot')return (id:string)=>self.snapshot(id);

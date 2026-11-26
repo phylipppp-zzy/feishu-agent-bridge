@@ -24,6 +24,7 @@ const PENDING_QUERY_PROVIDERS = new Set(['all', 'claude', 'codex', 'agy', 'decis
 const WAVE2_BINDING_EXEMPT_ACTIONS = new Set([
   'bind',
   'list',
+  'agy_status',
   'new_help',
   'new_provider',
   'new_pick',
@@ -135,11 +136,19 @@ function parseAction(value: unknown): RuntimeTrustedAction {
       if (draftToken(value.t) && counter(value.r) && counter(value.i)) return {action:'new_pick',t:value.t,r:value.r,i:value.i};
       break;
     case 'pending':
+    case 'agy_status':
     case 'pending_open': return {action:value.action};
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
-    case 'stop': if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration)) { const taskScope = parseTaskScope(value, false); return {action:'stop',turnId:value.turnId,revision:value.revision,controlGeneration:value.controlGeneration,...(taskScope ?? {})}; } break;
+    case 'stop':
+      if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration) &&
+          (value.fallbackCurrent === undefined || typeof value.fallbackCurrent === 'boolean')) {
+        const taskScope = parseTaskScope(value, false);
+        return {action:'stop',turnId:value.turnId,revision:value.revision,controlGeneration:value.controlGeneration,
+          ...(value.fallbackCurrent === true ? {fallbackCurrent:true} : {}),...(taskScope ?? {})};
+      }
+      break;
     case 'cancel': if (str(value.inputId) && counter(value.revision) && counter(value.controlGeneration)) { const taskScope = parseTaskScope(value, false); return {action:'cancel',inputId:value.inputId,revision:value.revision,controlGeneration:value.controlGeneration,...(taskScope ?? {})}; } break;
     case 'control': if (str(value.owner) && (value.strategy === 'wait' || value.strategy === 'interrupt') && counter(value.revision) && counter(value.controlGeneration) && (value.release === undefined || typeof value.release === 'boolean')) return {action:'control',owner:value.owner,strategy:value.strategy,revision:value.revision,controlGeneration:value.controlGeneration,...(typeof value.release === 'boolean' ? {release:value.release}:{})}; break;
     case 'models': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'models',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
@@ -283,7 +292,7 @@ export const KNOWN_BRIDGE_COMMANDS: ReadonlySet<string> = new Set([
   '/attach', '/stop', '/cancel', '/control', '/settings', '/notifications', '/archive',
   '/create', '/answer', '/queue', '/steer', '/', '/status', '/menu', '/panel', '/ls',
   '/deliver', '/export', '/history', '/file', '/files', '/models', '/pending', '/ops',
-  '/health', '/quota', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
+  '/health', '/quota', '/agy', '/agy-status', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
 ]);
 
 export function isBridgeCommand(command: string): boolean {
@@ -456,6 +465,9 @@ export function parseFeishuText(text: string, options?: { passthroughUnknownSlas
     case '/ops': if (!parts.length) return {action:'pending'}; break;
     case '/health': return {action:'health'};
     case '/quota': if (!parts.length) return {action:'quota'}; break;
+    case '/agy':
+    case '/agy-status':
+      return parts.length ? {action:'command_error',command,rawText:input} : {action:'agy_status'};
     case '/rename': {
       const title = rawTail.trim();
       if (title) return {action:'rename',title};

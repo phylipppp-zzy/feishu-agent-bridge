@@ -60,6 +60,7 @@ function setup() {
     async updateSessionSettings({ context }) { return receipt('updateSessionSettings', 'received', context); },
     async cancelQueuedInput({ context }) { return receipt('cancelQueuedInput', 'completed', context); },
     async interruptTurn({ context }) { return receipt('interruptTurn', 'received', context); },
+    async stopOrCancelQueued(context) { return receipt('interruptTurn', 'received', context); },
     async getWorkState() {
       return { runningTurns: [{turnId:'t',sessionId:session.sessionId,status:'running',inputId:null,startedAt:null,endedAt:null,model:null,outputIds:[]}], queuedInputs: [], canArchive: false };
     },

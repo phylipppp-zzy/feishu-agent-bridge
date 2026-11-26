@@ -50,7 +50,6 @@ export const DEFAULT_SESSION_IDLE_RELEASE_MS = 30 * 60_000;
 export const DEFAULT_PROMPT_TIMEOUT_MS = DEFAULT_PROMPT_MAX_TIMEOUT_MS;
 export const DEFAULT_WAKEUP_IDLE_MS = 1_500;
 export const MAX_TURN_RESIDUAL_SNAPSHOTS = 64;
-export const ELICITATION_SKIP_SENTINEL = '[已跳过/取消]';
 export const LIST_SNAPSHOT_TTL_MS = 120_000;
 export const MAX_LIST_SNAPSHOTS = 8;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -96,8 +95,6 @@ export type LiveSessionMeta = {
   models?: ModelOption[];
   effortConfigId?: string;
 };
-
-export type AgyElicitationAction = 'accept' | 'decline' | 'cancel';
 
 export type TurnResidualSnapshot = {
   turnId: string;
@@ -190,6 +187,7 @@ export interface AdapterContext {
   readonly activeTurns: Map<string, ActiveTurnState>;
   readonly lockedSessions?: Map<string, SessionLockState>;
   readonly turnResiduals?: Map<string, TurnResidualSnapshot>;
+  readonly recentTerminalTools?: Map<string, Set<string>>;
   readonly sessionTurns: Map<string, Map<string, Turn>>;
   readonly liveMessages: Map<string, Message[]>;
   readonly preLiveTranscriptIds: Map<string, Set<string>>;

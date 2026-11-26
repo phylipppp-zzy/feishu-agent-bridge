@@ -76,6 +76,7 @@ export function buildMainHelpCard(): ChannelCard {
       '• /pending — 查看待处理审批与问题',
       '• /task <标题> — 新建多后端任务话题',
       '• /health — 查看服务健康状态',
+      '• /agy — 查看 Antigravity 进行中/已完成对话与进程占用',
       '',
       '发送 /help admin 查看运维与调试命令。',
     ].join('\n'),
@@ -92,6 +93,7 @@ export function buildAdminHelpCard(): ChannelCard {
     text: [
       '运维与调试命令：',
       '• /health — 查看各后端与通道健康状态',
+      '• /agy — 查看 Antigravity 进行中/已完成对话与进程占用',
       '• /ops — 查看待完成的底层操作',
       '• /panel — 打开当前会话控制面板',
       '• /unbind — 解除当前话题的会话绑定',

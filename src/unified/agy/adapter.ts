@@ -93,6 +93,7 @@ export class AgyAdapter implements PlatformPort {
   private readonly knownSessions = new Map<string, LiveSessionMeta>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly lockedSessions = new Map<string, SessionLockState>();
+  private readonly recentTerminalTools = new Map<string, Set<string>>();
   private readonly turnResiduals = new Map<string, TurnResidualSnapshot>();
   private readonly sessionTurns = new Map<string, Map<string, Turn>>();
   private readonly liveMessages = new Map<string, Message[]>();
@@ -183,6 +184,7 @@ export class AgyAdapter implements PlatformPort {
       upsertLiveMessage: (sessionId, message) => this.upsertLiveMessage(sessionId, message),
       putSessionTurn: (sessionId, turn) => this.putSessionTurn(sessionId, turn),
       getSessionModel: sessionId => this.sessionSettings.get(sessionId)?.model ?? null,
+      recentTerminalTools: this.recentTerminalTools,
       recordTurnResidual: (sessionId, turnState) => this.recordTurnResidual(sessionId, turnState),
       pruneSnapshots: () => this.pruneSnapshots(),
     };
@@ -267,6 +269,7 @@ export class AgyAdapter implements PlatformPort {
     }
     expireAllPendingRequests(this.ctx, this.transport.connectionGeneration || null);
     this.activeTurns.clear();
+    this.recentTerminalTools.clear();
     this.lockedSessions.clear();
     this.active.clear();
     this.listSnapshots.clear();
@@ -456,7 +459,10 @@ export class AgyAdapter implements PlatformPort {
     const mode = this.transport.defaultMode;
     if (!mode || !this.transport.connected || !isRecord(res)) return;
     if (isRecord(res.modes)) {
-      await this.transport.request('session/set_mode', { sessionId, modeId: mode }).catch(() => {});
+      await this.transport.request('session/set_mode', { sessionId, modeId: mode }).catch(err => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[agy] session/set_mode(${mode}) failed for ${sessionId}: ${msg}`);
+      });
       return;
     }
     if (Array.isArray(res.configOptions)) {
@@ -464,7 +470,10 @@ export class AgyAdapter implements PlatformPort {
       if (modeConfigId) {
         await this.transport
           .request('session/set_config_option', { sessionId, configId: modeConfigId, value: mode })
-          .catch(() => {});
+          .catch(err => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`[agy] session/set_config_option(${modeConfigId}=${mode}) failed for ${sessionId}: ${msg}`);
+          });
       }
     }
   }
@@ -1087,16 +1096,10 @@ export class AgyAdapter implements PlatformPort {
 
     this.controlChanges.add(id);
     try {
-      // Some ACP versions omit session/close. Only clear timeout lock if session/close is confirmed.
-      let closeConfirmed = false;
-      try {
-        await this.transport.request('session/close', { sessionId: id });
-        closeConfirmed = true;
-      } catch {}
-      if (closeConfirmed) {
-        this.lockedSessions.delete(id);
-      }
+      await this.transport.request('session/close', { sessionId: id });
+      this.lockedSessions.delete(id);
       if (this.active.delete(id)) {
+        this.recentTerminalTools.delete(id);
         this.lastActivityAt.delete(id);
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
         this.emitSession(ref, id);
@@ -1143,6 +1146,7 @@ export class AgyAdapter implements PlatformPort {
         this.lockedSessions.delete(id);
       }
       if (this.active.delete(id)) {
+        this.recentTerminalTools.delete(id);
         this.lastActivityAt.delete(id);
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
         this.emitSession(this.ref(id), id);

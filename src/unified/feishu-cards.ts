@@ -1,5 +1,5 @@
 import type { QuestionForm } from './feishu-question-forms.js';
-import type { Interaction, Operation, Provider, Session } from './contracts.js';
+import { questionDeclineAction, type Interaction, type Operation, type Provider, type Session } from './contracts.js';
 import { compactCardField, formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 
@@ -50,7 +50,14 @@ export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only
   ] };
 }
 
+function wasQuestionSkipped(interaction: Interaction): boolean {
+  const result = interaction.nativeResult;
+  return interaction.kind !== 'approval' && result?.status === 'accepted' &&
+    (result.disposition === 'skipped' || questionDeclineAction(result.answer) !== null);
+}
+
 export function interactionStatusText(interaction: Interaction, operation?: Operation | null): string | null {
+  if (interaction.status === 'resolved' && wasQuestionSkipped(interaction)) return '已跳过/取消';
   if (operation?.status === 'completed') return '原端已确认答复';
   if (operation?.status === 'unknown') return '答复结果未知，请查看原会话';
   if (interaction.nativeResult?.status === 'rejected') return '原端未接受答复，请查看原会话';
@@ -144,15 +151,16 @@ export function interactionCard(
   }
   const resolved = i.status === 'resolved' || operation?.status === 'completed';
   const answer = i.nativeResult?.status === 'accepted' ? i.nativeResult.answer : null;
+  const skipped = wasQuestionSkipped(i);
   const withAnswer = (prompt: string, values?: string[]) =>
-    values?.length ? `${prompt}\n已答复：${values.join('、')}` : prompt;
+    !skipped && values?.length ? `${prompt}\n已答复：${values.join('、')}` : prompt;
   const text = i.kind === 'question'
     ? withAnswer(i.prompt, answer?.kind === 'question' ? answer.values : undefined)
     : i.questions.map(q => withAnswer(q.prompt, answer?.kind === 'question_group' ? answer.answers[q.id] : undefined)).join('\n');
   const note = resolved ? '' : readOnly ? readonlyNote : awaiting ? '可通过答复入口提交文字或多选。' : '';
   return {
-    title: resolved ? '问题 · 已答复' : '问题',
-    ...(resolved ? { template: 'green', format: 'plain' } : {}),
+    title: resolved ? (skipped ? '问题 · 已跳过' : '问题 · 已答复') : '问题',
+    ...(resolved ? { template: skipped ? 'grey' : 'green', format: 'plain' } : {}),
     text: [text, status, note].filter(Boolean).join('\n'),
     actions,
   };

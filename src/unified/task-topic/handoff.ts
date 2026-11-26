@@ -1,3 +1,4 @@
+import { shouldAutoQueueInput } from '../contracts.js';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { UnifiedService } from '../adapter.js';
@@ -29,7 +30,7 @@ import {
   validateHandoffTargetCwd,
   verifyHandoffArtifactRefs,
 } from './handoff-validation.js';
-import { getBindingRow, getTargetRow, runTransaction } from './schema.js';
+import { getBindingRow, getTargetRow, runTransaction, taskInputScope } from './schema.js';
 import { counter, nonempty, type TaskAuthorize } from './types.js';
 
 /**
@@ -543,7 +544,7 @@ export class TaskHandoffService {
 
       const submitOpId = `handoff:${handoffId}:${expectedPreviewDigest.slice(0, 16)}`;
 
-      const claimed = this.tx(() => {
+      const {claimed,channelScope} = this.tx(() => {
         const row = this.getHandoffRow(handoffId);
         const binding = getBindingRow(this.db, initial.task_id);
         const source = getTargetRow(this.db, initial.task_id, initial.source_target_id);
@@ -621,7 +622,7 @@ export class TaskHandoffService {
         if (updated.changes !== 1) {
           throw new TaskHandoffError('stale_revision', 'handoff CAS claim conflict');
         }
-        return toDraft(this.getHandoffRow(handoffId)!);
+        return {claimed:toDraft(this.getHandoffRow(handoffId)!),channelScope:taskInputScope(binding,target)};
       });
 
       const writeContext: WriteContext = {
@@ -633,9 +634,11 @@ export class TaskHandoffService {
         identity: owner,
       };
 
+      const mode = shouldAutoQueueInput(targetSession) ? 'queue' : 'new';
       const submitPromise = this.service.submitInput({
         context: writeContext,
-        mode: 'new',
+        mode,
+        channelScope,
         blocks: [{ type: 'text', text: formatHandoffSubmissionText(claimed) }],
       });
       void submitPromise.catch(() => undefined);
