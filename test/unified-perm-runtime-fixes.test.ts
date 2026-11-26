@@ -351,6 +351,12 @@ test('adapter-permission: ArtifactMetadata, read-only MCP/search_web, brain/<ses
       { kind: 'search', name: 'codex_lookup', rawInput: { prompt: 'check' } },
       { kind: 'other', name: 'mcp__codex-bridge__codex_status', rawInput: {} },
       { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge', ToolName: 'codex_job', jobId: '123' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_status' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_lookup' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_job' } },
+      { kind: 'execute', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_engineer' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_review' } },
+      { kind: 'edit', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_followup' } },
     ]) {
       assert.equal((await classifyAgyPermission(tool, project, scope)).kind, 'allow_once', JSON.stringify(tool));
       assert.equal((await classifyAgyPermission(tool, project, { enabled: false })).kind, 'ask', JSON.stringify(tool));

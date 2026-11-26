@@ -11,9 +11,17 @@ import { isRecord, isString, type Obj } from './adapter-types.js';
 const commandTools = new Set(['execute', 'run_command']);
 const readTools = new Set(['read', 'read_file', 'view_file', 'list_directory', 'list_dir', 'search', 'grep_search']);
 const builtinAutoAllowTools = new Set(['search_web', 'list_resources', 'read_resource']);
-const codexReadOnlyMcpTools = new Set(['codex_lookup', 'codex_status', 'codex_job']);
-const trustedCodexServers = new Set(['codex', 'codex-bridge', 'codex_bridge']);
+const codexAutoAllowMcpTools = new Set([
+  'codex_lookup',
+  'codex_status',
+  'codex_job',
+  'codex_engineer',
+  'codex_review',
+  'codex_followup',
+]);
+const trustedCodexServers = new Set(['codex', 'codex-bridge', 'codex_bridge', 'codex-bridge_codex']);
 const safeReadOnlyKinds = new Set(['read', 'search', 'fetch', 'other']);
+const safeCodexMcpKinds = new Set([...safeReadOnlyKinds, 'execute', 'edit', 'call', 'mcp']);
 const mcpWrapperTools = new Set(['call_mcp_tool', 'mcp_call', 'use_mcp_tool']);
 const forbiddenMcpCommandKeys = new Set(['CommandLine', 'commandLine', 'command', 'Command']);
 const destructiveTools = new Set(['delete', 'delete_file', 'move', 'move_file', 'rename', 'rename_file']);
@@ -206,25 +214,30 @@ function matchTrustedReadOnlyTool(rawName: string, serverName?: string): string 
   }
   if (lower.startsWith('default_api:')) {
     const leaf = lower.slice('default_api:'.length);
-    if (builtinAutoAllowTools.has(leaf) || codexReadOnlyMcpTools.has(leaf)) {
+    if (builtinAutoAllowTools.has(leaf) || codexAutoAllowMcpTools.has(leaf)) {
       if (normalizedServer && !trustedCodexServers.has(normalizedServer)) return null;
       return leaf;
     }
     return null;
   }
-  if (codexReadOnlyMcpTools.has(lower)) {
+  if (codexAutoAllowMcpTools.has(lower)) {
     if (normalizedServer && !trustedCodexServers.has(normalizedServer)) return null;
     return lower;
   }
   const mcpDouble = /^mcp__([a-z0-9_-]+)__([a-z0-9_-]+)$/.exec(lower);
-  if (mcpDouble && trustedCodexServers.has(mcpDouble[1]!) && codexReadOnlyMcpTools.has(mcpDouble[2]!)) {
+  if (mcpDouble && trustedCodexServers.has(mcpDouble[1]!) && codexAutoAllowMcpTools.has(mcpDouble[2]!)) {
     if (normalizedServer && normalizedServer !== mcpDouble[1]) return null;
     return mcpDouble[2]!;
   }
   const mcpColon = /^(?:mcp:)?([a-z0-9_-]+):([a-z0-9_-]+)$/.exec(lower);
-  if (mcpColon && trustedCodexServers.has(mcpColon[1]!) && codexReadOnlyMcpTools.has(mcpColon[2]!)) {
+  if (mcpColon && trustedCodexServers.has(mcpColon[1]!) && codexAutoAllowMcpTools.has(mcpColon[2]!)) {
     if (normalizedServer && normalizedServer !== mcpColon[1]) return null;
     return mcpColon[2]!;
+  }
+  const mcpSlash = /^(?:mcp:)?([a-z0-9_-]+)\/([a-z0-9_-]+)$/.exec(lower);
+  if (mcpSlash && trustedCodexServers.has(mcpSlash[1]!) && codexAutoAllowMcpTools.has(mcpSlash[2]!)) {
+    if (normalizedServer && normalizedServer !== mcpSlash[1]) return null;
+    return mcpSlash[2]!;
   }
   return null;
 }
@@ -248,9 +261,9 @@ function resolveTrustedReadOnlyTool(toolCall: MergedToolCall): string | null {
   if (identityKeys.some(key => Object.hasOwn(toolCall, key) && !isString(toolCall[key]))) {
     return null;
   }
-  if (Object.hasOwn(toolCall, 'kind')) {
-    const kind = String(toolCall.kind).trim().toLowerCase();
-    if (!safeReadOnlyKinds.has(kind)) return null;
+  const kind = Object.hasOwn(toolCall, 'kind') ? String(toolCall.kind).trim().toLowerCase() : null;
+  if (kind !== null && !safeCodexMcpKinds.has(kind)) {
+    return null;
   }
   const rawNames = ['name', 'toolName'].map(key => toolCall[key]).filter(isString).map(v => v.trim().toLowerCase());
   if (!rawNames.length || new Set(rawNames).size !== 1) return null;
@@ -264,16 +277,20 @@ function resolveTrustedReadOnlyTool(toolCall: MergedToolCall): string | null {
   );
   if (new Set(servers).size > 1) return null;
   const serverName = servers[0];
-  const direct = matchTrustedReadOnlyTool(toolName, serverName);
-  if (direct) return direct;
-  if (mcpWrapperTools.has(toolName)) {
+  let matched = matchTrustedReadOnlyTool(toolName, serverName);
+  if (!matched && mcpWrapperTools.has(toolName)) {
     const mcpNames = groups.flatMap(group =>
       ['ToolName', 'toolName', 'tool_name'].map(key => group[key]).filter(isString).map(v => v.trim().toLowerCase()),
     );
     if (!mcpNames.length || new Set(mcpNames).size !== 1) return null;
-    return matchTrustedReadOnlyTool(mcpNames[0]!, serverName);
+    if (!serverName || !trustedCodexServers.has(serverName)) return null;
+    matched = matchTrustedReadOnlyTool(mcpNames[0]!, serverName);
   }
-  return null;
+  if (!matched) return null;
+  if (kind !== null && !codexAutoAllowMcpTools.has(matched) && !safeReadOnlyKinds.has(kind)) {
+    return null;
+  }
+  return matched;
 }
 
 async function resolveSafeSessionBrainRoot(brainRoot: string, sessionId: string): Promise<string | null> {

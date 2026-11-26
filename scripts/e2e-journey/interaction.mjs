@@ -155,7 +155,12 @@ async function prepareApprovalRepo(project) {
 /** Use the same shared production gate and native approval observation shape as the adapters. */
 async function requestTool(ctx, topic, request, homeDir) {
   const project = ctx.projects.bridge;
-  const scope = { ...runtimeApprovalScope(ctx.config), project, cwd: project, homeDir };
+  const scope = {
+    ...runtimeApprovalScope({ ...ctx.config, approvalPolicy: { ...ctx.config.approvalPolicy, enabled: true } }),
+    project,
+    cwd: project,
+    homeDir,
+  };
   const decision = evaluateApproval(await resolveApprovalFacts(request, scope));
   ctx.trace.observe('生产审批策略返回值', { request, decision });
   if (decision.kind !== 'ask') return { decision };

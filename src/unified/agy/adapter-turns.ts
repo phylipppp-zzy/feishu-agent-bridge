@@ -867,9 +867,13 @@ export async function handleAcpServerRequest(
       ctx.active.has(sessionId) &&
       ctx.activeTurns.get(sessionId) === turn &&
       !turn.cancelRequested;
+    const bridgeApprovalEnabled = ctx.approvalPolicy?.enabled !== false;
     let decision: GateDecision;
     let checking: ToolCallCheck | undefined;
-    if (callIds.size > 1) {
+    if (!bridgeApprovalEnabled) {
+      const nativeReason = isString(p.reason) ? p.reason.trim() : isString(toolCall.reason) ? toolCall.reason.trim() : '';
+      decision = { kind: 'ask', reason: nativeReason };
+    } else if (callIds.size > 1) {
       decision = { kind: 'ask', reason: '原端请求中的工具调用标识不一致。' };
     } else if (!cwd) {
       decision = { kind: 'ask', reason: '缺少已验证的工作目录。' };
@@ -950,11 +954,12 @@ export async function handleAcpServerRequest(
       'agy_tool';
 
     const displayedCall = Object.fromEntries(Object.entries(toolCall));
+    const reasonPrefix = decision.kind === 'ask' && decision.reason ? `${decision.reason}\n` : '';
     const interaction: Interaction = {
       ...base,
       kind: 'approval',
       tool: toolLabel,
-      action: `${decision.kind === 'ask' ? `${decision.reason}\n` : ''}${JSON.stringify(displayedCall)}`,
+      action: `${reasonPrefix}${JSON.stringify(displayedCall)}`,
       scope: 'this_request',
       toolInputDigest: payloadDigest({ ...p, toolCall: displayedCall }),
       ...(allowAlwaysOptionId

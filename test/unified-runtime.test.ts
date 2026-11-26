@@ -55,7 +55,7 @@ test('runtime discovery and output roots allow reference reads while writes requ
   try {
     for (const path of [project, sibling, externalOutput]) mkdirSync(path);
     const config = runtimeFixtureConfig(dir);
-    const scope = runtimeApprovalScope({ ...config, allowedProjectRoots: [dir], outputRoots: [externalOutput] });
+    const scope = runtimeApprovalScope({ ...config, approvalPolicy: { enabled: true }, allowedProjectRoots: [dir], outputRoots: [externalOutput] });
     for (const [kind, path, expected] of [
       ['read', join(sibling, 'reference.ts'), 'allow_once'],
       ['read', join(externalOutput, 'output.txt'), 'allow_once'],
@@ -65,7 +65,7 @@ test('runtime discovery and output roots allow reference reads while writes requ
     ] as const) {
       assert.equal(evaluateApproval(await resolveApprovalFacts({ kind, paths: [path] }, { ...scope, project })).kind, expected, path);
     }
-    const explicit = runtimeApprovalScope({ ...config, approvalPolicy: { extraWriteRoots: [externalOutput] } });
+    const explicit = runtimeApprovalScope({ ...config, approvalPolicy: { enabled: true, extraWriteRoots: [externalOutput] } });
     assert.equal(evaluateApproval(await resolveApprovalFacts({ kind: 'write', paths: [join(externalOutput, 'output.txt')] }, { ...explicit, project })).kind, 'allow_once');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

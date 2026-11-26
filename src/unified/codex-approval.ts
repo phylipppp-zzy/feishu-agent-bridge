@@ -57,7 +57,7 @@ export function runtimeApprovalScope(config: RuntimeConfig) {
     ...writeRoots,
   ])];
   return {
-    enabled: policy?.enabled !== false,
+    enabled: policy?.enabled === true,
     ...(config.allowedProjectRoots !== undefined ? { allowedRoots: config.allowedProjectRoots } : {}),
     readRoots,
     writeRoots,

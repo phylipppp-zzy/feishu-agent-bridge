@@ -10,7 +10,7 @@ import { payloadDigest, type Answer, type Artifact, type Capabilities, type Inte
 import { contractError } from './errors.js';
 import { ClaudeState } from './claude-state.js';
 import { ClaudeResidualObservation } from './claude-residual.js';
-import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type ApprovalRequest, type ApprovalScope } from './approval-policy.js';
+import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type ApprovalRequest, type ApprovalScope, type GateDecision } from './approval-policy.js';
 import { unknown as unknownApprovalScope } from './approval-policy-paths.js';
 
 type SDK = { query: typeof query; listSessions: typeof listSessions; getSessionMessages: typeof getSessionMessages };
@@ -260,24 +260,31 @@ export class ClaudeAdapter implements PlatformPort {
     if (this.closed) throw contractError('temporarily_unavailable', 'adapter closed');
     const queue = new InputQueue<SDKUserMessage>(); const generation = this.owned.nextGeneration();
     const hookCwds = new Map<string, string>();
+    const bridgeApprovalEnabled = this.options.approvalPolicy?.enabled !== false;
     const approvalContext = { ...this.options.approvalPolicy, project: cwd };
     const canUseTool: CanUseTool = async (tool, input, opts) => {
       const toolCwd = hookCwds.get(opts.toolUseID) ?? cwd;
       hookCwds.delete(opts.toolUseID);
       const context = { ...approvalContext, cwd: toolCwd };
       const request = claudeApprovalRequest(tool, input);
-      let decision = request.kind === 'question' ? { kind: 'question' as const }
-        : await evaluateClaudeApproval(request, context);
-      if (decision.kind !== 'deny' && typeof opts.blockedPath === 'string' && opts.blockedPath) {
-        const blocked = evaluateApproval(await resolveApprovalFacts({
-          kind: readTools.has(tool) ? 'read' : 'write', paths: [opts.blockedPath],
-        }, { ...context, enabled: true }));
-        if (blocked.kind === 'deny') decision = blocked;
+      let decision: GateDecision;
+      if (request.kind === 'question') {
+        decision = { kind: 'question' as const };
+      } else if (!bridgeApprovalEnabled) {
+        decision = { kind: 'ask', reason: opts.decisionReason?.trim() || '' };
+      } else {
+        decision = await evaluateClaudeApproval(request, context);
+        if (decision.kind !== 'deny' && typeof opts.blockedPath === 'string' && opts.blockedPath) {
+          const blocked = evaluateApproval(await resolveApprovalFacts({
+            kind: readTools.has(tool) ? 'read' : 'write', paths: [opts.blockedPath],
+          }, { ...context, enabled: true }));
+          if (blocked.kind === 'deny') decision = blocked;
+        }
       }
       const live = this.lives.get(id);
       if (this.closed || live?.generation !== generation || opts.signal.aborted) return { behavior: 'deny', message: 'session closed' };
       if (decision.kind === 'deny') return { behavior: 'deny', message: decision.reason };
-      if (decision.kind !== 'question' && (opts.matchedAskRule !== undefined || opts.blockedPath !== undefined || opts.defaultToNo === true)) {
+      if (bridgeApprovalEnabled && decision.kind !== 'question' && (opts.matchedAskRule !== undefined || opts.blockedPath !== undefined || opts.defaultToNo === true)) {
         decision = { kind: 'ask', reason: opts.decisionReason || '原生权限规则要求人工确认' };
       }
       if (decision.kind === 'allow_once') return { behavior: 'allow', updatedInput: input };
@@ -297,7 +304,8 @@ export class ClaudeAdapter implements PlatformPort {
           interaction = { ...base, kind: 'question_group', toolInputDigest: null, questions };
         } else {
           const details = opts.blockedPath ? { input, blockedPath: opts.blockedPath } : input;
-          interaction = { ...base, kind: 'approval', tool, action: `${decision.reason}\n${JSON.stringify(details)}`, scope: 'this_request', toolInputDigest: payloadDigest(input) };
+          const reasonPrefix = decision.reason ? `${decision.reason}\n` : '';
+          interaction = { ...base, kind: 'approval', tool, action: `${reasonPrefix}${JSON.stringify(details)}`, scope: 'this_request', toolInputDigest: payloadDigest(input) };
         }
         const pendingInput = decision.kind === 'question' && !Array.isArray(input.questions) ? { ...input, questions: [{ question: input.question }] } : input;
         const pending: Pending = { interaction, input: pendingInput, toolId: opts.toolUseID, settle: resolve }; live.pending.set(interactionId, pending);
@@ -305,7 +313,7 @@ export class ClaudeAdapter implements PlatformPort {
         this.emit({ type: 'interaction', ref: this.ref(id), interaction });
       });
     };
-    const hooks: Options['hooks'] = { PreToolUse: [{ hooks: [async (event, _, { signal }) => {
+    const hooks: Options['hooks'] | undefined = bridgeApprovalEnabled ? { PreToolUse: [{ hooks: [async (event, _, { signal }) => {
       if (event.hook_event_name !== 'PreToolUse') return {};
       const live = this.lives.get(id);
       if (this.closed || live?.generation !== generation || signal.aborted) {
@@ -321,8 +329,8 @@ export class ClaudeAdapter implements PlatformPort {
         hookCwds.set(event.tool_use_id, event.cwd);
       }
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: decision.kind, permissionDecisionReason: decision.reason } };
-    }] }] };
-    const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool, hooks };
+    }] }] } : undefined;
+    const options: Options = { cwd, pathToClaudeCodeExecutable: this.claudeBin, env:{...process.env,FEISHU_CLAUDE_BRIDGE:'1',CLAUDE_CODE_ENTRYPOINT:'sdk-ts'}, ...(resume ? { resume: id } : { sessionId: id as `${string}-${string}-${string}-${string}-${string}` }), settingSources: ['user', 'project', 'local'], systemPrompt: { type: 'preset', preset: 'claude_code' }, permissionMode: 'default', includePartialMessages:true, ...(model ? { model } : {}), canUseTool, ...(hooks ? { hooks } : {}) };
     try {
       const q = this.sdk.query({ prompt: queue, options });
       return { id, cwd, model, turnModel: null, effortOverride: false, generation, queue, query: q, turn: null, interrupted: false, messages: [], pending: new Map(), stream: null, residual: new ClaudeResidualObservation(id) };
