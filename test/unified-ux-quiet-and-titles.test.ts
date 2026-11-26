@@ -284,14 +284,10 @@ test('titles use the first nonempty text line, with an attachment name fallback 
   assert.equal(deriveTitleFromInputBlocks([file, {type: 'text', text: '\n本周  进展\r\n下一段'}]), '本周 进展');
   assert.equal(deriveTitleFromInputBlocks([{type: 'text', text: '🧪'.repeat(49)}]), '🧪'.repeat(47) + '…');
   assert.equal(normalizeTopicTitle('🧪'.repeat(61)), '🧪'.repeat(59) + '…');
-  assert.equal(displayTopicTitle({ ...session, title: '[Codex · project] 已加前缀' }), '[Codex · project] 已加前缀');
-  assert.equal(displayTopicTitle({ ...session, title: '🧪'.repeat(61) }), '[Codex · project] ' + '🧪'.repeat(41) + '…');
-  const longDirectory = '🧪'.repeat(40);
-  const shortDirectory = '🧪'.repeat(23) + '…';
-  for (const name of [longDirectory, shortDirectory]) {
-    assert.equal(displayTopicTitle({ ...session, project: `/work/${longDirectory}`, title: `[Codex · ${name}] 会话名` }), `[Codex · ${shortDirectory}] 会话名`);
-  }
-  assert.equal(displayTopicTitle({ ...session, native: { ...session.native, provider: 'agy' }, project: '' }), '[AGY · 项目未知] 会话名');
+  assert.equal(displayTopicTitle({ ...session, title: '[Codex · project] 已加前缀' }), '🟢 已加前缀');
+  assert.equal(displayTopicTitle({ ...session, status: 'running', title: '🧪'.repeat(61) }), '🔵 ' + '🧪'.repeat(57) + '…');
+  assert.equal(displayTopicTitle({ ...session, status: 'waiting_approval', title: '🔵 [AGY · zhangzy] 论文审稿' }), '🟡 论文审稿');
+  assert.equal(displayTopicTitle({ ...session, native: { ...session.native, provider: 'agy' }, project: '' }), '🟢 会话名');
   assert.equal(shortenHomePath(homedir()), '~');
   assert.equal(shortenHomePath(`${homedir()}/work`), '~/work');
   assert.equal(shortenHomePath(`${homedir()}-other/work`), `${homedir()}-other/work`);

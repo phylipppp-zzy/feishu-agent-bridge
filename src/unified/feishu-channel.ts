@@ -23,7 +23,7 @@ import { buildHealthCard, buildQuotaCard } from './health-card.js';
 import { queryAgyQuota, type AgyQuotaSnapshot } from './agy-quota.js';
 import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
 import { inputConfirmationCard, needsOperationNotice, operationFromReceipt, patchOperationCard, pendingSessionAuthorization, publishOperationFeedback, suppressInputFailure, SUPPRESSED_COMPLETED_ACTIONS } from './feishu-operation-notices.js';
-import { BindingExpired, ReadAuthorizationRevoked, TOPIC_TITLE_SCHEMA, syncTopicRootTitle } from './topic-title-sync.js';
+import { BindingExpired, ReadAuthorizationRevoked, TOPIC_TITLE_SCHEMA, setCustomTopicTitle, syncTopicRootTitle } from './topic-title-sync.js';
 import {
   buildAdminHelpCard,
   buildMainChatTopicOnlyGuidanceCard,
@@ -100,6 +100,7 @@ export type ChannelAction = (
  | { action: 'task_panel' }
  | { action: 'handoff_preview'; targetId: string }
  | { action: 'quota' }
+ | { action: 'rename'; title: string }
  | { action: 'health' }) & { bindingId?: string };
 
 /** Standalone channel database. Never opens core's tables. */
@@ -712,6 +713,12 @@ export class FeishuChannel {
       const {card,page} = await sessionModelPage(this.service,session,cursor,this.accessMode(e.destination)==='read_only');
       await (cursor ? replyOrUpdate : reply)(card); return page;
     }
+    if (a.action === 'rename') {
+      const cleaned = setCustomTopicTitle(this.db, e.destination, bound, a.title);
+      await syncTopicRootTitle(this.db, this.port, e.destination, executionScope, session, card => this.stampCard(e.destination, card), guard);
+      await reply({ title: '话题标题已更新', text: `已将当前话题标题设为：**${escapeCardMarkdown(cleaned)}**`, actions: [] });
+      return { status: 'completed', title: cleaned };
+    }
     if (a.action === 'swarm') {
       if (session.native.provider !== 'agy') { await reply(buildSwarmUnsupportedCard()); return {status:'rejected',reason:'unsupported'}; }
       if (this.accessMode(e.destination) === 'read_only') { await reply(buildSwarmReadOnlyAgyCard()); return {status:'rejected',reason:'read_only_binding'}; }
@@ -872,12 +879,12 @@ export class FeishuChannel {
       const events = await this.service.subscribeEvents(sessionId,cursor,100); await syncGuard();
       if (events.status === 'events') {
         const snapshot=await this.service.getSnapshot(sessionId); await syncGuard();
-        await syncTitle(snapshot.value.session);
         for (const i of snapshot.value.interactions) await this.interactionCards.render(destination,sessionId,i.interactionId,scope,allowWaiting);
         const messageIds = new Set(events.events.filter(event => event.type === 'message.updated').map(event => event.objectId));
         const messages = snapshot.value.messages.filter(message => message.role === 'assistant' && messageIds.has(message.messageId) && unseen(message));
         await this.turnCards.sync(scopeKey, snapshot.value, events.events, messages, allowedPush);
         await syncGuard();
+        await syncTitle(snapshot.value.session);
         for (const message of messages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
         let retryCount=0; let firstRetry='';
         const visible=events.events.filter(event=>!eventTypes.length || eventTypes.includes(event.type));

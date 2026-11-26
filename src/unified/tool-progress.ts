@@ -76,9 +76,62 @@ function commandSummary(value: unknown): string {
   return '';
 }
 
+function safeLabel(value: unknown, limit = 48): string {
+  if (typeof value !== 'string') return '';
+  const cleaned = value.replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/gu, ' ').trim();
+  return cleaned ? short(cleaned, limit) : '';
+}
+
+function summarizeSpecialTool(tool: string, data: Record<string, unknown>): string | null {
+  switch (tool) {
+    case 'swarm': {
+      const action = safeLabel(data.action, 24);
+      const name = safeLabel(data.name, 28);
+      const title = safeLabel(data.title, 40);
+      if (action === 'add') return `🐝 Swarm 启动成员${name ? `：${name}` : ''}`;
+      if (action === 'title') return `🐝 Swarm 命名${title ? `：${title}` : ''}`;
+      if (action === 'status') return '🐝 Swarm 检查成员状态';
+      if (action === 'kill') return `🐝 Swarm 结束成员${name ? `：${name}` : ''}`;
+      if (action === 'model') return `🐝 Swarm 切换模型${name ? `：${name}` : ''}`;
+      if (action === 'models') return '🐝 Swarm 查询模型配额';
+      return action ? `🐝 Swarm · ${action}` : '🐝 Swarm 协作';
+    }
+    case 'swarm_wait':
+      return '🐝 Swarm 等待成员回报';
+    case 'post_message':
+      return '🐝 Swarm 协作板发帖';
+    case 'read_board':
+      return '🐝 Swarm 读取协作板';
+    case 'invoke_subagent': {
+      const role = safeLabel(data.Role ?? data.TypeName, 36);
+      return `🤖 派发子代理${role ? `：${role}` : ''}`;
+    }
+    case 'run_workflow': {
+      const desc = safeLabel(data.Description, 40);
+      return `⚙️ 运行工作流${desc ? `：${desc}` : ''}`;
+    }
+    case 'schedule':
+      return '⏰ 设置定时/等待任务';
+    case 'call_mcp_tool': {
+      const mcpTool = safeLabel(data.ToolName ?? data.tool_name, 40);
+      return `🔌 MCP${mcpTool ? `：${mcpTool}` : ''}`;
+    }
+    case 'ask_question':
+      return '❓ 等待用户回答';
+    case 'search_web': {
+      const q = safeLabel(data.query, 36);
+      return `🌐 联网检索${q ? `：${q}` : ''}`;
+    }
+    default:
+      return null;
+  }
+}
+
 export function summarizeTool(name: unknown, input: unknown, project?: string): Pick<ToolProgress, 'tool' | 'summary'> {
   const tool = toolName(name);
   const data = inputObject(input);
+  const special = summarizeSpecialTool(tool, data);
+  if (special) return { tool, summary: short(special, 120) };
   const detail = commandSummary(data.command ?? data.CommandLine) ||
     displayPath(data.file_path ?? data.path ?? data.TargetFile ?? data.FilePath ?? data.Path ?? data.AbsolutePath ?? data.DirectoryPath, project);
   return { tool, summary: short(detail ? `${tool} · ${detail}` : tool, 120) };

@@ -334,7 +334,7 @@ export class TurnCardDelivery {
       catch { /* File actions are optional; the persisted reply can still be delivered. */ }
     }
     await guard();
-    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files });
+    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3] });
     const learnedDuration = status === 'completed' && elapsed !== null && !old?.title.includes(' · 用时 ');
     if (old?.title && isTerminalTurn(old.status ?? undefined) && !learnedDuration) card.title = old.title;
     const signature = payloadDigest(card);

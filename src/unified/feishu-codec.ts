@@ -456,6 +456,11 @@ export function parseFeishuText(text: string, options?: { passthroughUnknownSlas
     case '/ops': if (!parts.length) return {action:'pending'}; break;
     case '/health': return {action:'health'};
     case '/quota': if (!parts.length) return {action:'quota'}; break;
+    case '/rename': {
+      const title = rawTail.trim();
+      if (title) return {action:'rename',title};
+      break;
+    }
     case '/upgrade': return {action:'upgrade'};
     case '/unbind': return {action:'unbind'};
     case '/task': {

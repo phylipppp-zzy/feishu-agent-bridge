@@ -957,12 +957,12 @@ test('autoMirror.showTitles validates and controls title masking for auto-mirror
 
     const masked = await runOnce(undefined);
     assert.equal(masked.isMarkedPrivate, true);
-    assert.match(masked.topicTitle, /^\[Codex · proj\] Codex 会话 · /);
+    assert.match(masked.topicTitle, /^[⚪🟢🔵🟡🔴] Codex 会话 · /u);
     assert.match(masked.presentedTitle, /^Codex 会话 · /);
 
     const visible = await runOnce(true);
     assert.equal(visible.isMarkedPrivate, false);
-    assert.equal(visible.topicTitle, `[Codex · proj] ${realTitle}`);
+    assert.match(visible.topicTitle, new RegExp(`^[⚪🟢🔵🟡🔴] ${realTitle}$`, 'u'));
     assert.equal(visible.presentedTitle, realTitle);
   } finally {
     rmSync(dir, { recursive: true, force: true });

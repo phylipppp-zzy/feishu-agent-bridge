@@ -570,6 +570,7 @@ function compactToolCall(turn: ActiveTurnState, toolCallId: string, call: Obj): 
 }
 
 const toolProgress = new WeakMap<ActiveTurnState, ToolProgressTracker>();
+const thinkingPhaseActive = new WeakSet<ActiveTurnState>();
 
 function releaseToolCall(ctx: AdapterContext, sessionId: string, turn: ActiveTurnState, toolCallId: string): void {
   if (!turn.fullToolCalls.has(toolCallId)) return;
@@ -626,10 +627,24 @@ export function handleAcpNotification(
   }
 
   if (kind !== 'tool_call' && kind !== 'tool_call_update' && kind !== 'agent_message_chunk') {
-    const existingWakeup = ctx.activeTurns.get(sessionId);
-    if (existingWakeup?.isWakeup && existingWakeup.generation === notification.generation) {
-      existingWakeup.lastActivityAt = Date.now();
-      scheduleWakeupFinalize(ctx, sessionId, existingWakeup);
+    const existingTurn = ctx.activeTurns.get(sessionId);
+    if (existingTurn && existingTurn.generation === notification.generation) {
+      existingTurn.lastActivityAt = Date.now();
+      if (existingTurn.isWakeup) {
+        scheduleWakeupFinalize(ctx, sessionId, existingTurn);
+      }
+      if (kind === 'agent_thought_chunk' && existingTurn.inProgressToolCalls.size === 0 && !existingTurn.assistantText) {
+        let tracker = toolProgress.get(existingTurn);
+        if (!tracker) { tracker = new ToolProgressTracker(); toolProgress.set(existingTurn, tracker); }
+        const obs = tracker.observe(ref, existingTurn.generation, existingTurn.turnId, 'phase:thinking', 'running', {
+          tool: 'thinking',
+          summary: '🧠 正在深度思考…',
+        });
+        if (obs) {
+          thinkingPhaseActive.add(existingTurn);
+          ctx.emit(obs);
+        }
+      }
     }
     return;
   }
@@ -689,6 +704,10 @@ export function handleAcpNotification(
       if (progress) {
         let tracker = toolProgress.get(turnState);
         if (!tracker) { tracker = new ToolProgressTracker(); toolProgress.set(turnState, tracker); }
+        if (thinkingPhaseActive.delete(turnState)) {
+          const doneThinking = tracker.observe(ref, turnState.generation, turnState.turnId, 'phase:thinking', 'succeeded');
+          if (doneThinking) ctx.emit(doneThinking);
+        }
         const observation = tracker.observe(ref, turnState.generation, turnState.turnId, toolCallId, progress.phase, progress.detail);
         if (observation) ctx.emit(observation);
       }
@@ -710,6 +729,13 @@ export function handleAcpNotification(
     if (!chunkText) return;
 
     if (turnState.assistantFinalized) return;
+    if (thinkingPhaseActive.delete(turnState)) {
+      const tracker = toolProgress.get(turnState);
+      if (tracker) {
+        const doneThinking = tracker.observe(ref, turnState.generation, turnState.turnId, 'phase:thinking', 'succeeded');
+        if (doneThinking) ctx.emit(doneThinking);
+      }
+    }
     if (!turnState.assistantMessageId) {
       const rawMsgId = isString(update.messageId) ? update.messageId : null;
       turnState.assistantMessageId = turnState.isWakeup

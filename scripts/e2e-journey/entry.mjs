@@ -126,7 +126,8 @@ async function blankSession(ctx) {
       trace.check('创建根卡和交互绑定，空白会话没有自动输入', () => {
         const { rootId, sessionId } = topics.codex;
         assert.equal(ctx.runtime.store.getSession(sessionId).project, ctx.projects.bridge);
-        assert.match(wire.messages.get(rootId).card.title, /^\[Codex · feishu-agent-bridge\]/);
+        assert.match(wire.messages.get(rootId).card.title, /^[🟢🔵🟡🔴⚪] /u);
+        assert.match(wire.messages.get(rootId).card.bodyText, /Codex · .*feishu-agent-bridge/);
         assert.equal(providers.codex.inputs.length, 0);
       });
       trace.observe('本步骤记录主群草稿更新、话题根消息和话题内回复。', {
@@ -163,7 +164,7 @@ async function blankSession(ctx) {
       trace.check('完成卡为绿色，话题标题同步，短轮次没有额外文本推送', () => {
         assert.ok(ctx.writes(topics.codex).some(message => message.card.template === 'green'
           && /^Codex · 已完成 · 用时 /.test(message.card.title)));
-        assert.equal(wire.messages.get(topics.codex.rootId).card.title, `[Codex · feishu-agent-bridge] ${prompt}`);
+        assert.equal(wire.messages.get(topics.codex.rootId).card.title, `🟢 ${prompt}`);
         assert.ok(![...wire.messages.values()].some(message => message.type === 'text' && message.rootId === topics.codex.rootId));
       });
     });
@@ -216,7 +217,8 @@ async function firstPrompt(ctx) {
       trace.check('话题根卡与接入卡均显示首句标题，接入卡没有闪现空闲状态', () => {
         const root = ctx.wire.messages.get(topics.agy.rootId);
         const binding = ctx.writes(topics.agy).find(({card}) => /已接入/.test(card.bodyText));
-        assert.equal(root.card.title, `[AGY · gui-rl] ${prompt}`);
+        assert.equal(root.card.title, `🔵 ${prompt}`);
+        assert.match(root.card.bodyText, /Antigravity · .*gui-rl/);
         assert.equal(binding?.card.title, prompt);
         assert.doesNotMatch(binding.card.bodyText, /空闲/);
       });
@@ -228,7 +230,8 @@ async function firstPrompt(ctx) {
       topics.claude = newTopic(ctx, 'claude');
       trace.check('创建 Claude 话题并完成交互绑定', () => {
         assert.equal(ctx.runtime.store.getSession(topics.claude.sessionId).project, ctx.projects.research);
-        assert.match(ctx.wire.messages.get(topics.claude.rootId).card.title, /^\[Claude · research\]/);
+        assert.match(ctx.wire.messages.get(topics.claude.rootId).card.title, /^[🟢🔵🟡🔴⚪] /u);
+        assert.match(ctx.wire.messages.get(topics.claude.rootId).card.bodyText, /Claude · .*research/);
       });
     });
     await trace.step('3.3 在已经绑定的 Codex 话题发送 /new', async () => {
