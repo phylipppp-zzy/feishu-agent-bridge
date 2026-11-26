@@ -152,9 +152,61 @@ test('formatApprovalAction renders MCP and structured non-shell/file tools witho
     'this_request',
   );
   assert.equal(webView.toolLabel, '网页搜索');
+  assert.equal(webView.compactTarget, 'query: feishu card 2.0 markdown');
   assert.doesNotMatch(webView.text, /原端未提供可展示的操作详情/);
   assert.ok(webView.text.includes('query: feishu card 2.0 markdown'));
   assert.ok(webView.text.includes('domain: open.feishu.cn'));
+
+  // Empty args:{} must not shadow non-empty rawInput, and "Run MCP Tool ..." must not mislabel as shell
+  const emptyArgsFallbackView = formatApprovalAction(
+    'search_web',
+    JSON.stringify({ name: 'search_web', args: {}, rawInput: { query: 'fallback query' } }),
+    'this_request',
+  );
+  assert.ok(emptyArgsFallbackView.text.includes('query: fallback query'));
+  assert.equal(emptyArgsFallbackView.compactTarget, 'query: fallback query');
+
+  const verbPrefixedMcpView = formatApprovalAction(
+    'Run MCP Tool codex_job',
+    JSON.stringify({
+      name: 'call_mcp_tool',
+      args: { ServerName: 'codex-bridge_codex', ToolName: 'codex_job', Arguments: {} },
+      rawInput: { Arguments: { action: 'status', job_id: 'job-99' } },
+    }),
+    'this_request',
+  );
+  assert.equal(verbPrefixedMcpView.toolLabel, 'MCP · codex_job');
+  assert.ok(verbPrefixedMcpView.text.includes('action: status'));
+  assert.ok(verbPrefixedMcpView.text.includes('job_id: job-99'));
+
+  // Sensitive keys and nested auth headers must be redacted, while non-secret keys like author/max_tokens remain visible
+  const secretMcpView = formatApprovalAction(
+    'MCP Tool http_request',
+    JSON.stringify({
+      name: 'call_mcp_tool',
+      args: {
+        ServerName: 'api-bridge',
+        ToolName: 'http_request',
+        Arguments: {
+          url: 'https://api.example.com/v1',
+          apiKey: 'sk-live-secret-12345',
+          client_secret: 'cs-hidden-999',
+          headers: { Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.secret', 'X-Api-Key': 'k-secret', 'X-Trace': 'trace-1' },
+          authHeader: 'Basic dXNlcjpwYXNz',
+          author: 'alice',
+          max_tokens: 512,
+        },
+      },
+    }),
+    'this_request',
+  );
+  assert.ok(secretMcpView.text.includes('url: https://api.example.com/v1'));
+  assert.ok(secretMcpView.text.includes('apiKey: [已脱敏]'));
+  assert.ok(secretMcpView.text.includes('client_secret: [已脱敏]'));
+  assert.ok(secretMcpView.text.includes('author: alice'));
+  assert.ok(secretMcpView.text.includes('max_tokens: 512'));
+  assert.ok(secretMcpView.text.includes('trace-1'));
+  assert.doesNotMatch(secretMcpView.text, /sk-live-secret-12345|cs-hidden-999|eyJhbGciOiJIUzI1NiJ9|k-secret|dXNlcjpwYXNz/);
 
   const writeFileView = formatApprovalAction(
     'File ../../../scripts/codex_dispatch.py',

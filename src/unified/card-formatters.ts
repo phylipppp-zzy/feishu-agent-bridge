@@ -153,15 +153,44 @@ const DETAIL_WRAPPER_KEYS = new Set([
   'args', 'input', 'params', 'locations', 'content', 'type', 'name', 'title',
 ]);
 
+const SENSITIVE_KEY_RE = /(?:^|[_-])(secret|token|password|passwd|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|app[_-]?secret|authorization|cookie|set[_-]?cookie|credential|credentials|bearer|auth[_-]?(?:token|key|header|secret))(?:$|[_-])/iu;
+const AUTH_SCHEME_VALUE_RE = /^((?:Bearer|Basic)\s+)\S+$/iu;
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = key.replace(/([a-z0-9])([A-Z])/gu, '$1_$2').toLowerCase();
+  return SENSITIVE_KEY_RE.test(normalized);
+}
+
+function redactSensitive(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return AUTH_SCHEME_VALUE_RE.test(trimmed) ? trimmed.replace(AUTH_SCHEME_VALUE_RE, '$1[已脱敏]') : value;
+  }
+  if (depth > 4 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(item => redactSensitive(item, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = isSensitiveKey(k) ? '[已脱敏]' : redactSensitive(v, depth + 1);
+  }
+  return out;
+}
+
+function nonEmptyRecord(value: unknown): Record<string, unknown> | undefined {
+  const obj = record(value);
+  return obj && Object.keys(obj).length > 0 ? obj : undefined;
+}
+
 function formatEntryValue(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value === 'string') {
     const trimmed = value.trim();
-    return trimmed ? shorten(trimmed, 400, '…') : null;
+    if (!trimmed) return null;
+    const safe = AUTH_SCHEME_VALUE_RE.test(trimmed) ? trimmed.replace(AUTH_SCHEME_VALUE_RE, '$1[已脱敏]') : trimmed;
+    return shorten(safe, 400, '…');
   }
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   try {
-    const serialized = JSON.stringify(value);
+    const serialized = JSON.stringify(redactSensitive(value));
     if (!serialized || serialized === '{}' || serialized === '[]') return null;
     return shorten(serialized, 400, '…');
   } catch {
@@ -175,7 +204,8 @@ function formatStructuredEntries(obj: Record<string, unknown> | undefined, skip?
   let omitted = 0;
   for (const [k, v] of Object.entries(obj)) {
     if (skip?.has(k)) continue;
-    const formatted = formatEntryValue(v);
+    if (v === undefined || v === null) continue;
+    const formatted = isSensitiveKey(k) ? '[已脱敏]' : formatEntryValue(v);
     if (!formatted) continue;
     if (entries.length >= 12) {
       omitted += 1;
@@ -198,7 +228,7 @@ function extractMcpToolName(detail?: Record<string, unknown>): string | undefine
   return undefined;
 }
 
-function approvalFallbackSummary(detail: Record<string, unknown>): string {
+function approvalFallbackSummary(detail: Record<string, unknown>, tool: string): { summary: string; compactTarget: string } {
   const fields = [detail, record(detail.args), record(detail.input), record(detail.params), record(detail.rawInput)];
   const server = fields
     .map(f => (nonblank(f?.ServerName) ? f.ServerName : nonblank(f?.serverName) ? f.serverName : nonblank(f?.server) ? f.server : undefined)?.trim())
@@ -207,29 +237,46 @@ function approvalFallbackSummary(detail: Record<string, unknown>): string {
   const uri = fields
     .map(f => (nonblank(f?.Uri) ? f.Uri : nonblank(f?.uri) ? f.uri : undefined)?.trim())
     .find(Boolean);
-  const mcpArgs = fields.map(f => record(f?.Arguments) ?? record(f?.arguments)).find(Boolean);
+  const mcpArgs = fields.map(f => nonEmptyRecord(f?.Arguments) ?? nonEmptyRecord(f?.arguments)).find(Boolean);
   if (mcpTool || server || uri) {
     const baseHeader = [server, mcpTool].filter(Boolean).join(' / ');
     const header = uri ? (baseHeader ? `${baseHeader} (${uri})` : uri) : baseHeader;
-    return [header, ...formatStructuredEntries(mcpArgs)].filter(Boolean).join('\n');
+    const lines = formatStructuredEntries(mcpArgs);
+    return {
+      summary: [header, ...lines].filter(Boolean).join('\n'),
+      compactTarget: header || lines[0] || '',
+    };
   }
-  const header = nonblank(detail.title) ? detail.title.trim() : nonblank(detail.name) ? detail.name.trim() : '';
-  const payload = record(detail.args) ?? record(detail.input) ?? record(detail.params) ?? record(detail.rawInput);
-  if (payload) {
+  const title = nonblank(detail.title) ? detail.title.trim() : '';
+  const name = nonblank(detail.name) ? detail.name.trim() : '';
+  const header = title || name;
+  const payloads = [nonEmptyRecord(detail.args), nonEmptyRecord(detail.input), nonEmptyRecord(detail.params), nonEmptyRecord(detail.rawInput)];
+  for (const payload of payloads) {
+    if (!payload) continue;
     const lines = formatStructuredEntries(payload);
-    if (lines.length) return [header, ...lines].filter(Boolean).join('\n');
+    if (lines.length) {
+      const redundantHeader = !title || title.toLowerCase() === tool.trim().toLowerCase() || title.toLowerCase() === name.toLowerCase();
+      return {
+        summary: [header, ...lines].filter(Boolean).join('\n'),
+        compactTarget: redundantHeader ? lines[0]! : title,
+      };
+    }
   }
   const directLines = formatStructuredEntries(detail, DETAIL_WRAPPER_KEYS);
-  return [header, ...directLines].filter(Boolean).join('\n');
+  const redundantHeader = !title || title.toLowerCase() === tool.trim().toLowerCase() || title.toLowerCase() === name.toLowerCase();
+  return {
+    summary: [header, ...directLines].filter(Boolean).join('\n'),
+    compactTarget: directLines.length && redundantHeader ? directLines[0]! : (header || directLines[0] || ''),
+  };
 }
 
 function resolveApprovalToolLabel(tool: string, detail?: Record<string, unknown>): string {
   const stripped = stripCardMentions(tool).trim();
+  const mcpTool = extractMcpToolName(detail) ?? stripped.match(/(?:^|\s)MCP\s+Tool\s+(\S+)/iu)?.[1];
+  if (mcpTool) return `MCP · ${shorten(stripCardMentions(mcpTool).trim(), 20, '…')}`;
   const toolName = stripped.split(/\s+/u)[0] ?? '';
   const key = toolName.toLowerCase();
   if (Object.hasOwn(toolLabels, key)) return toolLabels[key]!;
-  const mcpTool = extractMcpToolName(detail) ?? stripped.match(/^MCP\s+Tool\s+(\S+)/iu)?.[1];
-  if (mcpTool) return `MCP · ${shorten(stripCardMentions(mcpTool).trim(), 20, '…')}`;
   if (nonblank(detail?.name)) {
     const detailKey = detail.name.trim().toLowerCase();
     if (Object.hasOwn(toolLabels, detailKey)) return toolLabels[detailKey]!;
@@ -246,9 +293,13 @@ export function formatApprovalAction(tool: string, action: string, scope: string
     .find(value => /\p{Script=Han}/u.test(value))
     ?? '原端要求人工确认此操作。';
   const rawTargets = detail ? approvalTargets(detail).join('\n') : prefix;
-  const target = rawTargets || (detail ? approvalFallbackSummary(detail) : '');
+  const fallback = !rawTargets && detail ? approvalFallbackSummary(detail, tool) : null;
+  const target = rawTargets || fallback?.summary || '';
   const cleanTarget = stripCardMentions(target);
-  const compactTarget = cleanTarget.split('\n').map(line => line.trim()).find(Boolean) ?? '';
+  const compactTarget = stripCardMentions(fallback?.compactTarget ?? '')
+    .split('\n').map(line => line.trim()).find(Boolean)
+    ?? cleanTarget.split('\n').map(line => line.trim()).find(Boolean)
+    ?? '';
   const summary = shorten(cleanTarget, 2000, '\n…（其余内容已省略）')
     .replace(/`{3,}/gu, run => [...run].join('\u200b')) || '原端未提供可展示的操作详情。';
   const duration = scope === 'session' || scope === 'allow_always' ? '本会话内同类操作' : '仅本次操作';
