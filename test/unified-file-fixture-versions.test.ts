@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {existsSync,mkdtempSync,rmSync} from 'node:fs';
+import {mkdir,symlink,writeFile} from 'node:fs/promises';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {homedir,tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -13,6 +14,8 @@ import {FeishuSdkPort} from '../src/unified/feishu-sdk-port.js';
 import {FeishuChannel} from '../src/unified/feishu-channel.js';
 import {TestLaneRuntime} from '../src/unified/test-lane.js';
 import {parseFeishuAction} from '../src/unified/feishu-codec.js';
+import {listSafeProjectDirectory,selectSafeProjectFiles} from '../src/unified/project-files.js';
+import {ArtifactRegistry} from '../src/unified/artifact-registry.js';
 
 const execFileAsync=promisify(execFile);
 const oldReleaseDir=process.env.SSTEER_OLD_RELEASE || process.env.R12_OLD_RELEASE || process.env.TASK_GUARD_RELEASE || join(homedir(),'.local/share/feishu-unified-bridge/releases/0090d1a');
@@ -54,7 +57,7 @@ test('TestLaneRuntime operator.sock file-v2 exposes distinct artifact buttons an
  const sdkPath=join(dir,'sdk'),laneDir=join(dir,'lane'),channelPath=join(dir,'channel');
  const v1Hash=createHash('sha256').update('TEST fixture\n').digest('hex');
  const v2Hash=createHash('sha256').update('TEST fixture 第二版本\n').digest('hex');
- const operatorScript=fileURLToPath(new URL('../scripts/test-lane-operator.mjs',import.meta.url));
+ const operatorScript=fileURLToPath(new URL(import.meta.url.includes('/dist/test/')?'../../scripts/test-lane-operator.mjs':'../scripts/test-lane-operator.mjs',import.meta.url));
  const sdk=new FeishuSdkPort({appId:'app',appSecret:'fake'},sdkPath,new Set(['chat']),'owner');
  let seq=0,uploads=0,prod=0;
  const chats=new Map<string,string>();
@@ -187,6 +190,90 @@ test('TestLaneRuntime operator.sock file-v2 exposes distinct artifact buttons an
   try{channel?.close();}catch{}
   try{await lane.close();}catch{}
   try{sdk.close();}catch{}
+  rmSync(dir,{recursive:true,force:true});
+ }
+});
+
+test('project-files allows whitelisted outputRoots symlinks while blocking escapes and secrets, and ArtifactRegistry flags same-path overwrites',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'symlink-whitelist-'));
+ try{
+  const project=join(dir,'workspace','proj');
+  const outputs=join(dir,'data','outputs');
+  const outside=join(dir,'outside');
+  await mkdir(project,{recursive:true});
+  await mkdir(join(outputs,'run1'),{recursive:true});
+  await mkdir(outside,{recursive:true});
+
+  await writeFile(join(outputs,'run1','report.md'),'# Eval Report v1\n');
+  await writeFile(join(outputs,'run1','.env'),'API_KEY=secret\n');
+  await writeFile(join(outside,'leak.md'),'OUTSIDE\n');
+  await symlink(outputs,join(project,'output'));
+  await symlink(outside,join(project,'escape'));
+
+  // Without whitelist, symlinks remain blocked.
+  const blockedListing=await listSafeProjectDirectory('output',project,false);
+  assert.equal(blockedListing.kind,'error');
+  await assert.rejects(selectSafeProjectFiles(project,'output/run1/report.md'));
+
+  // With whitelist [project, outputs], output/ symlink is allowed; escape/ and secrets remain blocked.
+  const whitelist=[project,outputs];
+  const listing=await listSafeProjectDirectory('output/run1',project,false,whitelist);
+  assert.equal(listing.kind,'dir');
+  if(listing.kind==='dir'){
+   assert.deepEqual(listing.entries.map(e=>e.name),['report.md']);
+  }
+  const selected=await selectSafeProjectFiles(project,'output/run1/*.md',whitelist);
+  assert.equal(selected.length,1);
+  assert.equal(selected[0]!.path,join(project,'output','run1','report.md'));
+
+  const escapeListing=await listSafeProjectDirectory('escape',project,false,whitelist);
+  assert.equal(escapeListing.kind,'error');
+  await assert.rejects(selectSafeProjectFiles(project,'escape/leak.md',whitelist));
+  await assert.rejects(selectSafeProjectFiles(project,'output/run1/.env',whitelist));
+
+  // Even if the parent directory containing reviews/ or projtool/ is in allowedSymlinkRoots,
+  // symlinks targeting confidential reviews/ or projtool/ must remain strictly blocked.
+  const homeLike=join(dir,'home-like');
+  await mkdir(join(homeLike,'reviews'),{recursive:true});
+  await mkdir(join(homeLike,'projects','projtool'),{recursive:true});
+  await writeFile(join(homeLike,'reviews','blind.md'),'CONFIDENTIAL\n');
+  await writeFile(join(homeLike,'projects','projtool','core.md'),'INTERNAL\n');
+  await symlink(join(homeLike,'reviews'),join(project,'review-link'));
+  await symlink(join(homeLike,'projects','projtool','core.md'),join(project,'projtool-link.md'));
+  const wideWhitelist=[project,outputs,homeLike];
+  const reviewListing=await listSafeProjectDirectory('review-link',project,false,wideWhitelist);
+  assert.equal(reviewListing.kind,'error');
+  await assert.rejects(selectSafeProjectFiles(project,'review-link/blind.md',wideWhitelist));
+  await assert.rejects(selectSafeProjectFiles(project,'projtool-link.md',wideWhitelist));
+
+  // ArtifactRegistry marks same-path overwrites with contentChanged and explicit error notice.
+  const ref={provider:'agy' as const,hostId:'h',serviceId:'s',nativeSessionId:'conv-1'};
+  const sessionId=JSON.stringify([ref.provider,ref.hostId,ref.serviceId,ref.nativeSessionId]);
+  const registry=new ArtifactRegistry({});
+  registry.setRoots(ref,[outputs]);
+  registry.setProjectRoot(ref,project);
+
+  const targetFile=join(outputs,'run1','report.md');
+  const v1=await registry.register(sessionId,targetFile,'text/markdown',true);
+  assert.equal(v1.contentChanged,undefined);
+
+  await writeFile(targetFile,'# Eval Report v2 (overwritten)\n');
+  const v2=await registry.register(sessionId,targetFile,'text/markdown',true);
+  assert.equal(v2.contentChanged,true);
+  assert.equal(v2.previousContentVersion,v1.contentVersion);
+  assert.notEqual(v2.contentVersion,v1.contentVersion);
+
+  const status=registry.getContentChangeStatus(sessionId,v1.artifactId,v1.contentVersion);
+  assert.equal(status.changed,true);
+  assert.match(status.notice ?? '',/内容已变更/);
+
+  await assert.rejects(
+   registry.read(sessionId,v1.artifactId,v1.contentVersion),
+   /内容已变更/,
+  );
+  const v2Bytes=await registry.read(sessionId,v2.artifactId,v2.contentVersion);
+  assert.equal(Buffer.from(v2Bytes).toString('utf8'),'# Eval Report v2 (overwritten)\n');
+ }finally{
   rmSync(dir,{recursive:true,force:true});
  }
 });

@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const DEFAULT_AGY_SUMMARIES_DB_PATH = join(homedir(), '.gemini', 'antigravity', 'conversation_summaries.db');
 export const DEFAULT_AGY_BRAIN_DIR = join(homedir(), '.gemini', 'antigravity-cli', 'brain');
+export const DEFAULT_AGY_IDE_BRAIN_DIR = join(homedir(), '.gemini', 'antigravity', 'brain');
+export const CREATED_AT_HEADER_READ_BYTES = 8 * 1024;
 
 export const AGY_EXCLUDED_ARTIFACT_DIRS = new Set([
   '.system_generated',
@@ -21,6 +23,8 @@ export const AGY_EXCLUDED_ARTIFACT_DIRS = new Set([
   '.docker',
   '.config',
   '.claude',
+  'reviews',
+  'projtool',
 ]);
 
 export const DEFAULT_AGY_ARTIFACT_EXTENSIONS = new Set([
@@ -31,6 +35,13 @@ export const DEFAULT_AGY_ARTIFACT_EXTENSIONS = new Set([
   '.csv',
   '.html',
   '.htm',
+  '.json',
+  '.py',
+  '.sh',
+  '.tex',
+  '.svg',
+  '.yaml',
+  '.yml',
   '.png',
   '.jpg',
   '.jpeg',
@@ -82,6 +93,13 @@ export const MEDIA_TYPES: Record<string, string> = {
   '.csv': 'text/csv',
   '.html': 'text/html',
   '.htm': 'text/html',
+  '.json': 'application/json',
+  '.py': 'text/x-python',
+  '.sh': 'application/x-sh',
+  '.tex': 'application/x-tex',
+  '.svg': 'image/svg+xml',
+  '.yaml': 'application/yaml',
+  '.yml': 'application/yaml',
   '.pdf': 'application/pdf',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -148,11 +166,18 @@ export interface AgyDiscoveredSession {
   isTopLevel: true;
 }
 
+export type AgyCreatedAtSource = 'transcript' | 'unknown';
+
+export interface AgyCreatedAtInfo {
+  createdAt: string | null;
+  source: AgyCreatedAtSource;
+}
+
 export interface AgyTokenUsage {
-  inputTokens: number;
-  cacheReadTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
 }
 
 export interface AgyToolCallSummary {
@@ -207,6 +232,8 @@ export interface AgyTranscriptReadResult {
   transcriptPath: string | null;
   fullTranscriptPath: string | null;
   usedFullFallback: boolean;
+  fullTranscriptSkippedReason?: string | null;
+  warnings?: string[];
   steps: AgyTranscriptStep[];
   messages: AgyTranscriptMessage[];
   nextLine: number;
@@ -232,7 +259,10 @@ export interface AgyArtifactEntry {
 export interface AgyCatalogOptions {
   dbPath?: string;
   brainDir?: string;
+  brainDirs?: readonly string[];
   allowedProjectRoots?: readonly string[];
+  outputRoots?: readonly string[];
+  allowedSymlinkRoots?: readonly string[];
   includeOutsideRoots?: boolean;
   maxTitleLength?: number;
   maxTranscriptBytes?: number;
@@ -242,6 +272,8 @@ export interface AgyCatalogOptions {
 
 export interface AgyReadTranscriptOptions {
   brainDir?: string;
+  brainDirs?: readonly string[];
+  appDataDir?: string;
   afterLine?: number;
   sinceTimestamp?: string | number;
   afterStepIndex?: number;
@@ -251,8 +283,92 @@ export interface AgyReadTranscriptOptions {
 
 export interface AgyArtifactOptions {
   brainDir?: string;
+  brainDirs?: readonly string[];
+  appDataDir?: string;
   maxBytes?: number;
   allowedExtensions?: readonly string[];
+  includeScratch?: boolean;
+  allowedSymlinkRoots?: readonly string[];
+}
+
+export function isProtectedConfidentialTarget(canonicalTarget: string): boolean {
+  const segments = canonicalTarget.split(sep).filter(Boolean);
+  if (segments.some((seg) => seg === 'reviews' || seg === 'projtool')) return true;
+  const homes = new Set<string>();
+  if (process.env.HOME?.trim()) homes.add(resolve(process.env.HOME.trim()));
+  homes.add(resolve(homedir()));
+  for (const h of homes) {
+    for (const sub of ['reviews', join('projects', 'projtool')]) {
+      const candidate = join(h, sub);
+      if (isInside(canonicalTarget, candidate)) return true;
+      try {
+        if (existsSync(candidate) && isInside(canonicalTarget, realpathSync(candidate))) return true;
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolve candidate brain directories ordered by `appDataDir` preference.
+ * When neither `brainDir` nor `brainDirs` is explicitly specified, includes both
+ * `~/.gemini/antigravity-cli/brain` and `~/.gemini/antigravity/brain`.
+ * When a single `brainDir` (ending with `brain`) is specified without `brainDirs` and `appDataDir` is known,
+ * also includes the sibling `<parent>/<appDataDir>/brain` (or `<appDataDir>/brain` if absolute).
+ */
+export function resolveAgyBrainDirs(options?: {
+  brainDir?: string;
+  brainDirs?: readonly string[];
+  appDataDir?: string;
+}): string[] {
+  const candidates: string[] = [];
+  const pushUnique = (dir: string | undefined): void => {
+    if (typeof dir !== 'string' || !dir.trim()) return;
+    const resolved = resolve(expandHomePath(dir.trim()));
+    if (!candidates.includes(resolved)) candidates.push(resolved);
+  };
+
+  const appDataDir = options?.appDataDir?.trim();
+  const hasExplicitList = Boolean(options?.brainDirs?.length);
+  const hasExplicitSingle = Boolean(options?.brainDir?.trim());
+
+  if (hasExplicitSingle || hasExplicitList) {
+    if (options?.brainDir) {
+      const resolvedSingle = resolve(expandHomePath(options.brainDir.trim()));
+      pushUnique(resolvedSingle);
+      if (!hasExplicitList && appDataDir && basename(resolvedSingle) === 'brain') {
+        if (isAbsolute(appDataDir)) {
+          pushUnique(join(resolve(appDataDir), 'brain'));
+        } else if (!appDataDir.includes('/') && !appDataDir.includes('\\') && appDataDir !== '.' && appDataDir !== '..') {
+          pushUnique(join(dirname(dirname(resolvedSingle)), appDataDir, 'brain'));
+        }
+      }
+    }
+    if (options?.brainDirs) {
+      for (const dir of options.brainDirs) pushUnique(dir);
+    }
+  } else {
+    pushUnique(DEFAULT_AGY_BRAIN_DIR);
+    pushUnique(DEFAULT_AGY_IDE_BRAIN_DIR);
+  }
+
+  if (appDataDir && candidates.length > 1) {
+    const normalizedApp = isAbsolute(appDataDir) ? resolve(appDataDir) : appDataDir;
+    candidates.sort((a, b) => {
+      const aMatch =
+        (isAbsolute(normalizedApp) && (a === join(normalizedApp, 'brain') || dirname(a) === normalizedApp)) ||
+        basename(dirname(a)) === normalizedApp;
+      const bMatch =
+        (isAbsolute(normalizedApp) && (b === join(normalizedApp, 'brain') || dirname(b) === normalizedApp)) ||
+        basename(dirname(b)) === normalizedApp;
+      if (aMatch === bMatch) return 0;
+      return aMatch ? -1 : 1;
+    });
+  }
+
+  return candidates;
 }
 
 export const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');

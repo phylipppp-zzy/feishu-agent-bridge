@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { compactCardField, compactProjectName, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { payloadDigest, type Session } from './contracts.js';
-import { providerDisplayLabel, providerTitlePrefix, type ChannelCard } from './feishu-cards.js';
+import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 import type { FeishuPort } from './feishu-channel.js';
 import { isGenericSessionTitle, normalizeTopicTitle } from './session-title.js';
@@ -19,31 +19,85 @@ export const TOPIC_TITLE_SCHEMA = `
     retry_after INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(destination, session_id, binding_scope)
   );
+  CREATE TABLE IF NOT EXISTS channel_topic_custom_titles (
+    destination TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    custom_title TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(destination, session_id)
+  );
 `;
 
 type TopicTitleRow = { rowid: number; synced_title: string; retry_after: number };
 const inFlightRoots = new WeakMap<FeishuPort, Set<string>>();
 const EXPIRED_ROOT_RETRY_AFTER = Number.MAX_SAFE_INTEGER;
 
-export function topicRootCard(session: Session): ChannelCard {
+const STATUS_DOTS: Record<string, string> = {
+  running: '🔵',
+  waiting_approval: '🟡',
+  waiting_question: '🟡',
+  idle: '🟢',
+  failed: '🔴',
+  read_only: '⚪',
+  archived: '⚪',
+};
+
+export function sessionStatusDot(status: Session['status']): string {
+  return STATUS_DOTS[status] ?? '🟢';
+}
+
+function stripLegacyTitlePrefix(raw: string): string {
+  let text = raw.replace(/\s+/gu, ' ').trim();
+  // Strip repeated leading status dots
+  text = text.replace(/^(?:[🔵🟡🟢🔴⚪]\s*)+/u, '').trim();
+  // Strip legacy "[AGY · project] " / "[Codex · project] " / "[Claude · project] " prefix
+  text = text.replace(/^\[(?:AGY|Antigravity|Codex|Claude)\s*·\s*[^\]]+\]\s*/iu, '').trim();
+  return text;
+}
+
+export function getCustomTopicTitle(db: DatabaseSync, destination: string, sessionId: string): string | null {
+  try {
+    const row = db.prepare(
+      'SELECT custom_title FROM channel_topic_custom_titles WHERE destination=? AND session_id=?'
+    ).get(destination, sessionId) as { custom_title?: string } | undefined;
+    const value = row?.custom_title?.trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+export function setCustomTopicTitle(db: DatabaseSync, destination: string, sessionId: string, title: string): string {
+  const cleaned = stripLegacyTitlePrefix(title) || '未命名会话';
+  db.prepare(`
+    INSERT OR REPLACE INTO channel_topic_custom_titles(destination, session_id, custom_title, updated_at)
+    VALUES (?, ?, ?, ?)
+  `).run(destination, sessionId, cleaned, Date.now());
+  return cleaned;
+}
+
+export function topicRootCard(session: Session, customTitle?: string | null): ChannelCard {
+  const effective = customTitle ? { ...session, title: customTitle } : session;
+  const fullTitle = stripLegacyTitlePrefix(effective.title) || '未命名会话';
   const template = sessionStatusTemplate(session.status);
+  const projectText = shortenHomePath(session.project);
+  const metaLine = `${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(projectText)} · ${sessionStatusLabel(session.status)}`;
   return {
-    title: displayTopicTitle(session),
-    text: `${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${sessionStatusLabel(session.status)}`,
+    title: displayTopicTitle(effective),
+    text: `**${escapeCardMarkdown(fullTitle)}**\n${metaLine}`,
     ...(template ? { template } : {}),
     actions: [],
   };
 }
 
 export function displayTopicTitle(session: Session): string {
-  const provider = session.native.provider === 'agy' ? 'AGY' : providerTitlePrefix(session.native.provider);
-  const project = compactProjectName(session.project).replace(/\s+/gu, ' ');
-  const prefix = `[${provider} · ${compactCardField(project, 24)}]`;
-  const fullPrefix = `[${provider} · ${project}]`;
-  const title = session.title.replace(/\s+/gu, ' ').trim();
-  const existingPrefix = [prefix, fullPrefix].find(candidate => title.startsWith(candidate));
-  const description = existingPrefix ? title.slice(existingPrefix.length).trimStart() : title;
-  return normalizeTopicTitle(`${prefix} ${description || '未命名会话'}`);
+  const dot = sessionStatusDot(session.status);
+  const description = stripLegacyTitlePrefix(session.title);
+  return normalizeTopicTitle(`${dot} ${description || '未命名会话'}`);
+}
+
+function rootCardSignature(card: ChannelCard): string {
+  return `${card.title}\n${card.template ?? ''}\n${card.text}`;
 }
 
 async function lookupRoot(port: FeishuPort, destination: string, creationDeliveryId?: string): Promise<string | null> {
@@ -75,12 +129,13 @@ export async function recordNewTopicRootTitle(
 ): Promise<void> {
   const rootId = await lookupRoot(port, destination, creationDeliveryId);
   if (!rootId || !isCurrentTitleScope(db, destination, session.sessionId, scope)) return;
+  const cardSig = rootCardSignature(topicRootCard(session, getCustomTopicTitle(db, destination, session.sessionId)));
   db.prepare(`
     INSERT OR IGNORE INTO channel_topic_titles(destination,session_id,binding_scope,root_message_id,synced_title)
     SELECT ?,?,?,?,? WHERE NOT EXISTS (
       SELECT 1 FROM channel_topic_titles WHERE destination=? AND root_message_id=?
     )
-  `).run(destination, session.sessionId, scope, rootId, displayTopicTitle(session), destination, rootId);
+  `).run(destination, session.sessionId, scope, rootId, cardSig, destination, rootId);
 }
 
 function titlePatchRetryAfter(error: unknown): number {
@@ -103,7 +158,9 @@ export async function syncTopicRootTitle(
   const rootId = await lookupRoot(port, destination);
   if (!rootId) return;
   if (!isCurrentTitleScope(db, destination, session.sessionId, scope)) throw new BindingExpired('binding changed');
-  const card = topicRootCard(session);
+  const customTitle = getCustomTopicTitle(db, destination, session.sessionId);
+  const card = topicRootCard(session, customTitle);
+  const cardSig = rootCardSignature(card);
   const titleKey = [destination, session.sessionId, scope] as const;
   let roots = inFlightRoots.get(port);
   if (!roots) inFlightRoots.set(port, roots = new Set());
@@ -128,25 +185,25 @@ export async function syncTopicRootTitle(
       WHERE destination=? AND root_message_id=? AND synced_title<>''
       ORDER BY rowid DESC LIMIT 1
     `).get(destination, rootId) as TopicTitleRow | undefined;
-    if (!unsettled && row?.rowid === lastApplied?.rowid && row?.synced_title === card.title) return;
+    if (!unsettled && row?.rowid === lastApplied?.rowid && row?.synced_title === cardSig) return;
     if (row && row.retry_after > Date.now()) return;
 
     const rememberTitle = () => db.prepare(`
       INSERT OR REPLACE INTO channel_topic_titles(destination,session_id,binding_scope,root_message_id,synced_title)
       VALUES (?,?,?,?,?)
-    `).run(...titleKey, rootId, card.title);
+    `).run(...titleKey, rootId, cardSig);
     await guard();
     // For old installations with no title history, assume the original generic title.
     // When a root is reused, use the latest known title across binding scopes.
-    if (!unsettled && lastApplied?.synced_title === card.title) {
+    if (!unsettled && lastApplied?.synced_title === cardSig) {
       rememberTitle();
       return;
     }
-    if (!unsettled && !row && !lastApplied && isGenericSessionTitle(session.title)) return;
+    if (!unsettled && !row && !lastApplied && !customTitle && isGenericSessionTitle(session.title)) return;
 
     // A title can recur after an intervening rename. The last successful write
     // identifies this transition and lets us recover a patch accepted before a restart.
-    const deliveryId = `${deliveryPrefix}${payloadDigest([...titleKey, lastApplied?.rowid ?? null, card.title])}`;
+    const deliveryId = `${deliveryPrefix}${payloadDigest([...titleKey, lastApplied?.rowid ?? null, cardSig])}`;
     const claimed = db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes;
     try {
       const alreadyPatched = !claimed && await port.lookupMessageId?.(deliveryId) === rootId;

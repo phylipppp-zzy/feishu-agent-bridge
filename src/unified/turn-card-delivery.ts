@@ -8,10 +8,17 @@ import { aggregateTurnAssistantMessage } from './turn-reply.js';
 import { completionText, replyText, turnProgressCard } from './turn-progress-card.js';
 import { timestampMs, type TurnTiming, type TurnToolCounts } from './turn-progress-store.js';
 
+function positiveEnvMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export const LONG_TURN_NOTICE_MS = 120_000;
-const PATCH_INTERVAL_MS = 1500;
+const PATCH_INTERVAL_MS = positiveEnvMs('FEISHU_PATCH_INTERVAL_MS', 1500);
 const HEARTBEAT_MS = 15_000;
-const REJECTION_RETRY_MS = 3_000;
+const REJECTION_RETRY_MS = positiveEnvMs('FEISHU_REJECTION_RETRY_MS', 3_000);
 
 type BindingKey = [destination: string, sessionId: string, scope: string];
 type SlotKey = [...BindingKey, turnId: string];
@@ -281,8 +288,28 @@ export class TurnCardDelivery {
     if (pending) {
       const receipt = await this.deliveryState(pending.view.delivery);
       await guard();
-      if (receipt === 'unknown') return false;
-      if (receipt === 'sent') {
+      if (receipt === 'unknown') {
+        const canRetryIdempotentPatch =
+          cardId !== null &&
+          !pending.replaced &&
+          isTerminalTurn(pending.view.status ?? undefined) &&
+          (pending.attempts ?? 0) < 3;
+        if (!canRetryIdempotentPatch) return false;
+        if (pending.retryAfter > Date.now()) {
+          this.schedule(key, pending.retryAfter);
+          return false;
+        }
+        const nextAttempt = (pending.attempts ?? 0) + 1;
+        const retryDelivery = `${finalId}:patch-retry-${nextAttempt}`;
+        const nextPending: CardAttempt = {
+          ...pending,
+          attempts: nextAttempt,
+          retryAfter: Date.now() + Math.min(20_000, 5_000 * 2 ** (nextAttempt - 1)),
+          view: { ...pending.view, delivery: retryDelivery },
+        };
+        this.saveAttempt(key, nextPending);
+        pending = nextPending;
+      } else if (receipt === 'sent') {
         if (!cardId || pending.replaced) {
           cardId = await this.port.lookupMessageId?.(pending.view.delivery) ?? null;
           await guard();
@@ -334,7 +361,7 @@ export class TurnCardDelivery {
       catch { /* File actions are optional; the persisted reply can still be delivered. */ }
     }
     await guard();
-    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files });
+    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3] });
     const learnedDuration = status === 'completed' && elapsed !== null && !old?.title.includes(' · 用时 ');
     if (old?.title && isTerminalTurn(old.status ?? undefined) && !learnedDuration) card.title = old.title;
     const signature = payloadDigest(card);

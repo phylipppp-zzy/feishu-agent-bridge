@@ -1,7 +1,9 @@
 import type { UnifiedService } from './adapter.js';
+import type { AgyQuotaSnapshot } from './agy-quota.js';
 import { formatResumeCommand, sessionStatusLabel, sessionStatusTemplate } from './card-formatters.js';
 import type { Session } from './contracts.js';
 import type { ChannelCard } from './feishu-cards.js';
+import { formatQuotaSummary } from './health-card.js';
 
 type Panel = Pick<ChannelCard, 'text' | 'actions'>;
 type NoticeSettings = {paused:boolean; completed:boolean; waiting:boolean; failed:boolean; revision:number};
@@ -24,9 +26,17 @@ export function noticePanel(session: Session, settings: NoticeSettings, legacy?:
   ]};
 }
 
-export function buildSessionPanel(session: Session, notice: Panel, work: Awaited<ReturnType<UnifiedService['getWorkState']>> | null): ChannelCard {
+export function buildSessionPanel(
+  session: Session,
+  notice: Panel,
+  work: Awaited<ReturnType<UnifiedService['getWorkState']>> | null,
+  options?: { quota?: AgyQuotaSnapshot | null },
+): ChannelCard {
   const command = formatResumeCommand(session.native);
-  const details = [...(command ? [`电脑端接回：\`${command}\``] : []), notice.text];
+  const quotaLines = session.native.provider === 'agy' && options && 'quota' in options
+    ? formatQuotaSummary(options.quota)
+    : [];
+  const details = [...(command ? [`电脑端接回：\`${command}\``] : []), ...quotaLines, notice.text];
   if (!work) return {
     title:'只读会话', template:'grey', text:['状态：只读', ...details].join('\n'),
     actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},...notice.actions],
@@ -41,7 +51,7 @@ export function buildSessionPanel(session: Session, notice: Panel, work: Awaited
     running.forEach((turn,index) => actions.push({label:running.length === 1 ? '中断当前回复' : `中断本轮回复 ${index+1}`,type:'primary',value:{action:'stop',turnId:turn.turnId,...base}}));
   }
   if (available && session.capabilities?.queue?.status === 'available') {
-    queued.forEach((item,index) => actions.push({label:`取消排队输入 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}}));
+    queued.forEach((item,index) => actions.push({label:queued.length === 1 ? '撤回排队' : `撤回排队 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}}));
   }
   actions.push(...notice.actions);
   if (!available) actions.push({label:'重新接入',value:{action:'upgrade'}});

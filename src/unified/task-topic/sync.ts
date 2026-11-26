@@ -316,7 +316,10 @@ async function renderCurrentTaskInteraction(
         )
         .run(deliveryId, binding.task_id, target.target_id).changes
     ) {
-      if ((await deps.port.lookupDelivery?.(deliveryId)) === 'sent') {
+      const previous = deps.db
+        .prepare('SELECT state FROM task_deliveries_v1 WHERE delivery_id = ?')
+        .get(deliveryId) as { state: string } | undefined;
+      if (previous?.state === 'sent' || (await deps.port.lookupDelivery?.(deliveryId)) === 'sent') {
         await guard();
         deps.db.prepare("UPDATE task_deliveries_v1 SET state = 'sent' WHERE delivery_id = ?").run(deliveryId);
         deps.db
@@ -333,8 +336,8 @@ async function renderCurrentTaskInteraction(
             target.session_id,
             interaction.interactionId,
           );
+        return;
       }
-      return;
     }
     await guard();
     await deps.port.update(binding.destination, row.message_id, card, deliveryId, guard);

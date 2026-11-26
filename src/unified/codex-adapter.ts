@@ -6,7 +6,7 @@ import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, Platf
 import { payloadDigest, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
 import { contractError } from './errors.js';
 import { CodexTransport } from './codex-transport.js';
-import type { ApprovalScope } from './approval-policy.js';
+import type { ApprovalScope, GateDecision } from './approval-policy.js';
 import { codexApprovalChoices, evaluateCodexApproval } from './codex-approval.js';
 
 type Obj = Record<string, any>;
@@ -137,12 +137,18 @@ export class CodexAdapter implements PlatformPort {
     const paths = [...new Set([...(requestedPaths?.paths ?? []), ...(observedPaths?.paths ?? [])])];
     const completePaths = requestedPaths?.complete !== false && observedPaths?.complete !== false && paths.length <= 256;
     try {
-      let decision = await evaluateCodexApproval(command, p, paths.slice(0,256), {
-        ...this.options.approvalPolicy, ...(project ? { project } : {}), ...(cwd !== undefined ? { cwd } : {}),
-      }, completePaths);
-      if (decision.kind === 'allow_once' && this.options.proveSharedFilesystem
-        && (!await this.options.proveSharedFilesystem(nativePath) || this.knownSessions.get(thread)?.path !== nativePath)) {
-        decision = { kind: 'ask', reason: '无法确认 Codex 线程与服务共享本机文件系统，需人工审批' };
+      const bridgeApprovalEnabled = this.options.approvalPolicy?.enabled !== false;
+      let decision: GateDecision;
+      if (!bridgeApprovalEnabled) {
+        decision = { kind: 'ask', reason: typeof p.reason === 'string' ? p.reason.trim() : '' };
+      } else {
+        decision = await evaluateCodexApproval(command, p, paths.slice(0,256), {
+          ...this.options.approvalPolicy, ...(project ? { project } : {}), ...(cwd !== undefined ? { cwd } : {}),
+        }, completePaths);
+        if (decision.kind === 'allow_once' && this.options.proveSharedFilesystem
+          && (!await this.options.proveSharedFilesystem(nativePath) || this.knownSessions.get(thread)?.path !== nativePath)) {
+          decision = { kind: 'ask', reason: '无法确认 Codex 线程与服务共享本机文件系统，需人工审批' };
+        }
       }
       if (!this.transport.connected || this.transport.generation !== generation || !this.active.has(thread)
         || this.approvalTurns.get(thread) !== turn || this.evaluatingApprovals.get(key) !== work) return;
@@ -157,11 +163,12 @@ export class CodexAdapter implements PlatformPort {
         const allowedDecisions = (['allow', 'deny'] as const).filter(choice => approvalChoices[choice]);
         const details = paths.length ? { ...p, paths } : p;
         const blocked = decision.kind === 'deny' ? '\n原端未提供可用的拒绝选项，请在原端处理。' : '';
+        const reasonHeader = `${decision.reason}${blocked}`;
         const interaction: Interaction = {
           interactionId: id, sessionId: thread, turnId: turn.id, nativeRequestId: id, connectionGeneration: generation,
           revision: 1, status: 'awaiting_answer', expiresAt: null, nativeResult: null, kind: 'approval',
           tool: command ? 'command' : 'file_change',
-          action: `${decision.reason}${blocked}\n${JSON.stringify(details)}`,
+          action: reasonHeader ? `${reasonHeader}\n${JSON.stringify(details)}` : JSON.stringify(details),
           scope: 'this_request', toolInputDigest: payloadDigest(details),
           ...(allowedDecisions.length < 2 ? { allowedDecisions } : {}),
         };

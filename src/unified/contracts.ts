@@ -73,10 +73,15 @@ export function validateResolution(x: ResolveInteraction, current: Interaction, 
   if (current.status !== 'awaiting_answer' || (current.expiresAt !== null && Date.parse(current.expiresAt) <= now)) return { ok: false, error: contractError('interaction_expired') };
   if (!x.answer || x.answer.kind !== current.kind) return fail('answer kind mismatch');
   if (current.kind === 'approval') {
-    if (x.answer.kind !== 'approval' || !['allow', 'deny'].includes(x.answer.decision) || x.answer.scope !== current.scope || x.toolInputDigest !== current.toolInputDigest) return fail('approval scope or tool input mismatch');
+    const allowAlways = (current as { allowAlways?: boolean }).allowAlways === true;
+    const scopeValid = x.answer.kind === 'approval' && (
+      x.answer.scope === current.scope
+      || (allowAlways && x.answer.decision === 'allow' && (x.answer.scope === 'session' || x.answer.scope === 'allow_always'))
+    );
+    if (x.answer.kind !== 'approval' || !['allow', 'deny'].includes(x.answer.decision) || !scopeValid || x.toolInputDigest !== current.toolInputDigest) return fail('approval scope or tool input mismatch');
     if (current.allowedDecisions && !current.allowedDecisions.includes(x.answer.decision)) return fail('native request does not offer this decision');
   } else if (current.kind === 'question_group') {
-    if (x.answer.kind !== 'question_group' || !x.answer.answers || Object.keys(x.answer.answers).length !== current.questions.length || new Set(current.questions.map(q => q.id)).size !== current.questions.length || !current.questions.every(q => { const values = x.answer.kind === 'question_group' ? x.answer.answers[q.id] : undefined; return Array.isArray(values) && values.length > 0 && values.every(nonempty) && (q.multiple !== false || values.length === 1) && (q.allowFreeText || values.every(v => q.choices.includes(v))) && new Set(values).size === values.length; })) return fail('invalid grouped question answer');
+    if (x.answer.kind !== 'question_group' || !x.answer.answers || Object.keys(x.answer.answers).length !== current.questions.length || new Set(current.questions.map(q => q.id)).size !== current.questions.length || !current.questions.every(q => { const values = x.answer.kind === 'question_group' ? x.answer.answers[q.id] : undefined; const isOptional = (q as { required?: boolean }).required === false; if (isOptional && Array.isArray(values) && values.length === 0) return true; return Array.isArray(values) && values.length > 0 && values.every(nonempty) && (q.multiple !== false || values.length === 1) && (q.allowFreeText || values.every(v => q.choices.includes(v))) && new Set(values).size === values.length; })) return fail('invalid grouped question answer');
   } else if (x.answer.kind !== 'question' || !Array.isArray(x.answer.values) || !x.answer.values.length || !x.answer.values.every(nonempty) || (!current.multiple && x.answer.values.length !== 1) || (!current.allowFreeText && !x.answer.values.every(v => current.choices.includes(v))) || new Set(x.answer.values).size !== x.answer.values.length) return fail('invalid question answer');
   return { ok: true, value: x };
 }

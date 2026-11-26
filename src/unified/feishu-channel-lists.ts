@@ -29,9 +29,10 @@ export async function showSessionList(
   guard: () => Promise<void>,
   reply: (card:ChannelCard,suffix:string,extraGuard:()=>Promise<void>) => Promise<string|void>,
 ): Promise<{nextCursor:string|null}> {
+  const trimmedSearch = search?.trim();
   const page = await service.listSessions({
     limit:5,
-    ...(search === undefined ? {} : {search}),
+    ...(trimmedSearch ? {search:trimmedSearch} : {}),
     ...(provider && provider !== 'all' ? {provider} : {}),
     ...(cursor === undefined ? {} : {cursor}),
   });
@@ -64,7 +65,12 @@ export async function showSessionList(
   const hasAgy = service.hasProvider?.('agy') as unknown;
   if (hasAgy instanceof Promise) void hasAgy.catch(() => {});
   const providerFilters = provider !== undefined || page.items.some(s => s.native.provider === 'agy') || hasAgy === true;
-  const card = sessionListCard(visible,{topicUrls,nextCursor:page.nextCursor,providerFilters,...(search ? {search} : {}),...(provider !== undefined ? {provider} : {})});
+  const card = sessionListCard(visible,{topicUrls,nextCursor:page.nextCursor,providerFilters,...(trimmedSearch ? {search:trimmedSearch} : {}),...(provider !== undefined ? {provider} : {})});
+  if (trimmedSearch) {
+    card.text = visible.length
+      ? `筛选关键词：${trimmedSearch}\n\n${card.text}`
+      : `没有匹配「${trimmedSearch}」的会话。`;
+  }
   if (page.unavailableProviders?.length) card.text += `\n暂不可用：${page.unavailableProviders.map(providerTitlePrefix).join('、')}，列表可能不完整。`;
   await reply(card,'reply',listGuard);
   return {nextCursor:page.nextCursor};

@@ -390,11 +390,24 @@ export class FeishuSessionBinding {
     await guard();
     const id = `attachment-submit:${operationId}`;
     const context = {...this.channel.context(e,bound,session.revision,session.control.generation),operationId:id,idempotencyKey:id};
-    const result = await this.service.submitInput({context,mode:pending.mode as 'new'|'queue'|'steer',blocks:[{type:'artifact',artifactId:op.result.artifactId,contentVersion:op.result.contentVersion}]});
+    const effectiveMode =
+      pending.mode === 'new' &&
+      session.status === 'running' &&
+      session.capabilities?.steer?.status !== 'available' &&
+      session.capabilities?.queue?.status === 'available'
+        ? 'queue'
+        : (pending.mode as 'new' | 'queue' | 'steer');
+    const result = await this.service.submitInput({context,mode:effectiveMode,blocks:[{type:'artifact',artifactId:op.result.artifactId,contentVersion:op.result.contentVersion}]});
     this.completePending(operationId);
     if (needsOperationNotice(result) || result.status === 'queued') {
       const card = operationCard(result);
-      if (result.status === 'queued') card.actions.push({label:'查看排队',value:{action:'panel'}});
+      if (result.status === 'queued') {
+        card.actions.push({label:'查看排队',value:{action:'panel'}});
+        card.actions.push({
+          label: '撤回排队',
+          value: { action: 'cancel', inputId: result.operationId, revision: session.revision, controlGeneration: session.control.generation },
+        });
+      }
       await reply(card);
     }
     return result;

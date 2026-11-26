@@ -13,7 +13,7 @@ import {
 } from './catalog-types.js';
 import { readAgySummaries, type AgyTitleCacheEntry } from './catalog-summaries.js';
 import { refreshAgyCatalog } from './catalog-refresh.js';
-import { readAgyTranscript } from './catalog-transcript.js';
+import { readAgyTranscript, readAgyTranscriptCreatedAt } from './catalog-transcript.js';
 import { discoverAgyArtifacts, readAgyArtifact } from './catalog-artifacts.js';
 
 /**
@@ -98,16 +98,44 @@ export class AgyCatalog {
     };
   }
 
+  private symlinkRoots(): readonly string[] | undefined {
+    if (this.options.allowedSymlinkRoots !== undefined) return this.options.allowedSymlinkRoots;
+    const combined = [
+      ...(this.options.allowedProjectRoots ?? []),
+      ...(this.options.outputRoots ?? []),
+    ];
+    return combined.length > 0 ? combined : undefined;
+  }
+
   async readTranscript(
     conversationId: string,
     options: Omit<AgyReadTranscriptOptions, 'brainDir'> = {},
   ): Promise<AgyTranscriptReadResult> {
     const readOpts: AgyReadTranscriptOptions = { ...options };
     if (this.options.brainDir !== undefined) readOpts.brainDir = this.options.brainDir;
+    if (readOpts.brainDirs === undefined && this.options.brainDirs !== undefined) {
+      readOpts.brainDirs = this.options.brainDirs;
+    }
+    if (readOpts.appDataDir === undefined) {
+      const appDataDir = this.sessions.get(conversationId)?.appDataDir;
+      if (appDataDir) readOpts.appDataDir = appDataDir;
+    }
     if (readOpts.maxBytes === undefined && this.options.maxTranscriptBytes !== undefined) {
       readOpts.maxBytes = this.options.maxTranscriptBytes;
     }
     return readAgyTranscript(conversationId, readOpts);
+  }
+
+  async readTranscriptCreatedAt(
+    conversationId: string,
+    appDataDir?: string,
+  ): Promise<string | null> {
+    const resolvedAppDataDir = appDataDir ?? this.sessions.get(conversationId)?.appDataDir;
+    return readAgyTranscriptCreatedAt(conversationId, {
+      ...(this.options.brainDir !== undefined ? { brainDir: this.options.brainDir } : {}),
+      ...(this.options.brainDirs !== undefined ? { brainDirs: this.options.brainDirs } : {}),
+      ...(resolvedAppDataDir ? { appDataDir: resolvedAppDataDir } : {}),
+    });
   }
 
   async history(
@@ -146,13 +174,22 @@ export class AgyCatalog {
     };
   }
 
-  async listArtifacts(conversationId: string): Promise<AgyArtifactEntry[]> {
+  async listArtifacts(
+    conversationId: string,
+    options: { includeScratch?: boolean } = {},
+  ): Promise<AgyArtifactEntry[]> {
     const artOpts: AgyArtifactOptions = {};
     if (this.options.brainDir !== undefined) artOpts.brainDir = this.options.brainDir;
+    if (this.options.brainDirs !== undefined) artOpts.brainDirs = this.options.brainDirs;
+    const appDataDir = this.sessions.get(conversationId)?.appDataDir;
+    if (appDataDir) artOpts.appDataDir = appDataDir;
     if (this.options.maxArtifactBytes !== undefined) artOpts.maxBytes = this.options.maxArtifactBytes;
     if (this.options.allowedArtifactExtensions !== undefined) {
       artOpts.allowedExtensions = this.options.allowedArtifactExtensions;
     }
+    const symlinkRoots = this.symlinkRoots();
+    if (symlinkRoots !== undefined) artOpts.allowedSymlinkRoots = symlinkRoots;
+    if (options.includeScratch !== undefined) artOpts.includeScratch = options.includeScratch;
     return discoverAgyArtifacts(conversationId, artOpts);
   }
 
@@ -160,13 +197,20 @@ export class AgyCatalog {
     conversationId: string,
     relativePath: string,
     expectedContentVersion?: string,
+    options: { includeScratch?: boolean } = {},
   ): Promise<{ entry: AgyArtifactEntry; content: Uint8Array }> {
     const artOpts: AgyArtifactOptions & { expectedContentVersion?: string } = {};
     if (this.options.brainDir !== undefined) artOpts.brainDir = this.options.brainDir;
+    if (this.options.brainDirs !== undefined) artOpts.brainDirs = this.options.brainDirs;
+    const appDataDir = this.sessions.get(conversationId)?.appDataDir;
+    if (appDataDir) artOpts.appDataDir = appDataDir;
     if (this.options.maxArtifactBytes !== undefined) artOpts.maxBytes = this.options.maxArtifactBytes;
     if (this.options.allowedArtifactExtensions !== undefined) {
       artOpts.allowedExtensions = this.options.allowedArtifactExtensions;
     }
+    const symlinkRoots = this.symlinkRoots();
+    if (symlinkRoots !== undefined) artOpts.allowedSymlinkRoots = symlinkRoots;
+    if (options.includeScratch !== undefined) artOpts.includeScratch = options.includeScratch;
     if (expectedContentVersion !== undefined) artOpts.expectedContentVersion = expectedContentVersion;
     return readAgyArtifact(conversationId, relativePath, artOpts);
   }

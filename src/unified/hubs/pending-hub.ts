@@ -70,6 +70,7 @@ export class PendingHub {
     | undefined;
   private readonly now: () => number;
   private readonly shouldRefreshSource: PendingHubOptions['shouldRefreshSource'];
+  private readonly shouldDeliverSource: PendingHubOptions['shouldDeliverSource'];
   private readonly refLocks = new Map<string, Promise<void>>();
   private summaryLock = Promise.resolve();
   private rootCreation: Promise<PendingHubRoot> | undefined;
@@ -95,6 +96,7 @@ export class PendingHub {
     this.resolveTopicLink = options.resolveTopicLink;
     this.now = options.now ?? (() => Date.now());
     this.shouldRefreshSource = options.shouldRefreshSource;
+    this.shouldDeliverSource = options.shouldDeliverSource;
 
     this.db = new DatabaseSync(options.dbPath);
     this.db.exec(PENDING_HUB_SCHEMA_SQL);
@@ -500,7 +502,8 @@ export class PendingHub {
     let sourceCardMessageId = existing?.source_card_message_id ?? null;
     let hubCardMessageId = existing?.hub_card_message_id ?? null;
 
-    if (item.sourceDestination) {
+    const deliverSource = !this.shouldDeliverSource || this.shouldDeliverSource(item);
+    if (item.sourceDestination && deliverSource) {
       const sourceCard = this.renderHubItemCard(item, 'source', hubBindingId);
       if (!sourceCardMessageId) {
         const deliveryId = `pending-src:${payloadDigest([item.refId, item.sourceDestination, itemRevision])}`;

@@ -48,18 +48,18 @@ Unified v2 在原有 **Codex + Claude** 双后端统一架构基础上，新增 
 | **R03** | 创建新会话 (`/create <provider> <cwd> [model]`) | 支持（SDK `query()`） | 支持（`thread/start`） | 支持（ACP `session/new`） | `cwd` 必须通过 `realpath` 且位于 `allowedProjectRoots` 内 |
 | **R04** | 提交输入与排队 (正文 / `/queue`) | `new` 支持；`queue` 由 Core 协调 | `new` 支持；原生 `queue` + Core 协调 | `new` 支持；`queue` 由 Core 协调 | 本轮未结束时普通正文不会直接覆盖当前轮 |
 | **R05** | 历史记录与导出 (`/history`, `/export`) | 支持（SDK 历史 + `HistoryArchive`） | 支持（`thread/read` + `HistoryArchive`） | 支持（`transcript.jsonl` / `transcript_full.jsonl`） | `agy` 自动剥离宿主注入标签（如 `<SYSTEM_MESSAGE>`）；`/export` 双读一致性校验 |
-| **R06** | 问答与工具审批识别 | 支持（`AskUserQuestion`、`CanUseTool`） | 支持（`requestUserInput`、命令/文件审批） | 支持（`elicitation/create`、`session/request_permission`） | 外部只读终端会话的待处理项在源话题只展示只读提示 |
-| **R07** | 问答与审批回传（卡片按钮 / 结构化表单） | 仅桥内交互会话支持 | 支持 | 支持 | 严格校验 `revision`、`connectionGeneration`、`toolInputDigest` 与表单 `bindingId` |
-| **R08** | 原生控制权切入/释放 (`/control`) | `unsupported` | 支持（`acquire` / `release`） | `handoff: unsupported`（`control('release')` 仅用于释放 ACP 会话） | 跨后端交接请使用 T2 显式结构化交接，不依赖原生终端接管 |
-| **R09** | 中断当前回复与残留核对 (`/stop`) | 支持中断；支持进程内 `ClaudeResidualObservation` | 支持中断；支持 `thread/backgroundTerminals/list` 残留核对 | 支持中断（`session/cancel`）；支持活跃 tool call 残留核对 | 断连或无完整连接归属时保守返回 `unknown`，不谎报“已彻底终止” |
+| **R06** | 问答与工具审批识别 | 支持（`AskUserQuestion`、`CanUseTool`） | 支持（`requestUserInput`、命令/文件审批） | 支持（`elicitation/create`、`session/request_permission`） | `agy` 的 `elicitation/create` 依赖 ACP v1 握手能力协商前提（未声明客户端表单能力时服务端可能不发该请求）；外部只读终端会话的待处理项在源话题只展示只读提示 |
+| **R07** | 问答与审批回传（卡片按钮 / 结构化表单） | 仅桥内交互会话支持 | 支持 | 支持 | 严格校验 `revision`、`connectionGeneration`、`toolInputDigest` 与表单 `bindingId`；表单问答依赖 R06 协商前提 |
+| **R08** | 原生控制权切入/释放 (`/control`) | `unsupported` | 支持（`acquire` / `release`） | live 能力为 `available`（已接入过的会话可 `release` 后 `reacquire`） | `agy` 仅释放/重接桥接层 ACP 会话，不证明可接管另一独立终端进程；跨后端交接请使用 T2 显式结构化交接 |
+| **R09** | 中断当前回复与残留核对 (`/stop`) | 支持中断；支持进程内 `ClaudeResidualObservation` | 支持中断；支持 `thread/backgroundTerminals/list` 残留核对 | 支持中断（`session/cancel`）；残留核对受限于活动轮次生命周期 | `agy` 中断须以原 `session/prompt` 终态为准；轮次终结、清理 `activeTurns` 或断连后残留核对保守返回 `unknown`，不谎报“已彻底终止” |
 | **R10** | 快照与增量事件订阅 | 支持（Core 统一游标与快照） | 支持（Core 统一游标与快照） | 支持（Core 统一游标与快照） | 游标过期自动走 `snapshot_required` 对齐并补发未见终态 |
 | **R11** | 运行中同回合追加引导 (`/steer`) | `unsupported` | **唯一支持**（单运行轮捕获 `turnId` + 双代次） | `unsupported` | 切目标、换轮或重连后自动失效；仅 Codex 可用 |
-| **R12** | 产物列表、安全读取与文件发送 (`/files`, `/ls`, `/deliver`) | 依赖 `EnrichedPort` 项目文件与输出链接注册 | 依赖 `EnrichedPort` 项目文件与输出链接注册 | **原生支持** `brain/<convId>/` 白名单产物 + `EnrichedPort` 项目文件 | 同名多版本文件按钮自动带 `(<contentVersion 前8位>)`；排除 `.system_generated/` 与敏感文件/越界软链 |
-| **R13** | 入站图片与纯文本附件 | 支持 PNG/JPEG/GIF/WebP 与 UTF-8 `.txt` | 支持 PNG/JPEG/GIF/WebP 与 UTF-8 `.txt` | 支持 PNG/JPEG/GIF/WebP 与 UTF-8 `.txt`（单附件上限 10 MiB） | 先持久化凭证再下载；校验 Magic Bytes 与 UTF-8 无 NUL |
+| **R12** | 产物列表、安全读取与文件发送 (`/files`, `/ls`, `/deliver`) | 依赖 `EnrichedPort` 项目文件与输出链接注册 | 依赖 `EnrichedPort` 项目文件与输出链接注册 | **原生支持** `brain/<convId>/` 白名单产物 + `EnrichedPort` 项目文件 | 同名多版本文件按钮自动带版本前缀；软链经 `realpath()` 校验落在 `allowedProjectRoots ∪ outputRoots` 白名单内方可放行；排除 `.system_generated/` 与敏感文件/越界软链 |
+| **R13** | 入站图片与纯文本附件 | 支持 PNG/JPEG/GIF/WebP（SDK 入口 20 MiB）与 UTF-8 `.txt`（1 MiB） | 支持 PNG/JPEG/GIF/WebP（SDK 入口 20 MiB）与 UTF-8 `.txt`（1 MiB） | 支持 PNG/JPEG/GIF/WebP（SDK 入口 20 MiB、AGY prompt 侧 10 MiB）与 UTF-8 `.txt`（入口 1 MiB） | 先持久化凭证再下载；校验 Magic Bytes 与 UTF-8 无 NUL |
 | **R14** | 模型列表与思考强度切换 (`/models`, `/model`) | 支持模型与 `reasoningEffort` | 支持（`model/list` + 思考强度） | 支持（ACP 返回模型或默认模型目录 + `session/set_model` / `thought_level`） | `agy` 自动剥离 `-xhigh` 等后缀并拆分传递 `reasoningEffort` |
 | **R15** | 归档与飞书通知偏好 (`/archive`, 面板通知开关) | `archive` `unsupported`；飞书通知偏好支持 | 支持 `thread/archive` 与通知偏好 | `archive` `unsupported`；飞书通知偏好支持 | 通知偏好细分为完成/等待/失败与全局暂停 |
 | **R16** | 未知结果核对与候选排查 (`/reconcile`, `/finish`, `/pending`, `/candidates`) | 支持 `/reconcile`、`/finish`、`/pending` | 支持以上全部 + `/candidates`（`thread/loaded/list` 元数据只读核对） | 支持 `/reconcile`、`/finish`、`/pending` | 候选展示明确标明“历史未验证”，不会自动认领创建结果 |
-| **R17** | 自动镜像与只读历史基线 (`autoMirror`) | 支持（独立 `channel_auto_claude_scope_watermarks` + 主会话证明） | 支持（独立 `channel_auto_scope_watermarks`） | 支持（独立 `channel_auto_agy_scope_watermarks`，屏蔽子代理） | 各后端独立 watermark；仅证明为启动后新建且非未来时间戳的会话才自动增量同步 |
+| **R17** | 自动镜像与只读历史基线 (`autoMirror`) | 支持（独立 `channel_auto_claude_scope_watermarks` + 主会话证明） | 支持（独立 `channel_auto_scope_watermarks`） | 支持（独立 `channel_auto_agy_scope_watermarks`，屏蔽子代理） | 各后端独立 watermark；`agy` 仅读取 `transcript` 头部首行 `created_at` 作为创建证明，缺失或未知来源记为 `unknown`，绝不回退 `last_modified_time` 充当启动后新建证明 |
 | **R18** | 健康诊断分层 (`/health`) | `claude_connection`、`claude_run`、`claude_quota` | `codex_connection`、`codex_run` | `agy_connection`、`agy_run`、`agy_quota`（仅启用 `agy` 时显示） | 与 `core`、`runtime`、`feishu_*`、`interaction_return` 统一聚合展示 |
 
 ### v2 新增可选扩展模块对照（默认全部关闭）
@@ -76,7 +76,7 @@ Unified v2 在原有 **Codex + Claude** 双后端统一架构基础上，新增 
 
 ## 3. 配置示例与无痛回滚
 
-统一运行入口为 `scripts/unified-start.mjs`（要求配置文件权限为 `0600`、属主为当前用户，且顶级字段仅允许 `sdkDb` 与 `runtime`；飞书凭据通过环境变量 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 注入）。
+统一运行入口为 `scripts/unified-start.mjs`（要求配置文件权限为 `0600`、属主为当前用户，且顶级字段仅允许 `sdkDb` 与 `runtime`；飞书凭据通过环境变量 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 注入）。仓库提供用户级 systemd 模板 [deploy/feishu-unified-bridge.service](../../deploy/feishu-unified-bridge.service) 与推荐配置模板 [deploy/unified-config.example.json](../../deploy/unified-config.example.json)（已拆分子项目根、开启 `agy.processPerSession`、`autoMirror.showTitles: true` 与 `pendingHub`）。
 
 ### 3.1 `config.json` 完整配置示例（含 `agy` 与可选模块）
 
@@ -185,7 +185,7 @@ Unified v2 在原有 **Codex + Claude** 双后端统一架构基础上，新增 
 | **U01** | 三后端共存与 `/health` | 在群内发送 `/health`、`/sessions`、`/new`。 | `/health` 清晰显示 `Claude`、`Codex`、`Antigravity` 三套分层状态；`/sessions` 与 `/new` 均含「Antigravity」筛选按钮；刻意断开某个后端时仅该后端状态降级，其余两个仍正常列表与响应。 |
 | **U02** | `agy` 新建、对话、切换模型与中断 | 发送 `/create agy <允许的项目目录>`；在新话题发一条普通任务；发送 `/model` 切换模型与思考强度；触发问答/工具审批并点击卡片按钮；在长输出中途发送 `/stop`。 | 仅建一个新话题；回复卡标题/正文前缀清晰标示 `Antigravity`；`/model` 下轮生效；权限卡支持批准/拒绝并回传 ACP；`/stop` 返回本轮中断与残留核对状态。 |
 | **U03** | `agy` 自动镜像与子代理屏蔽 | 在终端用 `agy` 启动一个新顶层会话，并在其中触发至少 1 个子代理（`nesting_depth > 0`），然后等待轮询同步。 | 飞书仅自动镜像 **1** 个顶层只读话题（如标题附带子代理计数提示），绝不给子代理单独建话题；既有的历史旧会话不会被反复刷屏推送。 |
-| **U04** | 双版本文件 `R12` 消歧与发送定位 | 在同一会话（如 `agy` 的 `brain` 目录或项目目录）生成同名文件的 v1、v2 两个不同内容版本；发送 `/files`。 | 卡片正文列出两个完整版本哈希，按钮标题分别为 `<文件名> (<v1前8位>)` 与 `<文件名> (<v2前8位>)`（单版本文件保持原名）；分别点击两个按钮，飞书依次收到不同内容的文件；再次点击已发送过的版本按钮，不再重复上传，而是返回「定位原文件消息」跳转链接；`.system_generated/` 与 `.env` 均不可见不可发送。 |
+| **U04** | 双版本文件 `R12` 消歧与发送定位 | 在同一会话准备两个**均仍可读**的同名文件版本（例如不同路径的同名文件或测试夹具独立版本 `v1`/`v2`），发送 `/files`；另测同路径文件被新内容覆盖后点击旧版本按钮。 | 两个均仍可读的版本在卡片中分别以 `<文件名> (<前6~8位哈希>)` 消歧（单版本文件保持原名），点击后依次下载不同内容，重复点击返回「定位原文件消息」；**同路径覆盖**不会自动保留旧字节，读取旧版本明确报错提示“内容已变更”；`.system_generated/` 与 `.env` 均不可见不可发送。 |
 | **U05** | `T1` 同话题多后端挂载与输入防串台 | 开启 `taskTopic.enabled`：在同一任务话题同时挂载 `claude`（活跃）、`codex`、`agy`；先向 `claude` 发送消息，随后通过面板切换到 `agy` 并立即向 `agy` 发消息；尝试对 `read_only` 目标点写操作。 | 同一轮次下各后端流式卡片独立更新、不互相覆盖；切换前后在途消息严格锁定入站时捕获的目标，绝不串给新目标；只读目标点击批准/输入被明确拒绝；切回 `codex` 时 `/steer` 可用，在 `claude`/`agy` 时明确提示不支持。 |
 | **U06** | `T2` 跨后端零 LLM 显式交接 | 在任务话题发起 `codex → agy` 交接预览卡片，检查正文后点击「确认交接到 Antigravity」；随后再重复点击同一张确认按钮一次；另测一次预览后先切换活跃目标再点旧预览卡。 | 预览阶段 `agy` 收到 **0** 次输入；预览卡显式列出目标 `cwd`、摘要、约束、引用文件，且声明“不复制全量历史、不继承工具权限”；首次点击确认后仅 `agy` 收到 1 条结构化交接信息（`codex` 收到 0 条）；重复点击幂等不重发；目标切换后旧预览卡被拒绝。 |
 | **U07** | `N1` 看守与运行提醒固定话题 | 开启 `watchHub`：通过看守脚本或受控测试注入一条 `watch`/`agy_status` 告警，随后再注入同 `objectId` 恢复事件；再尝试用非白名单源（如 `weekly_report`）写入。 | 群内只建立 **1** 个「看守与运行提醒」根话题；恢复事件直接更新原告警卡片为「已恢复」，不新增刷屏卡片；点击卡片「返回任务话题」可直达源话题；普通周报被拒绝，绝不混入看守话题。 |

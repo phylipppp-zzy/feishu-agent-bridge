@@ -1,6 +1,6 @@
 import type { QuestionForm } from './feishu-question-forms.js';
 import type { Interaction, Operation, Provider, Session } from './contracts.js';
-import { formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { compactCardField, formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 
 export function providerDisplayLabel(provider: Provider): string {
@@ -69,18 +69,49 @@ export function interactionStatusText(interaction: Interaction, operation?: Oper
   return null;
 }
 
-export function interactionCard(i: Interaction, readOnly = false, operation?: Operation | null): ChannelCard {
+export function interactionCard(
+  i: Interaction & { allowAlways?: boolean; allowedScopes?: readonly string[] },
+  readOnly = false,
+  operation?: Operation | null,
+): ChannelCard {
   const base = { action: 'answer', interactionId: i.interactionId, revision: i.revision, connectionGeneration: i.connectionGeneration };
   const status = interactionStatusText(i,operation);
   const awaiting = !status && i.status === 'awaiting_answer';
   const readonlyNote = '此话题为只读。请在原终端答复。';
   let actions: ChannelCard['actions'] = [];
   if (!readOnly && awaiting) {
-    if (i.kind === 'approval') actions = (i.allowedDecisions ?? ['allow', 'deny']).map(decision => ({
-      label: decision === 'allow' ? '允许本次' : '拒绝',
-      type: decision === 'allow' ? 'primary' : 'default',
-      value: { ...base, answer: { kind: 'approval', decision, scope: i.scope }, toolInputDigest: i.toolInputDigest },
-    }));
+    if (i.kind === 'approval') {
+      const decisions = i.allowedDecisions ?? ['allow', 'deny'];
+      actions = [];
+      for (const decision of decisions) {
+        if (decision === 'allow') {
+          actions.push({
+            label: i.scope === 'allow_always' ? '本会话允许' : '允许本次',
+            type: 'primary',
+            value: { ...base, answer: { kind: 'approval', decision: 'allow', scope: i.scope }, toolInputDigest: i.toolInputDigest },
+          });
+          const wantsSessionButton = i.scope !== 'allow_always' && (
+            i.allowAlways === true ||
+            i.allowedScopes?.includes('session') === true ||
+            i.allowedScopes?.includes('allow_always') === true
+          );
+          if (wantsSessionButton) {
+            const sessionScope = i.allowedScopes?.includes('allow_always') ? 'allow_always' : 'session';
+            actions.push({
+              label: '本会话允许',
+              type: 'default',
+              value: { ...base, answer: { kind: 'approval', decision: 'allow', scope: sessionScope }, toolInputDigest: i.toolInputDigest },
+            });
+          }
+        } else {
+          actions.push({
+            label: '拒绝',
+            type: 'default',
+            value: { ...base, answer: { kind: 'approval', decision: 'deny', scope: i.scope }, toolInputDigest: i.toolInputDigest },
+          });
+        }
+      }
+    }
     else if (i.kind === 'question' && !i.multiple) actions = i.choices.map(choice => ({ label: choice, value: { ...base, answer: { kind: 'question', values: [choice] }, toolInputDigest: null } }));
   }
   if (i.kind === 'approval') {
@@ -97,7 +128,18 @@ export function interactionCard(i: Interaction, readOnly = false, operation?: Op
     else if (operation?.status === 'completed' || (i.status === 'resolved' && answer)) { title = '审批 · 已确认'; template = 'green'; }
     else if (i.status === 'resolved') { title = '审批 · 已处理'; template = 'grey'; }
     else if (status) title = '审批 · 等待原端确认';
-    const originalNote = awaiting && i.allowedDecisions?.length === 0 ? '请在原端处理此审批。' : '';
+    if (!awaiting) {
+      const compactTarget = view.compactTarget
+        ? `\`${compactCardField(view.compactTarget, 80).replace(/`/gu, "'")}\``
+        : '';
+      const compactText = [
+        escapeCardMarkdown(view.toolLabel),
+        compactTarget,
+        status,
+      ].filter(Boolean).join(' · ');
+      return { title, template, format: 'markdown', text: compactText, actions };
+    }
+    const originalNote = i.allowedDecisions?.length === 0 ? '请在原端处理此审批。' : '';
     return { title, template, format: 'markdown', text: [view.text, status, readOnly ? readonlyNote : originalNote].filter(Boolean).join('\n\n'), actions };
   }
   const resolved = i.status === 'resolved' || operation?.status === 'completed';

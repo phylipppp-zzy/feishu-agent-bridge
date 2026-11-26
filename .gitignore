@@ -10,5 +10,6 @@ env.pending
 *.sqlite-shm
 *.sqlite-wal
 coverage/
+.tsbuildinfo
 
 .feishu-release-staging-*/

@@ -12,11 +12,11 @@ import type { Interaction } from '../src/unified/contracts.js';
 
 const base = {interactionId:'i',sessionId:'s',turnId:'t',nativeRequestId:'n',connectionGeneration:2,revision:3,status:'awaiting_answer',expiresAt:null,toolInputDigest:null,nativeResult:null} as const;
 const metadata = {action:'answer_form',bindingId:'binding',interactionId:'i',revision:3,connectionGeneration:2};
-test('single choice and free text are distinct, mutually exclusive for a single answer',()=>{
+test('single choice and free text allow free text override for a single answer',()=>{
  const i:Interaction={...base,kind:'question',prompt:'What?',choices:['a','b'],multiple:false,allowFreeText:true};
  assert.deepEqual(decodeQuestionForm(metadata,{q0_choice:'1'},i,'binding').answer,{kind:'question',values:['b']});
  assert.deepEqual(decodeQuestionForm(metadata,{q0_text:'free, text'},i,'binding').answer,{kind:'question',values:['free, text']});
- assert.throws(()=>decodeQuestionForm(metadata,{q0_choice:'0',q0_text:'other'},i,'binding'),/invalid answer/);
+ assert.deepEqual(decodeQuestionForm(metadata,{q0_choice:'0',q0_text:'other'},i,'binding').answer,{kind:'question',values:['other']});
  assert.throws(()=>decodeQuestionForm(metadata,{q0_choice:'5'},i,'binding'),/invalid selection/);
  assert.throws(()=>decodeQuestionForm(metadata,{q0_text:'x'.repeat(1001)},i,'binding'),/too long/);
 });

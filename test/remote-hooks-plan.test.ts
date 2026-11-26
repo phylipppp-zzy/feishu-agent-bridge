@@ -10,7 +10,7 @@ import {
   stopAsyncRewakeSchemaFixture, stopHookSchemaFixture,
 } from "../src/claude/remote-hooks-plan.js";
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const root = resolve(dirname(fileURLToPath(import.meta.url)), import.meta.url.includes("/dist/test/") ? "../.." : "..");
 const cli = join(root, "scripts", "prepare-claude-remote-hooks.mjs");
 const permissionGroup = (command: string, hookScript: string, socketPath: string) => ({
   hooks: [{ type: "command", command, args: [hookScript, "--socket", socketPath], timeout: PERMISSION_HOOK_TIMEOUT_SECONDS }],
