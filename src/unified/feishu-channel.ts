@@ -939,6 +939,19 @@ export class FeishuChannel {
     if (cursor) {
       const events = await this.service.subscribeEvents(sessionId,cursor,100); await syncGuard();
       if (events.status === 'events') {
+        if (events.events.length === 0 && events.cursor === cursor) {
+          const hasPendingCards = this.turnCards.hasPendingWork(scopeKey);
+          const hasInteractionCards = Boolean(
+            this.db.prepare('SELECT 1 FROM channel_interaction_cards WHERE destination=? AND session_id=? AND binding_scope=? LIMIT 1')
+              .get(destination, sessionId, scope),
+          );
+          if (!hasPendingCards && !hasInteractionCards) {
+            const session = await this.service.getSession(sessionId); await syncGuard();
+            await syncTopicRootTitle(this.db, this.port, destination, scope, session, card => this.stampCard(destination, card), syncGuard);
+            if (reconcileReleasedReadonly(session)) return true;
+            return false;
+          }
+        }
         const snapshot=await this.service.getSnapshot(sessionId); await syncGuard();
         for (const i of snapshot.value.interactions) await this.interactionCards.render(destination,sessionId,i.interactionId,scope,allowWaiting);
         const messageIds = new Set(events.events.filter(event => event.type === 'message.updated').map(event => event.objectId));

@@ -94,6 +94,24 @@ export class TurnCardDelivery {
         PRIMARY KEY(destination,session_id,binding_scope,turn_id));
     `);
   }
+  hasPendingWork(key: BindingKey): boolean {
+    const [destination, sessionId, scope] = key;
+    const active = this.db.prepare(`SELECT 1 FROM channel_stream_cards s
+      LEFT JOIN channel_turn_card_views v ON v.destination=s.destination AND v.session_id=s.session_id
+        AND v.binding_scope=s.binding_scope AND v.turn_id=s.message_id
+      WHERE s.destination=? AND s.session_id=? AND s.binding_scope=? AND
+        (v.dirty=1 OR (v.status='running' OR v.status IS NULL AND s.final=0) AND NOT EXISTS (
+          SELECT 1 FROM channel_deliveries WHERE delivery_id=v.delivery AND state='rejected'
+        ) OR EXISTS (
+          SELECT 1 FROM channel_deliveries d JOIN channel_delivery_diagnostics x USING(delivery_id)
+          WHERE d.delivery_id=v.delivery AND d.state='unknown' AND x.kind='api_rejected' AND x.platform_code<>0
+        )) LIMIT 1`).get(destination, sessionId, scope);
+    if (active) return true;
+    const pending = this.db.prepare(`SELECT 1 FROM channel_turn_pending_finalization
+      WHERE destination=? AND session_id=? AND binding_scope=? LIMIT 1`).get(...key);
+    return Boolean(pending);
+  }
+
   isBaselinedMessage(key: BindingKey, messageId: string, revision: number): boolean {
     const row = this.db.prepare(`SELECT revision FROM channel_turn_baseline_messages
       WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?`)

@@ -624,12 +624,15 @@ export async function readSessionSnapshot(
         cursor: `warn-err:${id}`,
         data: {
           warnings: [`failed to read transcript: ${message}`],
-          parseErrors: 0,
+          parseErrors: 1,
           truncatedTrailingLine: false,
           fullTranscriptSkippedReason: 'transcript_read_error',
         },
       },
     });
+    if (!ctx.active.has(id)) {
+      throw contractError('temporarily_unavailable', `failed to read transcript for ${id}: ${message}`);
+    }
   }
 
   const live = ctx.liveMessages.get(id) ?? [];
