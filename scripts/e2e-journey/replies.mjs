@@ -277,12 +277,12 @@ async function longReplies(ctx) {
         { startedAt: turn.startedAt, endedAt: turn.endedAt });
       await waitForPatchWindow(ctx, claude);
       await ctx.tick();
-      trace.check('150 秒回复只发送一条文本通知，摘要恰到 79 字后接单省略号', () => {
+      trace.check('150 秒回复只发送一条极简完成提醒，不截断正文片段', () => {
         assert.match(completionCard(ctx, claude).card.title, /用时 2分30秒/);
         const pushes = visibleWrites(ctx, claude, 'text');
         assert.equal(pushes.length, 1);
         assert.equal(JSON.parse(pushes[0].content).text,
-          `✅ 本轮已完成（用时 2分30秒）· ${[...firstLine].slice(0, 79).join('')}…`);
+          '✅ 本轮已完成（用时 2分30秒），完整结论见上方回复卡。');
       });
     });
   });
