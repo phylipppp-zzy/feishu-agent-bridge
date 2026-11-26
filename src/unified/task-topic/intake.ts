@@ -6,6 +6,7 @@ import { isResolvedApproval } from '../feishu-interaction-cards.js';
 import {
   getBindingRow,
   getBindingRowByDestination,
+  firstMountedTargets,
   getTargetRow,
   runTransaction,
 } from './schema.js';
@@ -134,7 +135,11 @@ export function resolveTargetForIntake(
   }
 
   if (!binding.active_target_id) {
-    if (a.action === 'panel' || a.action === 'help') {
+    if (a.action === 'legacy_stop') {
+      const mounted = firstMountedTargets(db,binding.task_id);
+      if (mounted.length === 1) return mounted[0]!;
+    }
+    if (a.action === 'panel' || a.action === 'help' || a.action === 'legacy_stop') {
       return {
         task_id: binding.task_id,
         target_id: '',

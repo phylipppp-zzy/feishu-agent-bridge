@@ -139,7 +139,14 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
-    case 'stop': if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration)) { const taskScope = parseTaskScope(value, false); return {action:'stop',turnId:value.turnId,revision:value.revision,controlGeneration:value.controlGeneration,...(taskScope ?? {})}; } break;
+    case 'stop':
+      if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration) &&
+          (value.fallbackCurrent === undefined || typeof value.fallbackCurrent === 'boolean')) {
+        const taskScope = parseTaskScope(value, false);
+        return {action:'stop',turnId:value.turnId,revision:value.revision,controlGeneration:value.controlGeneration,
+          ...(value.fallbackCurrent === true ? {fallbackCurrent:true} : {}),...(taskScope ?? {})};
+      }
+      break;
     case 'cancel': if (str(value.inputId) && counter(value.revision) && counter(value.controlGeneration)) { const taskScope = parseTaskScope(value, false); return {action:'cancel',inputId:value.inputId,revision:value.revision,controlGeneration:value.controlGeneration,...(taskScope ?? {})}; } break;
     case 'control': if (str(value.owner) && (value.strategy === 'wait' || value.strategy === 'interrupt') && counter(value.revision) && counter(value.controlGeneration) && (value.release === undefined || typeof value.release === 'boolean')) return {action:'control',owner:value.owner,strategy:value.strategy,revision:value.revision,controlGeneration:value.controlGeneration,...(typeof value.release === 'boolean' ? {release:value.release}:{})}; break;
     case 'models': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'models',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;

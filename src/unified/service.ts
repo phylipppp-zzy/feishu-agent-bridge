@@ -1,7 +1,7 @@
 import type { HistoryReader } from './history-port.js';
 import { randomUUID } from 'node:crypto';
-import type { PlatformInputBlock, UnifiedService, DispatchGuard, ListQuery, PlatformObservation, PlatformPort } from './adapter.js';
-import { payloadDigest, validateSubmitInput, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SessionSnapshot, type SubmitInput, type WriteContext } from './contracts.js';
+import type { InputScopeValidator, PlatformInputBlock, UnifiedService, DispatchGuard, ListQuery, PlatformObservation, PlatformPort } from './adapter.js';
+import { payloadDigest, validateSubmitInput, validateWriteContext, type Interaction, type Message, type Operation, type Provider, type ResolveInteraction, type Session, type SessionSnapshot, type SubmitInput, type WriteContext } from './contracts.js';
 import { contractError, type ContractError } from './errors.js';
 import { responseLeaseKey, StoreError, UnifiedStore } from './store.js';
 
@@ -95,10 +95,19 @@ export class UnifiedCore implements UnifiedService {
   private readonly messageObservations=new Map<string,number>();
   private observationFailure: string | null = null;
   private closed=false;
-  validateSteerScope?: (scope:NonNullable<SubmitInput['channelScope']>,sessionId:string)=>boolean;
+  validateSteerScope?: InputScopeValidator;
+  private readonly localInputScopeValidators = new Set<InputScopeValidator>();
+  registerInputScopeValidator(validate: InputScopeValidator): () => void {
+    this.localInputScopeValidators.add(validate);
+    return () => { this.localInputScopeValidators.delete(validate); };
+  }
   private inputScopeCurrent(input: SubmitInput, sessionId: string): boolean {
-    return !input.channelScope || (input.mode !== 'steer' && input.mode !== 'new') ||
-      this.validateSteerScope?.(input.channelScope,sessionId) === true;
+    return this.channelScopeCurrent(input.channelScope,sessionId);
+  }
+  private channelScopeCurrent(scope: WriteContext['channelScope'], sessionId: string): boolean {
+    if (!scope) return true;
+    if (this.validateSteerScope) return this.validateSteerScope(scope,sessionId) === true;
+    return [...this.localInputScopeValidators].some(validate => validate(scope, sessionId));
   }
   onAcceptedObservation?: (observation:PlatformObservation)=>void;
   private readonly unsubscribe: Array<() => void> = [];
@@ -432,7 +441,44 @@ export class UnifiedCore implements UnifiedService {
   }
   async resolveInteraction(request: ResolveInteraction) { this.check(request.context, 'resolveInteraction'); return this.store.resolveInteraction(request); }
   async inspectTurnResidual(sessionId:string,turnId:string) {const s=this.store.getSession(sessionId);const turn=this.store.listTurns(sessionId).find(t=>t.turnId===turnId);if(!turn || turn.status!=='interrupted') return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'轮次尚未确认中断'};const port=this.port(s);if(!port.inspectTurnResidual) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'此provider未提供可信残留查询'};try {const result=await port.inspectTurnResidual(s.native,turnId); if(!['running','none','unknown'].includes(result.status) || typeof result.complete!=='boolean' || (result.count!==null && (!Number.isSafeInteger(result.count) || result.count<0)) || (result.observedAt!==null && !Number.isFinite(Date.parse(result.observedAt)))) throw Error('invalid residual result'); if(result.status==='unknown' || result.count===null || !result.observedAt) return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'查询失败或连接归属不完整'}; if(!result.complete) return result.status==='running' && result.count>0 ? {...result,reason:'至少有已登记任务仍在运行；查询不完整，其他外部作业或后代未确认'} : {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'查询失败或连接归属不完整'}; if((result.status==='none' && result.count!==0) || (result.status==='running' && result.count===0)) throw Error('invalid residual count');return {...result,reason:result.status==='running'?'目标轮次已登记任务仍在运行；未知外部作业或后代未确认':'未发现目标轮次已登记残留；未知外部作业或后代未确认'};} catch {return {status:'unknown' as const,count:null,observedAt:null,complete:false,reason:'残留查询不可用'};} }
-  async interruptTurn(request: { context: WriteContext; payload: { turnId: string } }) { const s = this.check(request.context, 'interruptTurn'); if (s.capabilities.interrupt.status !== 'available') return fail('unsupported'); return this.store.registerOperation(request.context, 'interruptTurn', request.payload); }
+  private checkStopScope(context: WriteContext): Session {
+    const valid = validateWriteContext(context);
+    if (!valid.ok) throw new StoreError(valid.error);
+    const session = this.check(context,'interruptTurn');
+    if (!this.channelScopeCurrent(context.channelScope,session.sessionId)) return fail('control_conflict','binding changed');
+    return session;
+  }
+  async interruptTurn(request: { context: WriteContext; payload: { turnId: string } }) {
+    const session = this.checkStopScope(request.context);
+    if (session.capabilities.interrupt.status !== 'available') return fail('unsupported');
+    return this.store.registerOperation(request.context,'interruptTurn',request.payload);
+  }
+  async stopOrCancelQueued(context: WriteContext, assertCurrent?: () => Promise<void>) {
+    this.checkStopScope(context);
+    const authorize = (action: 'interruptTurn' | 'cancelQueuedInput') => {
+      const session = this.check(context,action);
+      if (action === 'interruptTurn' && session.capabilities.interrupt.status !== 'available') return fail('unsupported');
+    };
+    const replay = this.store.findStopOrCancelQueued(context,authorize);
+    if (replay) return replay;
+    // Drain any native dispatch and its turn observations before selecting the stop target.
+    let tail: Promise<unknown> | undefined;
+    do {
+      while ((tail = this.tails.get(context.targetId))) await tail.catch(() => undefined);
+      if (assertCurrent) await assertCurrent();
+    } while (this.tails.has(context.targetId));
+    this.checkStopScope(context);
+    const settled = this.store.findStopOrCancelQueued(context,authorize);
+    if (settled) return settled;
+    const owner = randomUUID();
+    const lease = this.store.acquireDispatchLease(context.targetId,owner,Date.now(),30000);
+    if (lease === null) return fail('busy','another dispatcher owns this session');
+    try {
+      return this.store.stopOrCancelQueued(context,authorize);
+    } finally {
+      this.store.releaseDispatchLease(context.targetId,owner,lease);
+    }
+  }
   async setNotificationSubscription(request: { context: WriteContext; payload: { enabled: boolean; eventTypes: string[] } }) { this.check(request.context, 'setNotificationSubscription'); if (typeof request.payload.enabled !== 'boolean' || !Array.isArray(request.payload.eventTypes) || !request.payload.eventTypes.every(x => typeof x === 'string' && !!x)) return fail('invalid_request'); return this.store.setNotificationPreference(request.context, request.payload); }
   async detachSession(request: {context:WriteContext; payload:Record<string,never>}): Promise<Operation> { const s = this.check(request.context,'detachSession'); if (!this.mayDetach(s)) return fail('busy','other bindings not confirmed absent'); return this.store.detachTracking(request.context); }
   async stageInputArtifact(request: {context:WriteContext; payload:{name:string; mediaType:string; size:number; contentDigest:string; content:Uint8Array}}): Promise<Operation> { this.check(request.context,'stageInputArtifact'); return this.store.stageArtifact(request.context,request.payload); }
@@ -479,7 +525,8 @@ export class UnifiedCore implements UnifiedService {
       const out = this.store.getOutbox(id);
       if (out.state !== 'pending') return this.store.getOperation(id);
       const session = this.check(out.context, out.kind);
-      if (out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));
+      if ((out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) ||
+          (out.kind === 'interruptTurn' && !this.channelScopeCurrent(out.context.channelScope,session.sessionId))) return this.store.reconcileOperation(id,'failed',contractError('control_conflict','binding changed'));
       const earlier = out.kind === 'submitInput' ? this.store.pendingOutbox(session.sessionId, 'submitInput')[0] : id;
       if (earlier !== id) return fail('busy', 'earlier input awaits dispatch');
       if (out.kind === 'submitInput') { const barrier=this.store.settingsBarrier(session.sessionId); if(barrier) return fail(barrier === 'unknown' ? 'outcome_unknown' : 'busy','settings must be reconciled before input'); }
@@ -497,7 +544,8 @@ export class UnifiedCore implements UnifiedService {
           if (!this.authorize(out.context.identity,current,out.kind) || this.store.isDetached(session.sessionId) || this.store.recoveryQuarantined(session.sessionId)) return fail('unauthorized');
           if (current.control.generation !== out.context.controlGeneration || (out.kind !== 'requestControl' && current.control.input !== 'available')) return fail('control_conflict');
           if (this.store.connectionGeneration(session.sessionId) !== out.connectionGeneration) return fail('interaction_expired');
-          if (out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) return fail('control_conflict','binding changed');
+          if ((out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) ||
+              (out.kind === 'interruptTurn' && !this.channelScopeCurrent(out.context.channelScope,session.sessionId))) return fail('control_conflict','binding changed');
           if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || input.expectedConnectionGeneration!==out.connectionGeneration)return fail('interaction_expired','captured turn changed');}
           if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
           if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
@@ -542,6 +590,8 @@ export class UnifiedCore implements UnifiedService {
         if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {if(nativeReference!==(out.payload as SubmitInput).requiredTurnId)return this.store.markDeliveryUnknown(id);return this.store.completeSteer(id);}
         return this.store.acceptSubmission(id,nativeReference);
       } catch (error) {
+        // Terminal evidence may already have settled the interruption.
+        if (out.kind === 'interruptTurn' && this.store.getOutbox(id).state !== 'in_flight') return this.store.getOperation(id);
         if (!guarded && (out.kind === 'requestControl' || out.kind === 'releaseControl')) {
           const rejected = responsePrewriteError(error);
           if (rejected) return this.store.reconcileOperation(id,'failed',rejected);
@@ -549,7 +599,7 @@ export class UnifiedCore implements UnifiedService {
         const input = out.kind === 'submitInput' ? out.payload as SubmitInput : null;
         if (!guarded && error instanceof StoreError && (
             error.detail.code === 'busy' ||
-            ((input?.mode === 'steer' || (input?.mode === 'new' && input.channelScope)) &&
+            ((input?.mode === 'steer' || input?.channelScope || (out.kind === 'interruptTurn' && out.context.channelScope)) &&
               ['control_conflict','interaction_expired','unauthorized'].includes(error.detail.code))
         )) return this.store.reconcileOperation(id,'failed',error.detail);
         if (!guarded && error && typeof error === 'object' && 'code' in error) {

@@ -18,7 +18,8 @@ const obj = (required: Record<string, Check>, optional: Record<string, Check> = 
 const record = (v: Check): Check => x => !!x && typeof x === 'object' && !Array.isArray(x) && Object.getPrototypeOf(x) === Object.prototype && Reflect.ownKeys(x).every(k => typeof k === 'string' && !!Object.getOwnPropertyDescriptor(x,k)?.enumerable && 'value' in Object.getOwnPropertyDescriptor(x,k)! && v((x as Record<string,unknown>)[k]));
 const json: Check = x => { try { const walk = (v: unknown, seen: Set<object>): boolean => { if (v === null || typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) return true; if (!v || typeof v !== 'object' || seen.has(v)) return false; seen.add(v); const valid = Array.isArray(v) ? Object.keys(v).length === v.length && v.every(y => walk(y, seen)) : record(y => walk(y, seen))(v); seen.delete(v); return valid; }; return walk(x,new Set()); } catch { return false; } };
 const identity = obj({subject:str,source:str});
-const context = obj({operationId:str,idempotencyKey:str,targetId:str,expectedRevision:uint,controlGeneration:uint,identity});
+const channelScope = obj({destination:str,bindingScope:str,ownerSource:str,ownerSubject:str});
+const context = obj({operationId:str,idempotencyKey:str,targetId:str,expectedRevision:uint,controlGeneration:uint,identity},{channelScope});
 const native = obj({provider:one('claude','codex','agy'),hostId:str,serviceId:str,nativeSessionId:str});
 const capability: Check = x => obj({status:one('available')})(x) || obj({status:one('unsupported','temporarily_unavailable'),reason:str})(x);
 const capabilities = obj(Object.fromEntries(['view','send','queue','steer','answer','approve','interrupt','handoff','files','config'].map(k => [k,capability])));
@@ -28,11 +29,12 @@ const block: Check = x => obj({type:one('text'),text:str})(x) || obj({type:one('
 const message = obj({messageId:str,sessionId:str,turnId:str,role:one('user','assistant','tool'),blocks:array(block),sequence:uint,revision:uint,final:bool,source:str});
 const question = obj({id:str,prompt:str,choices:array(str),multiple:nullable(bool),allowFreeText:bool});
 const answer: Check = x => obj({kind:one('question_group'),answers:record(array(str))})(x) || obj({kind:one('question'),values:array(str)})(x) || obj({kind:one('approval'),decision:one('allow','deny'),scope:str})(x);
-const result: Check = x => obj({status:one('accepted'),source:str,answer:nullable(answer)})(x) || obj({status:one('unknown'),source:str})(x) || obj({status:one('rejected'),reason:str})(x);
+const result: Check = x => obj({status:one('accepted'),source:str,answer:one(null),disposition:one('skipped')})(x) ||
+  obj({status:one('accepted'),source:str,answer:nullable(answer)},{disposition:one()})(x) || obj({status:one('unknown'),source:str})(x) || obj({status:one('rejected'),reason:str})(x);
 const ibase = {interactionId:str,sessionId:str,turnId:str,nativeRequestId:str,connectionGeneration:uint,revision:uint,status:one('awaiting_answer','answer_pending_delivery','resolved','expired','cancelled'),expiresAt:nullable(date),nativeResult:nullable(result)};
 const interaction: Check = x => obj({...ibase,kind:one('question_group'),toolInputDigest:nullable(str),questions:array(question)})(x) || obj({...ibase,kind:one('question'),toolInputDigest:nullable(str),prompt:str,choices:array(str),multiple:bool,allowFreeText:bool})(x) || obj({...ibase,kind:one('approval'),toolInputDigest:str,tool:str,action:str,scope:str})(x);
 const error = obj({code:one('unsupported','busy','control_conflict','stale_revision','interaction_expired','unauthorized','temporarily_unavailable','outcome_unknown','idempotency_conflict','invalid_request','snapshot_required'),retryable:bool,suggestedAction:str},{message:str});
-const operationResult: Check = x => obj({kind:one('session'),sessionId:str})(x) || obj({kind:one('artifact'),artifactId:str,contentVersion:str})(x) || obj({kind:one('turn'),turnId:str,status:one('completed','failed','interrupted')})(x);
+const operationResult: Check = x => obj({kind:one('stopRejected'),reason:one('no_running_turn','ambiguous_running_turn')})(x) || obj({kind:one('queueCancellation'),cancelled:uint})(x) || obj({kind:one('session'),sessionId:str})(x) || obj({kind:one('artifact'),artifactId:str,contentVersion:str})(x) || obj({kind:one('turn'),turnId:str,status:one('completed','failed','interrupted')})(x);
 const operation = obj({operationId:str,idempotencyKey:str,targetId:str,action:str,payloadDigest:str,status:one('received','queued','accepted','completed','failed','unknown'),revision:uint,error:nullable(error)},{result:operationResult});
 const artifact = obj({artifactId:str,sessionId:str,name:str,mediaType:str,size:uint,contentVersion:str},{relativePath:str});
 const event = obj({schemaVersion:one(1),eventId:str,sessionId:str,objectId:str,objectRevision:uint,sequence:uint,type:str,occurredAt:date,receivedAt:date,operationId:nullable(str),cursor:str,data:json});

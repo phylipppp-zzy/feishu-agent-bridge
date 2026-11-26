@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { relative, isAbsolute, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
 import type { Answer, Identity, Operation, Provider, WriteContext, Session, SessionSnapshot, Message } from './contracts.js';
-import { payloadDigest } from './contracts.js';
+import { payloadDigest, shouldAutoQueueInput } from './contracts.js';
 import { contractError } from './errors.js';
 import { decodeQuestionForm } from './feishu-question-forms.js';
 import { historyTextCard, listAllArtifacts, sessionModelPage, showSessionList } from './feishu-channel-lists.js';
@@ -70,7 +70,7 @@ export type ChannelAction = (
  | { action: 'input'; text: string; mode: 'new' | 'queue' | 'steer' }
  | { action: 'answer_form'; interactionId:string; revision:number; connectionGeneration:number; fields:Record<string,unknown>; decline?: boolean }
  | { action: 'answer'; interactionId: string; revision: number; connectionGeneration: number; answer: Answer; toolInputDigest: string | null }
- | { action: 'stop'; turnId: string; revision: number; controlGeneration: number }
+ | { action: 'stop'; turnId: string; revision: number; controlGeneration: number; fallbackCurrent?: boolean }
  | { action: 'legacy_stop' }
  | { action: 'control'; owner: string; strategy: 'wait' | 'interrupt'; revision: number; controlGeneration: number; release?: boolean }
  | { action: 'artifacts'; sessionId?: string; cursor?: string }
@@ -114,6 +114,7 @@ export class FeishuChannel {
   private readonly topicSyncs = new Map<string, Promise<void>>();
   private migrationLocked=false;
   private closed = false;
+  private readonly unregisterInputScope: (() => void) | undefined;
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
@@ -173,6 +174,8 @@ export class FeishuChannel {
       stamp: (...args) => this.stampCard(...args),
       deliver: (...args) => this.deliver(...args),
     });
+    const unregister = service.registerInputScopeValidator?.((scope,id) => this.isCurrentSteerScope(scope,id));
+    if (typeof unregister === 'function') this.unregisterInputScope = unregister;
   }
   recordDeliveryDiagnostic(id:string,kind:'api_rejected'|'guard_rejected'|'unknown',code:number|null):void {try {this.db.prepare('INSERT OR REPLACE INTO channel_delivery_diagnostics VALUES (?,?,?)').run(id,kind,code);this.diagnosticFaults.delete('feishu_delivery');} catch(error) {this.diagnosticFaults.add('feishu_delivery');throw error;}}
   unconfirmedDeliveryCount():number {const row=this.db.prepare("SELECT COUNT(*) AS count FROM channel_deliveries d LEFT JOIN channel_delivery_diagnostics x ON x.delivery_id=d.delivery_id WHERE d.state='unknown' AND (x.kind IS NULL OR x.kind='unknown')").get() as {count:number};return Number(row.count);}
@@ -187,7 +190,7 @@ export class FeishuChannel {
     } catch(error){this.healthFaults.add(component);throw error;}
   }
   healthFact(component:string):{status:'healthy'|'degraded'|'unverified';reason:string|null;lastObservedAt:string|null;lastSuccessAt:string|null;lastFailureAt:string|null;lastFailureReason:string|null} {const r=this.db.prepare('SELECT status,reason,observed_at,success_at,failure_at,failure_reason FROM channel_health_facts WHERE component=?').get(component) as {status:'healthy'|'degraded'|'unverified';reason:string|null;observed_at:string;success_at:string|null;failure_at:string|null;failure_reason:string|null}|undefined;const fault=this.healthFaults.has(component)||this.diagnosticFaults.has(component);return r?{status:fault?'degraded':this.observedHealth.has(component)?r.status:'unverified',reason:fault?'健康诊断记录失败':this.observedHealth.has(component)?r.reason:'当前进程尚未重新观测',lastObservedAt:r.observed_at,lastSuccessAt:r.success_at,lastFailureAt:r.failure_at,lastFailureReason:r.failure_reason}:{status:fault?'degraded':'unverified',reason:fault?'健康诊断记录失败':'尚无可验证观测',lastObservedAt:null,lastSuccessAt:null,lastFailureAt:null,lastFailureReason:null};}
-  close(): void { this.closed = true; this.turnCards.close(); this.db.close(); }
+  close(): void { this.closed = true; this.unregisterInputScope?.(); this.turnCards.close(); this.db.close(); }
   beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
   endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
   inspectMigrationBinding(id:string,destination:string):'removable'|'retained'|'absent' { if(!this.migrationLocked) throw new Error('migration lock required'); this.db.exec('SAVEPOINT migration_inspect'); try {const result=this.rollbackMigrationBinding(id); if(result==='retained' && !this.db.prepare('SELECT 1 FROM channel_bindings WHERE destination=?').get(destination)) throw new Error('migration binding missing despite receipt; manual review'); this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); return result==='removed'?'removable':result==='absent' && this.db.prepare('SELECT 1 FROM channel_bindings WHERE destination=?').get(destination)?'retained':result;} catch(e) {this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); throw e;} }
@@ -641,6 +644,7 @@ export class FeishuChannel {
     if (!bound) throw new Error('destination is not bound');
     const session = await this.service.getSession(bound);
     const current = () => this.context(e, bound, session.revision, session.control.generation);
+    const channelScope = {destination:e.destination,bindingScope:executionScope,ownerSource:e.identity.source,ownerSubject:e.identity.subject};
     if (a.action === 'panel') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
       const mode=this.accessMode(e.destination);
@@ -651,7 +655,18 @@ export class FeishuChannel {
       await reply(buildSessionPanel(session,this.noticePanel(e.destination,bound,executionScope,session),work,quotaOption));
       return work ? {running:work.runningTurns.length,queued:work.queuedInputs.length} : {accessMode:mode};
     }
-    if (a.action === 'legacy_stop') { const work=await this.service.getWorkState(bound); await guard(); if(work.runningTurns.length!==1) {await reply({title:'中断回复',text:work.runningTurns.length===0 ? '当前没有可中断的回复。' : '当前有多个进行中的回复，请打开会话控制选择本轮。',actions:[{label:'会话控制',value:{action:'panel'}}]});return {status:'rejected',reason:work.runningTurns.length===0?'no_running_turn':'ambiguous_running_turn'};} const op=await this.service.interruptTurn({context:current(),payload:{turnId:work.runningTurns[0]!.turnId}});if (needsOperationNotice(op)) await reply(operationCard(op));return op; }
+    if (a.action === 'legacy_stop') {
+      await guard();
+      const result = await this.service.stopOrCancelQueued({...current(),channelScope},guard);
+      if ('operationId' in result) {
+        if (needsOperationNotice(result)) await reply(operationCard(result));
+      } else if ('cancelled' in result) {
+        await reply({title:'中断回复',text:`已取消排队中的 ${result.cancelled} 条输入`,actions:[]});
+      } else {
+        await reply({title:'中断回复',text:result.reason === 'no_running_turn' ? '当前没有可中断的回复。' : '当前有多个进行中的回复，请打开会话控制选择本轮。',actions:[{label:'会话控制',value:{action:'panel'}}]});
+      }
+      return result;
+    }
     if (a.action === 'project_files') {
       if (!this.service.listProjectFiles) throw new Error('project browsing unavailable');
       const listing = await this.service.listProjectFiles(bound, a.directory, a.showHidden);
@@ -730,25 +745,40 @@ export class FeishuChannel {
     if (a.action === 'swarm') {
       if (session.native.provider !== 'agy') { await reply(buildSwarmUnsupportedCard()); return {status:'rejected',reason:'unsupported'}; }
       if (this.accessMode(e.destination) === 'read_only') { await reply(buildSwarmReadOnlyAgyCard()); return {status:'rejected',reason:'read_only_binding'}; }
-      const swarmOp = await this.service.submitInput({context:current(),mode:'new',blocks:[{type:'text',text:a.rawText}]});
+      const mode = shouldAutoQueueInput(session) ? 'queue' : 'new';
+      const swarmOp = await this.service.submitInput({context:current(),mode,blocks:[{type:'text',text:a.rawText}],
+        channelScope});
       if (swarmOp.status !== 'queued' && swarmOp.status !== 'failed' && swarmOp.status !== 'unknown') return swarmOp;
       const card = operationCard(swarmOp); if (swarmOp.status === 'queued') card.actions.push({label:'查看排队',value:{action:'panel'}});
       await reply(card); return swarmOp;
     }
-    if(a.action==='stop' && this.service.getTurn) {await guard();const turn=await this.service.getTurn(bound,a.turnId);await guard();if(turn && ['completed','failed','interrupted'].includes(turn.status)) {const label:Record<string,string>={completed:'已完成',failed:'已失败',interrupted:'已中断'};let text=`目标轮次${label[turn.status]}，未再次发出中断。`;if(turn.status==='interrupted'){const result=await this.service.inspectTurnResidual?.(bound,a.turnId);await guard();text=`${formatInterruptedTurn(result)}\n未再次发出中断。`;}await reply({title:'中断回复',text,actions:[]});return {status:'already_finished',turnStatus:turn.status};}}
+    let stopTurnId: string | undefined;
+    if (a.action === 'stop' && this.service.getTurn) {
+      await guard();
+      const turn = await this.service.getTurn(bound,a.turnId);
+      if (turn && ['completed','failed','interrupted'].includes(turn.status)) {
+        const running = a.fallbackCurrent && a.bindingId && a.controlGeneration === session.control.generation
+          ? (await this.service.getWorkState(bound)).runningTurns : [];
+        if (running.length === 1) stopTurnId = running[0]!.turnId;
+        else {
+          const labels:Record<string,string> = {completed:'已完成',failed:'已失败',interrupted:'已中断'};
+          const text = turn.status === 'interrupted'
+            ? `${formatInterruptedTurn(await this.service.inspectTurnResidual?.(bound,a.turnId))}\n未再次发出中断。`
+            : `目标轮次${labels[turn.status]}，未再次发出中断。`;
+          await reply({title:'中断回复',text,actions:[]});
+          return {status:'already_finished',turnStatus:turn.status};
+        }
+      }
+      await guard();
+    }
+    const autoQueue = shouldAutoQueueInput(session);
     let op;
     let effectiveInputMode: 'new' | 'queue' | 'steer' | undefined;
     let queuedPreviewText: string | undefined;
     if (a.action === 'input') {
-      effectiveInputMode =
-        a.mode === 'new' &&
-        session.status === 'running' &&
-        session.capabilities?.steer?.status !== 'available' &&
-        session.capabilities?.queue?.status === 'available'
-          ? 'queue'
-          : a.mode;
+      effectiveInputMode = a.mode === 'new' && autoQueue ? 'queue' : a.mode;
       queuedPreviewText = a.text;
-      op = await this.service.submitInput({context:current(),mode:effectiveInputMode,blocks:[{type:'text',text:a.text}]});
+      op = await this.service.submitInput({context:current(),mode:effectiveInputMode,blocks:[{type:'text',text:a.text}],channelScope});
     }
     else if (a.action === 'answer_form') {
       const i = await this.service.getInteraction(a.interactionId);
@@ -762,17 +792,11 @@ export class FeishuChannel {
     else if (a.action === 'answer') { const i = await this.service.getInteraction(a.interactionId); if (i.sessionId !== bound) throw new Error('interaction target mismatch'); op = await this.service.resolveInteraction({context:this.context(e,bound,a.revision,session.control.generation),interactionId:a.interactionId,expectedConnectionGeneration:a.connectionGeneration,answer:a.answer,toolInputDigest:a.toolInputDigest}); }
     else if (a.action === 'attachment') {
       if (a.mediaType === 'application/pdf' && a.localPath) {
-        effectiveInputMode =
-          a.mode === 'new' &&
-          session.status === 'running' &&
-          session.capabilities?.steer?.status !== 'available' &&
-          session.capabilities?.queue?.status === 'available'
-            ? 'queue'
-            : a.mode;
+        effectiveInputMode = a.mode === 'new' && autoQueue ? 'queue' : a.mode;
         const byteSize = a.size ?? a.content.byteLength;
         const promptText = `用户上传了 PDF 附件：${a.name}（${byteSize} 字节）\n本地路径：${a.localPath}\n请使用 read_file 读取该文件。`;
         queuedPreviewText = promptText;
-        op = await this.service.submitInput({context:current(),mode:effectiveInputMode,blocks:[{type:'text',text:promptText}]});
+        op = await this.service.submitInput({context:current(),mode:effectiveInputMode,blocks:[{type:'text',text:promptText}],channelScope});
       } else {
         const stageContext = current();
         this.sessionBinding.recordPending(stageContext.operationId,e,bound,'artifact',a.mode);
@@ -781,7 +805,10 @@ export class FeishuChannel {
       }
     }
     else { const ctx = this.context(e,bound,a.revision,a.controlGeneration); switch (a.action) {
-      case 'stop': op = await this.service.interruptTurn({context:ctx,payload:{turnId:a.turnId}}); break;
+      case 'stop': op = await this.service.interruptTurn({
+        context:{...ctx,channelScope,expectedRevision:a.bindingId ? session.revision : ctx.expectedRevision},
+        payload:{turnId:stopTurnId ?? a.turnId},
+      }); break;
       case 'control': op = a.release ? await this.service.releaseControl({context:ctx,payload:{owner:a.owner}}) : await this.service.requestControl({context:ctx,payload:{owner:a.owner,strategy:a.strategy}}); break;
       case 'settings': op = await this.service.updateSessionSettings({context:ctx,payload:{model:a.model,preferences:a.preferences}}); break;
       case 'cancel': op = await this.service.cancelQueuedInput({context:ctx,payload:{inputId:a.inputId}}); break;

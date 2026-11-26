@@ -1,12 +1,16 @@
 import type { DirectoryListing } from '../claude/deliver.js';
-import type { ModelOption, ConfirmedSettings, ResponseEvidence } from './contracts.js';
+import type { ModelOption, ConfirmedSettings, ResponseEvidence, ChannelInputScope, StopRejection } from './contracts.js';
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
+export type InputScopeValidator = (scope:ChannelInputScope, sessionId:string) => boolean;
+export type StopResult = Operation | {status:'completed'; cancelled:number} |
+  {status:'rejected'; reason:StopRejection};
 export type { ResponseEvidence } from './contracts.js';
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
+  registerInputScopeValidator?(validate: InputScopeValidator): () => void;
   hasProvider?(provider: Provider): boolean;
   listSessions(query: ListQuery): Promise<Page<Session>>;
   unknownCreateProvider?(identity:{source:string;subject:string},destination:string,operationId:string):Promise<Provider|null>;
@@ -37,6 +41,7 @@ export interface UnifiedService {
   getResponseOperation?(interactionId: string): Promise<Operation | null>;
   resolveInteraction(request: ResolveInteraction): Promise<Operation>;
   interruptTurn(request: WriteRequest<{ turnId: string }>): Promise<Operation>;
+  stopOrCancelQueued(context: WriteContext, assertCurrent?: () => Promise<void>): Promise<StopResult>;
   inspectTurnResidual?(sessionId:string,turnId:string):Promise<TurnResidual>;
   cancelQueuedInput(request: WriteRequest<{ inputId: string }>): Promise<Operation>;
   getControlState(sessionId: string): Promise<ControlState>;

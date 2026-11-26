@@ -93,6 +93,7 @@ export class AgyAdapter implements PlatformPort {
   private readonly knownSessions = new Map<string, LiveSessionMeta>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly lockedSessions = new Map<string, SessionLockState>();
+  private readonly recentTerminalTools = new Map<string, Set<string>>();
   private readonly turnResiduals = new Map<string, TurnResidualSnapshot>();
   private readonly sessionTurns = new Map<string, Map<string, Turn>>();
   private readonly liveMessages = new Map<string, Message[]>();
@@ -183,6 +184,7 @@ export class AgyAdapter implements PlatformPort {
       upsertLiveMessage: (sessionId, message) => this.upsertLiveMessage(sessionId, message),
       putSessionTurn: (sessionId, turn) => this.putSessionTurn(sessionId, turn),
       getSessionModel: sessionId => this.sessionSettings.get(sessionId)?.model ?? null,
+      recentTerminalTools: this.recentTerminalTools,
       recordTurnResidual: (sessionId, turnState) => this.recordTurnResidual(sessionId, turnState),
       pruneSnapshots: () => this.pruneSnapshots(),
     };
@@ -267,6 +269,7 @@ export class AgyAdapter implements PlatformPort {
     }
     expireAllPendingRequests(this.ctx, this.transport.connectionGeneration || null);
     this.activeTurns.clear();
+    this.recentTerminalTools.clear();
     this.lockedSessions.clear();
     this.active.clear();
     this.listSnapshots.clear();
@@ -1097,6 +1100,7 @@ export class AgyAdapter implements PlatformPort {
         this.lockedSessions.delete(id);
       }
       if (this.active.delete(id)) {
+        this.recentTerminalTools.delete(id);
         this.lastActivityAt.delete(id);
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
         this.emitSession(ref, id);
@@ -1143,6 +1147,7 @@ export class AgyAdapter implements PlatformPort {
         this.lockedSessions.delete(id);
       }
       if (this.active.delete(id)) {
+        this.recentTerminalTools.delete(id);
         this.lastActivityAt.delete(id);
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
         this.emitSession(this.ref(id), id);

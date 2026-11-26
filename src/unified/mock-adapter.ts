@@ -26,6 +26,7 @@ export function createMockAdapter(provider: Provider): UnifiedService & { provid
     receipts.set(context.idempotencyKey, op); return op;
   }
   const methods = {
+    registerInputScopeValidator: undefined,
     provider,
     hasProvider(p: Provider) { return p === provider; },
     async listSessions(_query: ListQuery) { return { items: [session], nextCursor: null }; },
@@ -40,6 +41,7 @@ export function createMockAdapter(provider: Provider): UnifiedService & { provid
     async requestControl(request: WriteRequest<{ owner: string; strategy: 'wait' | 'interrupt' }>) { return receipt(request.context, 'requestControl', request.payload); },
     async releaseControl(request: WriteRequest<{ owner: string }>) { return receipt(request.context, 'releaseControl', request.payload); },
     async interruptTurn(request: WriteRequest<{ turnId: string }>) { return receipt(request.context, 'interruptTurn', request.payload); },
+    async stopOrCancelQueued() { return {status:'rejected',reason:'no_running_turn'}; },
     async cancelQueuedInput(request: WriteRequest<{ inputId: string }>) { return receipt(request.context, 'cancelQueuedInput', request.payload); },
     async getSession(_id: string) { return session; },
     async capabilities(_id: string) { return capabilities; },

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Build a sealed production release of feishu-agent-bridge and update config + systemd unit."""
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 REPO = Path('/home/zhangzy/workspace/feishu-agent-bridge')
 RELEASES_ROOT = Path('/home/zhangzy/.local/share/feishu-unified-bridge/releases')
@@ -14,6 +16,28 @@ CONF_DIR = Path('/home/zhangzy/.config/feishu-unified-bridge')
 CONF_FILE = CONF_DIR / 'config.json'
 UNIT_FILE = Path('/home/zhangzy/.config/systemd/user/feishu-unified-production.service')
 PARENT_RELEASE = 'ebee30d-uxv2-7691b684804b'
+
+def validate_agy_sandbox(runtime):
+    approval_disabled = runtime.get('approvalPolicy', {}).get('enabled') is False
+    agy = runtime.get('agy')
+    if approval_disabled and (not isinstance(agy, dict) or agy.get('sandbox') is not True):
+        raise RuntimeError('agy.sandbox must be explicitly true when approvalPolicy.enabled is false')
+    extra_args = agy.get('extraArgs', []) if isinstance(agy, dict) else []
+    if not isinstance(extra_args, list) or any(
+        not isinstance(arg, str) or not arg.strip() or '\0' in arg for arg in extra_args
+    ):
+        raise RuntimeError('agy.extraArgs must be a list of non-empty strings without NUL bytes')
+    if not approval_disabled:
+        return
+    args = [arg.strip().lower() for arg in extra_args]
+    disabled = {'false', 'off', '0'}
+    for index, arg in enumerate(args):
+        flag, sep, value = arg.partition('=')
+        if flag == '--no-sandbox' or (flag == '--sandbox' and (
+            (sep and value.strip() in disabled) or
+            (not sep and index + 1 < len(args) and args[index + 1] in disabled)
+        )):
+            raise RuntimeError('agy.extraArgs must preserve the sandbox when approvalPolicy.enabled is false')
 
 commit = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'], text=True).strip()
 branch = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--abbrev-ref', 'HEAD'], text=True).strip()
@@ -76,6 +100,7 @@ CONF = Path('/home/zhangzy/.config/feishu-unified-bridge')
 STATE = Path('/home/zhangzy/.local/state/feishu-unified-bridge')
 MAN = RELEASE / 'dist.sha256'
 EXPECTED = {dist_manifest_sha!r}
+{inspect.getsource(validate_agy_sandbox)}
 def ok(v):
     if not v:
         raise RuntimeError('preflight rejected')
@@ -85,6 +110,7 @@ try:
     ok(p.is_file() and not p.is_symlink() and s.st_uid == os.getuid() and not s.st_mode & 0o077)
     c = json.loads(p.read_text())
     r = c['runtime']
+    validate_agy_sandbox(r)
     context = json.loads((CONF / 'root-check-context.json').read_text())
     candidates = json.loads((CONF / 'root-candidates-private.json').read_text())['records']
     ok(len(candidates) == 136 and all(x['chatId'] == r['allowedDestinations'][0] for x in candidates))
@@ -192,8 +218,12 @@ WantedBy=default.target
 os.rename(staging, release_dir)
 
 # 2. Update config.json cleanly (atomic replace with 0600 permissions)
-cfg = json.loads(CONF_FILE.read_text(encoding='utf-8'))
+orig_bytes = CONF_FILE.read_bytes()
+cfg = json.loads(orig_bytes.decode('utf-8'))
 rt = cfg['runtime']
+rt['approvalPolicy'] = {'enabled': False}
+agy = rt.setdefault('agy', {})
+agy['sandbox'] = True
 rt['allowedProjectRoots'] = [
     '/home/zhangzy/workspace',
     '/home/zhangzy/papers',
@@ -209,9 +239,7 @@ rt['outputRoots'] = [
     '/data/zhangzy/outputs',
     '/ssd/zhangzy/scratch',
 ]
-rt['approvalPolicy'] = {'enabled': False}
 rt['autoTakeControlOnInput'] = True
-agy = rt.setdefault('agy', {})
 agy['processPerSession'] = True
 agy['defaultMode'] = 'auto'
 agy['addDirs'] = ['/ssd/zhangzy', '/data/zhangzy']
@@ -221,19 +249,27 @@ agy['extraWriteRoots'] = [
     '/data/zhangzy/staging',
 ]
 
-tmp_cfg = CONF_DIR / '.config.json.tmp'
-fd = os.open(tmp_cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, 'w', encoding='utf-8') as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-    f.write('\n')
-os.chmod(tmp_cfg, 0o600)
-os.replace(tmp_cfg, CONF_FILE)
-
-# 3. Validate config syntax with new unified-start.mjs (offline check)
-subprocess.run(
-    ['/usr/local/node-v24.11.1-linux-x64/bin/node', '--no-warnings', str(release_dir / 'scripts/unified-start.mjs'), '--config', str(CONF_FILE)],
-    check=True,
-)
+validate_agy_sandbox(rt)
+tmp_cfg = None
+try:
+    with NamedTemporaryFile(mode='w', encoding='utf-8', dir=CONF_DIR,
+                            prefix='.config.json.', suffix='.tmp', delete=False) as f:
+        tmp_cfg = Path(f.name)
+        os.fchmod(f.fileno(), 0o600)
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+    # Validate the candidate offline before atomically replacing the live config.
+    subprocess.run(
+        ['/usr/local/node-v24.11.1-linux-x64/bin/node', '--no-warnings', str(release_dir / 'scripts/unified-start.mjs'), '--config', str(tmp_cfg)],
+        check=True,
+    )
+    if CONF_FILE.read_bytes() != orig_bytes:
+        raise RuntimeError('Live config changed during validation; refusing to replace it')
+    os.replace(tmp_cfg, CONF_FILE)
+    tmp_cfg = None
+finally:
+    if tmp_cfg is not None:
+        tmp_cfg.unlink(missing_ok=True)
 
 # 4. Update systemd user unit
 UNIT_FILE.write_text(unit_content, encoding='utf-8')

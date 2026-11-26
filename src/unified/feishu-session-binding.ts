@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from './adapter.js';
-import type { Operation, Session, WriteContext } from './contracts.js';
+import { shouldAutoQueueInput, type Operation, type Session, type WriteContext } from './contracts.js';
 import { operationCard, sessionCard, type ChannelCard } from './feishu-cards.js';
 import type { Authorize, AuthorizeBindingAdmin, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { needsOperationNotice, operationFromReceipt, pendingSessionAuthorization } from './feishu-operation-notices.js';
@@ -444,14 +444,11 @@ export class FeishuSessionBinding {
     await guard();
     const id = `attachment-submit:${operationId}`;
     const context = {...this.channel.context(e,bound,session.revision,session.control.generation),operationId:id,idempotencyKey:id};
-    const effectiveMode =
-      pending.mode === 'new' &&
-      session.status === 'running' &&
-      session.capabilities?.steer?.status !== 'available' &&
-      session.capabilities?.queue?.status === 'available'
-        ? 'queue'
-        : (pending.mode as 'new' | 'queue' | 'steer');
-    const result = await this.service.submitInput({context,mode:effectiveMode,blocks:[{type:'artifact',artifactId:op.result.artifactId,contentVersion:op.result.contentVersion}]});
+    const effectiveMode = pending.mode === 'new' && shouldAutoQueueInput(session)
+      ? 'queue' : (pending.mode as 'new' | 'queue' | 'steer');
+    const channelScope = {destination:pending.destination,bindingScope:pending.scope,ownerSource:e.identity.source,ownerSubject:e.identity.subject};
+    const result = await this.service.submitInput({context,mode:effectiveMode,blocks:[{type:'artifact',artifactId:op.result.artifactId,contentVersion:op.result.contentVersion}],
+      channelScope});
     this.completePending(operationId);
     if (needsOperationNotice(result) || result.status === 'queued') {
       const card = operationCard(result);
@@ -613,7 +610,7 @@ export class FeishuSessionBinding {
     };
     return this.service.submitInput({
       context,
-      mode: row.mode === 'steer' ? 'steer' : 'new',
+      mode: row.mode === 'steer' ? 'steer' : shouldAutoQueueInput(current) ? 'queue' : 'new',
       blocks: [{ type: 'text', text: row.text }],
       channelScope,
     });

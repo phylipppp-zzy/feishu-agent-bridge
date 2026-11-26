@@ -1,9 +1,9 @@
-import type { Answer, Interaction } from './contracts.js';
+import { DECLINED_ANSWER_MARKER, type Answer, type Interaction } from './contracts.js';
 import { QUESTION_INPUT_MAX_LENGTH } from './feishu-card-wire.js';
 
 /** Card JSON 2.0 form uses only components supported inside a form container. */
 export { QUESTION_INPUT_MAX_LENGTH, renderQuestionForm } from './feishu-card-wire.js';
-export const DECLINED_ANSWER_MARKER = '[已跳过/取消]';
+export { DECLINED_ANSWER_MARKER } from './contracts.js';
 type Question = { id: string; prompt: string; choices: string[]; multiple: boolean; allowFreeText: boolean; required?: boolean };
 export interface QuestionForm {
   interactionId: string;
