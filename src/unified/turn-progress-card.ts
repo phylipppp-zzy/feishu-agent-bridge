@@ -1,5 +1,5 @@
 import type { Artifact, Message, Provider, Turn } from './contracts.js';
-import { stripCardMentions, escapeCardMarkdown } from './feishu-card-wire.js';
+import { escapeCardMarkdown } from './feishu-card-wire.js';
 import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import type { ToolProgress } from './tool-progress.js';
 import type { TurnToolCounts } from './turn-progress-store.js';
@@ -17,15 +17,8 @@ export function formatDuration(ms: number): string {
   return seconds < 60 ? `${seconds}秒` : `${Math.floor(seconds / 60)}分${String(seconds % 60).padStart(2, '0')}秒`;
 }
 
-export function completionText(duration: number, message: Message | undefined, count: number): string {
-  const firstLine = message && stripCardMentions(replyText(message))
-    .replace(/!?\[([^\]\r\n]*)\]\([^\r\n)]*\)/g, '$1')
-    .replace(/<[^>\r\n]*>/g, '')
-    .split(/\r\n|[\r\n\u0085\u2028\u2029]/u).map(line => line.replace(/^\s*(?:(?:#{1,6}|>|[-*+]|\d+[.)])\s+)+/, '').replace(/[`*_~]/g, '').trim())
-    .find(Boolean);
-  const chars = [...(firstLine ?? '')];
-  const summary = chars.length > 80 ? `${chars.slice(0, 79).join('').trimEnd()}…` : firstLine ?? `完成 ${count} 项工具操作`;
-  return `✅ 本轮已完成（用时 ${formatDuration(duration)}）· ${summary}`.replace(/[\p{Cc}\p{Cf}]/gu, ' ');
+export function completionText(duration: number, _message?: Message | undefined, _count?: number): string {
+  return `✅ 本轮已完成（用时 ${formatDuration(duration)}），完整结论见上方回复卡。`;
 }
 
 type CardState = {

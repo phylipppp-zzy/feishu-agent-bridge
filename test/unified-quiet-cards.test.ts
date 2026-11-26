@@ -88,7 +88,7 @@ for (const duration of [119_999, 120_000, 120_001]) {
         const expected = duration >= 120_000 && !paused && completed ? 1 : 0;
         assert.equal(x.pushes.length, expected);
         if (expected) {
-          assert.deepEqual(x.pushes[0]!.text, '✅ 本轮已完成（用时 2分00秒）· 结果 报告');
+          assert.deepEqual(x.pushes[0]!.text, '✅ 本轮已完成（用时 2分00秒），完整结论见上方回复卡。');
           assert.match(x.pushes[0]!.id, /^turn-push:/);
         }
         await x.channel.sync('topic');
@@ -176,8 +176,8 @@ test('a snapshot-first completion can be followed by a same-generation live comp
   } finally { x.close(); }
 });
 
-test('completion summary marks an abbreviated first line', () => {
+test('completion summary emits clean status notice without truncated body excerpt', () => {
   const text = '结'.repeat(79) + ' 尾句';
   const message = { blocks: [{ type: 'text', text }] } as Parameters<typeof completionText>[1];
-  assert.equal(completionText(120_000, message, 0), `✅ 本轮已完成（用时 2分00秒）· ${'结'.repeat(79)}…`);
+  assert.equal(completionText(120_000, message, 0), '✅ 本轮已完成（用时 2分00秒），完整结论见上方回复卡。');
 });
