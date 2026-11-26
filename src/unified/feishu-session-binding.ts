@@ -85,6 +85,10 @@ export class FeishuSessionBinding {
       CREATE TABLE IF NOT EXISTS channel_binding_attach_cards (
         operation_id TEXT NOT NULL, message_id TEXT NOT NULL, envelope TEXT NOT NULL, PRIMARY KEY(operation_id,message_id)
       );
+      CREATE TABLE IF NOT EXISTS channel_upgrade_pending_inputs (
+        operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT NOT NULL,
+        text TEXT NOT NULL, mode TEXT NOT NULL, envelope TEXT NOT NULL
+      );
     `);
   }
 
@@ -203,7 +207,14 @@ export class FeishuSessionBinding {
       ? this.port.createTopic(destination,session.sessionId,topicRootCard(session),deliveryId,guard) : destination;
   }
 
-  async beginInteractiveAttach(e: TrustedEnvelope, sessionId: string, scope: string, guard: Guard, reply: Reply): Promise<unknown> {
+  async beginInteractiveAttach(
+    e: TrustedEnvelope,
+    sessionId: string,
+    scope: string,
+    guard: Guard,
+    reply: Reply,
+    pendingInput?: { text: string; mode: 'new' | 'steer' },
+  ): Promise<unknown> {
     const { destination } = e;
     const existing = this.ownerRow(destination);
     if (existing && existing.session_id !== sessionId) {
@@ -244,6 +255,10 @@ export class FeishuSessionBinding {
 
     const context = this.channel.context(e,`new:${destination}`,0,0);
     this.recordPending(context.operationId,e,sessionId,'session','interactive');
+    if (pendingInput?.text.trim()) {
+      this.db.prepare('INSERT OR REPLACE INTO channel_upgrade_pending_inputs VALUES (?,?,?,?,?,?)')
+        .run(context.operationId, destination, sessionId, pendingInput.text, pendingInput.mode, JSON.stringify(e));
+    }
     const n = session.native;
     let op: Operation;
     try {
@@ -252,8 +267,21 @@ export class FeishuSessionBinding {
         payload:{provider:n.provider,hostId:n.hostId,serviceId:n.serviceId,nativeSessionId:n.nativeSessionId,mode:'interactive'},
       });
     } catch (error) {
-      const fault = error as {detail?: Operation['error']; code?: string} | null;
+      this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
+      const fault = error as {detail?: Operation['error']; code?: string; message?: string} | null;
       const code = fault?.detail?.code ?? fault?.code ?? 'temporarily_unavailable';
+      const detailMessage = typeof fault?.detail?.message === 'string' ? fault.detail.message.trim()
+        : typeof fault?.message === 'string' ? fault.message.trim() : '';
+      if (detailMessage.includes('本地终端 agy')) {
+        const noticeDeliveryId = `${e.eventId}:external-holder`;
+        if (this.port.sendText) {
+          await this.port.sendText(destination, `⚠️ ${detailMessage}`, noticeDeliveryId, guard);
+        } else {
+          await this.showOutcome(e, { title: '暂未接管', text: `⚠️ ${detailMessage}`, format: 'plain', actions: [] }, 'external-holder', guard, reply);
+        }
+        this.completePending(context.operationId);
+        return {status:'rejected',reason:code,message:detailMessage};
+      }
       const reason = code === 'unauthorized' ? '当前账号没有接入权限。'
         : code === 'outcome_unknown' ? '原端接入结果未确认，请先核对会话状态。'
         : '原端暂时无法完成接入，请刷新会话状态。';
@@ -261,7 +289,33 @@ export class FeishuSessionBinding {
       this.completePending(context.operationId);
       return {status:'rejected',reason:code};
     }
+    if (op.status === 'failed' && typeof op.error?.message === 'string' && op.error.message.includes('本地终端 agy')) {
+      this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
+      const noticeDeliveryId = `${e.eventId}:external-holder`;
+      if (this.port.sendText) {
+        await this.port.sendText(destination, `⚠️ ${op.error.message}`, noticeDeliveryId, guard);
+      } else {
+        await this.showOutcome(e, { title: '暂未接管', text: `⚠️ ${op.error.message}`, format: 'plain', actions: [] }, 'external-holder', guard, reply);
+      }
+      this.completePending(context.operationId);
+      return {status:'rejected',reason:op.error.code,message:op.error.message};
+    }
+    if (op.status === 'failed') {
+      this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(context.operationId);
+    }
     if (needsOperationNotice(op)) await this.showOutcome(e,operationCard(op),'reply',guard,reply);
+    if (pendingInput?.text.trim() && op.status === 'completed' && op.result?.kind === 'session') {
+      await this.finishSession(e, {
+        operation_id: context.operationId,
+        destination,
+        session_id: sessionId,
+        kind: 'session',
+        mode: 'interactive',
+        state: 'pending',
+        envelope: JSON.stringify(e),
+        scope,
+      }, op, op.result.sessionId, guard, true);
+    }
     return op;
   }
 
@@ -522,9 +576,47 @@ export class FeishuSessionBinding {
     if (deliverNow) {
       const child = await this.advanceFirstPrompt(op.operationId);
       if (child) return child;
+      const upgradeChild = await this.advanceUpgradePendingInput(op.operationId);
+      if (upgradeChild) return upgradeChild;
       await this.flushDeliveries(op.operationId);
     }
     return {sessionId,accessMode:mode,destination};
+  }
+
+  private async advanceUpgradePendingInput(operationId: string): Promise<Operation | null> {
+    const row = this.db.prepare('SELECT destination,session_id,text,mode,envelope FROM channel_upgrade_pending_inputs WHERE operation_id=?')
+      .get(operationId) as { destination: string; session_id: string; text: string; mode: string; envelope: string } | undefined;
+    if (!row) return null;
+    this.db.prepare('DELETE FROM channel_upgrade_pending_inputs WHERE operation_id=?').run(operationId);
+    const original = JSON.parse(row.envelope) as TrustedEnvelope;
+    const binding = this.ownerRow(row.destination);
+    if (!binding || binding.session_id !== row.session_id || binding.access_mode !== 'interactive') return null;
+    if (!await this.authorize(original.identity, row.destination, row.session_id)) return null;
+    const current = await this.service.getSession(row.session_id);
+    if (!this.interactiveReady(current)) return null;
+    const bindingScope = this.channel.scope(row.destination);
+    const channelScope = {
+      destination: row.destination,
+      bindingScope,
+      ownerSource: original.identity.source,
+      ownerSubject: original.identity.subject,
+    };
+    const childId = `${operationId}:auto-input`;
+    const context = {
+      operationId: childId,
+      idempotencyKey: childId,
+      targetId: row.session_id,
+      expectedRevision: current.revision,
+      controlGeneration: current.control.generation,
+      identity: original.identity,
+      channelScope,
+    };
+    return this.service.submitInput({
+      context,
+      mode: row.mode === 'steer' ? 'steer' : 'new',
+      blocks: [{ type: 'text', text: row.text }],
+      channelScope,
+    });
   }
 
   private interactiveReady(session: Session): boolean {
