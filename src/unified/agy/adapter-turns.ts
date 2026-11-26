@@ -724,8 +724,8 @@ export function handleAcpNotification(
       } else {
         turnState.inProgressToolCalls.add(toolCallId);
       }
-      if ((update.status === 'in_progress' || update.status === 'completed') &&
-          previous?.status !== 'in_progress' && previous?.status !== 'completed') {
+      if ((update.status === 'in_progress' && previous?.status !== 'in_progress') ||
+          (update.status === 'completed' && previous?.status !== 'completed')) {
         observeToolExecution(ctx, sessionId, turnState, toolCallId);
       }
       const progress = agyToolProgress(call, ctx.knownSessions.get(sessionId)?.cwd, kind === 'tool_call');
@@ -1143,7 +1143,22 @@ export function expireAllPendingRequests(
     if (generation !== null && entry.generation !== generation) continue;
     if (sessionId !== undefined && entry.interaction.sessionId !== sessionId) continue;
     if (turnId !== undefined && entry.turnId !== turnId) continue;
-    entry.closedSource ??= source;
+    if (entry.interaction.status === 'answer_pending_delivery' && turnId !== undefined) {
+      // Execution may already be confirmed while the response write receipt is still pending.
+      if (entry.executed) continue;
+      entry.closedSource ??= 'agy_turn_ended';
+    } else {
+      if (entry.interaction.status === 'awaiting_answer' && entry.submission === null && turnId !== undefined) {
+        safeRespondServerRejection(
+          ctx,
+          { ...entry, method: entry.interaction.kind === 'approval' ? 'session/request_permission' : 'elicitation/create' },
+          'Request expired on turn end',
+          -32000,
+          'cancel',
+        );
+      }
+      entry.closedSource ??= source;
+    }
     if (entry.submission !== 'writing') publishRequestClosure(ctx, entry);
   }
 }
@@ -1238,11 +1253,27 @@ export async function respondToInteraction(
     !req ||
     !current ||
     current.sessionId !== id ||
-    ctx.activeTurns.get(id)?.turnId !== req.turnId ||
     req.generation !== ctx.transport.connectionGeneration ||
     req.generation !== guard.expectedConnectionGeneration ||
     current.status !== 'awaiting_answer'
   ) {
+    throw contractError('interaction_expired');
+  }
+  const requestTurn = ctx.activeTurns.get(id);
+  const toolStatus = req.toolCallId ? requestTurn?.toolCalls.get(req.toolCallId)?.status : undefined;
+  const terminalApprovalTool = current.kind === 'approval' && (
+      (req.toolCallId && ctx.recentTerminalTools?.get(id)?.has(req.toolCallId)) ||
+      (isString(toolStatus) && terminalToolStatuses.has(toolStatus)));
+  if (requestTurn?.turnId !== req.turnId || requestTurn.generation !== req.generation || terminalApprovalTool) {
+    safeRespondServerRejection(
+      ctx,
+      { ...req, method: current.kind === 'approval' ? 'session/request_permission' : 'elicitation/create' },
+      'Interaction request has already ended',
+      -32000,
+      'cancel',
+    );
+    req.closedSource ??= 'agy_tool_call_terminal';
+    publishRequestClosure(ctx, req);
     throw contractError('interaction_expired');
   }
   if (!ctx.active.has(id) || !ctx.transport.connected) {
@@ -1383,6 +1414,12 @@ export async function respondToInteraction(
   try {
     await submission;
   } catch (error) {
+    if (req.executed) {
+      req.submission = 'submitted';
+      releaseRequestToolCall(ctx, req);
+      publishResponseResolution(ctx, req, 'agy_tool_execution');
+      return ack();
+    }
     req.closedSource ??= 'agy_response_write_failed';
     publishRequestClosure(ctx, req);
     throw error;
@@ -1396,11 +1433,12 @@ export async function respondToInteraction(
       scheduleWakeupFinalize(ctx, id, activeTurn);
     }
   }
-  if (req.closedSource) {
+  if (req.executed) {
+    publishResponseResolution(ctx, req, 'agy_tool_execution');
+  } else if (req.closedSource) {
     // Let dispatch persist the transport receipt before closing the interaction without native confirmation.
     setImmediate(() => publishRequestClosure(ctx, req));
-  } else if (req.executed) publishResponseResolution(ctx, req, 'agy_tool_execution');
-  else if (req.interaction.kind !== 'approval' ||
+  } else if (req.interaction.kind !== 'approval' ||
       (answer.kind === 'approval' && answer.decision === 'deny')) {
     publishResponseResolution(ctx, req, 'agy_response_write');
   } else ctx.emitInteraction(req.interaction);

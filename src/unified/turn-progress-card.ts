@@ -1,12 +1,15 @@
 import type { Artifact, Message, Provider, Turn } from './contracts.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
-import type { ToolProgress } from './tool-progress.js';
+import { isTerminalTool, type ToolProgress } from './tool-progress.js';
 import type { TurnToolCounts } from './turn-progress-store.js';
 
 import { formatCardReplyBody } from './turn-reply.js';
 
 const LOG_SIZE = 15;
+const DELEGATED_TOOLS = new Set(['invoke_subagent', 'run_workflow', 'swarm', 'swarm_wait', 'manage_subagents', 'send_message']);
+const TOOL_ICONS = { succeeded: '✓', failed: '✗', running: '⏳', pending: '⏳', cancelled: '—' };
+const TOOL_PHASE_LABELS = { succeeded: '已完成', failed: '失败', running: '进行中', pending: '等待开始', cancelled: '已取消' };
 
 export function replyText(message: Message): string {
   return message.blocks.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n');
@@ -37,17 +40,23 @@ function formatRunningNote(active: readonly ToolProgress[]): string | undefined 
   if (!active.length) return undefined;
   const latest = active.at(-1)!;
   const extra = active.length > 1 ? `（另有 ${active.length - 1} 项并行）` : '';
-  if (latest.tool === 'swarm_wait') return `🐝 Swarm 协作中：等待成员回报…${extra}`;
-  if (latest.tool === 'swarm' || latest.tool === 'post_message' || latest.tool === 'read_board') {
-    return `${latest.summary}${extra}`;
-  }
-  if (latest.tool === 'invoke_subagent' || latest.tool === 'run_workflow') {
-    return `${latest.summary}${extra}`;
+  if (/^(?:⚡ Codex MCP|🤖|🐝)/u.test(latest.summary)) {
+    return `⏳ ${latest.summary}${extra}`;
   }
   if (latest.tool === 'thinking') {
     return `🧠 正在深度思考…${extra}`;
   }
   return `⏳ 正在执行：${latest.summary}${extra}`;
+}
+
+function formatDelegatedStatus(tools: readonly ToolProgress[]): string {
+  const recent = tools.filter(({ tool, summary }) => DELEGATED_TOOLS.has(tool) ||
+    tool === 'call_mcp_tool' && summary.startsWith('⚡ Codex MCP')).slice(-8).reverse();
+  if (!recent.length) return '';
+  recent.sort((a, b) => Number(isTerminalTool(a.phase)) - Number(isTerminalTool(b.phase)));
+  const lines = recent.map(({ phase, summary }) =>
+    `- ${TOOL_ICONS[phase]} ${escapeCardMarkdown(summary)}（${TOOL_PHASE_LABELS[phase]}）`);
+  return ['**子代理与 Codex 状态**', ...lines].join('\n');
 }
 
 export function turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration, files, turnId }: CardState): ChannelCard {
@@ -72,16 +81,15 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
   const active = running ? visibleTools.filter(tool => tool.phase === 'running') : [];
   const activeReal = active.filter(tool => tool.tool !== 'thinking');
   const onlyThinking = active.length > 0 && activeReal.length === 0;
-  const hasActiveSwarm = activeReal.some(tool => tool.tool === 'swarm' || tool.tool === 'swarm_wait' || tool.tool === 'post_message' || tool.tool === 'read_board');
   const runningNote = formatRunningNote(activeReal);
-  const idleBody = onlyThinking
+  const idleBody = activeReal.some(tool => tool.tool === 'post_message' || tool.tool === 'read_board')
+    ? '🐝 Swarm 多代理协作进行中…'
+    : onlyThinking
     ? '🧠 正在深度思考…'
-    : hasActiveSwarm
-      ? '🐝 Swarm 多代理协作进行中…'
-      : isWakeup
+    : isWakeup
         ? '🤖 后台异步唤醒处理中…'
         : '正在处理…';
-  const text = preview.text || (running ? idleBody : status === 'completed' ?
+  const text = preview.text || (running ? formatDelegatedStatus(visibleTools) || idleBody : status === 'completed' ?
       (count ? `完成 ${count} 项工具操作` : '本轮处理完成。') : '本轮未形成完整回复。');
   const actions: ChannelCard['actions'] = [];
   if (preview.truncated && message) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
@@ -90,9 +98,8 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
     actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,
       value: { action: 'file', artifactId: file.artifactId, contentVersion: file.contentVersion } });
   }
-  const icons = { succeeded: '✓', failed: '✗', running: '⏳', pending: '⏳', cancelled: '—' };
   const logTools = visibleTools.filter(tool => tool.tool !== 'thinking');
-  const lines = logTools.slice(-LOG_SIZE).map(tool => `${icons[tool.phase]} ${tool.summary}`);
+  const lines = logTools.slice(-LOG_SIZE).map(tool => `${TOOL_ICONS[tool.phase]} ${tool.summary}`);
   if (count > lines.length && logTools.length > 0) lines.unshift(`已省略较早的 ${count - lines.length} 项`);
   const executionLog = (logTools.length > 0 || runningNote) ? { count: Math.max(logTools.length, count), failedCount,
     lines, ...(runningNote ? { runningNote } : {}) } : undefined;

@@ -79,7 +79,7 @@ createInterface({ input, crlfDelay: Infinity }).on('line', line => {
       break;
     case 'test/question':
       send({ id: params.id ?? 'question', method: 'elicitation/create', params: {
-        sessionId, message: 'Choose env', requestedSchema: params.single ? {} : {
+        sessionId, message: 'Choose env', toolCallId: params.toolCallId, requestedSchema: params.single ? {} : {
           type: 'object', properties: { env: { type: 'string', enum: ['prod', 'staging'] } }, required: ['env'],
         },
       } });
@@ -477,6 +477,128 @@ test('late tool updates and a new permission RPC cannot reopen a terminal toolCa
   ]);
   assert.deepEqual(f.snapshot().interactions.map(item => item.status),['expired']);
 });
+
+test('tool completion confirms an approval when the tool was already running before the answer', async t => {
+  const f = await fixture(t);
+  await f.start();
+  await f.transport.request('test/tool', { id: 'already-running', status: 'in_progress', kind: 'tool_call' });
+  const { card, interaction } = await f.approval('already-running');
+  const op = await f.click(card, '允许本次') as Operation;
+  assert.equal((await f.core.dispatch(op.operationId)).status, 'accepted');
+  assert.equal(f.store.getInteraction(interaction.interactionId).status, 'answer_pending_delivery');
+  await f.transport.request('test/tool', { id: 'already-running', status: 'completed' });
+  const resolved = f.store.getInteraction(interaction.interactionId);
+  assert.equal(resolved.status, 'resolved');
+  assert.deepEqual(resolved.nativeResult, {
+    status: 'accepted', source: 'agy_tool_execution',
+    answer: { kind: 'approval', decision: 'allow', scope: 'this_request' },
+  });
+  assert.equal(f.store.getOperation(op.operationId).status, 'completed');
+});
+
+for (const terminalEvidence of ['recent tool cache', 'active turn tool status', 'missing turn'] as const) {
+  test(`approval submission cancels the ACP request when fenced by ${terminalEvidence}`, async t => {
+    const f = await fixture(t);
+    await f.start();
+    const { card, interaction } = await f.approval('stale-tool');
+    const op = await f.click(card, '允许本次') as Operation;
+    const nativeId = f.session().native.nativeSessionId;
+    // Model terminal evidence retained independently of the still-open request.
+    const turns = f.adapter['activeTurns'];
+    if (terminalEvidence === 'recent tool cache') f.adapter['ctx'].recentTerminalTools!.set(nativeId, new Set(['stale-tool']));
+    else if (terminalEvidence === 'active turn tool status') turns.get(nativeId)!.toolCalls.set('stale-tool', { status: 'completed' });
+    else turns.delete(nativeId);
+
+    assert.equal(f.transport.health().pendingServerRequests, 1);
+    const result = await f.core.dispatch(op.operationId);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error?.code, 'interaction_expired');
+    assert.equal(f.store.getInteraction(interaction.interactionId).status, 'expired');
+    assert.equal(f.transport.health().pendingServerRequests, 0);
+    assert.deepEqual((await f.counts() as { responses: unknown[] }).responses, [
+      { id: 'stale-tool', result: { outcome: { outcome: 'cancelled' } } },
+    ]);
+  });
+}
+
+test('elicitation linked to a completed tool can still be answered in the active turn', async t => {
+  const f = await fixture(t);
+  await f.start();
+  await f.transport.request('test/tool', { id: 'elicitation-tool', status: 'completed' });
+  await f.transport.request('test/question', { id: 'tool-elicitation', toolCallId: 'elicitation-tool' });
+  const interaction = await until(() => f.snapshot().interactions.find(item => item.kind === 'question_group'), 'elicitation');
+  assert.equal(f.adapter['ctx'].requests.get(interaction.interactionId)?.toolCallId, 'elicitation-tool');
+  const op = await f.act({ action: 'answer', interactionId: interaction.interactionId, revision: interaction.revision,
+    connectionGeneration: interaction.connectionGeneration, toolInputDigest: null,
+    answer: { kind: 'question_group', answers: { env: ['prod'] } },
+  }) as Operation;
+  assert.equal((await f.core.dispatch(op.operationId)).status, 'completed');
+  assert.equal(f.store.getInteraction(interaction.interactionId).status, 'resolved');
+  assert.equal(f.transport.health().pendingServerRequests, 0);
+  assert.deepEqual((await f.counts() as { responses: unknown[] }).responses, [
+    { id: 'tool-elicitation', result: { action: 'accept', content: { env: 'prod' } } },
+  ]);
+});
+
+test('tool execution before disconnect resolves an approval when its held write receipt succeeds', async t => {
+  const f = await fixture(t);
+  await f.start();
+  const { card, interaction } = await f.approval('executed-before-disconnect');
+  const op = await f.click(card, '允许本次') as Operation;
+  const writing = gate(), finish = gate();
+  const write = f.transport.respondServerRequest.bind(f.transport);
+  f.transport.respondServerRequest = async (...args) => {
+    await write(...args);
+    writing.release();
+    await finish.wait;
+  };
+  const dispatch = f.core.dispatch(op.operationId);
+  try {
+    await Promise.race([writing.wait, dispatch.then(() => assert.fail('reply did not reach ACP'))]);
+    const request = f.adapter['ctx'].requests.get(interaction.interactionId)!;
+    assert.equal(request.submission, 'writing');
+    await f.transport.request('test/tool', { id: 'executed-before-disconnect', status: 'completed' });
+    assert.equal(request.executed, true);
+    await f.transport.close();
+    assert.equal(request.closedSource, 'connection_closed');
+    assert.equal(request.submission, 'writing');
+  } finally {
+    finish.release();
+    f.transport.respondServerRequest = write;
+    await dispatch;
+  }
+  const resolved = f.store.getInteraction(interaction.interactionId);
+  assert.equal(resolved.status, 'resolved');
+  assert.deepEqual(resolved.nativeResult, {
+    status: 'accepted', source: 'agy_tool_execution', answer: { kind: 'approval', decision: 'allow', scope: 'this_request' },
+  });
+  assert.equal(f.store.getOperation(op.operationId).status, 'completed');
+  assert.equal(f.store.getOutbox(op.operationId).state, 'done');
+});
+
+for (const completion of ['completed prompt', 'failed prompt', 'wakeup'] as const) {
+  test(`a ${completion} closes a submitted approval with no tool execution confirmation`, async t => {
+    const f = await fixture(t, completion === 'wakeup' ? { wakeupIdleMs: 60, promptIdleTimeoutMs: 900 } : {});
+    if (completion === 'wakeup') {
+      await f.transport.request('test/tool', { id: 'no-confirmation', status: 'in_progress', kind: 'tool_call' });
+      await until(() => f.snapshot().turns.find(turn => turn.status === 'running'), 'wakeup turn');
+    } else await f.start();
+    const { card, interaction } = await f.approval('no-confirmation');
+    const op = await f.click(card, '允许本次') as Operation;
+    assert.equal((await f.core.dispatch(op.operationId)).status, 'accepted');
+    assert.equal(f.store.getInteraction(interaction.interactionId).status, 'answer_pending_delivery');
+
+    if (completion === 'completed prompt') await f.transport.request('test/finish', { stopReason: 'end_turn' });
+    if (completion === 'failed prompt') await f.transport.request('test/fail-prompt', {});
+    await until(() => f.snapshot().turns.find(turn => turn.turnId === interaction.turnId &&
+      turn.status === (completion === 'completed prompt' ? 'completed' : 'failed')), 'terminal turn');
+    const expired = f.store.getInteraction(interaction.interactionId);
+    assert.equal(expired.status, 'expired');
+    assert.deepEqual(expired.nativeResult, { status: 'unknown', source: 'agy_turn_ended' });
+    assert.equal((await f.refresh(interaction)).title, '审批 · 已过期');
+    assert.equal(f.store.getOutbox(op.operationId).state, 'done');
+  });
+}
 
 test('queued Feishu and task attachments and text are fenced by their real binding', async t => {
   const f = await fixture(t);

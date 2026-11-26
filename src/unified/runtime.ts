@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { homedir, tmpdir } from 'node:os';
 import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
 import { realpathSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -29,6 +30,7 @@ import { collectAgyStatusSnapshot } from './agy/session-status.js';
 import { providerTitlePrefix } from './feishu-cards.js';
 import { DecisionSyncStore } from './decision-sync.js';
 import { PendingHub, type PendingQuery } from './pending-hub.js';
+import { readWaitingClaudePresence } from './hubs/pending-discovery.js';
 import { TaskHandoffService } from './task-handoff.js';
 import { TaskTopicChannel, TaskChannelError, type TaskAuthorize, type TaskChannelAction } from './task-topic-channel.js';
 import type { TaskTopicToken } from './task-topic-store.js';
@@ -164,7 +166,7 @@ export class UnifiedRuntime {
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
   private readonly startupRestorations = new Map<Provider, Promise<void>>();
   private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly inFlightUnknownOpAlerts=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
-  constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
+  constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;resolveDiscoveryProject?:(native:Omit<Session['native'],'nativeSessionId'>,project:string|null)=>string|null;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
     const channelPath=resolve(config.channelDb); const canonical=existsSync(channelPath) ? realpathSync(channelPath) : join(realpathSync(dirname(channelPath)),basename(channelPath));
     this.lock=new DatabaseSync(`${canonical}.runtime-lock`);
@@ -264,6 +266,41 @@ export class UnifiedRuntime {
                 !this.channel.ownsInteractionCard(destination,sessionId,interactionId,messageId)
                 && !this._taskChannel?.ownsInteractionCard(destination,sessionId,interactionId,messageId),
               shouldDeliverSource: (item) => item.provider === 'decision',
+              discoverCliNotices: async () => {
+                const native = { provider: 'claude' as const, hostId: config.hostId, serviceId: config.claudeServiceId };
+                const resolveProject = options.resolveDiscoveryProject ?? ((ref, project) => {
+                  const sources = config.catalogSources?.filter(source => canonicalDirectory(source.directory) !== null) ?? [];
+                  const roots = allowedProjectRoots.flatMap(root => canonicalDirectory(root) ?? []);
+                  return discoverySourceAllowed(config, ref, sources) ? trustedDiscoveryProject(project, roots) : null;
+                });
+                const presenceDirs = [join(config.claudeStateDir, 'presence')];
+                const defaultPresenceDir = join(homedir(), '.local', 'state', 'feishu-claude-bridge', 'presence');
+                const tempRoot = tmpdir();
+                if (!inside(config.claudeStateDir, tempRoot) || inside(defaultPresenceDir, tempRoot)) {
+                  presenceDirs.push(defaultPresenceDir);
+                }
+                const records = await readWaitingClaudePresence(presenceDirs, Date.now());
+                if (!records.length) return [];
+                const sessions = new Map(this.store.listSessions()
+                  .filter(({ native }) => native.provider === 'claude' && native.hostId === config.hostId &&
+                    native.serviceId === config.claudeServiceId)
+                  .map(session => [session.native.nativeSessionId, session]));
+                return records.flatMap(record => {
+                  const session = sessions.get(record.sessionId);
+                  if (session && (session.control.input === 'available' || this.store.isDetached(session.sessionId) ||
+                    options.canDiscover && !options.canDiscover(session))) return [];
+                  const project = resolveProject(native, record.cwd ?? session?.project ?? null);
+                  if (!project) return [];
+                  return [{
+                    provider: 'claude' as const,
+                    nativeSessionId: record.sessionId,
+                    title: session ? this.core.presentSession(session).title : `Claude Code 会话 · ${record.sessionId.slice(0, 8)}`,
+                    summary: 'Claude Code 终端有待处理的请求。',
+                    project,
+                    sourceSessionId: session?.sessionId ?? null,
+                  }];
+                });
+              },
               resolveTopicLink: async (sessionId, hubDest) => {
                 if (this._taskChannel && this.port.topicLinkForTask) {
                   const sourceDest = this._pendingHub?.getSourceDestination(sessionId);
@@ -961,6 +998,34 @@ export class UnifiedRuntime {
 }
 const canonicalPath=(path:string):string => { const p=resolve(path); return existsSync(p) ? realpathSync(p) : join(realpathSync(dirname(p)),basename(p)); };
 const inside=(child:string,root:string):boolean => {const rel=relative(root,child);return rel==='' || (!isAbsolute(rel) && rel!=='..' && !rel.startsWith(`..${sep}`));};
+
+function canonicalDirectory(path: string | null): string | null {
+  if (!path || !isAbsolute(path)) return null;
+  try {
+    const canonical = realpathSync(path);
+    return statSync(canonical).isDirectory() ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+
+function trustedDiscoveryProject(project: string | null, canonicalRoots: readonly string[]): string | null {
+  const canonical = canonicalDirectory(project);
+  return canonical && canonicalRoots.some(root => inside(canonical, root)) ? canonical : null;
+}
+
+function runtimeServiceId(config: RuntimeConfig, provider: Provider): string | undefined {
+  return provider === 'claude' ? config.claudeServiceId : provider === 'codex' ? config.codexServiceId :
+    config.agy?.enabled !== false ? config.agy?.serviceId : undefined;
+}
+
+function discoverySourceAllowed(config: RuntimeConfig, native: Omit<Session['native'], 'nativeSessionId'>,
+    sources: readonly CatalogRoot[]): boolean {
+  return native.hostId === config.hostId && native.serviceId === runtimeServiceId(config, native.provider) &&
+    (native.provider === 'agy' || sources.some(source =>
+      source.provider === native.provider && source.hostId === native.hostId && source.serviceId === native.serviceId));
+}
+
 /** Construct enrichment under a separate state lock; no network connections are opened. */
 export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuPort, bases:PlatformPort[]):Promise<UnifiedRuntime> {
   validateRuntimeConfig(config);
@@ -969,9 +1034,10 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   const persistent=[config.coreDb,config.channelDb,config.artifactStatePath,...(agyEnabled && config.agy?.quotaCachePath ? [config.agy.quotaCachePath] : []),...(config.watchHub?.enabled ? [resolveWatchHubDbPath(config)] : []),...(config.pendingHub?.enabled ? [resolvePendingHubDbPath(config)] : []),...(config.decisionSync?.enabled ? [resolveDecisionSyncDbPath(config)] : [])].map(canonicalPath); if (new Set(persistent).size !== persistent.length) throw new Error('runtime state paths must be distinct');
   const projects=config.allowedProjectRoots.map(x=>realpathSync(x)), outputs=config.outputRoots.map(x=>realpathSync(x));
   const sources=config.catalogSources.map(s=>({...s,directory:realpathSync(s.directory)}));
-  const serviceIdFor=(provider:Provider):string|undefined=>provider==='claude'?config.claudeServiceId:provider==='codex'?config.codexServiceId:agyEnabled?config.agy!.serviceId:undefined;
-  const sourceAllowed=(s:Session)=>s.native.hostId===config.hostId && s.native.serviceId===serviceIdFor(s.native.provider) && (s.native.provider==='agy' ? agyEnabled : sources.some(x=>x.provider===s.native.provider && x.hostId===s.native.hostId && x.serviceId===s.native.serviceId));
-  const trusted=(s:Session):boolean=>{try {return sourceAllowed(s) && isAbsolute(s.project) && projects.some(root=>inside(realpathSync(s.project),root));}catch{return false;}};
+  const serviceIdFor=(provider:Provider):string|undefined=>runtimeServiceId(config,provider);
+  const resolveDiscoveryProject = (native: Omit<Session['native'], 'nativeSessionId'>, project: string | null): string | null =>
+    discoverySourceAllowed(config, native, sources) ? trustedDiscoveryProject(project, projects) : null;
+  const trusted=(s:Session):boolean=>resolveDiscoveryProject(s.native,s.project)!==null;
   const registry=new ArtifactRegistry({},20*1024*1024,config.artifactStatePath); const catalog=new LocalCatalog(sources); const discovered=new Set<string>(); let enrichmentError=false;
   const configure=(s:Session)=>{if(!trusted(s)) throw new Error('session outside trusted configuration'); const project=realpathSync(s.project); registry.setRoots(s.native,outputs.filter(root=>inside(root,project))); registry.setProjectRoot(s.native,project);};
   // Pin each verified native ref to its canonical project; provider events alone cannot establish authority.
@@ -1074,7 +1140,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   let fastAgyTimer: ReturnType<typeof setInterval> | undefined;
   let fastRefreshing = false;
   let runtime:UnifiedRuntime; let refreshOffset=0; let autoCursor:string|null=null; let agyAutoCursor:string|null=null; const recentCursors:Record<Provider,string|null>={codex:null,claude:null,agy:null}; const scopeByProvider:Record<Provider,Array<{root:string;watermark:number}>>={codex:[],claude:[],agy:[]}; const localCodexClock=isLocalCodexEndpoint(config.codexEndpoint);
-  try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,canInspectCandidate:(native,project)=>{try{return native.provider==='codex'&&native.hostId===config.hostId&&native.serviceId===config.codexServiceId&&sources.some(x=>x.provider==='codex'&&x.hostId===native.hostId&&x.serviceId===native.serviceId)&&isAbsolute(project)&&projects.some(root=>inside(realpathSync(project),root))}catch{return false}},allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,allowedProjectRoots:config.allowedProjectRoots,cleanup:()=>{if(fastAgyTimer){clearInterval(fastAgyTimer);fastAgyTimer=undefined;}stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
+  try { runtime=new UnifiedRuntime(config,port,ports,{canDiscover:trusted,resolveDiscoveryProject,canInspectCandidate:(native,project)=>native.provider==='codex'&&resolveDiscoveryProject(native,project)!==null,allowDiscovered:id=>discovered.has(id),requireReadonlyHydration:true,allowedProjectRoots:config.allowedProjectRoots,cleanup:()=>{if(fastAgyTimer){clearInterval(fastAgyTimer);fastAgyTimer=undefined;}stateLock.exec('ROLLBACK');stateLock.close();},refresh:async r=>{
       let autoFailed=false;
       const handleAutoFailure=(key:string,err:unknown):void=>{if(isPendingContentionError(err))return;if(isMetadataTimeoutError(err)){const next=(autoTimeoutStreaks.get(key)??0)+1;autoTimeoutStreaks.set(key,next);if(next<3)return;}autoFailed=true;};
       try {await r.channel.applyPendingAutoBaselines();} catch {autoFailed=true;}

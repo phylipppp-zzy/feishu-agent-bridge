@@ -1,5 +1,7 @@
 export {
   PENDING_CATEGORIES,
+  type PendingCliNotice,
+  type PendingCliNoticeItem,
   type PendingCategory,
   type PendingDecisionItem,
   type PendingEnvelope,

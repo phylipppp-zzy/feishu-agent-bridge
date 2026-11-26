@@ -164,6 +164,22 @@ export function renderPendingItemCard(
   hubBindingId: string,
   nowMs: number,
 ): ChannelCard {
+  if (item.readonlyNotice) {
+    return {
+      title: `【终端待审批 · 仅提醒 · ${providerDisplayLabel(item.provider)}】${item.title}`,
+      template: 'orange',
+      format: 'plain',
+      text: [
+        `会话：${item.title}`,
+        item.project ? `工作目录：${item.project}` : `会话 ID：${item.nativeSessionId.slice(0, 8)}`,
+        item.summary,
+        '⚠️ 请在电脑终端中处理该审批（本卡片仅作提醒，不支持在飞书直接审批）。',
+      ].join('\n'),
+      actions: isSafePendingAppLink(item.sourceTopicUrl)
+        ? [{ label: '跳回源话题', value: {}, url: item.sourceTopicUrl }]
+        : [],
+    };
+  }
   if (item.provider !== 'decision') {
     const base = interactionCard(item.interaction, false);
     const actions: ChannelCard['actions'] = base.actions.map((a) => ({
@@ -248,7 +264,7 @@ export function formatPendingSummaryCard(
       ? ['当前没有待处理事项。']
       : page.items.map(
           (item, idx) =>
-            `${idx + 1}. 【${PENDING_CATEGORY_LABELS[item.category]}】${escapeCardMarkdown(item.title.replace(/\s+/gu, ' '))}`,
+            `${idx + 1}. 【${item.readonlyNotice ? '终端待审批 · 仅提醒' : PENDING_CATEGORY_LABELS[item.category]}】${escapeCardMarkdown(item.title.replace(/\s+/gu, ' '))}`,
         );
   const actions: ChannelCard['actions'] = [];
   for (const [index, item] of page.items.entries()) {
