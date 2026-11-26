@@ -76,12 +76,20 @@ export function setCustomTopicTitle(db: DatabaseSync, destination: string, sessi
   return cleaned;
 }
 
-export function topicRootCard(session: Session, customTitle?: string | null): ChannelCard {
-  const effective = customTitle ? { ...session, title: customTitle } : session;
+export function topicRootCard(
+  session: Session,
+  customTitle?: string | null,
+  options?: { externallyWorking?: boolean },
+): ChannelCard {
+  const effectiveStatus: Session['status'] = session.status === 'read_only' && options?.externallyWorking ? 'running' : session.status;
+  const effective = { ...session, status: effectiveStatus, ...(customTitle ? { title: customTitle } : {}) };
   const fullTitle = stripLegacyTitlePrefix(effective.title) || '未命名会话';
-  const template = sessionStatusTemplate(session.status);
+  const template = sessionStatusTemplate(effectiveStatus);
   const projectText = shortenHomePath(session.project);
-  const metaLine = `${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(projectText)} · ${sessionStatusLabel(session.status)}`;
+  const statusLabel = session.status === 'read_only' && options?.externallyWorking
+    ? '终端运行中'
+    : sessionStatusLabel(session.status);
+  const metaLine = `${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(projectText)} · ${statusLabel}`;
   return {
     title: displayTopicTitle(effective),
     text: `**${escapeCardMarkdown(fullTitle)}**\n${metaLine}`,
@@ -154,12 +162,13 @@ export async function syncTopicRootTitle(
   session: Session,
   stampCard: (card: ChannelCard) => ChannelCard,
   guard: () => Promise<void>,
+  options?: { externallyWorking?: boolean },
 ): Promise<void> {
   const rootId = await lookupRoot(port, destination);
   if (!rootId) return;
   if (!isCurrentTitleScope(db, destination, session.sessionId, scope)) throw new BindingExpired('binding changed');
   const customTitle = getCustomTopicTitle(db, destination, session.sessionId);
-  const card = topicRootCard(session, customTitle);
+  const card = topicRootCard(session, customTitle, options);
   const cardSig = rootCardSignature(card);
   const titleKey = [destination, session.sessionId, scope] as const;
   let roots = inFlightRoots.get(port);

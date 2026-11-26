@@ -32,6 +32,7 @@ import {
   DEFAULT_AGY_MODELS,
   DEFAULT_PROMPT_IDLE_TIMEOUT_MS,
   DEFAULT_PROMPT_MAX_TIMEOUT_MS,
+  DEFAULT_SESSION_IDLE_RELEASE_MS,
   DEFAULT_WAKEUP_IDLE_MS,
   extractServerCurrentSettings,
   findEffortConfigId,
@@ -76,6 +77,12 @@ import {
   handleTransportDisconnect,
   respondToInteraction,
 } from './adapter-turns.js';
+import {
+  createProcExternalAgyHolderDetector,
+  defaultAgyConversationsDir,
+  formatExternalAgyHolderError,
+  type ExternalAgyHolderDetector,
+} from './process-guard.js';
 
 export class AgyAdapter implements PlatformPort {
   readonly provider = 'agy' as const;
@@ -97,9 +104,13 @@ export class AgyAdapter implements PlatformPort {
   private readonly recentDiscovery = new Map<string, RecentDiscoveryState>();
   private readonly existingSnapshots = new Map<string, ExistingSnapshotState>();
   private readonly acpTitles = new Map<string, string>();
+  private readonly lastActivityAt = new Map<string, number>();
   private readonly promptMaxTimeoutMs: number;
   private readonly promptIdleTimeoutMs: number;
   private readonly wakeupIdleMs: number;
+  private readonly idleReleaseMs: number;
+  private readonly detectExternalHolder: ExternalAgyHolderDetector;
+  private idleSweepTimer?: ReturnType<typeof setInterval>;
 
   private sequence = 0;
   private closed = false;
@@ -116,6 +127,8 @@ export class AgyAdapter implements PlatformPort {
       promptMaxTimeoutMs?: number;
       promptIdleTimeoutMs?: number;
       wakeupIdleMs?: number;
+      idleReleaseMs?: number;
+      externalHolderDetector?: ExternalAgyHolderDetector;
     } = {},
   ) {
     if (!isString(hostId) || !isString(serviceId)) {
@@ -124,6 +137,16 @@ export class AgyAdapter implements PlatformPort {
     this.promptMaxTimeoutMs = options.promptMaxTimeoutMs ?? DEFAULT_PROMPT_MAX_TIMEOUT_MS;
     this.promptIdleTimeoutMs = options.promptIdleTimeoutMs ?? DEFAULT_PROMPT_IDLE_TIMEOUT_MS;
     this.wakeupIdleMs = options.wakeupIdleMs ?? DEFAULT_WAKEUP_IDLE_MS;
+    this.idleReleaseMs = options.idleReleaseMs ?? DEFAULT_SESSION_IDLE_RELEASE_MS;
+    this.detectExternalHolder = options.externalHolderDetector
+      ?? createProcExternalAgyHolderDetector(defaultAgyConversationsDir((catalog as { brainDir?: string }).brainDir));
+    if (this.idleReleaseMs > 0 && Number.isFinite(this.idleReleaseMs)) {
+      const interval = Math.max(1_000, Math.min(60_000, Math.floor(this.idleReleaseMs / 2)));
+      this.idleSweepTimer = setInterval(() => {
+        void this.reconcileIdleAndExternalHolders().catch(() => {});
+      }, interval);
+      this.idleSweepTimer.unref?.();
+    }
 
     this.ctx = {
       transport: this.transport,
@@ -231,6 +254,11 @@ export class AgyAdapter implements PlatformPort {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    if (this.idleSweepTimer) {
+      clearInterval(this.idleSweepTimer);
+      delete this.idleSweepTimer;
+    }
+    this.lastActivityAt.clear();
     for (const turn of this.activeTurns.values()) {
       if (turn.wakeupTimer) {
         clearTimeout(turn.wakeupTimer);
@@ -546,6 +574,7 @@ export class AgyAdapter implements PlatformPort {
     // Register the created session immediately so a subsequent model/config error preserves sessionId.
     this.preLiveTranscriptIds.set(sessionId, new Set());
     this.active.add(sessionId);
+    this.lastActivityAt.set(sessionId, Date.now());
     this.controlEpoch.set(sessionId, 0);
     this.lockedSessions.delete(sessionId);
     const generation = this.transport.connectionGeneration;
@@ -611,6 +640,10 @@ export class AgyAdapter implements PlatformPort {
     if (!this.transport.connected) {
       throw contractError('temporarily_unavailable', 'ACP transport not connected');
     }
+    const externalHolder = this.detectExternalHolder(id);
+    if (externalHolder) {
+      throw contractError('control_conflict', formatExternalAgyHolderError(externalHolder));
+    }
     const generation = this.transport.connectionGeneration;
 
     if (!this.knownSessions.has(id)) await this.catalog.refreshAsync();
@@ -653,6 +686,7 @@ export class AgyAdapter implements PlatformPort {
       this.lockedSessions.delete(id);
     }
     this.active.add(id);
+    this.lastActivityAt.set(id, Date.now());
     this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
     this.emit({ type: 'connection', ref, connectionGeneration: generation });
 
@@ -687,6 +721,12 @@ export class AgyAdapter implements PlatformPort {
     if (this.activeTurns.has(id)) {
       throw contractError('busy', 'turn already running');
     }
+    const externalHolder = this.detectExternalHolder(id);
+    if (externalHolder) {
+      void this.releaseActiveSessionInternal(id).catch(() => {});
+      throw contractError('control_conflict', formatExternalAgyHolderError(externalHolder));
+    }
+    this.lastActivityAt.set(id, Date.now());
     const lock = this.lockedSessions.get(id);
     if (lock && lock.generation === this.transport.connectionGeneration) {
       throw contractError(
@@ -1057,6 +1097,7 @@ export class AgyAdapter implements PlatformPort {
         this.lockedSessions.delete(id);
       }
       if (this.active.delete(id)) {
+        this.lastActivityAt.delete(id);
         this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
         this.emitSession(ref, id);
       }
@@ -1064,6 +1105,53 @@ export class AgyAdapter implements PlatformPort {
       this.controlChanges.delete(id);
     }
     return ack('unsubscribed');
+  }
+
+  async reconcileIdleAndExternalHolders(now: number = Date.now()): Promise<string[]> {
+    if (this.closed || !this.transport.connected) return [];
+    const released: string[] = [];
+    for (const id of [...this.active]) {
+      if (this.closed || !this.transport.connected) break;
+      if (this.controlChanges.has(id) || this.activeTurns.has(id) || this.pendingRequests(id).length > 0) continue;
+      const externalHolder = this.detectExternalHolder(id);
+      const lastActive = this.lastActivityAt.get(id) ?? 0;
+      const idleTooLong = this.idleReleaseMs > 0 && Number.isFinite(this.idleReleaseMs) && lastActive > 0 && now - lastActive >= this.idleReleaseMs;
+      if (!externalHolder && !idleTooLong) continue;
+      if (await this.releaseActiveSessionInternal(id)) {
+        released.push(id);
+      }
+    }
+    return released;
+  }
+
+  private async releaseActiveSessionInternal(id: string): Promise<boolean> {
+    if (this.closed || !this.active.has(id) || this.controlChanges.has(id) || this.activeTurns.has(id) || this.pendingRequests(id).length > 0) {
+      return false;
+    }
+    this.controlChanges.add(id);
+    try {
+      let closeConfirmed = false;
+      try {
+        if (this.transport.connected) {
+          await this.transport.request('session/close', { sessionId: id });
+          closeConfirmed = true;
+        }
+      } catch {
+        // Best-effort close on idle/external release.
+      }
+      if (closeConfirmed) {
+        this.lockedSessions.delete(id);
+      }
+      if (this.active.delete(id)) {
+        this.lastActivityAt.delete(id);
+        this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
+        this.emitSession(this.ref(id), id);
+        return true;
+      }
+      return false;
+    } finally {
+      this.controlChanges.delete(id);
+    }
   }
 
   private emitSession(ref: NativeSessionRef, id: string): void {

@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { relative, isAbsolute, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
-import type { Answer, Identity, Operation, Provider, WriteContext, Session, Message } from './contracts.js';
+import type { Answer, Identity, Operation, Provider, WriteContext, Session, SessionSnapshot, Message } from './contracts.js';
 import { payloadDigest } from './contracts.js';
 import { contractError } from './errors.js';
 import { decodeQuestionForm } from './feishu-question-forms.js';
@@ -117,7 +117,7 @@ export class FeishuChannel {
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
-  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null } = {}) {
+  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; autoTakeControlOnInput?: boolean; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null } = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL);`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
@@ -484,7 +484,11 @@ export class FeishuChannel {
     if (!await this.authorize(e.identity,e.destination,a.action === 'bind' ? a.sessionId : bound)) return rejectUnauthorized();
     try { await this.checkManager(e,a); } catch(error) { if (error instanceof BindingManagementDenied) return rejectUnauthorized(); throw error; }
     if (!validScope() || executionScope !== this.bindingScope(e.destination)) return expired();
-    if (bound && this.accessMode(e.destination) === 'read_only' && (['input','answer','answer_form','attachment','stop','legacy_stop','control','settings','cancel','archive'].includes(a.action) || (a.action === 'reconcile' && !pendingSessionAuthorization(this.db,this.port,this.authorize,e,a.operationId)) || (a.action === 'legacy_model' && !!a.model))) {
+    const autoUpgradeInput = Boolean(
+      this.channelOptions.autoTakeControlOnInput &&
+      (a.action === 'input' || a.action === 'swarm'),
+    );
+    if (bound && this.accessMode(e.destination) === 'read_only' && !autoUpgradeInput && (['input','answer','answer_form','attachment','stop','legacy_stop','control','settings','cancel','archive'].includes(a.action) || (a.action === 'reconcile' && !pendingSessionAuthorization(this.db,this.port,this.authorize,e,a.operationId)) || (a.action === 'legacy_model' && !!a.model))) {
       const result={status:'rejected',reason:'read_only_binding'};
       this.db.exec('BEGIN IMMEDIATE');
       try { this.db.prepare("UPDATE channel_inbox SET state='rejected' WHERE event_id=? AND state='received'").run(eventId); this.db.prepare("UPDATE channel_receipts SET state='rejected',result=? WHERE event_id=?").run(JSON.stringify(result),eventId); this.db.exec('COMMIT'); } catch(error) { this.db.exec('ROLLBACK'); throw error; }
@@ -612,6 +616,10 @@ export class FeishuChannel {
       };
       await this.deliver(e.destination,{title:'已解除绑定',template:'grey',text:'当前话题已与原会话解除绑定。如需继续，请回主群发送 /sessions 打开会话，或发送 /new 新建会话。',actions:[]},`${e.eventId}:reply`,unboundGuard);
       return {unbound:true};
+    }
+    if (bound && this.accessMode(e.destination) === 'read_only' && this.channelOptions.autoTakeControlOnInput && (a.action === 'input' || a.action === 'swarm')) {
+      const text = a.action === 'swarm' ? (a.prompt ? `/swarm ${a.prompt}` : '/swarm') : a.text;
+      return this.sessionBinding.beginInteractiveAttach(e, bound, executionScope, guard, reply, { text, mode: 'new' });
     }
     if (a.action === 'upgrade') {
       if (!bound) throw new Error('no bound session');
@@ -860,7 +868,26 @@ export class FeishuChannel {
   private async syncTopic(destination: string): Promise<boolean> {
     const row=this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string}|undefined; if(!row) throw new Error('destination is not bound'); const sessionId=row.session_id, scope=JSON.stringify(row);
     const syncGuard=()=>this.checkBinding(destination,sessionId,scope);
-    const syncTitle=(session:Session)=>syncTopicRootTitle(this.db,this.port,destination,scope,session,card=>this.stampCard(destination,card),syncGuard);
+    const isExternallyWorking = (snap: SessionSnapshot): boolean => {
+      if (snap.session.status !== 'read_only') return false;
+      if (snap.turns?.some(t => t.status === 'running')) return true;
+      const latest = snap.messages.at(-1);
+      if (latest?.role === 'user' && snap.session.updatedAt) {
+        const ageMs = Date.now() - Date.parse(snap.session.updatedAt);
+        if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 120_000) return true;
+      }
+      return false;
+    };
+    const syncTitle=(snap:SessionSnapshot)=>syncTopicRootTitle(this.db,this.port,destination,scope,snap.session,card=>this.stampCard(destination,card),syncGuard,{externallyWorking:isExternallyWorking(snap)});
+    const reconcileReleasedReadonly = (session: Session): boolean => {
+      if (this.channelOptions.autoTakeControlOnInput && this.accessMode(destination) === 'interactive' && session.status === 'read_only' && session.control.owner === null) {
+        this.db.prepare("UPDATE channel_bindings SET access_mode='read_only',binding_id=?,revision=revision+1 WHERE destination=? AND session_id=?")
+          .run(randomUUID(), destination, sessionId);
+        this.turnCards.discardOtherScopes(destination, this.bindingScope(destination));
+        return true;
+      }
+      return false;
+    };
     const sendSync=async(d:string,card:ChannelCard,id:string)=>{await syncGuard();const result=await this.deliver(d,card,`sync:${payloadDigest([scope,id])}`,syncGuard);await syncGuard();return result;};
     await syncGuard();
     const preference = this.db.prepare('SELECT enabled,event_types FROM channel_preferences WHERE destination=? AND session_id=?').get(destination,sessionId) as {enabled:number;event_types:string} | undefined;
@@ -920,7 +947,8 @@ export class FeishuChannel {
         const messages = snapshot.value.messages.filter(message => message.role === 'assistant' && messageIds.has(message.messageId) && unseen(message));
         await this.turnCards.sync(scopeKey, snapshot.value, events.events, messages, allowedPush);
         await syncGuard();
-        await syncTitle(snapshot.value.session);
+        await syncTitle(snapshot.value);
+        if (reconcileReleasedReadonly(snapshot.value.session)) return true;
         for (const message of messages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
         let retryCount=0; let firstRetry='';
         const visible=events.events.filter(event=>!eventTypes.length || eventTypes.includes(event.type));
@@ -963,7 +991,8 @@ export class FeishuChannel {
     }
     if (!cursor) {
       const snapshot = await this.service.getSnapshot(sessionId); await syncGuard();
-      await syncTitle(snapshot.value.session);
+      await syncTitle(snapshot.value);
+      if (reconcileReleasedReadonly(snapshot.value.session)) return true;
       if (expiredFrom === undefined) this.turnCards.baseline(scopeKey,snapshot.cursor);
       if (expiredFrom !== undefined) {
         await deliverCliPrompts(snapshot.value.session, snapshot.value.messages.filter(m => m.role === 'user' && unseen(m)));
