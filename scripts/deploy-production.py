@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Build a sealed production release of feishu-agent-bridge and update config + systemd unit."""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path('/home/zhangzy/workspace/feishu-agent-bridge')
+RELEASES_ROOT = Path('/home/zhangzy/.local/share/feishu-unified-bridge/releases')
+CONF_DIR = Path('/home/zhangzy/.config/feishu-unified-bridge')
+CONF_FILE = CONF_DIR / 'config.json'
+UNIT_FILE = Path('/home/zhangzy/.config/systemd/user/feishu-unified-production.service')
+PARENT_RELEASE = 'ebee30d-uxv2-7691b684804b'
+
+commit = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'], text=True).strip()
+branch = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--abbrev-ref', 'HEAD'], text=True).strip()
+
+def sha256_file(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def build_manifest(base: Path, files: list[Path]) -> str:
+    lines = []
+    for p in sorted(files, key=lambda x: str(x.relative_to(base))):
+        lines.append(f"{sha256_file(p)}  {p.relative_to(base)}")
+    return "\n".join(lines) + "\n"
+
+# 1. Stage release into a temp directory under RELEASES_ROOT, then rename to final deterministic name
+staging = RELEASES_ROOT / f".staging-{commit}-{os.getpid()}"
+if staging.exists():
+    shutil.rmtree(staging)
+staging.mkdir(parents=True, mode=0o700)
+
+for d in ('dist', 'scripts', 'src', 'test'):
+    shutil.copytree(REPO / d, staging / d, symlinks=False)
+for f in ('package.json', 'package-lock.json', 'tsconfig.json'):
+    shutil.copy2(REPO / f, staging / f)
+os.symlink(str(REPO / 'node_modules'), str(staging / 'node_modules'))
+
+dist_files = [p for p in (staging / 'dist').rglob('*') if p.is_file()]
+dist_manifest = build_manifest(staging, dist_files)
+(staging / 'dist.sha256').write_text(dist_manifest, encoding='utf-8')
+dist_manifest_sha = hashlib.sha256(dist_manifest.encode('utf-8')).hexdigest()
+
+source_files = [
+    p for root in ('src', 'scripts', 'test') for p in (staging / root).rglob('*') if p.is_file()
+] + [staging / 'package.json', staging / 'package-lock.json', staging / 'tsconfig.json']
+source_manifest = build_manifest(staging, source_files)
+(staging / 'source.sha256').write_text(source_manifest, encoding='utf-8')
+source_manifest_sha = hashlib.sha256(source_manifest.encode('utf-8')).hexdigest()
+start_script_sha = sha256_file(staging / 'scripts/unified-start.mjs')
+
+release_name = f"{commit}-agy-{source_manifest_sha[:12]}"
+release_dir = RELEASES_ROOT / release_name
+if release_dir.exists():
+    shutil.rmtree(release_dir)
+
+generation = {
+    "commit": commit,
+    "branch": branch,
+    "parentRelease": PARENT_RELEASE,
+    "distManifestSha256": dist_manifest_sha,
+    "sourceManifestSha256": source_manifest_sha,
+    "release": release_name,
+}
+(staging / 'generation.json').write_text(json.dumps(generation, indent=2) + "\n", encoding='utf-8')
+
+preflight_code = f'''#!/usr/bin/env python3
+"""Offline launch preflight. No network, native process, or database writes."""
+import hashlib, json, os, shutil, sqlite3, subprocess, sys
+from pathlib import Path
+RELEASE = Path({str(release_dir)!r})
+CONF = Path('/home/zhangzy/.config/feishu-unified-bridge')
+STATE = Path('/home/zhangzy/.local/state/feishu-unified-bridge')
+MAN = RELEASE / 'dist.sha256'
+EXPECTED = {dist_manifest_sha!r}
+def ok(v):
+    if not v:
+        raise RuntimeError('preflight rejected')
+try:
+    p = CONF / 'config.json'
+    s = p.lstat()
+    ok(p.is_file() and not p.is_symlink() and s.st_uid == os.getuid() and not s.st_mode & 0o077)
+    c = json.loads(p.read_text())
+    r = c['runtime']
+    context = json.loads((CONF / 'root-check-context.json').read_text())
+    candidates = json.loads((CONF / 'root-candidates-private.json').read_text())['records']
+    ok(len(candidates) == 136 and all(x['chatId'] == r['allowedDestinations'][0] for x in candidates))
+    owner = os.environ.get('FEISHU_OWNER_OPEN_ID')
+    app = os.environ.get('FEISHU_APP_ID')
+    ok(owner and app and os.environ.get('FEISHU_APP_SECRET') and owner == r['ownerOpenId'] and len(r['allowedDestinations']) == 1)
+    ok(context['environmentMatchesGuardRegistry'] is True and context['ownerMatchesProductionConfig'] is True and context['appFingerprint'] == hashlib.sha256(app.encode()).hexdigest())
+    ok(r['hostId'] == 'gpu3-local-v1' and r['claudeServiceId'] == 'feishu-unified-claude-v1' and r['codexServiceId'] == 'feishu-unified-codex-v1' and r['codexEndpoint'] == 'codex-proxy://default')
+    ok(shutil.which('codex') in ('/home/zhangzy/bin/codex', '/home/zhangzy/.local/bin/codex') and shutil.which('claude') is not None)
+    agy = r.get('agy')
+    allowed_providers = ('claude', 'codex', 'agy') if agy else ('claude', 'codex')
+    for e in r['catalogSources']:
+        q = Path(e['directory'])
+        ok(e['provider'] in allowed_providers and not q.is_symlink() and q.resolve() == (STATE / 'catalog' / e['provider']).resolve() and q.is_dir() and not any(q.iterdir()))
+    ok(len(r['catalogSources']) in (2, 3))
+    proj_roots = r['allowedProjectRoots']
+    ok(isinstance(proj_roots, list) and len(proj_roots) >= 1 and all(Path(x).is_dir() and Path(x).resolve().is_relative_to('/home/zhangzy') for x in proj_roots))
+    paths = [r['coreDb'], r['channelDb'], r['artifactStatePath'], c['sdkDb']]
+    ok(len(set(paths)) == 4 and all(Path(x).parent.resolve() == STATE.resolve() for x in paths))
+    ok(Path(r['claudeStateDir']).is_dir())
+    allowed_output_bases = (Path('/home/zhangzy').resolve(), Path('/data/zhangzy').resolve(), Path('/ssd/zhangzy').resolve())
+    ok(all(Path(x).is_dir() and any(Path(x).resolve().is_relative_to(base) for base in allowed_output_bases) for x in r['outputRoots']))
+    if agy and agy.get('enabled', True):
+        ok(agy.get('serviceId') == 'feishu-unified-agy-v1' and Path(agy.get('binPath', '/home/zhangzy/.gemini/bin/agy')).is_file())
+        if agy.get('brainDir'):
+            ok(Path(agy['brainDir']).is_dir())
+    receipt = CONF / 'history-baseline-preparation.json'
+    rs = receipt.lstat()
+    ok(receipt.is_file() and not receipt.is_symlink() and rs.st_uid == os.getuid() and not rs.st_mode & 0o077)
+    proof = json.loads(receipt.read_text())
+    ok(proof.get('state') == 'completed' and type(proof.get('sessions')) is int and proof['sessions'] == 18 and type(proof.get('nonemptyTitles')) is int and proof['nonemptyTitles'] == 18 and type(proof.get('forbiddenSends')) is int and proof['forbiddenSends'] == 0 and type(proof.get('forbiddenModels')) is int and proof['forbiddenModels'] == 0)
+    batches = proof.get('batches')
+    ok(isinstance(batches, list) and len(batches) > 0 and isinstance(batches[-1], dict) and type(batches[-1].get('remaining')) is int and batches[-1]['remaining'] == 0)
+    channel = Path(r['channelDb'])
+    ok(channel.is_file() and not channel.is_symlink())
+    db = sqlite3.connect(channel.resolve().as_uri() + '?mode=ro', uri=True)
+    db.execute('PRAGMA query_only=ON')
+    try:
+        ok(db.execute('SELECT COUNT(*) FROM channel_history_baselines').fetchone()[0] >= 18)
+    finally:
+        db.close()
+    arc = r['historyArchive']
+    a = Path(arc['root'])
+    m = Path(arc['manifestPath'])
+    ok(a.resolve() == (STATE / 'archive/20261116').resolve() and m.parent.resolve() == a.resolve() and m.is_file() and hashlib.sha256(m.read_bytes()).hexdigest() == arc['manifestSha256'] and (a / 'ledger.sqlite').is_file())
+    ok(not RELEASE.is_symlink() and MAN.is_file() and hashlib.sha256(MAN.read_bytes()).hexdigest() == EXPECTED)
+    names = set()
+    for line in MAN.read_text().splitlines():
+        digest, name = line.split('  ', 1)
+        q = RELEASE / name
+        ok(name.startswith('dist/') and '..' not in Path(name).parts and not q.is_symlink() and q.is_file() and q.resolve().is_relative_to(RELEASE.resolve()) and name not in names)
+        names.add(name)
+        ok(hashlib.sha256(q.read_bytes()).hexdigest() == digest)
+    actual = {{str(p.relative_to(RELEASE)) for p in (RELEASE / 'dist').rglob('*') if p.is_file()}}
+    ok(actual == names)
+    ok(hashlib.sha256((RELEASE / 'scripts/unified-start.mjs').read_bytes()).hexdigest() == {start_script_sha!r})
+    source_manifest = (RELEASE / 'source.sha256').read_text()
+    ok(hashlib.sha256(source_manifest.encode()).hexdigest() == {source_manifest_sha!r})
+    source_names = set()
+    for line in source_manifest.splitlines():
+        digest, name = line.split('  ', 1)
+        q = RELEASE / name
+        ok((name.startswith(('src/', 'scripts/', 'test/')) or name in ('package.json', 'package-lock.json', 'tsconfig.json')) and '..' not in Path(name).parts and not q.is_symlink() and q.is_file() and q.resolve().is_relative_to(RELEASE.resolve()) and name not in source_names)
+        source_names.add(name)
+        ok(hashlib.sha256(q.read_bytes()).hexdigest() == digest)
+    source_actual = {{str(p.relative_to(RELEASE)) for root in ('src', 'scripts', 'test') for p in (RELEASE / root).rglob('*') if p.is_file()}} | {{'package.json', 'package-lock.json', 'tsconfig.json'}}
+    ok(source_actual == source_names)
+    for unit in ['feishu-claude-bridge.service', 'feishu-mobile-ui-20261116.service', 'feishu-mobile-ui-resume-20261116.service', 'feishu-m5-test.service']:
+        q = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ok(q.returncode in (3, 4))
+    print('offline preflight passed')
+except Exception as e:
+    print(f'offline production preflight rejected: {{e}}', file=sys.stderr)
+    sys.exit(1)
+'''
+preflight_path = staging / 'preflight.py'
+preflight_path.write_text(preflight_code, encoding='utf-8')
+preflight_path.chmod(0o755)
+
+unit_content = f"""[Unit]
+Description=Feishu unified Claude, Codex and Agy bridge
+After=network-online.target
+Wants=network-online.target
+Conflicts=feishu-claude-bridge.service feishu-mobile-ui-20261116.service feishu-mobile-ui-resume-20261116.service feishu-m5-test.service
+[Service]
+Type=simple
+WorkingDirectory={release_dir}
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--no-warnings
+EnvironmentFile=/home/zhangzy/.config/feishu-claude-bridge/env
+EnvironmentFile=/home/zhangzy/.config/feishu-claude-bridge/release-77310a6-features.env
+Environment=PATH=/home/zhangzy/bin:/home/zhangzy/.local/bin:/home/zhangzy/.gemini/bin:/usr/local/node-v24.11.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/python3 {release_dir}/preflight.py
+ExecStart=/usr/local/node-v24.11.1-linux-x64/bin/node --no-warnings {release_dir}/scripts/unified-start.mjs --run --config /home/zhangzy/.config/feishu-unified-bridge/config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+ProtectSystem=full
+[Install]
+WantedBy=default.target
+"""
+(staging / 'feishu-unified-production.service').write_text(unit_content, encoding='utf-8')
+
+os.rename(staging, release_dir)
+
+# 2. Update config.json cleanly (atomic replace with 0600 permissions)
+cfg = json.loads(CONF_FILE.read_text(encoding='utf-8'))
+rt = cfg['runtime']
+rt['allowedProjectRoots'] = [
+    '/home/zhangzy/workspace',
+    '/home/zhangzy/papers',
+    '/home/zhangzy/research',
+    '/home/zhangzy/scripts',
+    '/home/zhangzy/courses',
+    '/home/zhangzy',
+]
+rt['outputRoots'] = [
+    '/home/zhangzy/workspace',
+    '/home/zhangzy/papers',
+    '/home/zhangzy/research',
+    '/data/zhangzy/outputs',
+    '/ssd/zhangzy/scratch',
+]
+rt['approvalPolicy'] = {'enabled': False}
+rt['autoTakeControlOnInput'] = True
+agy = rt.setdefault('agy', {})
+agy['processPerSession'] = True
+agy['defaultMode'] = 'auto'
+agy['addDirs'] = ['/ssd/zhangzy', '/data/zhangzy']
+agy['extraWriteRoots'] = [
+    '/ssd/zhangzy/scratch',
+    '/data/zhangzy/outputs',
+    '/data/zhangzy/staging',
+]
+
+tmp_cfg = CONF_DIR / '.config.json.tmp'
+fd = os.open(tmp_cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.chmod(tmp_cfg, 0o600)
+os.replace(tmp_cfg, CONF_FILE)
+
+# 3. Validate config syntax with new unified-start.mjs (offline check)
+subprocess.run(
+    ['/usr/local/node-v24.11.1-linux-x64/bin/node', '--no-warnings', str(release_dir / 'scripts/unified-start.mjs'), '--config', str(CONF_FILE)],
+    check=True,
+)
+
+# 4. Update systemd user unit
+UNIT_FILE.write_text(unit_content, encoding='utf-8')
+
+print(f"DEPLOYED_RELEASE={release_name}")
+print(f"RELEASE_DIR={release_dir}")
