@@ -51,6 +51,37 @@ export function shortenHomePath(path: string): string {
   return path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
+export function formatInlineCode(value: string): string {
+  return stripCardMentions(value).replace(/`/gu, "'").replace(/[\r\n]+/gu, ' ');
+}
+
+export function formatReadableProjectPath(project: string, maxChars = 34): string {
+  const trimmed = project.trim().replace(/(?<=.)[\\/]+$/u, '');
+  if (!trimmed) return '项目未知';
+  if (trimmed === homedir()) return '~ (主目录)';
+  const short = shortenHomePath(trimmed);
+  const chars = [...short];
+  if (chars.length <= maxChars) return short;
+  const segments = short.split(/[\\/]/u).filter(Boolean);
+  if (segments.length >= 3) {
+    const head = short.startsWith('~/') ? `~/${segments[1]}` : short.startsWith('/') ? `/${segments[0]}` : segments[0]!;
+    const tail = segments.at(-1)!;
+    const candidate = `${head}/…/${tail}`;
+    if ([...candidate].length <= maxChars) return candidate;
+    const headPrefix = `${head}/…/`;
+    const remaining = maxChars - [...headPrefix].length;
+    if (remaining >= 6) {
+      return `${headPrefix}${[...tail].slice(0, remaining - 1).join('')}…`;
+    }
+  }
+  const tail = segments.at(-1) ?? short;
+  if ([...tail].length + 2 <= maxChars) {
+    const prefixLen = Math.max(1, maxChars - [...tail].length - 2);
+    return `${chars.slice(0, prefixLen).join('')}…/${tail}`;
+  }
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`;
+}
+
 export function compactProjectName(project: string): string {
   return project.trim().replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.trim() || '项目未知';
 }
@@ -130,7 +161,8 @@ function approvalTargets(detail: Record<string, unknown>): string[] {
       }) : []),
     ];
   });
-  return [...new Set([...(command ? [command] : []), ...paths])];
+  const shortenedPaths = paths.map(p => shortenHomePath(p.trim()));
+  return [...new Set([...(command ? [command] : []), ...shortenedPaths])];
 }
 
 function shorten(value: string, size: number, suffix: string): string {
@@ -233,7 +265,9 @@ function extractPrefixedMcpToolName(tool: string, detail?: Record<string, unknow
 function formatPrefixedMcpLabel(raw: string): string {
   const withoutPrefix = raw.replace(/^mcp_/iu, '');
   if (withoutPrefix.startsWith('agy-fast_fast_')) return `MCP · agy-fast/${withoutPrefix.slice('agy-fast_fast_'.length)}`;
+  if (withoutPrefix.startsWith('agent-dispatch_mcp_')) return `MCP · agent-dispatch/${withoutPrefix.slice('agent-dispatch_mcp_'.length)}`;
   if (withoutPrefix.startsWith('codex-bridge_codex_')) return `MCP · codex/${withoutPrefix.slice('codex-bridge_codex_'.length)}`;
+  if (withoutPrefix.startsWith('codex-bridge_mcp_')) return `MCP · codex/${withoutPrefix.slice('codex-bridge_mcp_'.length)}`;
   return `MCP · ${shorten(withoutPrefix, 24, '…')}`;
 }
 

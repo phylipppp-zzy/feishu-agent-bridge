@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { formatInlineCode, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { payloadDigest, type Session } from './contracts.js';
-import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
+import { providerBadgeColor, providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 import type { FeishuPort } from './feishu-channel.js';
 import { isGenericSessionTitle, normalizeTopicTitle } from './session-title.js';
@@ -89,9 +89,13 @@ export function topicRootCard(
   const statusLabel = session.status === 'read_only' && options?.externallyWorking
     ? '终端运行中'
     : sessionStatusLabel(session.status);
-  const metaLine = `${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(projectText)} · ${statusLabel}`;
+  const providerLabel = providerDisplayLabel(session.native.provider);
+  const metaLine = `${providerLabel} · \`${formatInlineCode(projectText)}\` · ${statusLabel}`;
   return {
+    schema: '2.0',
     title: displayTopicTitle(effective),
+    subtitle: `${projectText} · ${statusLabel}`,
+    headerTags: [{ text: providerLabel, color: providerBadgeColor(session.native.provider) }],
     text: `**${escapeCardMarkdown(fullTitle)}**\n${metaLine}`,
     ...(template ? { template } : {}),
     actions: [],
@@ -105,7 +109,8 @@ export function displayTopicTitle(session: Session): string {
 }
 
 function rootCardSignature(card: ChannelCard): string {
-  return `${card.title}\n${card.template ?? ''}\n${card.text}`;
+  const tags = card.headerTags?.map(t => `${t.text}:${t.color ?? ''}`).join(',') ?? '';
+  return `${card.title}\n${card.subtitle ?? ''}\n${tags}\n${card.template ?? ''}\n${card.text}`;
 }
 
 async function lookupRoot(port: FeishuPort, destination: string, creationDeliveryId?: string): Promise<string | null> {
@@ -218,7 +223,9 @@ export async function syncTopicRootTitle(
       const alreadyPatched = !claimed && await port.lookupMessageId?.(deliveryId) === rootId;
       if (!alreadyPatched) {
         await guard();
-        await port.update(destination, rootId, stampCard(card), deliveryId, guard);
+        // Default unrecorded legacy roots to 1.0 so FeishuSdkPort's 200830 upgrade path runs;
+        // newly created topics record '2.0' in sdk_card_schemas and still patch as Card 2.0.
+        await port.update(destination, rootId, stampCard({ ...card, schema: '1.0' }), deliveryId, guard);
       }
     } catch (error) {
       db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);

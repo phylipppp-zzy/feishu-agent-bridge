@@ -71,10 +71,11 @@ export function buildMainHelpCard(): ChannelCard {
     title: '帮助',
     text: [
       '主群常用入口：',
-      '• /sessions — 查看并打开已有会话',
-      '• /new [后端] [首句] — 选择项目目录并新建会话',
+      '• /sessions [关键词] — 查看、搜索并按 Agent 筛选已有会话',
+      '• /new [agy|codex|claude] [路径] [首句] — 选择执行 Agent 与文件夹新建会话',
       '• /pending — 查看待处理审批与问题',
       '• /task <标题> — 新建多后端任务话题',
+      '• /quota — 查看 Antigravity 额度余量与重置时间',
       '• /health — 查看服务健康状态',
       '• /agy — 查看 Antigravity 进行中/已完成对话与进程占用',
       '',
@@ -93,6 +94,7 @@ export function buildAdminHelpCard(): ChannelCard {
     text: [
       '运维与调试命令：',
       '• /health — 查看各后端与通道健康状态',
+      '• /quota — 查看 Antigravity 额度余量与重置时间',
       '• /agy — 查看 Antigravity 进行中/已完成对话与进程占用',
       '• /ops — 查看待完成的底层操作',
       '• /panel — 打开当前会话控制面板',
@@ -118,8 +120,11 @@ export function buildSessionHelpCard(
   }
   lines.push(
     '• /stop — 中断当前回复',
-    '• /ls — 浏览项目目录文件',
+    '• /ls [-a] [子目录] — 浏览项目目录文件',
     '• /file — 查看并下载会话产物文件',
+    '• /file <相对路径> — 直接发送指定项目文件到飞书',
+    '• /rename <新标题> — 自定义当前话题标题',
+    '• /quota — 查看 Antigravity 额度余量',
     '• /history — 查看会话历史',
   );
   const actions: ChannelCard['actions'] = [];
@@ -148,7 +153,8 @@ export function buildTaskTopicHelpCard(activeProvider?: Provider | null): Channe
       '• /model — 查看或切换当前后端模型',
       '• /swarm <任务目标> — 在 Antigravity 目标下启动多 Agent 协同',
       '• /stop — 中断当前回复',
-      '• /ls / /file — 浏览项目文件与会话产物',
+      '• /ls / /file <相对路径> — 浏览目录或直接发送项目文件与会话产物',
+      '• /rename <新标题> / /quota — 自定义标题或查看额度',
     ].join('\n'),
     actions: [],
   };

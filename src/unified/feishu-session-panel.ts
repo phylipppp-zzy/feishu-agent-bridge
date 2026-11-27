@@ -1,8 +1,8 @@
 import type { UnifiedService } from './adapter.js';
 import type { AgyQuotaSnapshot } from './agy-quota.js';
-import { formatResumeCommand, sessionStatusLabel, sessionStatusTemplate } from './card-formatters.js';
+import { formatInlineCode, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import type { Session } from './contracts.js';
-import type { ChannelCard } from './feishu-cards.js';
+import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import { formatQuotaSummary } from './health-card.js';
 
 type Panel = Pick<ChannelCard, 'text' | 'actions'>;
@@ -29,12 +29,20 @@ export function buildSessionPanel(
   options?: { quota?: AgyQuotaSnapshot | null },
 ): ChannelCard {
   const command = formatResumeCommand(session.native);
+  const providerLabel = providerDisplayLabel(session.native.provider);
+  const shortPath = shortenHomePath(session.project);
+  const contextLines = [
+    `🤖 Agent：${providerLabel}`,
+    `📂 路径：\`${formatInlineCode(shortPath)}\``,
+  ];
   const quotaLines = session.native.provider === 'agy' && options && 'quota' in options
     ? formatQuotaSummary(options.quota)
     : [];
   const details = [...(command ? [`电脑端接回：\`${command}\``] : []), ...quotaLines, notice.text];
   if (!work) return {
-    title:'只读会话', template:'grey', text:['状态：只读', ...details].join('\n'),
+    title:'只读会话',
+    template:'grey',
+    text:[...contextLines, '状态：只读', ...details].join('\n'),
     actions:[{label:'一键接入并续聊',value:{action:'upgrade'}},...notice.actions],
   };
 
@@ -66,7 +74,7 @@ export function buildSessionPanel(
       value:{action:'control',owner:ownsControl ? owner : serviceId || 'feishu',strategy:'wait',...(ownsControl ? {release:true} : {}),...base}});
   }
   const status = archived ? '已归档' : available ? sessionStatusLabel(session.status) : '连接不可用';
-  const text = [`状态：${status}`, ...details, ...(queued.length ? [`排队中：${queued.length} 条`] : [])].join('\n');
+  const text = [...contextLines, `状态：${status}`, ...details, ...(queued.length ? [`排队中：${queued.length} 条`] : [])].join('\n');
   const template = archived ? 'grey' : available ? sessionStatusTemplate(session.status) : 'orange';
   return {title:'会话控制',text,actions,...(template ? {template} : {})};
 }
