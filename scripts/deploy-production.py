@@ -270,9 +270,13 @@ agy['extraWriteRoots'] = [
     '/data/zhangzy/outputs',
     '/data/zhangzy/staging',
 ]
-if isinstance(rt.get('usageHub'), dict):
-    rt['usageHub'].setdefault('dbPath', '/home/zhangzy/.local/state/feishu-unified-bridge/usage-hub.sqlite')
-    rt['usageHub'].setdefault('intervalMinutes', 60)
+usage_hub = rt.setdefault('usageHub', {
+    'enabled': True,
+    'destination': 'oc_d7baeebbf218aebad70265c1b0f1a104',
+})
+if isinstance(usage_hub, dict):
+    usage_hub.setdefault('dbPath', '/home/zhangzy/.local/state/feishu-unified-bridge/usage-hub.sqlite')
+    usage_hub.setdefault('intervalMinutes', 60)
 
 validate_agy_sandbox(rt)
 tmp_cfg = None
