@@ -13,7 +13,14 @@ import { formatCompactModelBadge, turnProgressCard } from '../src/unified/turn-p
 import { parseFeishuText } from '../src/unified/feishu-codec.js';
 import { encodeCard } from '../src/unified/feishu-card-wire.js';
 import { DEFAULT_PROMPT_IDLE_TIMEOUT_MS } from '../src/unified/agy/adapter-types.js';
-import type { Session } from '../src/unified/contracts.js';
+import { formatApprovalAction } from '../src/unified/card-formatters.js';
+import { reconcilePersistedAgyHistory } from '../src/unified/agy/transcript-reconciliation.js';
+import { UnifiedStore } from '../src/unified/store.js';
+import { UnifiedCore } from '../src/unified/service.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Message, Session } from '../src/unified/contracts.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
 import type { FeishuPort } from '../src/unified/feishu-channel.js';
 
@@ -321,4 +328,154 @@ test('turn progress card appends compact model + effort badge to header title', 
     modelBadge: formatCompactModelBadge('gemini-4-carbon', 'medium'),
   });
   assert.equal(card.title, 'Antigravity · 进行中 · 用时 17分00秒 · carbon medium');
+});
+
+test('formatApprovalAction identifies prefixed MCP tools and renders toolSummary instead of bare cwd', () => {
+  const action = JSON.stringify({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'call_1',
+    name: 'mcp_agy-fast_fast_batch_search',
+    title: 'Run mcp_agy-fast_fast_batch_search',
+    args: {
+      cwd: '/home/zhangzy/workspace/feishu-agent-bridge',
+      toolSummary: 'Search approval policy and auto-reply logic',
+      queries: [{ pattern: 'approvalPolicy', type: 'text' }],
+    },
+  });
+  const view = formatApprovalAction('Run mcp_agy-fast_fast_batch_search', action, 'this_request');
+  assert.equal(view.toolLabel, 'MCP · agy-fast/batch_search');
+  assert.ok(view.compactTarget.includes('Search approval policy and auto-reply logic'));
+  assert.ok(view.compactTarget.includes('feishu-agent-bridge'));
+  assert.ok(!view.toolLabel.includes('执行命令'));
+});
+
+test('reconcilePersistedAgyHistory absorbs duplicate native user prompts even when live turn had no assistant reply', () => {
+  const msg = (id: string, turnId: string, text: string, seq: number): Message => ({
+    messageId: id,
+    sessionId: 'sess-1',
+    turnId,
+    role: 'user',
+    blocks: [{ type: 'text', text }],
+    sequence: seq,
+    revision: 1,
+    final: true,
+    source: 'agy',
+  });
+  const persisted = new Map<string, Message>([
+    ['3cc5d7ae-uuid', msg('3cc5d7ae-uuid', '3cc5d7ae-uuid', 'status', 306)],
+    ['655c728a-uuid', msg('655c728a-uuid', '655c728a-uuid', '三项同步推进', 307)],
+  ]);
+  const observed = {
+    messages: [
+      msg('hash-3034', 'step-3034', 'status', 1),
+      msg('hash-3039', 'step-3039', '三项同步推进', 2),
+    ],
+    turns: [
+      { turnId: 'step-3034', sessionId: 'sess-1', status: 'completed' as const, inputId: null, startedAt: null, endedAt: null, model: null, outputIds: [] },
+      { turnId: 'step-3039', sessionId: 'sess-1', status: 'completed' as const, inputId: null, startedAt: null, endedAt: null, model: null, outputIds: [] },
+    ],
+  };
+  const result = reconcilePersistedAgyHistory(observed, persisted);
+  assert.equal(result.snapshot.messages.length, 0);
+  assert.equal(result.snapshot.turns?.length, 0);
+  assert.equal(result.conflicts.length, 0);
+});
+
+test('UnifiedCore merges consecutive queued text inputs into a single dispatched turn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'queue-merge-'));
+  const dispatched: string[] = [];
+  const nativeSession: Session = makeSession({
+    sessionId: 'ignored',
+    native: { provider: 'agy', hostId: 'local', serviceId: 'agy', nativeSessionId: 'native-merge' },
+    project: '/home/zhangzy',
+    title: 'Queue merge test',
+    status: 'idle',
+    revision: 1,
+    control: { input: 'available', owner: 'feishu', generation: 1, serviceId: 'agy', operationId: null, reason: null },
+    capabilities: {
+      ...makeSession().capabilities,
+      view: { status: 'available' },
+      send: { status: 'available' },
+      answer: { status: 'available' },
+      approve: { status: 'available' },
+      queue: { status: 'available' },
+      steer: { status: 'unsupported', reason: 'acp' },
+      interrupt: { status: 'available' },
+      handoff: { status: 'available' },
+    },
+  });
+  const port: any = {
+    provider: 'agy',
+    onObservation: () => () => {},
+    list: async () => ({ items: [nativeSession], nextCursor: null }),
+    attach: async () => ({ session: nativeSession, connectionGeneration: 1 }),
+    resume: async () => ({ session: nativeSession, connectionGeneration: 1 }),
+    subscribe: async () => ({ session: nativeSession, messages: [], interactions: [], turns: [], connectionGeneration: 1 }),
+    unsubscribe: async () => {},
+    read: async () => ({ session: nativeSession, messages: [], interactions: [], turns: [] }),
+    input: async (_native: any, _mode: string, blocks: any[], guard: any) => {
+      guard.assertCurrent();
+      dispatched.push(blocks.map(b => b.text).join('\n'));
+      return { nativeReference: `turn-${dispatched.length}` };
+    },
+  };
+  const store = new UnifiedStore(join(dir, 'core.sqlite'));
+  const core = new UnifiedCore(store, [port], () => true, () => true);
+  try {
+    const idCtx = (opId: string) => ({
+      operationId: opId,
+      idempotencyKey: opId,
+      identity: { source: 'feishu' as const, subject: 'owner' },
+    });
+    const attached = store.attachSession(
+      { ...idCtx('att'), targetId: 'native-merge', expectedRevision: 0, controlGeneration: 0 },
+      nativeSession,
+      { ...nativeSession.native, mode: 'interactive' },
+      1,
+    );
+    const sessionId = (attached.result as { sessionId: string }).sessionId;
+    // Simulate a running turn so inputs queue up.
+    store.observeTurn({
+      turnId: 'running-1',
+      sessionId,
+      status: 'running',
+      inputId: null,
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      model: null,
+      outputIds: [],
+    });
+    const session = await core.getSession(sessionId);
+    const op1 = await core.submitInput({
+      context: { ...idCtx('q1'), targetId: sessionId, expectedRevision: session.revision, controlGeneration: session.control.generation },
+      mode: 'queue',
+      blocks: [{ type: 'text', text: '第一条排队消息' }],
+    });
+    const op2 = await core.submitInput({
+      context: { ...idCtx('q2'), targetId: sessionId, expectedRevision: session.revision, controlGeneration: session.control.generation },
+      mode: 'queue',
+      blocks: [{ type: 'text', text: '第二条排队消息' }],
+    });
+    assert.equal(store.queuedInputs(sessionId).length, 2);
+    // Finish running turn so queued inputs become eligible.
+    store.observeTurn({
+      turnId: 'running-1',
+      sessionId,
+      status: 'completed',
+      inputId: null,
+      startedAt: new Date().toISOString(),
+      endedAt: new Date().toISOString(),
+      model: null,
+      outputIds: [],
+    });
+    const dispatchedOp = await core.dispatch(op1.operationId);
+    assert.equal(dispatchedOp.status, 'accepted');
+    assert.deepEqual(dispatched, ['第一条排队消息\n\n第二条排队消息']);
+    assert.equal(store.queuedInputs(sessionId).length, 0);
+    assert.equal(store.getOperation(op2.operationId).status, 'completed');
+  } finally {
+    await core.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

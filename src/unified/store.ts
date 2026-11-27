@@ -279,10 +279,22 @@ export class UnifiedStore {
     const done:Operation={...accepted,status:'completed',revision:accepted.revision+1};this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(done),id);this.run("UPDATE outbox SET state='done' WHERE operation_id=?",id);this.eventFor(op.targetId,id,done.revision,'operation.completed',id,done);return done;
   }); }
   /** Persist the actual native turn reference and handle observations that arrived before the acknowledgement. */
-  acceptSubmission(id: string, nativeReference: string | null): Operation { return this.transaction(() => {
+  acceptSubmission(id: string, nativeReference: string | null, mergedIds: readonly string[] = []): Operation { return this.transaction(() => {
     const op=this.getOperation(id); const out=this.getOutbox(id); if (out.kind === 'resolveInteraction' || out.state !== 'in_flight' || !canTransitionOperation(op.status,'accepted')) return fail('invalid_request');
     if (op.action === 'submitInput' && nativeReference) this.run('INSERT INTO operation_turns(operation_id,session_id,turn_id) VALUES(?,?,?)',id,op.targetId,nativeReference);
     const next: Operation = {...op,status:'accepted',revision:op.revision+1,error:null}; this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id); this.eventFor(op.targetId,id,next.revision,'operation.accepted',id,next);
+    for (const mergedId of mergedIds) {
+      const mergedOp = this.getOperation(mergedId);
+      const mergedOut = this.getOutbox(mergedId);
+      if (mergedOut.state !== 'in_flight') continue;
+      const acceptedMerged = canTransitionOperation(mergedOp.status, 'accepted')
+        ? this.updateOperationInTransaction(mergedOp, 'accepted')
+        : mergedOp;
+      if (canTransitionOperation(acceptedMerged.status, 'completed')) {
+        this.updateOperationInTransaction(acceptedMerged, 'completed');
+      }
+      this.run("UPDATE outbox SET state='done' WHERE operation_id=?", mergedId);
+    }
     if (op.action === 'submitInput' && nativeReference) {const row=this.row('SELECT value FROM turns WHERE id=? AND session_id=?',nativeReference,op.targetId); if(row) this.settleTurn(parse<Turn>(row.value));}
     if (out.kind === 'archiveSession') {
       const current = this.session(op.targetId), { archived } = out.payload as { archived: boolean };
@@ -427,7 +439,11 @@ export class UnifiedStore {
   listSessions(): Session[] { return (this.db.prepare('SELECT value FROM sessions ORDER BY rowid').all() as Record<string, unknown>[]).map(r => parse<Session>(r.value)); }
   findSession(native: Session['native']): Session | undefined { const row = this.row("SELECT value FROM sessions WHERE json_extract(value,'$.native.provider')=? AND json_extract(value,'$.native.hostId')=? AND json_extract(value,'$.native.serviceId')=? AND json_extract(value,'$.native.nativeSessionId')=?",native.provider,native.hostId,native.serviceId,native.nativeSessionId); return row ? parse<Session>(row.value) : undefined; }
   connectionGeneration(id: string): number { const row = this.row('SELECT connection_generation FROM sessions WHERE id=?', id); if (!row) return fail('invalid_request', 'unknown session'); return Number(row.connection_generation); }
-  hasUnsettledInput(sessionId: string, exceptId: string): boolean { return !!this.row("SELECT 1 FROM outbox WHERE json_extract(context,'$.targetId')=? AND kind='submitInput' AND state IN ('in_flight','unknown') AND operation_id<>? LIMIT 1",sessionId,exceptId); }
+  hasUnsettledInput(sessionId: string, exceptIds: string | readonly string[]): boolean {
+    const ids = Array.isArray(exceptIds) ? exceptIds : [exceptIds];
+    const placeholders = ids.map(() => '?').join(',');
+    return !!this.row(`SELECT 1 FROM outbox WHERE json_extract(context,'$.targetId')=? AND kind='submitInput' AND state IN ('in_flight','unknown') AND operation_id NOT IN (${placeholders}) LIMIT 1`,sessionId,...ids);
+  }
   hasOpenInteraction(sessionId: string): boolean { return !!this.row("SELECT 1 FROM interactions WHERE session_id=? AND json_extract(value,'$.status') IN ('awaiting_answer','answer_pending_delivery') LIMIT 1",sessionId); }
   interactionHealthCounts(): {pending:number; unknown:number} {
     const row = this.db.prepare(`
@@ -843,6 +859,47 @@ export class UnifiedStore {
     if(valid && table==='steer_outbox_v1') {const req=parse<import('./contracts.js').SubmitInput>(row.payload),turns=this.listTurns(context.targetId).filter(t=>t.status==='running');valid=req.mode==='steer' && turns.length===1 && turns[0]?.turnId===req.requiredTurnId && Number(row.connection_generation)===req.expectedConnectionGeneration;}
     if (!valid) { this.cancelPending(id); return false; }
     this.run(`UPDATE ${table} SET state='in_flight' WHERE operation_id=?`, id); return true;
+  }); }
+  /** Atomically claim a queued text input together with immediately following compatible queued text inputs. */
+  claimQueuedTextBatch(id: string): { claimed: boolean; mergedIds: string[]; mergedText?: string } { return this.transaction(() => {
+    const row = this.row('SELECT kind,payload,context,connection_generation,state FROM outbox WHERE operation_id=?', id);
+    if (!row || row.state !== 'pending' || row.kind !== 'submitInput' || this.row('SELECT 1 FROM first_prompt_suspensions WHERE operation_id=?', id)) {
+      return { claimed: false, mergedIds: [] };
+    }
+    const context = parse<WriteContext>(row.context);
+    const payload = parse<import('./contracts.js').SubmitInput>(row.payload);
+    const session = this.row('SELECT control_generation,connection_generation FROM sessions WHERE id=?', context.targetId);
+    const valid = !!session && Number(session.control_generation) === context.controlGeneration && Number(session.connection_generation) === Number(row.connection_generation);
+    if (!valid) { this.cancelPending(id); return { claimed: false, mergedIds: [] }; }
+    this.run("UPDATE outbox SET state='in_flight' WHERE operation_id=?", id);
+    if (payload.mode !== 'queue' || !payload.blocks.length || !payload.blocks.every(b => b.type === 'text')) {
+      return { claimed: true, mergedIds: [] };
+    }
+    const texts: string[] = [payload.blocks.map(b => (b.type === 'text' ? b.text : '')).join('\n')];
+    const mergedIds: string[] = [];
+    const following = this.pendingOutbox(context.targetId, 'submitInput');
+    for (const nextId of following) {
+      if (nextId === id) continue;
+      const nextOut = this.getOutbox(nextId);
+      if (nextOut.state !== 'pending' || nextOut.kind !== 'submitInput') break;
+      const nextPayload = nextOut.payload as import('./contracts.js').SubmitInput;
+      const compatible =
+        nextPayload.mode === 'queue' &&
+        nextOut.connectionGeneration === Number(row.connection_generation) &&
+        nextOut.context.controlGeneration === context.controlGeneration &&
+        nextOut.context.identity.source === context.identity.source &&
+        nextOut.context.identity.subject === context.identity.subject &&
+        nextPayload.channelScope === payload.channelScope &&
+        nextPayload.blocks.length > 0 &&
+        nextPayload.blocks.every(b => b.type === 'text');
+      if (!compatible) break;
+      this.run("UPDATE outbox SET state='in_flight' WHERE operation_id=?", nextId);
+      mergedIds.push(nextId);
+      texts.push(nextPayload.blocks.map(b => (b.type === 'text' ? b.text : '')).join('\n'));
+    }
+    return mergedIds.length
+      ? { claimed: true, mergedIds, mergedText: texts.join('\n\n') }
+      : { claimed: true, mergedIds: [] };
   }); }
   /** Pending at restart is not proof of a currently authorized delivery context. */
   failUnreboundPending(ids:string[]):void { this.transaction(()=>{ for(const id of ids) { const out=this.getOutbox(id); if(out.state!=='pending') continue; if(this.row('SELECT id FROM sessions WHERE id=?',out.context.targetId)) {this.cancelPending(id);continue;} const op=this.getOperation(id); if(canTransitionOperation(op.status,'failed')) {const next:Operation={...op,status:'failed',revision:op.revision+1,error:contractError('control_conflict','restart requires a new authorized request')};this.run('UPDATE operations SET value=? WHERE id=?',JSON.stringify(next),id);this.run("UPDATE outbox SET state='cancelled' WHERE operation_id=?",id);} } }); }

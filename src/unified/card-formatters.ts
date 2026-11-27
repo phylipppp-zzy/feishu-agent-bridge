@@ -217,6 +217,26 @@ function formatStructuredEntries(obj: Record<string, unknown> | undefined, skip?
   return entries;
 }
 
+function extractPrefixedMcpToolName(tool: string, detail?: Record<string, unknown>): string | undefined {
+  const candidates = [
+    nonblank(detail?.name) ? detail.name.trim() : undefined,
+    nonblank(detail?.title) ? detail.title.trim() : undefined,
+    stripCardMentions(tool).trim(),
+  ].filter(nonblank);
+  for (const candidate of candidates) {
+    const match = candidate.match(/^(?:Run\s+)?(mcp_[A-Za-z0-9_-]+)$/iu);
+    if (match?.[1]) return match[1];
+  }
+  return undefined;
+}
+
+function formatPrefixedMcpLabel(raw: string): string {
+  const withoutPrefix = raw.replace(/^mcp_/iu, '');
+  if (withoutPrefix.startsWith('agy-fast_fast_')) return `MCP · agy-fast/${withoutPrefix.slice('agy-fast_fast_'.length)}`;
+  if (withoutPrefix.startsWith('codex-bridge_codex_')) return `MCP · codex/${withoutPrefix.slice('codex-bridge_codex_'.length)}`;
+  return `MCP · ${shorten(withoutPrefix, 24, '…')}`;
+}
+
 function extractMcpToolName(detail?: Record<string, unknown>): string | undefined {
   if (!detail) return undefined;
   const fields = [detail, record(detail.args), record(detail.input), record(detail.params), record(detail.rawInput)];
@@ -228,12 +248,25 @@ function extractMcpToolName(detail?: Record<string, unknown>): string | undefine
   return undefined;
 }
 
+function extractToolSummary(detail?: Record<string, unknown>): string | undefined {
+  if (!detail) return undefined;
+  const fields = [detail, record(detail.args), record(detail.input), record(detail.params), record(detail.rawInput)];
+  for (const field of fields) {
+    if (!field) continue;
+    if (nonblank(field.toolSummary)) return field.toolSummary.trim();
+    if (nonblank(field.ToolSummary)) return field.ToolSummary.trim();
+  }
+  return undefined;
+}
+
 function approvalFallbackSummary(detail: Record<string, unknown>, tool: string): { summary: string; compactTarget: string } {
   const fields = [detail, record(detail.args), record(detail.input), record(detail.params), record(detail.rawInput)];
   const server = fields
     .map(f => (nonblank(f?.ServerName) ? f.ServerName : nonblank(f?.serverName) ? f.serverName : nonblank(f?.server) ? f.server : undefined)?.trim())
     .find(Boolean);
   const mcpTool = extractMcpToolName(detail);
+  const prefixedMcp = extractPrefixedMcpToolName(tool, detail);
+  const toolSummary = extractToolSummary(detail);
   const uri = fields
     .map(f => (nonblank(f?.Uri) ? f.Uri : nonblank(f?.uri) ? f.uri : undefined)?.trim())
     .find(Boolean);
@@ -244,21 +277,25 @@ function approvalFallbackSummary(detail: Record<string, unknown>, tool: string):
     const lines = formatStructuredEntries(mcpArgs);
     return {
       summary: [header, ...lines].filter(Boolean).join('\n'),
-      compactTarget: header || lines[0] || '',
+      compactTarget: toolSummary || header || lines[0] || '',
     };
   }
   const title = nonblank(detail.title) ? detail.title.trim() : '';
   const name = nonblank(detail.name) ? detail.name.trim() : '';
-  const header = title || name;
+  const header = prefixedMcp ? formatPrefixedMcpLabel(prefixedMcp) : (title || name);
   const payloads = [nonEmptyRecord(detail.args), nonEmptyRecord(detail.input), nonEmptyRecord(detail.params), nonEmptyRecord(detail.rawInput)];
   for (const payload of payloads) {
     if (!payload) continue;
     const lines = formatStructuredEntries(payload);
     if (lines.length) {
+      const cwd = nonblank(payload.cwd) ? shortenHomePath(payload.cwd.trim()) : '';
+      const mcpCompact = toolSummary
+        ? (cwd ? `${toolSummary} (${cwd})` : toolSummary)
+        : (prefixedMcp && cwd ? `${prefixedMcp} (${cwd})` : '');
       const redundantHeader = !title || title.toLowerCase() === tool.trim().toLowerCase() || title.toLowerCase() === name.toLowerCase();
       return {
-        summary: [header, ...lines].filter(Boolean).join('\n'),
-        compactTarget: redundantHeader ? lines[0]! : title,
+        summary: [header, ...(toolSummary ? [`摘要: ${toolSummary}`] : []), ...lines].filter(Boolean).join('\n'),
+        compactTarget: mcpCompact || (redundantHeader ? lines[0]! : title),
       };
     }
   }
@@ -266,7 +303,7 @@ function approvalFallbackSummary(detail: Record<string, unknown>, tool: string):
   const redundantHeader = !title || title.toLowerCase() === tool.trim().toLowerCase() || title.toLowerCase() === name.toLowerCase();
   return {
     summary: [header, ...directLines].filter(Boolean).join('\n'),
-    compactTarget: directLines.length && redundantHeader ? directLines[0]! : (header || directLines[0] || ''),
+    compactTarget: toolSummary || (directLines.length && redundantHeader ? directLines[0]! : (header || directLines[0] || '')),
   };
 }
 
@@ -274,6 +311,8 @@ function resolveApprovalToolLabel(tool: string, detail?: Record<string, unknown>
   const stripped = stripCardMentions(tool).trim();
   const mcpTool = extractMcpToolName(detail) ?? stripped.match(/(?:^|\s)MCP\s+Tool\s+(\S+)/iu)?.[1];
   if (mcpTool) return `MCP · ${shorten(stripCardMentions(mcpTool).trim(), 20, '…')}`;
+  const prefixedMcp = extractPrefixedMcpToolName(tool, detail);
+  if (prefixedMcp) return formatPrefixedMcpLabel(prefixedMcp);
   const toolName = stripped.split(/\s+/u)[0] ?? '';
   const key = toolName.toLowerCase();
   if (Object.hasOwn(toolLabels, key)) return toolLabels[key]!;
@@ -292,7 +331,8 @@ export function formatApprovalAction(tool: string, action: string, scope: string
   const reason = [detail && prefix, detail?.reason].filter(nonblank).map(stripCardMentions)
     .find(value => /\p{Script=Han}/u.test(value))
     ?? '原端要求人工确认此操作。';
-  const targets = detail ? approvalTargets(detail) : [prefix];
+  const isMcpTool = Boolean(detail && (extractMcpToolName(detail) || extractPrefixedMcpToolName(tool, detail)));
+  const targets = detail && !isMcpTool ? approvalTargets(detail) : (detail ? [] : [prefix]);
   const rawTargets = targets.join('\n');
   const fallback = !rawTargets && detail ? approvalFallbackSummary(detail, tool) : null;
   const target = rawTargets || fallback?.summary || '';

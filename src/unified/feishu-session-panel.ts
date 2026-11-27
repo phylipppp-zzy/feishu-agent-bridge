@@ -10,18 +10,14 @@ type NoticeSettings = {paused:boolean; completed:boolean; waiting:boolean; faile
 
 export function noticePanel(session: Session, settings: NoticeSettings, legacy?: {enabled:number; event_types:string}): Panel {
   const base = {action:'notice_settings', revision:session.revision, controlGeneration:session.control.generation, settingsRevision:settings.revision};
-  const names = {completed:'完成', waiting:'等待', failed:'失败'} as const;
-  const fields = ['completed','waiting','failed'] as const;
   const legacyFilter = !!legacy && JSON.parse(legacy.event_types).length > 0;
-  const summary = fields.map(field => `${names[field]}：${settings[field] ? '开' : '关'}`).join(' · ');
   const text = [
-    `通知：${settings.paused ? '已暂停' : '开启'}（${summary}）`,
+    `通知：${settings.paused ? '已暂停' : '开启'}`,
     ...(legacy?.enabled === 0 ? ['旧版暂停同时停止回复同步，恢复通知后继续。'] : []),
     ...(legacyFilter ? ['已有旧版筛选仍同时生效。'] : []),
   ].join('\n');
   return {text, actions:[
     {label:settings.paused ? '恢复通知' : '暂停通知', value:{...base,field:'paused',value:!settings.paused}},
-    ...fields.map(field => ({label:`${settings[field] ? '关闭' : '开启'}${names[field]}提醒`,value:{...base,field,value:!settings[field]}})),
     ...(legacyFilter ? [{label:'清除旧版筛选',value:{...base,field:'legacy',value:false}}] : []),
   ]};
 }

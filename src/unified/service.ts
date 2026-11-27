@@ -634,7 +634,25 @@ export class UnifiedCore implements UnifiedService {
       if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(session.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return this.store.getOperation(id);
       if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || this.store.connectionGeneration(session.sessionId)!==input.expectedConnectionGeneration)return this.store.reconcileOperation(id,'failed',contractError('interaction_expired','captured turn changed'));}
       if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return this.store.reconcileOperation(id,'failed',contractError('busy','turn is no longer running'));
-      if (!this.store.claimOutbox(id)) return this.store.getOperation(id);
+      const queuedBatch = out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue'
+        ? this.store.claimQueuedTextBatch(id)
+        : { claimed: this.store.claimOutbox(id), mergedIds: [] as string[], mergedText: undefined as string | undefined };
+      if (!queuedBatch.claimed) return this.store.getOperation(id);
+      const batchIds = [id, ...queuedBatch.mergedIds];
+      const markBatchUnknown = (): Operation => {
+        const primary = this.store.markDeliveryUnknown(id);
+        for (const mergedId of queuedBatch.mergedIds) {
+          if (this.store.getOutbox(mergedId).state === 'in_flight') this.store.markDeliveryUnknown(mergedId);
+        }
+        return primary;
+      };
+      const failBatch = (detail: ContractError): Operation => {
+        const primary = this.store.reconcileOperation(id, 'failed', detail);
+        for (const mergedId of queuedBatch.mergedIds) {
+          if (this.store.getOutbox(mergedId).state === 'in_flight') this.store.reconcileOperation(mergedId, 'failed', detail);
+        }
+        return primary;
+      };
       let guarded = false;
       const guard: DispatchGuard = {
         operationId: id, expectedControlGeneration: out.context.controlGeneration, expectedConnectionGeneration: out.connectionGeneration,
@@ -648,7 +666,7 @@ export class UnifiedCore implements UnifiedService {
           if ((out.kind === 'submitInput' && !this.inputScopeCurrent(out.payload as SubmitInput,session.sessionId)) ||
               (out.kind === 'interruptTurn' && !this.channelScopeCurrent(out.context.channelScope,session.sessionId))) return fail('control_conflict','binding changed');
           if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {const input=out.payload as SubmitInput,turns=this.store.listTurns(session.sessionId).filter(t=>t.status==='running');if(turns.length!==1 || turns[0]?.turnId!==input.requiredTurnId || input.expectedConnectionGeneration!==out.connectionGeneration)return fail('interaction_expired','captured turn changed');}
-          if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,id))) return fail('busy','session no longer ready for queued input');
+          if (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'queue' && (!['idle','failed','interrupted'].includes(current.status) || this.store.listTurns(session.sessionId).some(t=>t.status==='running'||t.status==='queued') || this.store.hasOpenInteraction(session.sessionId) || this.store.hasUnsettledInput(session.sessionId,batchIds))) return fail('busy','session no longer ready for queued input');
           if (out.kind === 'interruptTurn' && !this.store.listTurns(session.sessionId).some(t=>t.turnId === (out.payload as {turnId:string}).turnId && t.status === 'running')) return fail('busy','turn is no longer running');
           guarded = true;
         },
@@ -660,12 +678,14 @@ export class UnifiedCore implements UnifiedService {
           const setting = input.mode === 'steer' ? null : this.store.confirmedSettings(session.sessionId);
           if (setting && !this.settingsSyncMatches(session.sessionId, out.connectionGeneration, setting)) {
             const restored = await port.updateSettings(session.native, { model: setting.model, preferences: setting.preferences }, guard);
-            if (restored.settingsApplied !== true) return this.store.markDeliveryUnknown(id);
+            if (restored.settingsApplied !== true) return markBatchUnknown();
             this.markSettingsSynced(session.sessionId, out.connectionGeneration, setting);
             // Reset guard so port.input() is fenced independently from the preceding settings sync.
             guarded = false;
           }
-          const blocks: PlatformInputBlock[] = input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; });
+          const blocks: PlatformInputBlock[] = queuedBatch.mergedText !== undefined
+            ? [{ type: 'text', text: queuedBatch.mergedText }]
+            : input.blocks.map(block => { if (block.type === 'text') return block; const artifact = this.store.stagedArtifacts(session.sessionId).find(a => a.artifactId === block.artifactId && a.contentVersion === block.contentVersion); const content = this.store.stagedArtifact(session.sessionId,block.artifactId,block.contentVersion); if (!artifact || !content) return fail('invalid_request','staged artifact missing'); return {...block,name:artifact.name,mediaType:artifact.mediaType,content}; });
           nativeReference = (await port.input(session.native, input.mode === 'queue' ? 'new' : input.mode, blocks, guard, input.requiredTurnId)).nativeReference;
         }
         else if (out.kind === 'archiveSession') { if (!port.archive) return this.store.reconcileOperation(id,'failed',contractError('unsupported')); await port.archive(session.native,(out.payload as {archived:boolean}).archived,guard); }
@@ -685,11 +705,11 @@ export class UnifiedCore implements UnifiedService {
         else if (out.kind === 'interruptTurn') { await port.interrupt(session.native, (out.payload as { turnId: string }).turnId, guard); }
         else return this.store.reconcileOperation(id, 'failed', contractError('unsupported'));
         // A provider that omits its mandatory fence cannot establish a reliable acknowledgement.
-        if (!guarded && this.store.getOutbox(id).state === 'in_flight') return this.store.markDeliveryUnknown(id);
+        if (!guarded && this.store.getOutbox(id).state === 'in_flight') return markBatchUnknown();
         // An observation or control change can invalidate an in-flight submission.
         if (this.store.getOutbox(id).state !== 'in_flight') return this.store.getOperation(id);
         if(out.kind==='submitInput' && (out.payload as SubmitInput).mode==='steer') {if(nativeReference!==(out.payload as SubmitInput).requiredTurnId)return this.store.markDeliveryUnknown(id);return this.store.completeSteer(id);}
-        return this.store.acceptSubmission(id,nativeReference);
+        return this.store.acceptSubmission(id,nativeReference,queuedBatch.mergedIds);
       } catch (error) {
         // Terminal evidence may already have settled the interruption.
         if (out.kind === 'interruptTurn' && this.store.getOutbox(id).state !== 'in_flight') return this.store.getOperation(id);
@@ -702,7 +722,7 @@ export class UnifiedCore implements UnifiedService {
             error.detail.code === 'busy' ||
             ((input?.mode === 'steer' || input?.channelScope || (out.kind === 'interruptTurn' && out.context.channelScope)) &&
               ['control_conflict','interaction_expired','unauthorized'].includes(error.detail.code))
-        )) return this.store.reconcileOperation(id,'failed',error.detail);
+        )) return failBatch(error.detail);
         if (!guarded && error && typeof error === 'object' && 'code' in error) {
           const code = (error as { code: unknown }).code;
           const message = 'message' in error && typeof (error as { message?: unknown }).message === 'string'
@@ -713,10 +733,10 @@ export class UnifiedCore implements UnifiedService {
             code === 'busy' ||
             (out.kind === 'submitInput' && (out.payload as SubmitInput).mode === 'steer' &&
               (code === 'control_conflict' || code === 'interaction_expired' || code === 'unauthorized'))
-          ) return this.store.reconcileOperation(id, 'failed', contractError(code, message));
+          ) return failBatch(contractError(code, message));
         }
         // The transport may have written before losing its acknowledgement.
-        return this.store.markDeliveryUnknown(id);
+        return markBatchUnknown();
       }
       } finally { this.store.releaseDispatchLease(pending.context.targetId,owner,generation); }
     });

@@ -137,7 +137,7 @@ export function interactionCard(
     else if (status) title = '审批 · 等待原端确认';
     if (!awaiting) {
       const compactTarget = view.compactTarget
-        ? `\`${compactCardField(view.compactTarget, 80).replace(/`/gu, "'")}\``
+        ? `\`${compactCardField(view.compactTarget, 140).replace(/`/gu, "'")}\``
         : '';
       const compactText = [
         escapeCardMarkdown(view.toolLabel),
