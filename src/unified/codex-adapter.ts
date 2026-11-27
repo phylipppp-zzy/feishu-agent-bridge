@@ -264,7 +264,7 @@ export class CodexAdapter implements PlatformPort {
     if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread), connectionGeneration:generation } as PlatformObservation); }
   }
   async list(cursor: string | null, limit: number): Promise<{ items: Session[]; nextCursor: string | null }> {
-    if (!Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request'); const r = await this.transport.request('thread/list', { cursor, limit }) as Obj;
+    if (!Number.isSafeInteger(limit) || limit < 1) throw contractError('invalid_request'); const r = await this.transport.request('thread/list', { cursor, limit, useStateDbOnly: true }) as Obj;
     if (!Array.isArray(r?.data) || !(r.nextCursor == null || typeof r.nextCursor === 'string')) return invalidNative(); return { items: r.data.map((t: Obj) => this.session(t)), nextCursor: r.nextCursor ?? null };
   }
   candidateGeneration():number|null{return this.transport.connected?this.transport.generation:null;}

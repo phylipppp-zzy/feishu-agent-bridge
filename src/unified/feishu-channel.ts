@@ -12,7 +12,7 @@ import { formatInterruptedTurn } from './card-formatters.js';
 import { buildSessionPanel, noticePanel } from './feishu-session-panel.js';
 import { NewSessionDrafts } from './new-session-drafts.js';
 import { NewSessionFlow, type NewSessionAction } from './new-session-flow.js';
-import { operationCard, type ChannelCard } from './feishu-cards.js';
+import { operationCard, providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import { readTurnReply } from './turn-reply.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 import { FeishuInteractionCards, isResolvedApproval } from './feishu-interaction-cards.js';
@@ -366,6 +366,39 @@ export class FeishuChannel {
     if(row.binding_scope!==this.bindingScope(row.destination)) {this.db.prepare('DELETE FROM channel_auto_baselines WHERE event_id=?').run(eventId);return;}
     await this.baselineReadonlyHistory(row.destination,row.session_id,JSON.parse(row.snapshot));
     this.db.prepare('DELETE FROM channel_auto_baselines WHERE event_id=?').run(eventId);
+  }
+  /**
+   * One-shot idempotent history replay for an already-bound `read_only` topic.
+   * Resets known/baseline markers and cursor back to `initialCursor`, then runs `sync(destination)`
+   * so all persisted user prompts (as CLI prompt cards) and assistant replies are delivered once.
+   */
+  async replayReadonlyHistoryOnce(sessionId: string): Promise<boolean> {
+    const markerId = `ro-replay:${sessionId}`;
+    const binding = this.db
+      .prepare("SELECT destination, binding_id, revision, access_mode FROM channel_bindings WHERE session_id=? AND access_mode='read_only' LIMIT 1")
+      .get(sessionId) as { destination: string; binding_id: string; revision: number; access_mode: 'read_only' } | undefined;
+    if (!binding) return false;
+    const initial = await this.service.initialCursor?.(sessionId);
+    if (!initial) return false;
+    const scope = JSON.stringify({ session_id: sessionId, binding_id: binding.binding_id, revision: binding.revision, access_mode: binding.access_mode });
+    const claimed = this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(markerId).changes;
+    if (!claimed) return false;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM channel_known_messages WHERE destination=? AND session_id=?').run(binding.destination, sessionId);
+      this.db.prepare('DELETE FROM channel_history_baselines WHERE destination=? AND session_id=?').run(binding.destination, sessionId);
+      this.db.prepare('INSERT OR REPLACE INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?)')
+        .run(binding.destination, sessionId, initial, scope);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(markerId);
+      throw error;
+    }
+    this.turnCards.discardOtherScopes(binding.destination, '');
+    await this.sync(binding.destination);
+    this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(markerId);
+    return true;
   }
   async baselineReadonlyHistory(destination:string,sessionId:string,prepared?:{cursor:string;messages:Array<{messageId:string;revision:number}>}):Promise<void> {
     const scope=this.bindingScope(destination); await this.checkBinding(destination,sessionId,scope); if(this.accessMode(destination)!=='read_only') throw new Error('binding changed'); if(this.readonlyHydrated(destination,sessionId)) return;
@@ -1395,11 +1428,26 @@ export class FeishuChannel {
         const deliveryId = `cli-prompt:${payloadDigest([scope, destination, sessionId, message.messageId])}`;
         await syncGuard();
         if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
-          if (this.port.sendText) {
-            await this.port.sendText(destination, `💻 CLI 指令：\n${body}`, deliveryId, syncGuard);
-          } else {
-            await this.port.send(destination, this.stampCard(destination, { title: '💻 CLI 指令', text: body, format: 'plain', actions: [] }), deliveryId, syncGuard);
-          }
+          const providerLabel = providerDisplayLabel(session.native.provider);
+          const statusLabels: Record<Session['status'], string> = {
+            read_only: '只读镜像',
+            running: '运行中',
+            idle: '空闲',
+            waiting_approval: '等待审批',
+            waiting_question: '等待回答',
+            interrupted: '已中断',
+            failed: '执行失败',
+            unreachable: '暂不可达',
+          };
+          const statusText = statusLabels[session.status] ?? session.status;
+          const cliCard: ChannelCard = {
+            schema: '2.0',
+            title: `💻 CLI 指令 · ${providerLabel} · ${statusText}`,
+            template: 'blue',
+            text: `${body}\n\n---\n**会话状态**：${statusText}（电脑终端发起 · 发消息可自动接管续聊）`,
+            actions: [{ label: '查看状态', value: { action: 'panel' } }],
+          };
+          await this.port.send(destination, this.stampCard(destination, cliCard), deliveryId, syncGuard);
           await syncGuard();
           this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
         }

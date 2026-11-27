@@ -2,7 +2,7 @@ import type { DirectoryListing } from '../claude/deliver.js';
 import type { ModelOption, ConfirmedSettings, ResponseEvidence, ChannelInputScope, StopRejection } from './contracts.js';
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
-export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean }
+export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean; storedOnly?: boolean }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
 export interface AttachOptions { allowQuarantineRecovery?: boolean; stillAuthorized?: () => boolean | Promise<boolean> }
 export type InputScopeValidator = (scope:ChannelInputScope, sessionId:string) => boolean;
