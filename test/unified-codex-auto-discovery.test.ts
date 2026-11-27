@@ -129,6 +129,7 @@ test('Codex discoverNewer/discoverExisting respect 30s/90s production cooldowns 
     capabilities: caps,
     control: { serviceId: 'x', owner: null, input: 'unavailable', generation: 0, operationId: null, reason: null },
   };
+  const staleUpdatedIso = new Date(now - 60_000).toISOString();
   const base: any = {
     provider: 'codex',
     onObservation: () => () => {},
@@ -140,7 +141,12 @@ test('Codex discoverNewer/discoverExisting respect 30s/90s production cooldowns 
     },
     discoverExisting: async () => {
       oldCalls += 1;
-      return { items: [], nextCursor: null };
+      // Return a stale item with updatedAt <= watermark and a non-null nextCursor to verify
+      // production cutoff stops paginating immediately and enters the 90s cooldown!
+      return {
+        items: [{ ...backfillSession, updatedAt: staleUpdatedIso }],
+        nextCursor: 'stale-older-pages',
+      };
     },
     read: async () => ({
       session: backfillSession,
