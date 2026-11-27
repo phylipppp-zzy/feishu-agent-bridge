@@ -119,6 +119,7 @@ export function buildSessionHelpCard(
     lines.push('• /steer <补充> — 向当前唯一运行轮追加引导输入');
   }
   lines.push(
+    '• /compact — 压缩当前会话上下文，释放 token 空间',
     '• /stop — 中断当前回复',
     '• /ls [-a] [子目录] — 浏览项目目录文件',
     '• /file — 查看并下载会话产物文件',

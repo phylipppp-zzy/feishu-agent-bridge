@@ -1,4 +1,4 @@
-import { agyToolProgress, ToolProgressTracker } from '../tool-progress.js';
+import { agyToolProgress, formatThinkingSummary, ToolProgressTracker } from '../tool-progress.js';
 import { randomUUID } from 'node:crypto';
 import type { DispatchGuard, PlatformAcknowledgement } from '../adapter.js';
 import type { AgyAcpNotification, AgyServerRequest } from '../agy-transport.js';
@@ -652,16 +652,28 @@ export function handleAcpNotification(
       if (existingTurn.isWakeup) {
         scheduleWakeupFinalize(ctx, sessionId, existingTurn);
       }
-      if (kind === 'agent_thought_chunk' && existingTurn.inProgressToolCalls.size === 0 && !existingTurn.assistantText) {
-        let tracker = toolProgress.get(existingTurn);
-        if (!tracker) { tracker = new ToolProgressTracker(); toolProgress.set(existingTurn, tracker); }
-        const obs = tracker.observe(ref, existingTurn.generation, existingTurn.turnId, 'phase:thinking', 'running', {
-          tool: 'thinking',
-          summary: '🧠 正在深度思考…',
-        });
-        if (obs) {
-          thinkingPhaseActive.add(existingTurn);
-          ctx.emit(obs);
+      if (kind === 'agent_thought_chunk' && existingTurn.inProgressToolCalls.size === 0) {
+        const thoughtChunk = extractTextFromUpdateContent(update.content);
+        const hadThinking = thinkingPhaseActive.has(existingTurn);
+        if (thoughtChunk) {
+          const combined = ((existingTurn.thinkingText ?? '') + thoughtChunk).slice(-600);
+          existingTurn.thinkingText = combined;
+        }
+        const now = Date.now();
+        const shouldEmit = !hadThinking || (Boolean(thoughtChunk) && now - (existingTurn.lastThinkingEmitAt ?? 0) >= 1_500);
+        if (shouldEmit) {
+          const summary = formatThinkingSummary(existingTurn.thinkingText ?? '');
+          let tracker = toolProgress.get(existingTurn);
+          if (!tracker) { tracker = new ToolProgressTracker(); toolProgress.set(existingTurn, tracker); }
+          const obs = tracker.observe(ref, existingTurn.generation, existingTurn.turnId, 'phase:thinking', 'running', {
+            tool: 'thinking',
+            summary,
+          });
+          if (obs) {
+            thinkingPhaseActive.add(existingTurn);
+            existingTurn.lastThinkingEmitAt = now;
+            ctx.emit(obs);
+          }
         }
       }
     }

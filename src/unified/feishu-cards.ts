@@ -61,7 +61,15 @@ export interface ChannelCard {
   headerTags?: readonly ChannelCardHeaderTag[];
   sections?: readonly ChannelCardSection[];
   format?: 'markdown' | 'plain';
-  executionLog?: { count: number; lines: readonly string[]; failedCount?: number; runningNote?: string };
+  executionLog?: {
+    count: number;
+    lines: readonly string[];
+    failedCount?: number;
+    runningNote?: string;
+    thinking?: string;
+    expanded?: boolean;
+    position?: 'top' | 'bottom';
+  };
   form?: QuestionForm;
   title: string;
   text: string;

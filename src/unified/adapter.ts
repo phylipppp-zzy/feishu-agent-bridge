@@ -9,6 +9,8 @@ export type InputScopeValidator = (scope:ChannelInputScope, sessionId:string) =>
 export type StopResult = Operation | {status:'completed'; cancelled:number} |
   {status:'rejected'; reason:StopRejection};
 export type { ResponseEvidence } from './contracts.js';
+import type { ContextUsageInfo } from './context-usage.js';
+export type { ContextUsageInfo } from './context-usage.js';
 /** Unified service contract. Implementations must persist receipts and enforce idempotency atomically. */
 export interface UnifiedService {
   registerInputScopeValidator?(validate: InputScopeValidator): () => void;
@@ -53,6 +55,7 @@ export interface UnifiedService {
   readArtifact(sessionId: string, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   stageInputArtifact(request: WriteRequest<{ name: string; mediaType: string; size: number; contentDigest: string; content: Uint8Array }>): Promise<Operation>;
   getConfirmedSettings?(sessionId: string): Promise<ConfirmedSettings | null>;
+  getContextUsage?(sessionId: string): Promise<ContextUsageInfo | null>;
   listModels(sessionId: string, query: ListQuery): Promise<Page<ModelOption>>;
   updateSessionSettings(request: WriteRequest<{ model: string | null; preferences: Record<string, string> }>): Promise<Operation>;
   getOperation(operationId: string): Promise<Operation>;
@@ -114,6 +117,7 @@ export interface PlatformPort {
   listArtifacts(ref: NativeSessionRef): Promise<Artifact[]>;
   readArtifact(ref: NativeSessionRef, artifactId: string, contentVersion: string): Promise<Uint8Array>;
   listModels(ref: NativeSessionRef): Promise<ModelOption[]>;
+  getContextUsage?(ref: NativeSessionRef): Promise<ContextUsageInfo | null>;
   updateSettings(ref: NativeSessionRef, settings: { model: string | null; preferences: Record<string, string> }, guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   control(ref: NativeSessionRef, action: 'acquire' | 'release', guard: DispatchGuard): Promise<PlatformAcknowledgement>;
   archive?(ref: NativeSessionRef, archived: boolean, guard: DispatchGuard): Promise<PlatformAcknowledgement>;

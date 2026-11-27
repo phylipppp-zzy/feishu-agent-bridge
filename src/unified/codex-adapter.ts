@@ -1,7 +1,8 @@
-import { codexToolProgress, nativeTimestamp, ToolProgressTracker } from './tool-progress.js';
+import { codexToolProgress, formatThinkingSummary, nativeTimestamp, ToolProgressTracker } from './tool-progress.js';
 import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
+import { resolveModelMaxContextTokens, type ContextUsageInfo } from './context-usage.js';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
 import { answerDigest, payloadDigest, questionDeclineAction, type ResponseEvidence, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
 import { contractError } from './errors.js';
@@ -63,6 +64,8 @@ export class CodexAdapter implements PlatformPort {
   private sequence = 0;
   private readonly toolProgress = new ToolProgressTracker();
   private settings = new Map<string, {model:string|null; effort?:string}>();
+  private readonly contextUsage = new Map<string, ContextUsageInfo>();
+  private readonly reasoningBuffers = new Map<string, { text: string; lastEmitAt: number }>();
   constructor(readonly transport: CodexTransport, readonly hostId: string, readonly serviceId: string,
     private readonly options: CodexAdapterOptions = {}) {
     if (!isString(hostId) || !isString(serviceId)) throw contractError('invalid_request');
@@ -86,6 +89,10 @@ export class CodexAdapter implements PlatformPort {
   hasActiveNativeSession(ref: NativeSessionRef): boolean {
     return ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
       && this.transport.connected && this.active.has(ref.nativeSessionId);
+  }
+  async getContextUsage(ref: NativeSessionRef): Promise<ContextUsageInfo | null> {
+    const id = this.check(ref);
+    return this.contextUsage.get(id) ?? null;
   }
   onObservation(listener: (event: PlatformObservation) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private emit(event: PlatformObservation): void { for (const fn of this.listeners) fn(event); }
@@ -236,11 +243,56 @@ export class CodexAdapter implements PlatformPort {
       }
       return;
     }
-    if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
+    if (m.method === 'thread/tokenUsage/updated' && p.tokenUsage && typeof p.tokenUsage === 'object') {
+      const tu = p.tokenUsage as Obj;
+      const last = (tu.last && typeof tu.last === 'object' ? tu.last : tu.total) as Obj | undefined;
+      const total = typeof last?.totalTokens === 'number' && Number.isFinite(last.totalTokens)
+        ? Math.round(last.totalTokens)
+        : (typeof last?.inputTokens === 'number' ? Math.round(last.inputTokens) : 0) +
+          (typeof last?.cachedInputTokens === 'number' ? Math.round(last.cachedInputTokens) : 0) +
+          (typeof last?.outputTokens === 'number' ? Math.round(last.outputTokens) : 0);
+      const model = this.settings.get(thread)?.model ?? (typeof info?.model === 'string' ? info.model : null);
+      const maxWindow = typeof tu.modelContextWindow === 'number' && Number.isFinite(tu.modelContextWindow) && tu.modelContextWindow > 0
+        ? Math.round(tu.modelContextWindow)
+        : resolveModelMaxContextTokens(model, 'codex');
+      if (total > 0) {
+        if (this.contextUsage.size >= 512) this.contextUsage.delete(this.contextUsage.keys().next().value!);
+        this.contextUsage.set(thread, { usedTokens: total, maxTokens: maxWindow, ...(model ? { model } : {}) });
+      }
+      return;
+    }
+    if (m.method === 'item/reasoning/summaryTextDelta' && isString(p.turnId) && typeof p.delta === 'string' && this.active.has(thread)) {
+      const rkey = `${thread}\0${p.turnId}`;
+      const buf = this.reasoningBuffers.get(rkey) ?? { text: '', lastEmitAt: 0 };
+      buf.text = (buf.text + p.delta).slice(-600);
+      const now = Date.now();
+      if (buf.lastEmitAt === 0 || now - buf.lastEmitAt >= 1_500) {
+        buf.lastEmitAt = now;
+        if (this.reasoningBuffers.size >= 256) this.reasoningBuffers.delete(this.reasoningBuffers.keys().next().value!);
+        this.reasoningBuffers.set(rkey, buf);
+        const obs = this.toolProgress.observe(this.ref(thread), generation, p.turnId, 'phase:thinking', 'running', {
+          tool: 'thinking',
+          summary: formatThinkingSummary(buf.text),
+        });
+        if (obs) this.emit(obs);
+      } else {
+        this.reasoningBuffers.set(rkey, buf);
+      }
+      return;
+    }
+    const closeReasoning = (turnId: string) => {
+      const rkey = `${thread}\0${turnId}`;
+      if (this.reasoningBuffers.delete(rkey)) {
+        const done = this.toolProgress.observe(this.ref(thread), generation, turnId, 'phase:thinking', 'succeeded');
+        if (done) this.emit(done);
+      }
+    };
+    if (m.method==='item/agentMessage/delta' && isString(p.turnId) && isString(p.itemId) && typeof p.delta==='string' && this.active.has(thread)) { closeReasoning(p.turnId); const prior=this.messages.get(`${thread}\0${p.itemId}`); if(prior?.final) return; const text=(prior?.blocks[0]?.type==='text' ? prior.blocks[0].text : '')+p.delta; const message=this.message(thread,p.turnId,{type:'agentMessage',id:p.itemId,text},false); if(message) this.emit({type:'message',ref:this.ref(thread),message,connectionGeneration:generation}); return; }
     if(m.method==='turn/started' && isString(p.turn?.id) && this.active.has(thread)) {this.trackApprovalTurn(thread,p.turn.id,generation);const key=`${thread}\0${p.turn.id}`;if(this.residualTurns.get(key)?.generation!==generation){if(this.residualTurns.size>=1024) this.residualTurns.delete(this.residualTurns.keys().next().value!);this.residualTurns.set(key,{generation,items:new Set(),version:0,overflow:false});}}
     if ((m.method === 'item/started' || m.method === 'item/completed') && this.active.has(thread) && isString(p.turnId) && p.item) {
       const tool = codexToolProgress(p.item, m.method === 'item/completed', info?.cwd);
       if (tool) {
+        if (m.method === 'item/started') closeReasoning(p.turnId);
         const update = this.toolProgress.observe(this.ref(thread), generation, p.turnId, tool.callId, tool.phase, tool.detail);
         if (update) this.emit(update);
       }
@@ -253,6 +305,7 @@ export class CodexAdapter implements PlatformPort {
     }
     if((m.method==='item/started' || m.method==='item/completed') && isString(p.turnId) && p.item?.type==='commandExecution' && isString(p.item?.id)) {const tracked=this.residualTurns.get(`${thread}\0${p.turnId}`);if(tracked?.generation===generation && !tracked.items.has(p.item.id)) {if(tracked.items.size>=10000) tracked.overflow=true;else tracked.items.add(p.item.id);tracked.version++;}}
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
+      if (m.method === 'turn/completed') closeReasoning(p.turn.id);
       const turn = this.turn(thread,p.turn);
       if (m.method === 'turn/completed' && this.approvalTurns.get(thread)?.id === turn.turnId) this.approvalTurns.delete(thread);
       if (info) {

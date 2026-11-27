@@ -7,6 +7,8 @@ import type {
   PlatformObservation,
   PlatformPort,
 } from '../adapter.js';
+import type { ContextUsageInfo } from '../context-usage.js';
+import { readAgyContextUsage } from '../context-usage.js';
 import type { AgyCatalog, AgyDiscoveredSession } from '../agy-catalog.js';
 import type { AgyQuotaClient } from '../agy-quota.js';
 import type { AgyAcpTransport, AgyEffortLevel } from '../agy-transport.js';
@@ -106,6 +108,7 @@ export class AgyAdapter implements PlatformPort {
   private readonly existingSnapshots = new Map<string, ExistingSnapshotState>();
   private readonly acpTitles = new Map<string, string>();
   private readonly lastActivityAt = new Map<string, number>();
+  private readonly contextUsageCache = new Map<string, ContextUsageInfo>();
   private readonly promptMaxTimeoutMs: number;
   private readonly promptIdleTimeoutMs: number;
   private readonly wakeupIdleMs: number;
@@ -510,6 +513,24 @@ export class AgyAdapter implements PlatformPort {
 
   async read(ref: NativeSessionRef): Promise<SessionSnapshot> {
     return readSessionSnapshot(this.ctx, ref);
+  }
+
+  async getContextUsage(ref: NativeSessionRef): Promise<ContextUsageInfo | null> {
+    const id = this.check(ref);
+    const summary = this.catalog.get(id);
+    const fresh = readAgyContextUsage(id, {
+      ...(this.catalog.brainDir ? { brainDir: this.catalog.brainDir } : {}),
+      ...(summary?.appDataDir ? { appDataDir: summary.appDataDir } : {}),
+    });
+    if (fresh) {
+      if (this.contextUsageCache.size >= 512) {
+        const oldest = this.contextUsageCache.keys().next().value;
+        if (oldest) this.contextUsageCache.delete(oldest);
+      }
+      this.contextUsageCache.set(id, fresh);
+      return fresh;
+    }
+    return this.contextUsageCache.get(id) ?? null;
   }
 
   private captureServerSessionMeta(id: string, cwd: string, res: unknown): void {

@@ -268,6 +268,15 @@ function summarizeSpecialTool(tool: string, data: Record<string, unknown>): stri
   }
 }
 
+export function formatThinkingSummary(raw: string): string {
+  const clean = raw.replace(/[\p{Cc}\p{Cf}\p{Cs}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+  if (!clean) return '🧠 正在深度思考…';
+  const chars = Array.from(clean);
+  const maxContent = 112;
+  const excerpt = chars.length > maxContent ? `…${chars.slice(-(maxContent - 1)).join('')}` : clean;
+  return `🧠 ${excerpt}`;
+}
+
 export function summarizeTool(name: unknown, input: unknown, project?: string): Pick<ToolProgress, 'tool' | 'summary'> {
   const tool = toolName(name);
   const data = inputObject(input);

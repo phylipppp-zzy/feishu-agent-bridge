@@ -1,6 +1,12 @@
 import type { Artifact, Message, Provider, Turn } from './contracts.js';
+import {
+  formatCompactTokenCount,
+  formatContextUsageBadge,
+  type CompactTurnInfo,
+  type ContextUsageInfo,
+} from './context-usage.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
-import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
+import { providerBadgeColor, providerDisplayLabel, type ChannelCard, type ChannelCardHeaderTag } from './feishu-cards.js';
 import { isTerminalTool, type ToolProgress } from './tool-progress.js';
 import type { TurnToolCounts } from './turn-progress-store.js';
 
@@ -76,6 +82,8 @@ type CardState = {
   activeSubagents?: readonly SessionSubagentActivity[] | undefined;
   allowFullReplyButton?: boolean | undefined;
   modelBadge?: string | undefined;
+  contextUsage?: ContextUsageInfo | null | undefined;
+  compactInfo?: CompactTurnInfo | undefined;
 };
 
 function formatRunningNote(active: readonly ToolProgress[]): string | undefined {
@@ -133,24 +141,80 @@ function formatDelegatedStatus(
   return ['**子代理与 Codex 状态**', ...lines].join('\n');
 }
 
-export function turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration, files, turnId, activeSubagents, allowFullReplyButton = true, modelBadge }: CardState): ChannelCard {
+function extractThinkingSummary(tools: readonly ToolProgress[]): string | undefined {
+  for (let i = tools.length - 1; i >= 0; i--) {
+    const item = tools[i]!;
+    if (item.tool !== 'thinking') continue;
+    const stripped = item.summary.replace(/^🧠\s*/u, '').trim();
+    if (stripped && stripped !== '正在深度思考…') return stripped;
+  }
+  return undefined;
+}
+
+function formatCompactResultText(compactInfo: CompactTurnInfo, replyPreview: string): string {
+  const before = compactInfo.beforeTokens;
+  const after = compactInfo.afterTokens;
+  const max = compactInfo.maxTokens;
+  let summaryLine = '✅ 上下文已压缩。';
+  if (typeof before === 'number' && before > 0 && typeof after === 'number' && after > 0) {
+    const savedPct = before > after ? Math.round(((before - after) / before) * 100) : 0;
+    const maxSuffix = typeof max === 'number' && max > 0 ? ` / \`${formatCompactTokenCount(max)}\`` : '';
+    const savedSuffix = savedPct > 0 ? `（释放 ${savedPct}%）` : '';
+    summaryLine = `✅ 上下文压缩完成：\`${formatCompactTokenCount(before)}\` → \`${formatCompactTokenCount(after)}\`${maxSuffix}${savedSuffix}`;
+  } else if (typeof after === 'number' && after > 0) {
+    const maxSuffix = typeof max === 'number' && max > 0 ? ` / \`${formatCompactTokenCount(max)}\`` : '';
+    summaryLine = `✅ 上下文压缩完成，当前占用：\`${formatCompactTokenCount(after)}\`${maxSuffix}`;
+  }
+  return replyPreview ? `${summaryLine}\n\n${replyPreview}` : summaryLine;
+}
+
+export function turnProgressCard({
+  provider,
+  status,
+  schema,
+  message,
+  tools,
+  toolCounts,
+  duration,
+  files,
+  turnId,
+  activeSubagents,
+  allowFullReplyButton = true,
+  modelBadge,
+  contextUsage,
+  compactInfo,
+}: CardState): ChannelCard {
   const title = providerDisplayLabel(provider);
   const isWakeup = Boolean(turnId?.startsWith('wakeup:'));
+  const isCompact = Boolean(compactInfo?.isCompact);
   const visibleTools = tools.filter(tool => !(tool.tool === 'thinking' && tool.phase !== 'running'));
-  const finishedThinkingCount = tools.length - visibleTools.length;
-  const count = Math.max(0, (toolCounts?.totalTools ?? tools.length) - finishedThinkingCount);
+  const totalThinkingCount = tools.filter(tool => tool.tool === 'thinking').length;
+  const count = Math.max(0, (toolCounts?.totalTools ?? tools.length) - totalThinkingCount);
   const failedCount = toolCounts?.failedTools ?? visibleTools.filter(tool => tool.phase === 'failed').length;
   const running = status === 'running' || status === 'queued' || status === undefined && !message?.final;
   const elapsed = duration === null ? '' : ` · 用时 ${formatDuration(duration)}`;
   const interruptedElapsed = duration !== null && duration >= 5000 ? elapsed : '';
-  const badge = modelBadge?.trim() ? ` · ${modelBadge.trim()}` : '';
+  const cleanModelBadge = modelBadge?.trim() || formatCompactModelBadge(contextUsage?.model);
+  const badge = cleanModelBadge ? ` · ${cleanModelBadge}` : '';
+  const ctxBadge = formatContextUsageBadge(contextUsage);
+
   const header: Pick<ChannelCard, 'title' | 'template'> = status === 'completed'
-    ? { title: `${title} · ${isWakeup ? '后台唤醒已完成' : '已完成'}${elapsed}${badge}`, template: 'green' }
+    ? { title: `${title} · ${isCompact ? '上下文已压缩' : isWakeup ? '后台唤醒已完成' : '已完成'}${elapsed}${badge}`, template: 'green' }
     : status === 'failed' ? { title: `${title} · 执行失败${elapsed}${badge}`, template: 'red' }
       : status === 'interrupted' ? { title: `${title} · 已中断${interruptedElapsed}${badge}`, template: 'grey' }
         : running
-          ? { title: `${title} · ${isWakeup ? '后台唤醒进行中' : '进行中'}${elapsed}${badge}`, template: 'blue' }
+          ? { title: `${title} · ${isCompact ? '正在压缩上下文' : isWakeup ? '后台唤醒进行中' : '进行中'}${elapsed}${badge}`, template: 'blue' }
           : { title: `${title} · 回复${badge}` };
+
+  const subtitleParts: string[] = [];
+  if (cleanModelBadge) subtitleParts.push(`模型 ${cleanModelBadge}`);
+  if (ctxBadge) subtitleParts.push(`上下文 ${ctxBadge.text}`);
+  const subtitle = subtitleParts.length ? subtitleParts.join(' · ') : undefined;
+
+  const headerTags: ChannelCardHeaderTag[] = [];
+  if (cleanModelBadge) headerTags.push({ text: cleanModelBadge, color: providerBadgeColor(provider) });
+  if (ctxBadge) headerTags.push({ text: `上下文 ${ctxBadge.text}`, color: ctxBadge.color });
+
   const raw = message?.blocks.map(block => block.type === 'text' ? block.text :
     `[文件 ${escapeCardMarkdown(block.artifactId)}]`).join('\n') ?? '';
   const preview = formatCardReplyBody(raw);
@@ -159,20 +223,25 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
   const onlyThinking = active.length > 0 && activeReal.length === 0;
   const runningNote = formatRunningNote(activeReal);
   const delegatedStatus = running ? formatDelegatedStatus(visibleTools, activeSubagents) : '';
-  const idleBody = activeReal.some(tool => tool.tool === 'post_message' || tool.tool === 'read_board')
-    ? '🐝 Swarm 多代理协作进行中…'
-    : onlyThinking
-    ? '🧠 正在深度思考…'
-    : isWakeup
-        ? '🤖 后台异步唤醒处理中…'
-        : '正在处理…';
+  const thinkingSummary = extractThinkingSummary(tools);
+  const idleBody = isCompact
+    ? '🗜️ 正在压缩对话上下文，请稍候…'
+    : activeReal.some(tool => tool.tool === 'post_message' || tool.tool === 'read_board')
+      ? '🐝 Swarm 多代理协作进行中…'
+      : onlyThinking
+        ? '🧠 正在深度思考…'
+        : isWakeup
+          ? '🤖 后台异步唤醒处理中…'
+          : '正在处理…';
   const text = running
     ? (delegatedStatus
         ? (preview.text ? `${delegatedStatus}\n\n---\n\n${preview.text}` : delegatedStatus)
         : (preview.text || idleBody))
-    : (preview.text || (status === 'completed'
-        ? (count ? `完成 ${count} 项工具操作` : '本轮处理完成。')
-        : '本轮未形成完整回复。'));
+    : isCompact && status === 'completed'
+      ? formatCompactResultText(compactInfo!, preview.text)
+      : (preview.text || (status === 'completed'
+          ? (count ? `完成 ${count} 项工具操作` : '本轮处理完成。')
+          : '本轮未形成完整回复。'));
   const actions: ChannelCard['actions'] = [];
   if (preview.truncated && message && allowFullReplyButton) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
   for (const file of files.slice(0, 3)) {
@@ -183,7 +252,24 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
   const logTools = visibleTools.filter(tool => tool.tool !== 'thinking');
   const lines = logTools.slice(-LOG_SIZE).map(tool => `${TOOL_ICONS[tool.phase]} ${tool.summary}`);
   if (count > lines.length && logTools.length > 0) lines.unshift(`已省略较早的 ${count - lines.length} 项`);
-  const executionLog = (logTools.length > 0 || runningNote) ? { count: Math.max(logTools.length, count), failedCount,
-    lines, ...(runningNote ? { runningNote } : {}) } : undefined;
-  return { schema, ...header, text, actions, ...(executionLog ? { executionLog } : {}) };
+  const executionLog = (logTools.length > 0 || runningNote || thinkingSummary)
+    ? {
+        count: logTools.length > 0 ? Math.max(logTools.length, count) : 0,
+        lines,
+        failedCount,
+        ...(runningNote ? { runningNote } : {}),
+        ...(thinkingSummary ? { thinking: thinkingSummary } : {}),
+        expanded: running || logTools.length <= 5,
+        position: 'top' as const,
+      }
+    : undefined;
+  return {
+    schema,
+    ...header,
+    ...(subtitle ? { subtitle } : {}),
+    ...(headerTags.length ? { headerTags } : {}),
+    text,
+    actions,
+    ...(executionLog ? { executionLog } : {}),
+  };
 }

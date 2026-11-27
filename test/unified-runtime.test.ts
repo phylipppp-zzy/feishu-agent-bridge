@@ -448,8 +448,8 @@ for (const provider of ['claude', 'codex', 'agy'] as const) {
       const wire = encodeCard(first.card) as { schema: string; body: { elements: Array<Record<string, unknown>> } };
       assert.equal(wire.schema, '2.0');
       const panel = wire.body.elements.find(element => element.tag === 'collapsible_panel');
-      assert.equal(panel?.expanded, false);
-      assert.match(JSON.stringify(panel), /执行记录（1 项）/);
+      assert.equal(panel?.expanded, true);
+      assert.match(JSON.stringify(panel), /执行步骤（1 项）/);
       assert.deepEqual((await runtime.core.getSnapshot('s')).value.messages, []);
       assert.deepEqual(subscriptions, ['s']);
       await runtime.core.observe(tool('2', 'running'));
