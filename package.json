@@ -20,6 +20,7 @@
     "doctor:claude": "node scripts/doctor-claude.mjs",
     "notify:claude": "node dist/src/claude/notify.js",
     "check:cards": "node scripts/check-cards.mjs",
+    "send": "node scripts/feishu-send.mjs",
     "install:local": "node scripts/install.mjs",
     "install:claude": "node scripts/install-claude.mjs",
     "rebind": "node scripts/rebind.mjs",
