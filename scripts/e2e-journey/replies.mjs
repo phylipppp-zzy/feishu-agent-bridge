@@ -285,6 +285,44 @@ async function longReplies(ctx) {
           '✅ 本轮已完成（用时 2分30秒），完整结论见上方回复卡。');
       });
     });
+
+    await trace.step('10.6 AGY 话题进行中含过渡说明 + 子代理 + Codex MCP，完成后收起状态面板', async () => {
+      const { agy } = ctx.topics;
+      const turn = await ctx.start(agy, '派发子代理和 Codex MCP 联合排查');
+      const tracker = new ToolProgressTracker();
+      const generation = ctx.runtime.store.connectionGeneration(agy.sessionId);
+      const subObs = tracker.observe(agy.ref, generation, turn.turnId, 'sub-journey-1', 'running',
+        { tool: 'invoke_subagent', summary: '🤖 派发子代理：Astra Auditor' });
+      const mcpObs = tracker.observe(agy.ref, generation, turn.turnId, 'mcp-journey-1', 'running',
+        { tool: 'call_mcp_tool', summary: '⚡ Codex MCP (sol · 工程实现)' });
+      assert.ok(subObs && mcpObs);
+      providers.agy.emit(subObs);
+      providers.agy.emit(mcpObs);
+      ctx.emitText(agy, '已并行派发子代理与 Codex MCP，等待回报…', { messageId: 'journey-delegated-interim', final: false });
+      await ctx.settle();
+      await waitForPatchWindow(ctx, agy);
+      const liveCard = completionCard(ctx, agy, /进行中/);
+      trace.check('进行中卡片同时保留子代理/Codex 状态面板与过渡说明', () => {
+        const body = liveCard.card.raw.body.elements.filter(el => el.tag === 'markdown').map(el => el.content).join('\n\n');
+        assert.match(body, /\*\*子代理与 Codex 状态\*\*/);
+        assert.match(body, /Astra Auditor/);
+        assert.match(body, /Codex MCP/);
+        assert.match(body, /已并行派发子代理与 Codex MCP，等待回报…/);
+      });
+      providers.agy.emit(tracker.observe(agy.ref, generation, turn.turnId, 'sub-journey-1', 'succeeded',
+        { tool: 'invoke_subagent', summary: '🤖 派发子代理：Astra Auditor' }));
+      providers.agy.emit(tracker.observe(agy.ref, generation, turn.turnId, 'mcp-journey-1', 'succeeded',
+        { tool: 'call_mcp_tool', summary: '⚡ Codex MCP (sol · 工程实现)' }));
+      await ctx.finish(agy, '联合排查完成，最终结论已收口。');
+      await waitForPatchWindow(ctx, agy);
+      trace.check('完成态同一卡片收起顶部状态面板，仅保留干净最终正文', () => {
+        const done = completionCard(ctx, agy);
+        assert.equal(done.id, liveCard.id);
+        assert.equal(done.card.template, 'green');
+        assert.match(done.card.bodyText, /联合排查完成，最终结论已收口。/);
+        assert.doesNotMatch(done.card.bodyText, /子代理与 Codex 状态/);
+      });
+    });
   });
 }
 

@@ -7,6 +7,8 @@ import {
   ALL_CONTROL_CHARS_RE,
   canonicalizePath,
   CONVERSATION_ID_RE,
+  DEFAULT_AGY_BRAIN_DIR,
+  DEFAULT_AGY_IDE_BRAIN_DIR,
   DEFAULT_AGY_SUMMARIES_DB_PATH,
   DEFAULT_MAX_TITLE_LENGTH,
   expandHomePath,
@@ -15,12 +17,16 @@ import {
   isPlainRecord,
   isTruthyFlag,
   parseAgyTimestamp,
+  parseAgyTimestampNanos,
   resolveAgyBrainDirs,
+  resolveAgySummariesDbPaths,
   stripHostInjectionBlocks,
   TITLE_TRANSCRIPT_READ_BYTES,
   type AgyConversationSummaryRow,
   type AgyDiscoveredSession,
   type AgySessionStatus,
+  type AgySubagentSummary,
+  type AgySummariesDefaultPair,
 } from './catalog-types.js';
 
 /** Parse a `workspace_uris` JSON array of `file://` URIs into normalized local absolute paths. */
@@ -289,7 +295,312 @@ function mapCascadeStatus(raw: string): AgySessionStatus {
   }
 }
 
-/** Read and aggregate top-level Antigravity sessions from `conversation_summaries.db` in strict read-only mode. */
+const SUMMARY_SELECT_SQL = `SELECT
+  conversation_id,
+  title,
+  preview,
+  step_count,
+  last_modified_time,
+  workspace_uris,
+  status,
+  source,
+  project_id,
+  agent_name,
+  parent_conversation_id,
+  nesting_depth,
+  battle_id,
+  winning_conversation_id,
+  not_fully_idle,
+  killed,
+  last_user_input_time,
+  last_user_input_step_index,
+  app_data_dir,
+  group_id
+FROM conversation_summaries`;
+
+export interface AgySummaryHierarchy {
+  byId: Map<string, AgyConversationSummaryRow>;
+  isTopLevelRow: (row: AgyConversationSummaryRow) => boolean;
+  resolveTopAncestor: (startRow: AgyConversationSummaryRow) => string | null;
+  partialFailure: boolean;
+}
+
+/**
+ * Resolve ONLY explicitly configured or built-in default brain roots for security-sensitive readers.
+ * Untrusted `appDataDir` values from SQLite may only choose ordering among built-in defaults,
+ * never inject arbitrary external directories.
+ */
+function resolveAuthorizedBrainDirs(options: {
+  brainDir?: string;
+  brainDirs?: readonly string[];
+  appDataDir?: string;
+}): string[] {
+  const configured: string[] = [];
+  const pushUnique = (dir: string | undefined): void => {
+    if (typeof dir !== 'string' || !dir.trim()) return;
+    const abs = resolve(expandHomePath(dir.trim()));
+    if (!configured.includes(abs)) configured.push(abs);
+  };
+  if (options.brainDir?.trim() || options.brainDirs?.length) {
+    pushUnique(options.brainDir);
+    if (options.brainDirs) {
+      for (const d of options.brainDirs) pushUnique(d);
+    }
+    return configured;
+  }
+  const preferIde = options.appDataDir?.trim() === 'antigravity';
+  if (preferIde) {
+    pushUnique(DEFAULT_AGY_IDE_BRAIN_DIR);
+    pushUnique(DEFAULT_AGY_BRAIN_DIR);
+  } else {
+    pushUnique(DEFAULT_AGY_BRAIN_DIR);
+    pushUnique(DEFAULT_AGY_IDE_BRAIN_DIR);
+  }
+  return configured;
+}
+
+export type AncestorChainResult =
+  | { status: 'ok'; chain: AgyConversationSummaryRow[]; rootRow: AgyConversationSummaryRow }
+  | { status: 'missing' }
+  | { status: 'invalid' };
+
+/** Walk the full parent chain from `startRow` to its top-level root with 64-level cycle protection. */
+export function resolveSummaryAncestorChain(
+  startRow: AgyConversationSummaryRow,
+  hierarchy: AgySummaryHierarchy,
+): AncestorChainResult {
+  if (hierarchy.isTopLevelRow(startRow)) {
+    return { status: 'ok', chain: [startRow], rootRow: startRow };
+  }
+  const chain: AgyConversationSummaryRow[] = [startRow];
+  const visited = new Set<string>([startRow.conversation_id]);
+  let parentId = startRow.parent_conversation_id;
+  let depth = 0;
+  while (parentId && depth < 64) {
+    if (visited.has(parentId)) return { status: 'invalid' };
+    visited.add(parentId);
+    const parent = hierarchy.byId.get(parentId);
+    if (!parent) return { status: 'missing' };
+    chain.push(parent);
+    if (hierarchy.isTopLevelRow(parent)) {
+      return { status: 'ok', chain, rootRow: parent };
+    }
+    parentId = parent.parent_conversation_id;
+    depth++;
+  }
+  return { status: 'invalid' };
+}
+
+/**
+ * Verify that EVERY node along a descendant's ancestor chain is alive (not killed)
+ * and that EVERY explicit workspace declared by any descendant/intermediate node
+ * stays within `allowedProjectRoots` (if set) AND is consistent with `rootProject`.
+ */
+export function isAncestorChainAuthorizedForProject(
+  chain: readonly AgyConversationSummaryRow[],
+  rootId: string,
+  rootProject: string,
+  allowedProjectRoots?: readonly string[],
+): boolean {
+  const canonicalRoot = canonicalizePath(rootProject);
+  for (const node of chain) {
+    if (isTruthyFlag(node.killed)) return false;
+    const nodeWorkspaces = parseWorkspaceUris(node.workspace_uris);
+    if (!nodeWorkspaces.length) continue;
+    if (allowedProjectRoots !== undefined) {
+      const nodeProj = resolveAllowedProject(node.workspace_uris, allowedProjectRoots);
+      if (!nodeProj.allowed) return false;
+      for (const ws of nodeWorkspaces) {
+        const wsCheck = resolveAllowedProject(JSON.stringify([`file://${ws}`]), allowedProjectRoots);
+        if (!wsCheck.allowed) return false;
+      }
+    }
+    if (node.conversation_id === rootId) continue;
+    const allConsistent = nodeWorkspaces.every((ws) => {
+      const canonicalWs = canonicalizePath(ws);
+      return canonicalWs === canonicalRoot || isInside(canonicalWs, canonicalRoot) || isInside(canonicalRoot, canonicalWs);
+    });
+    if (!allConsistent) return false;
+  }
+  return true;
+}
+
+/**
+ * Safely read the trailing `maxBytes` of a conversation's `transcript.jsonl`
+ * enforcing authorized brain roots, segment-by-segment non-symlink checks,
+ * canonical root containment, and `O_NOFOLLOW`.
+ */
+export function readSafeTranscriptTail(
+  conversationId: string,
+  maxBytes: number,
+  options: { brainDir?: string; brainDirs?: readonly string[]; appDataDir?: string },
+): string | null {
+  if (
+    !conversationId ||
+    conversationId === '.' ||
+    conversationId === '..' ||
+    !CONVERSATION_ID_RE.test(conversationId) ||
+    maxBytes <= 0
+  ) {
+    return null;
+  }
+  const dirs = resolveAuthorizedBrainDirs(options);
+  for (const dir of dirs) {
+    let canonicalBrainDir: string;
+    try {
+      if (!existsSync(dir)) continue;
+      canonicalBrainDir = realpathSync(dir);
+    } catch {
+      continue;
+    }
+    let fd: number | undefined;
+    try {
+      const sessionDir = join(canonicalBrainDir, conversationId);
+      const sessionStat = lstatSync(sessionDir);
+      if (sessionStat.isSymbolicLink() || !sessionStat.isDirectory()) continue;
+      const canonicalSessionDir = realpathSync(sessionDir);
+      if (!isInside(canonicalSessionDir, canonicalBrainDir)) continue;
+
+      let current = canonicalSessionDir;
+      let validSegments = true;
+      for (const seg of ['.system_generated', 'logs']) {
+        current = join(current, seg);
+        const segStat = lstatSync(current);
+        if (segStat.isSymbolicLink() || !segStat.isDirectory()) {
+          validSegments = false;
+          break;
+        }
+        const canonicalSeg = realpathSync(current);
+        if (!isInside(canonicalSeg, canonicalSessionDir)) {
+          validSegments = false;
+          break;
+        }
+        current = canonicalSeg;
+      }
+      if (!validSegments) continue;
+
+      const transcriptPath = join(current, 'transcript.jsonl');
+      const fileStat = lstatSync(transcriptPath);
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) continue;
+      const canonicalPath = realpathSync(transcriptPath);
+      if (!isInside(canonicalPath, canonicalSessionDir)) continue;
+
+      fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size === 0) return '';
+      const toRead = Math.min(st.size, maxBytes);
+      const offset = Math.max(0, st.size - toRead);
+      const buf = Buffer.allocUnsafe(toRead);
+      let bytesRead = 0;
+      while (bytesRead < toRead) {
+        const n = readSync(fd, buf, bytesRead, toRead - bytesRead, offset + bytesRead);
+        if (n <= 0) break;
+        bytesRead += n;
+      }
+      const text = buf.subarray(0, bytesRead).toString('utf8');
+      if (offset > 0) {
+        const firstNl = text.indexOf('\n');
+        return firstNl >= 0 ? text.slice(firstNl + 1) : '';
+      }
+      return text;
+    } catch {
+      continue;
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch {}
+      }
+    }
+  }
+  return null;
+}
+
+function readSingleSummariesDb(dbPath: string): AgyConversationSummaryRow[] {
+  if (!existsSync(dbPath)) return [];
+  const st = lstatSync(dbPath);
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`refusing non-regular summaries database: ${dbPath}`);
+  }
+  const db = new DatabaseSync(dbPath, { readOnly: true, timeout: 2000 });
+  try {
+    db.exec('PRAGMA query_only = ON');
+    return db.prepare(SUMMARY_SELECT_SQL).all() as unknown as AgyConversationSummaryRow[];
+  } finally {
+    db.close();
+  }
+}
+
+function isNewerSummaryRow(candidate: AgyConversationSummaryRow, current: AgyConversationSummaryRow): boolean {
+  const nextNs = parseAgyTimestampNanos(candidate.last_modified_time);
+  const prevNs = parseAgyTimestampNanos(current.last_modified_time);
+  if (nextNs !== null && prevNs !== null) {
+    if (nextNs !== prevNs) return nextNs > prevNs;
+  } else if (nextNs !== prevNs) {
+    return nextNs !== null;
+  }
+  const nextSteps = typeof candidate.step_count === 'number' ? candidate.step_count : -1;
+  const prevSteps = typeof current.step_count === 'number' ? current.step_count : -1;
+  return nextSteps > prevSteps;
+}
+
+export function readAgySummaryHierarchy(
+  dbPath?: string,
+  defaultPair?: AgySummariesDefaultPair,
+): AgySummaryHierarchy {
+  const dbPaths = resolveAgySummariesDbPaths(dbPath, defaultPair);
+  const byId = new Map<string, AgyConversationSummaryRow>();
+  let firstError: unknown = null;
+  let loadedAny = false;
+  for (const candidatePath of dbPaths) {
+    if (!existsSync(candidatePath)) continue;
+    try {
+      const rows = readSingleSummariesDb(candidatePath);
+      loadedAny = true;
+      for (const row of rows) {
+        if (
+          typeof row.conversation_id !== 'string' ||
+          !CONVERSATION_ID_RE.test(row.conversation_id) ||
+          row.conversation_id === '.' ||
+          row.conversation_id === '..'
+        ) {
+          continue;
+        }
+        const existing = byId.get(row.conversation_id);
+        if (!existing || isNewerSummaryRow(row, existing)) {
+          byId.set(row.conversation_id, row);
+        }
+      }
+    } catch (error) {
+      if (dbPaths.length === 1) throw error;
+      if (firstError === null) firstError = error;
+    }
+  }
+  if (!loadedAny && firstError !== null) throw firstError;
+
+  const isTopLevelRow = (row: AgyConversationSummaryRow): boolean =>
+    row.nesting_depth === 0 &&
+    (row.parent_conversation_id ?? '') === '' &&
+    (row.agent_name ?? '') === '';
+
+  const resolveTopAncestor = (startRow: AgyConversationSummaryRow): string | null => {
+    if (isTopLevelRow(startRow)) return startRow.conversation_id;
+    const visited = new Set<string>([startRow.conversation_id]);
+    let parentId = startRow.parent_conversation_id;
+    let depth = 0;
+    while (parentId && depth < 64) {
+      if (visited.has(parentId)) return null;
+      visited.add(parentId);
+      const parent = byId.get(parentId);
+      if (!parent) return null;
+      if (isTopLevelRow(parent)) return parent.conversation_id;
+      parentId = parent.parent_conversation_id;
+      depth++;
+    }
+    return null;
+  };
+
+  return { byId, isTopLevelRow, resolveTopAncestor, partialFailure: firstError !== null };
+}
+
 export function readAgySummaries(
   options: {
     dbPath?: string;
@@ -299,9 +610,8 @@ export function readAgySummaries(
     includeOutsideRoots?: boolean;
     maxTitleLength?: number;
   } = {},
-  titleCache?: AgyTitleCache,
+  titleCache?: { previous: Map<string, AgyTitleCacheEntry>; next: Map<string, AgyTitleCacheEntry> },
 ): AgyDiscoveredSession[] {
-  const dbPath = resolve(expandHomePath(options.dbPath ?? DEFAULT_AGY_SUMMARIES_DB_PATH));
   const canonicalBrainDirCache = new Map<string, string | null>();
   const resolveCanonicalBrain = (dir: string): string | null => {
     if (canonicalBrainDirCache.has(dir)) return canonicalBrainDirCache.get(dir)!;
@@ -326,85 +636,31 @@ export function readAgySummaries(
     }
     return null;
   };
-  if (!existsSync(dbPath)) return [];
-  const st = lstatSync(dbPath);
-  if (st.isSymbolicLink() || !st.isFile()) {
-    throw new Error(`refusing non-regular summaries database: ${dbPath}`);
-  }
 
-  const db = new DatabaseSync(dbPath, { readOnly: true, timeout: 2000 });
-  let rows: AgyConversationSummaryRow[];
-  try {
-    db.exec('PRAGMA query_only = ON');
-    rows = db
-      .prepare(
-        `SELECT
-          conversation_id,
-          title,
-          preview,
-          step_count,
-          last_modified_time,
-          workspace_uris,
-          status,
-          source,
-          project_id,
-          agent_name,
-          parent_conversation_id,
-          nesting_depth,
-          battle_id,
-          winning_conversation_id,
-          not_fully_idle,
-          killed,
-          last_user_input_time,
-          last_user_input_step_index,
-          app_data_dir,
-          group_id
-        FROM conversation_summaries`,
-      )
-      .all() as unknown as AgyConversationSummaryRow[];
-  } finally {
-    db.close();
-  }
+  const { byId, isTopLevelRow, resolveTopAncestor } = readAgySummaryHierarchy(options.dbPath);
 
-  const byId = new Map<string, AgyConversationSummaryRow>();
-  for (const row of rows) {
-    if (typeof row.conversation_id === 'string' && CONVERSATION_ID_RE.test(row.conversation_id) && row.conversation_id !== '.' && row.conversation_id !== '..') {
-      byId.set(row.conversation_id, row);
-    }
-  }
-
-  const isTopLevelRow = (row: AgyConversationSummaryRow): boolean =>
-    row.nesting_depth === 0 &&
-    (row.parent_conversation_id ?? '') === '' &&
-    (row.agent_name ?? '') === '';
-
-  const counts = new Map<string, { total: number; active: number }>();
-  const resolveTopAncestor = (startRow: AgyConversationSummaryRow): string | null => {
-    const visited = new Set<string>([startRow.conversation_id]);
-    let parentId = startRow.parent_conversation_id;
-    let depth = 0;
-    while (parentId && depth < 64) {
-      if (visited.has(parentId)) return null;
-      visited.add(parentId);
-      const parent = byId.get(parentId);
-      if (!parent) return null;
-      if (isTopLevelRow(parent)) return parent.conversation_id;
-      parentId = parent.parent_conversation_id;
-      depth++;
-    }
-    return null;
-  };
+  const counts = new Map<string, { total: number; active: number; activeList: AgySubagentSummary[] }>();
 
   for (const row of byId.values()) {
     if (isTopLevelRow(row)) continue;
     const rootId = resolveTopAncestor(row);
     if (!rootId) continue;
-    const entry = counts.get(rootId) ?? { total: 0, active: 0 };
+    const entry = counts.get(rootId) ?? { total: 0, active: 0, activeList: [] };
     entry.total += 1;
     const active =
       !isTruthyFlag(row.killed) &&
       (ACTIVE_CASCADE_STATUSES.has(row.status) || isTruthyFlag(row.not_fully_idle));
-    if (active) entry.active += 1;
+    if (active) {
+      entry.active += 1;
+      entry.activeList.push({
+        conversationId: row.conversation_id,
+        agentName: typeof row.agent_name === 'string' && row.agent_name.trim()
+          ? row.agent_name.trim()
+          : (typeof row.title === 'string' && row.title.trim() ? row.title.trim() : row.conversation_id.slice(0, 8)),
+        status: mapCascadeStatus(typeof row.status === 'string' ? row.status : ''),
+        lastModifiedAt: parseAgyTimestamp(row.last_modified_time),
+      });
+    }
     counts.set(rootId, entry);
   }
 
@@ -417,7 +673,8 @@ export function readAgySummaries(
     if (options.allowedProjectRoots !== undefined && !projectInfo.allowed && !options.includeOutsideRoots) {
       continue;
     }
-    const subCounts = counts.get(row.conversation_id) ?? { total: 0, active: 0 };
+    const subCounts = counts.get(row.conversation_id) ?? { total: 0, active: 0, activeList: [] };
+    subCounts.activeList.sort((a, b) => (b.lastModifiedAt ?? '').localeCompare(a.lastModifiedAt ?? ''));
     const rawTitle = typeof row.title === 'string' ? row.title : '';
     const preview = typeof row.preview === 'string' ? row.preview : '';
     const rawStatus = typeof row.status === 'string' ? row.status : '';
@@ -453,6 +710,7 @@ export function readAgySummaries(
       killed: isTruthyFlag(row.killed),
       subagentCount: subCounts.total,
       activeSubagentCount: subCounts.active,
+      ...(subCounts.activeList.length ? { activeSubagents: subCounts.activeList } : {}),
       isTopLevel: true,
     });
   }

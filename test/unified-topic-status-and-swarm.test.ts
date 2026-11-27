@@ -166,10 +166,11 @@ test('Codex MCP progress uses only allowlisted metadata and recognizes delegatio
   assert.equal(summarizeTool('send_message', { message: 'private prompt' }).summary, '🤖 通知子代理');
 });
 
-test('turn progress shows the latest eight delegated calls before the main reply', () => {
+test('turn progress keeps active delegated calls before main completion and collapses on completed', () => {
   const tool = (callId: string, phase: ToolProgress['phase'], name: string, input: unknown = {}): ToolProgress =>
     ({ turnId: 't1', callId, phase, ...summarizeTool(name, input) });
   const tools = [
+    tool('child-early', 'running', 'invoke_subagent', { Role: 'Early Long Runner' }),
     ...Array.from({ length: 8 }, (_, i) => tool(`child-${i}`, 'succeeded', 'invoke_subagent', { Role: `Auditor ${i}` })),
     tool('child-live', 'running', 'invoke_subagent', { Role: 'Astra Auditor' }),
     tool('mcp', 'running', 'call_mcp_tool', { ToolName: 'codex_review', Arguments: { tier: 'astra' } }),
@@ -178,27 +179,36 @@ test('turn progress shows the latest eight delegated calls before the main reply
   const state = { provider: 'agy', status: 'running', schema: '2.0', message: undefined, tools, duration: null, files: [] } as const;
   const card = turnProgressCard(state);
   const lines = card.text.split('\n');
-  assert.equal(lines.length, 9);
-  assert.deepEqual(lines.slice(0, 4), [
+  assert.equal(lines.length, 10);
+  assert.deepEqual(lines.slice(0, 5), [
     '**子代理与 Codex 状态**',
     '- ⏳ ⚡ Codex MCP \\(astra · 代码审查\\)（进行中）',
     '- ⏳ 🤖 派发子代理：Astra Auditor（进行中）',
+    '- ⏳ 🤖 派发子代理：Early Long Runner（进行中）',
     '- ✓ 🤖 派发子代理：Auditor 7（已完成）',
   ]);
-  assert.doesNotMatch(card.text, /Auditor [01]|lookup_paper/);
-  assert.equal(card.executionLog?.runningNote, '⏳ ⚡ Codex MCP (astra · 代码审查)（另有 1 项并行）');
-  const reply = turnProgressCard({ ...state, message: {
+  assert.match(card.text, /另有 3 项子代理\/Codex 记录/);
+  assert.doesNotMatch(card.text, /Auditor [012]|lookup_paper/);
+  assert.equal(card.executionLog?.runningNote, '⏳ ⚡ Codex MCP (astra · 代码审查)（另有 2 项并行）');
+  const interimReply = turnProgressCard({ ...state, message: {
     messageId: 'reply', sessionId: 'session', turnId: 't1', role: 'assistant',
-    final: false, revision: 1, sequence: 1, source: 'agy', blocks: [{ type: 'text', text: '主回复已开始' }],
+    final: false, revision: 1, sequence: 1, source: 'agy', blocks: [{ type: 'text', text: '阶段过渡说明' }],
   } });
-  assert.equal(reply.text, '主回复已开始');
-  assert.equal(reply.executionLog?.count, tools.length);
-  const completed = turnProgressCard({ ...state, status: 'completed' });
-  assert.doesNotMatch(completed.text, /子代理与 Codex 状态/);
-  assert.equal(completed.executionLog?.runningNote, undefined);
+  assert.match(interimReply.text, /\*\*子代理与 Codex 状态\*\*/);
+  assert.match(interimReply.text, /---\n\n阶段过渡说明$/);
+  assert.equal(interimReply.executionLog?.count, tools.length);
+  const completedWithText = turnProgressCard({ ...state, status: 'completed', message: {
+    messageId: 'reply', sessionId: 'session', turnId: 't1', role: 'assistant',
+    final: true, revision: 2, sequence: 1, source: 'agy', blocks: [{ type: 'text', text: '最终完整结论' }],
+  } });
+  assert.equal(completedWithText.text, '最终完整结论');
+  assert.doesNotMatch(completedWithText.text, /子代理与 Codex 状态/);
+  const completedNoText = turnProgressCard({ ...state, status: 'completed' });
+  assert.doesNotMatch(completedNoText.text, /子代理与 Codex 状态/);
+  assert.equal(completedNoText.executionLog?.runningNote, undefined);
 });
 
-test('tool tracker keeps the Codex MCP summary when completion omits the tool input', () => {
+test('tool tracker keeps the Codex MCP summary when completion omits or clears Arguments', () => {
   const tracker = new ToolProgressTracker();
   const ref = makeSession().native;
   const detail = summarizeTool('call_mcp_tool', { ToolName: 'codex_review', Arguments: { tier: 'astra' } });
@@ -209,6 +219,54 @@ test('tool tracker keeps the Codex MCP summary when completion omits the tool in
   const done = tracker.observe(ref, 1, 'turn', 'mcp', 'succeeded', generic);
   assert.ok(done?.type === 'event');
   assert.deepEqual(done.event.data, { turnId: 'turn', callId: 'mcp', phase: 'succeeded', ...detail });
+
+  // Also verify codex_job(wait + job_id) does not downgrade to 查询作业 when completion sends Arguments: {}
+  const jobWait = summarizeTool('call_mcp_tool', {
+    ServerName: 'codex-bridge_codex',
+    ToolName: 'codex_job',
+    Arguments: { action: 'wait', job_id: 'job-20261126-111851-314ddb40' },
+  });
+  assert.equal(jobWait.summary, '⚡ Codex MCP (等待作业 …314ddb40)');
+  tracker.observe(ref, 1, 'turn', 'mcp-job', 'running', jobWait);
+  const jobEmpty = summarizeTool('call_mcp_tool', {
+    ServerName: 'codex-bridge_codex',
+    ToolName: 'codex_job',
+    Arguments: {},
+  });
+  const jobDone = tracker.observe(ref, 1, 'turn', 'mcp-job', 'succeeded', jobEmpty);
+  assert.ok(jobDone?.type === 'event');
+  assert.equal((jobDone.event.data as ToolProgress).summary, '⚡ Codex MCP (等待作业 …314ddb40)');
+
+  // P2: Unified 8-item budget shared between delegated tools and active session subagents.
+  const eightDoneTools: ToolProgress[] = Array.from({ length: 8 }, (_, idx) => ({
+    turnId: 'turn',
+    callId: `done-${idx}`,
+    phase: 'succeeded',
+    ...summarizeTool('invoke_subagent', { Role: `Finished ${idx}` }),
+  }));
+  const threeActiveSubs = [
+    { conversationId: 'sub-11111111', agentName: 'Active Sub A', status: 'running' },
+    { conversationId: 'sub-22222222', agentName: 'Active Sub B', status: 'running' },
+    { conversationId: 'sub-33333333', agentName: 'Active Sub C', status: 'running' },
+  ];
+  const unifiedCard = turnProgressCard({
+    provider: 'agy',
+    status: 'running',
+    schema: '2.0',
+    message: undefined,
+    tools: eightDoneTools,
+    duration: null,
+    files: [],
+    turnId: 'turn',
+    activeSubagents: threeActiveSubs,
+  });
+  assert.match(unifiedCard.text, /Active Sub A/);
+  assert.match(unifiedCard.text, /Active Sub B/);
+  assert.match(unifiedCard.text, /Active Sub C/);
+  assert.match(unifiedCard.text, /另有 3 项子代理\/Codex 记录/);
+  const bulletLines = unifiedCard.text.split('\n').filter((line) => line.startsWith('- '));
+  // 8 visible items + 1 omitted summary line = 9 bullet lines total
+  assert.equal(bulletLines.length, 9);
 });
 
 test('summary limits count Unicode code points and never split an emoji', () => {

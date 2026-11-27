@@ -85,6 +85,78 @@ function safeLabel(value: unknown, limit = 48): string {
   return cleaned ? short(cleaned, limit) : '';
 }
 
+interface CodexMcpMeta {
+  subtool: string;
+  tier: string;
+  action: string;
+  jobTail: string;
+}
+
+const CODEX_MCP_LABELS: Record<string, string> = {
+  codex_engineer: '工程实现',
+  codex_review: '代码审查',
+  codex_followup: '续接会话',
+  codex_lookup: '低成本检索',
+  codex_status: '状态查询',
+};
+
+function extractCodexMcpMeta(name: unknown, server: unknown, argsInput: unknown): CodexMcpMeta | null {
+  const subtool = typeof name === 'string' ? name.trim() : '';
+  if (server !== 'codex-bridge_codex' && !subtool.startsWith('codex_')) return null;
+  const { tier, action, job_id: jobId } = inputObject(argsInput);
+  const safeTier = tier === 'sol' || tier === 'astra' || tier === 'astra-deep' || tier === 'luna' ? tier : '';
+  const safeAction = action === 'wait' || action === 'cancel' || action === 'status' || action === 'list' ? action : '';
+  const jobTail = typeof jobId === 'string' && /^(?:(?:job-(?:\d{8}-\d{6}-)?)?[a-f\d]{8}|[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i.test(jobId)
+    ? jobId.slice(-8) : '';
+  return { subtool, tier: safeTier, action: safeAction, jobTail };
+}
+
+function formatCodexMcpMeta(meta: CodexMcpMeta): string {
+  const label = meta.subtool === 'codex_job'
+    ? (meta.action === 'wait' ? '等待作业' : meta.action === 'cancel' ? '取消作业' : '查询作业')
+    : (Object.hasOwn(CODEX_MCP_LABELS, meta.subtool) ? CODEX_MCP_LABELS[meta.subtool]! : '工具调用');
+  const job = meta.jobTail ? ` …${meta.jobTail}` : '';
+  return `⚡ Codex MCP (${[meta.tier, label].filter(Boolean).join(' · ')}${job})`;
+}
+
+function parseCodexMcpSummary(summary: string): CodexMcpMeta | null {
+  const match = /^⚡ Codex MCP \((.+)\)$/u.exec(summary);
+  if (!match) return null;
+  const inner = match[1]!;
+  const jobMatch = /\s…([a-f\d]{8})$/i.exec(inner);
+  const jobTail = jobMatch ? jobMatch[1]! : '';
+  const head = jobMatch ? inner.slice(0, jobMatch.index) : inner;
+  const parts = head.split(' · ').map(s => s.trim()).filter(Boolean);
+  const first = parts[0] ?? '';
+  const tier = first === 'sol' || first === 'astra' || first === 'astra-deep' || first === 'luna' ? first : '';
+  const label = tier ? (parts[1] ?? '') : first;
+  let subtool = '';
+  let action = '';
+  if (label === '等待作业') { subtool = 'codex_job'; action = 'wait'; }
+  else if (label === '取消作业') { subtool = 'codex_job'; action = 'cancel'; }
+  else if (label === '查询作业') { subtool = 'codex_job'; }
+  else {
+    for (const [key, val] of Object.entries(CODEX_MCP_LABELS)) {
+      if (val === label) { subtool = key; break; }
+    }
+  }
+  return { subtool, tier, action, jobTail };
+}
+
+function mergeCodexMcpSummary(priorSummary: string, nextSummary: string): string {
+  const prior = parseCodexMcpSummary(priorSummary);
+  const next = parseCodexMcpSummary(nextSummary);
+  if (!prior || !next) return nextSummary;
+  const sameJob = prior.subtool === 'codex_job' && next.subtool === 'codex_job';
+  const merged: CodexMcpMeta = {
+    subtool: next.subtool || prior.subtool,
+    tier: next.tier || prior.tier,
+    action: next.action || (sameJob ? prior.action : ''),
+    jobTail: next.jobTail || (next.subtool === prior.subtool || !next.subtool ? prior.jobTail : ''),
+  };
+  return formatCodexMcpMeta(merged);
+}
+
 function summarizeSpecialTool(tool: string, data: Record<string, unknown>): string | null {
   switch (tool) {
     case 'swarm': {
@@ -122,22 +194,8 @@ function summarizeSpecialTool(tool: string, data: Record<string, unknown>): stri
     case 'call_mcp_tool': {
       const name = data.ToolName ?? data.tool_name;
       const server = data.ServerName ?? data.server_name;
-      if (server === 'codex-bridge_codex' || typeof name === 'string' && name.startsWith('codex_')) {
-        const { tier, action, job_id: jobId } = inputObject(data.Arguments ?? data.arguments);
-        const safeTier = tier === 'sol' || tier === 'astra' || tier === 'astra-deep' || tier === 'luna' ? tier : '';
-        const labels: Record<string, string> = {
-          codex_engineer: '工程实现',
-          codex_review: '代码审查',
-          codex_followup: '续接会话',
-          codex_lookup: '低成本检索',
-          codex_status: '状态查询',
-        };
-        const label = name === 'codex_job' ? (action === 'wait' ? '等待作业' : action === 'cancel' ? '取消作业' : '查询作业') :
-          typeof name === 'string' && Object.hasOwn(labels, name) ? labels[name] : '工具调用';
-        const job = typeof jobId === 'string' && /^(?:(?:job-(?:\d{8}-\d{6}-)?)?[a-f\d]{8}|[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i.test(jobId)
-          ? ` …${jobId.slice(-8)}` : '';
-        return `⚡ Codex MCP (${[safeTier, label].filter(Boolean).join(' · ')}${job})`;
-      }
+      const codexMeta = extractCodexMcpMeta(name, server, data.Arguments ?? data.arguments);
+      if (codexMeta) return formatCodexMcpMeta(codexMeta);
       const mcpTool = safeLabel(name, 40);
       return `🔌 MCP${mcpTool ? `：${mcpTool}` : ''}`;
     }
@@ -183,8 +241,12 @@ export class ToolProgressTracker {
     const prior = this.calls.get(key);
     if (prior && (isTerminalTool(prior.phase) && phase !== prior.phase || prior.phase === 'running' && phase === 'pending')) return;
     const genericMcp = detail?.tool === 'call_mcp_tool' && detail.summary === '🔌 MCP' && prior?.tool === detail.tool;
-    const description = !detail || genericMcp || prior && detail.summary === detail.tool &&
+    let description = !detail || genericMcp || prior && detail.summary === detail.tool &&
       (prior.tool !== 'tool' || detail.tool === 'tool') ? prior : detail;
+    if (prior && description && prior.tool === 'call_mcp_tool' && description.tool === 'call_mcp_tool' &&
+        prior.summary.startsWith('⚡ Codex MCP') && description.summary.startsWith('⚡ Codex MCP')) {
+      description = { ...description, summary: short(mergeCodexMcpSummary(prior.summary, description.summary), 120) };
+    }
     const data = readToolProgress({
       turnId, callId, phase, tool: description?.tool ?? 'tool', summary: description?.summary ?? 'tool',
     });

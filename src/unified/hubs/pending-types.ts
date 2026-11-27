@@ -25,6 +25,13 @@ export interface PendingEnvelope {
   identity: Identity;
 }
 
+export type CliNoticeDiscoveryResult =
+  | PendingCliNotice[]
+  | {
+      notices: PendingCliNotice[];
+      unknownRefIds?: readonly string[];
+    };
+
 export interface PendingHubOptions {
   dbPath: string;
   owner: Identity;
@@ -45,7 +52,7 @@ export interface PendingHubOptions {
     messageId: string;
   }) => boolean;
   shouldDeliverSource?: (item: PendingItemView) => boolean;
-  discoverCliNotices?: () => Promise<PendingCliNotice[]>;
+  discoverCliNotices?: () => Promise<CliNoticeDiscoveryResult> | CliNoticeDiscoveryResult;
   now?: () => number;
 }
 
@@ -328,5 +335,10 @@ export const PENDING_HUB_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS pending_hub_deliveries_v1 (
     delivery_id TEXT PRIMARY KEY,
     state TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS pending_hub_notice_signatures_v1 (
+    ref_id TEXT PRIMARY KEY,
+    signature TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
   );
 `;

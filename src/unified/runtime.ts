@@ -26,11 +26,15 @@ import { AgyCatalog } from './agy-catalog.js';
 import { AgyQuotaClient, type AgyQuotaSnapshot } from './agy-quota.js';
 import { AgyAcpTransport } from './agy-transport.js';
 import { defaultAgyConversationsDir } from './agy/process-guard.js';
+import { AgyCliWaitingDetector } from './agy/cli-waiting-detector.js';
+import { readReadonlyAgyLiveTurn } from './agy/readonly-live-turn.js';
+import { resolveAgySummariesDbPaths } from './agy/catalog-types.js';
 import { collectAgyStatusSnapshot } from './agy/session-status.js';
 import { providerTitlePrefix } from './feishu-cards.js';
 import { DecisionSyncStore } from './decision-sync.js';
 import { PendingHub, type PendingQuery } from './pending-hub.js';
 import { readWaitingClaudePresence } from './hubs/pending-discovery.js';
+import type { PendingCliNotice } from './hubs/pending-types.js';
 import { TaskHandoffService } from './task-handoff.js';
 import { TaskTopicChannel, TaskChannelError, type TaskAuthorize, type TaskChannelAction } from './task-topic-channel.js';
 import type { TaskTopicToken } from './task-topic-store.js';
@@ -46,6 +50,7 @@ export interface AgyRuntimeConfig {
   serviceId: string;
   summariesDbPath?: string;
   brainDir?: string;
+  conversationsDir?: string;
   binPath?: string;
   quotaCachePath?: string;
   sandbox?: boolean;
@@ -166,7 +171,7 @@ export class UnifiedRuntime {
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
   private readonly startupRestorations = new Map<Provider, Promise<void>>();
   private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly inFlightUnknownOpAlerts=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
-  constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;resolveDiscoveryProject?:(native:Omit<Session['native'],'nativeSessionId'>,project:string|null)=>string|null;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void}={}) {
+  constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;resolveDiscoveryProject?:(native:Omit<Session['native'],'nativeSessionId'>,project:string|null)=>string|null;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void;isTrustedAgyCliHolder?:(holder:{pid:number;tty:string;cmdline:string;kind:'external_cli'|'bridge_acp';exe?:string})=>boolean}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
     const channelPath=resolve(config.channelDb); const canonical=existsSync(channelPath) ? realpathSync(channelPath) : join(realpathSync(dirname(channelPath)),basename(channelPath));
     this.lock=new DatabaseSync(`${canonical}.runtime-lock`);
@@ -193,8 +198,17 @@ export class UnifiedRuntime {
           readAgyStatus: () => collectAgyStatusSnapshot({
             ...(agyConfig?.summariesDbPath !== undefined ? { summariesDbPath: agyConfig.summariesDbPath } : {}),
             ...(agyConfig?.brainDir !== undefined ? { brainDir: agyConfig.brainDir } : {}),
-            conversationsDir: defaultAgyConversationsDir(agyConfig?.brainDir),
+            conversationsDir: agyConfig?.conversationsDir ?? defaultAgyConversationsDir(agyConfig?.brainDir),
           }),
+          ...(agyConfig && agyConfig.enabled !== false ? {
+            readReadonlyLiveTurn: (session: Session) => {
+              if (session.native.provider !== 'agy') return null;
+              return readReadonlyAgyLiveTurn(session.native.nativeSessionId, session.project, {
+                ...(agyConfig.summariesDbPath !== undefined ? { summariesDbPath: agyConfig.summariesDbPath } : {}),
+                ...(agyConfig.brainDir !== undefined ? { brainDir: agyConfig.brainDir } : {}),
+              });
+            },
+          } : {}),
         }); } catch(error) { this.core.close(); throw error; }
         this.core.validateSteerScope = (scope,sessionId) => {
           if (!owner({source:scope.ownerSource,subject:scope.ownerSubject})) return false;
@@ -255,6 +269,7 @@ export class UnifiedRuntime {
             });
           }
           if (config.pendingHub?.enabled) {
+            const agyWaitingDetector = new AgyCliWaitingDetector();
             this._pendingHub = new PendingHub({
               dbPath: resolvePendingHubDbPath(config),
               owner: ownerIdentity,
@@ -267,12 +282,15 @@ export class UnifiedRuntime {
                 && !this._taskChannel?.ownsInteractionCard(destination,sessionId,interactionId,messageId),
               shouldDeliverSource: (item) => item.provider === 'decision',
               discoverCliNotices: async () => {
-                const native = { provider: 'claude' as const, hostId: config.hostId, serviceId: config.claudeServiceId };
+                const claudeNative = { provider: 'claude' as const, hostId: config.hostId, serviceId: config.claudeServiceId };
                 const resolveProject = options.resolveDiscoveryProject ?? ((ref, project) => {
                   const sources = config.catalogSources?.filter(source => canonicalDirectory(source.directory) !== null) ?? [];
                   const roots = allowedProjectRoots.flatMap(root => canonicalDirectory(root) ?? []);
                   return discoverySourceAllowed(config, ref, sources) ? trustedDiscoveryProject(project, roots) : null;
                 });
+                const notices: PendingCliNotice[] = [];
+                const unknownRefIds: string[] = [];
+
                 const presenceDirs = [join(config.claudeStateDir, 'presence')];
                 const defaultPresenceDir = join(homedir(), '.local', 'state', 'feishu-claude-bridge', 'presence');
                 const tempRoot = tmpdir();
@@ -280,26 +298,73 @@ export class UnifiedRuntime {
                   presenceDirs.push(defaultPresenceDir);
                 }
                 const records = await readWaitingClaudePresence(presenceDirs, Date.now());
-                if (!records.length) return [];
-                const sessions = new Map(this.store.listSessions()
-                  .filter(({ native }) => native.provider === 'claude' && native.hostId === config.hostId &&
-                    native.serviceId === config.claudeServiceId)
-                  .map(session => [session.native.nativeSessionId, session]));
-                return records.flatMap(record => {
-                  const session = sessions.get(record.sessionId);
-                  if (session && (session.control.input === 'available' || this.store.isDetached(session.sessionId) ||
-                    options.canDiscover && !options.canDiscover(session))) return [];
-                  const project = resolveProject(native, record.cwd ?? session?.project ?? null);
-                  if (!project) return [];
-                  return [{
-                    provider: 'claude' as const,
-                    nativeSessionId: record.sessionId,
-                    title: session ? this.core.presentSession(session).title : `Claude Code 会话 · ${record.sessionId.slice(0, 8)}`,
-                    summary: 'Claude Code 终端有待处理的请求。',
-                    project,
-                    sourceSessionId: session?.sessionId ?? null,
-                  }];
-                });
+                if (records.length) {
+                  const claudeSessions = new Map(this.store.listSessions()
+                    .filter(({ native }) => native.provider === 'claude' && native.hostId === config.hostId &&
+                      native.serviceId === config.claudeServiceId)
+                    .map(session => [session.native.nativeSessionId, session]));
+                  for (const record of records) {
+                    const session = claudeSessions.get(record.sessionId);
+                    if (session && (session.control.input === 'available' || this.store.isDetached(session.sessionId) ||
+                      options.canDiscover && !options.canDiscover(session))) continue;
+                    const project = resolveProject(claudeNative, record.cwd ?? session?.project ?? null);
+                    if (!project) continue;
+                    notices.push({
+                      provider: 'claude',
+                      nativeSessionId: record.sessionId,
+                      title: session ? this.core.presentSession(session).title : `Claude Code 会话 · ${record.sessionId.slice(0, 8)}`,
+                      summary: 'Claude Code 终端有待处理的请求。',
+                      project,
+                      sourceSessionId: session?.sessionId ?? null,
+                    });
+                  }
+                }
+
+                if (config.agy && config.agy.enabled !== false) {
+                  const agyNative = { provider: 'agy' as const, hostId: config.hostId, serviceId: config.agy.serviceId };
+                  const agyScan = agyWaitingDetector.scan({
+                    ...(config.agy.summariesDbPath !== undefined ? { summariesDbPath: config.agy.summariesDbPath } : {}),
+                    ...(config.agy.brainDir !== undefined ? { brainDir: config.agy.brainDir } : {}),
+                    conversationsDir: config.agy.conversationsDir ?? defaultAgyConversationsDir(config.agy.brainDir),
+                    ...(config.allowedProjectRoots !== undefined ? { allowedProjectRoots: config.allowedProjectRoots } : {}),
+                    ...(options.isTrustedAgyCliHolder !== undefined ? { isTrustedHolder: options.isTrustedAgyCliHolder } : {}),
+                  });
+                  for (const unknownId of agyScan.unknownConversationIds) {
+                    unknownRefIds.push(`cli_notice:agy:${unknownId}`);
+                  }
+                  if (agyScan.notices.length) {
+                    const agySessions = new Map(this.store.listSessions()
+                      .filter(({ native }) => native.provider === 'agy' && native.hostId === config.hostId &&
+                        native.serviceId === config.agy!.serviceId)
+                      .map(session => [session.native.nativeSessionId, session]));
+                    for (const item of agyScan.notices) {
+                      const rootSession = agySessions.get(item.rootConversationId);
+                      if (rootSession && (rootSession.control.input === 'available' || this.store.isDetached(rootSession.sessionId) ||
+                        options.canDiscover && !options.canDiscover(rootSession))) continue;
+                      const project = resolveProject(agyNative, item.rootProject);
+                      if (!project) continue;
+                      const rootTitle = rootSession ? this.core.presentSession(rootSession).title : item.rootTitle;
+                      const title = item.subagentName ? `${rootTitle} · 子代理 ${item.subagentName}` : rootTitle;
+                      const ttyPart = item.holder.tty ? ` (${item.holder.tty})` : '';
+                      const parts = [
+                        item.toolSummary
+                          ? `终端步骤 #${item.waitingStepIdx} 等待确认/输入：${item.toolSummary}`
+                          : `终端步骤 #${item.waitingStepIdx} 等待确认/输入。`,
+                        `持有终端：PID ${item.holder.pid}${ttyPart} · 切回命令：agy --conversation ${item.rootConversationId}`,
+                      ];
+                      notices.push({
+                        provider: 'agy',
+                        nativeSessionId: item.waitingConversationId,
+                        title,
+                        summary: parts.join('\n'),
+                        project,
+                        sourceSessionId: rootSession?.sessionId ?? null,
+                      });
+                    }
+                  }
+                }
+
+                return unknownRefIds.length ? { notices, unknownRefIds } : notices;
               },
               resolveTopicLink: async (sessionId, hubDest) => {
                 if (this._taskChannel && this.port.topicLinkForTask) {
@@ -1126,6 +1191,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   const autoTimeoutStreaks=new Map<string,number>();
   const refreshTimeoutStreaks=new Map<string,number>();
   const agyBrainDir = agyEnabled ? config.agy?.brainDir : undefined;
+  const agySummaryPaths = agyEnabled ? resolveAgySummariesDbPaths(config.agy?.summariesDbPath) : [];
   const lastTranscriptStat = new Map<string, string>();
   const scannedAssistantMessages = new Map<string, number>();
   const agyTranscriptSignature = (nativeSessionId: string): string | null => {
@@ -1133,9 +1199,14 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     const logsDir = join(agyBrainDir, nativeSessionId, '.system_generated', 'logs');
     let compact = '';
     let full = '';
+    let summaries = '';
     try { const st = statSync(join(logsDir, 'transcript.jsonl')); compact = `${st.mtimeMs}:${st.size}`; } catch {}
     try { const st = statSync(join(logsDir, 'transcript_full.jsonl')); full = `${st.mtimeMs}:${st.size}`; } catch {}
-    return compact || full ? `${compact}|${full}` : null;
+    for (const p of agySummaryPaths) {
+      try { const st = statSync(p); summaries += `${st.mtimeMs}:${st.size};`; } catch {}
+      try { const st = statSync(`${p}-wal`); summaries += `${st.mtimeMs}:${st.size};`; } catch {}
+    }
+    return compact || full || summaries ? `${compact}|${full}|${summaries}` : null;
   };
   let fastAgyTimer: ReturnType<typeof setInterval> | undefined;
   let fastRefreshing = false;
@@ -1308,13 +1379,11 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
             try {
               configure(session);
               const refreshed = await runtime.core.refreshReadOnlySession(sessionId);
-              if (refreshed) {
-                for (const dest of destinations) {
-                  if (!runtime.channel.readonlyHydrated(dest, sessionId) && !runtime.channel.hasPendingAutoBaseline(dest, sessionId)) {
-                    await runtime.channel.baselineReadonlyHistory(dest, sessionId);
-                  }
-                  runtime.notifyChannelProgress(dest);
+              for (const dest of destinations) {
+                if (refreshed && !runtime.channel.readonlyHydrated(dest, sessionId) && !runtime.channel.hasPendingAutoBaseline(dest, sessionId)) {
+                  await runtime.channel.baselineReadonlyHistory(dest, sessionId);
                 }
+                runtime.notifyChannelProgress(dest);
               }
             } catch {
               // Best-effort fast lane; main poll loop handles retries and health reporting.

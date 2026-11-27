@@ -13,6 +13,7 @@ export type ExternalAgyHolderDetector = (sessionId: string) => ExternalAgyHolder
 
 export interface AgySessionHolder extends ExternalAgyHolder {
   kind: 'external_cli' | 'bridge_acp';
+  exe?: string;
 }
 
 function isBridgeAcpProcess(argv: readonly string[]): boolean {
@@ -139,11 +140,18 @@ export function scanAgySessionHolders(
       continue;
     }
     if (!argv.length) continue;
+    let exe = '';
+    try {
+      exe = readlinkSync(join(pidDir, 'exe'));
+    } catch {
+      // Ignore unreadable /proc/<pid>/exe in synthetic proc roots or restricted environments.
+    }
     const holder: AgySessionHolder = {
       pid: Number(pid),
       tty,
       cmdline: argv.join(' '),
       kind: isBridgeAcpProcess(argv) ? 'bridge_acp' : 'external_cli',
+      ...(exe ? { exe } : {}),
     };
     for (const id of sessionIds) {
       const existing = holders.get(id);
