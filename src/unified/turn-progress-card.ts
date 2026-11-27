@@ -20,6 +20,35 @@ export function formatDuration(ms: number): string {
   return seconds < 60 ? `${seconds}秒` : `${Math.floor(seconds / 60)}分${String(seconds % 60).padStart(2, '0')}秒`;
 }
 
+const COMPACT_EFFORT_SUFFIX_RE = /^(.*?)(?:-tiered)?-(low|medium|high|xhigh|max)$/i;
+
+/** Format a compact model + reasoning effort badge for turn card headers, e.g. `carbon medium`, `neon high`, `sol high`. */
+export function formatCompactModelBadge(model?: string | null, effort?: string | null): string {
+  const rawModel = typeof model === 'string' ? model.trim() : '';
+  let base = rawModel;
+  let parsedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  const m = COMPACT_EFFORT_SUFFIX_RE.exec(base);
+  if (m) {
+    base = m[1]!.trim();
+    if (!parsedEffort) parsedEffort = m[2]!.toLowerCase();
+  }
+  if (!base) return '';
+  const lower = base.toLowerCase();
+  let shortModel: string;
+  if (/^gemini-\d+(?:\.\d+)?-(carbon|neon|hydrogen|argon)$/.test(lower)) {
+    shortModel = lower.split('-').at(-1)!;
+  } else if (/^gpt-[\d.]+-(sol|astra|luna)$/.test(lower)) {
+    shortModel = lower.split('-').at(-1)!;
+  } else if (/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)$/.test(lower)) {
+    const cm = /^claude-(opus|sonnet|haiku)-(\d+)-(\d+)$/.exec(lower)!;
+    shortModel = `${cm[1]} ${cm[2]}.${cm[3]}`;
+  } else {
+    shortModel = lower.replace(/^(?:gemini|claude)-/, '').replace(/-/g, ' ').trim();
+  }
+  const cleanEffort = /^(low|medium|high|xhigh|max)$/.test(parsedEffort) ? parsedEffort : '';
+  return cleanEffort ? `${shortModel} ${cleanEffort}` : shortModel;
+}
+
 export function completionText(duration: number, _message?: Message | undefined, _count?: number): string {
   return `✅ 本轮已完成（用时 ${formatDuration(duration)}），完整结论见上方回复卡。`;
 }
@@ -42,6 +71,7 @@ type CardState = {
   turnId?: string | undefined;
   activeSubagents?: readonly SessionSubagentActivity[] | undefined;
   allowFullReplyButton?: boolean | undefined;
+  modelBadge?: string | undefined;
 };
 
 function formatRunningNote(active: readonly ToolProgress[]): string | undefined {
@@ -99,7 +129,7 @@ function formatDelegatedStatus(
   return ['**子代理与 Codex 状态**', ...lines].join('\n');
 }
 
-export function turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration, files, turnId, activeSubagents, allowFullReplyButton = true }: CardState): ChannelCard {
+export function turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration, files, turnId, activeSubagents, allowFullReplyButton = true, modelBadge }: CardState): ChannelCard {
   const title = providerDisplayLabel(provider);
   const isWakeup = Boolean(turnId?.startsWith('wakeup:'));
   const visibleTools = tools.filter(tool => !(tool.tool === 'thinking' && tool.phase !== 'running'));
@@ -108,13 +138,14 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
   const failedCount = toolCounts?.failedTools ?? visibleTools.filter(tool => tool.phase === 'failed').length;
   const running = status === 'running' || status === 'queued' || status === undefined && !message?.final;
   const elapsed = duration === null ? '' : ` · 用时 ${formatDuration(duration)}`;
+  const badge = modelBadge?.trim() ? ` · ${modelBadge.trim()}` : '';
   const header: Pick<ChannelCard, 'title' | 'template'> = status === 'completed'
-    ? { title: `${title} · ${isWakeup ? '后台唤醒已完成' : '已完成'}${elapsed}`, template: 'green' }
-    : status === 'failed' ? { title: `${title} · 执行失败`, template: 'red' }
-      : status === 'interrupted' ? { title: `${title} · 已中断`, template: 'grey' }
+    ? { title: `${title} · ${isWakeup ? '后台唤醒已完成' : '已完成'}${elapsed}${badge}`, template: 'green' }
+    : status === 'failed' ? { title: `${title} · 执行失败${badge}`, template: 'red' }
+      : status === 'interrupted' ? { title: `${title} · 已中断${badge}`, template: 'grey' }
         : running
-          ? { title: `${title} · ${isWakeup ? '后台唤醒进行中' : '进行中'}${elapsed}`, template: 'blue' }
-          : { title: `${title} · 回复` };
+          ? { title: `${title} · ${isWakeup ? '后台唤醒进行中' : '进行中'}${elapsed}${badge}`, template: 'blue' }
+          : { title: `${title} · 回复${badge}` };
   const raw = message?.blocks.map(block => block.type === 'text' ? block.text :
     `[文件 ${escapeCardMarkdown(block.artifactId)}]`).join('\n') ?? '';
   const preview = formatCardReplyBody(raw);
