@@ -1407,7 +1407,7 @@ export class FeishuChannel {
       return { handledIds, deferredIds };
     };
     const deliverCliPrompts = async (session: Session, candidates: readonly Message[]) => {
-      if (!isCliReadonly(session) || !candidates.length) return;
+      if (this.accessMode(destination) !== 'read_only' || !candidates.length) return;
       const ordered = [...candidates].sort((a, b) => a.sequence - b.sequence || a.messageId.localeCompare(b.messageId));
       for (const message of ordered) {
         if (message.role !== 'user' || !message.final || !unseen(message)) continue;

@@ -170,6 +170,7 @@ export class UnifiedRuntime {
   get taskChannel():TaskTopicChannel|undefined { return this._taskChannel; }
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
   private readonly startupRestorations = new Map<Provider, Promise<void>>();
+  private readonly reconnectRestorations = new Set<Provider>();
   private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly inFlightUnknownOpAlerts=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
   constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;resolveDiscoveryProject?:(native:Omit<Session['native'],'nativeSessionId'>,project:string|null)=>string|null;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void;isTrustedAgyCliHolder?:(holder:{pid:number;tty:string;cmdline:string;kind:'external_cli'|'bridge_acp';exe?:string})=>boolean}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
@@ -894,8 +895,16 @@ export class UnifiedRuntime {
       }
     }
   }
+  isSessionPendingInteractiveRestore(session: Session): boolean {
+    if (!this.store.hasInteractiveIntent(session.sessionId)) return false;
+    return this.startupRestorations.has(session.native.provider) ||
+      this.reconnectRestorations.has(session.native.provider) ||
+      this.recoveryFailedSessions.has(session.sessionId);
+  }
   /** Retry persisted interactive intent (including runtime-disconnected and taskTopic targets) for the provider that just reconnected. */
   async restoreProviderAfterReconnect(provider:Provider):Promise<{restored:string[];failed:string[]}> {
+    this.reconnectRestorations.add(provider);
+    try {
     const restoredIds: string[] = [];
     const failedIds: string[] = [];
     const startup = this.startupRestorations.get(provider);
@@ -932,6 +941,9 @@ export class UnifiedRuntime {
       });
     }
     return {restored:restoredIds,failed:failedIds};
+    } finally {
+      this.reconnectRestorations.delete(provider);
+    }
   }
   private hasPendingOrActiveWork():boolean {
     if(this.channel.pendingInbox().length>0) return true;
@@ -1373,6 +1385,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
         const baselines=r.channel.bindingsForRestore().filter(binding=>binding.sessionId===session.sessionId && binding.accessMode==='read_only' && !r.channel.readonlyHydrated(binding.destination,session.sessionId));
         let refreshed = false;
         if(session.status==='read_only' && session.control.input!=='available') {
+          if (r.isSessionPendingInteractiveRestore(session)) continue;
           try {
             refreshed = await r.core.refreshReadOnlySession(session.sessionId);
             refreshTimeoutStreaks.delete(session.sessionId);

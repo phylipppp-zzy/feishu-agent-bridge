@@ -445,15 +445,16 @@ async function historyAndNotices(ctx) {
     await ctx.send(codex, '/status');
     await ctx.settle();
     panel = cardWith(ctx, codex, '会话控制');
-    trace.check('面板显示中文状态及完成、等待、失败设置，无内部修订号或能力枚举', () => {
-      assert.match(panel.card.bodyText, /通知：开启（完成：开 · 等待：开 · 失败：开）/);
+    trace.check('面板显示中文状态及精简通知设置，无内部修订号或冗余细分提醒开关', () => {
+      assert.match(panel.card.bodyText, /通知：开启/);
       assert.doesNotMatch(panel.card.bodyText, /\brev\s*=|\bavailable\b|\bunsupported\b/i);
-      assert.equal(action(panel, 'notice_settings', 'waiting').label, '关闭等待提醒');
+      assert.equal(action(panel, 'notice_settings', 'paused').label, '暂停通知');
+      assert.equal(panel.card.buttons.some(({value}) => value?.action === 'notice_settings' && ['completed', 'waiting', 'failed'].includes(value?.field)), false);
     });
   });
 
-  await trace.step('5.5 点击「关闭等待提醒」，随后重开状态面板确认', async () => {
-    const callback = await ctx.click(panel, '关闭等待提醒');
+  await trace.step('5.5 点击「暂停通知」，随后重开状态面板确认', async () => {
+    const callback = await ctx.click(panel, '暂停通知');
     await ctx.settle();
     const notice = cardWith(ctx, codex, '会话控制');
     trace.check('开关更新当前控制面板，并保留会话操作', () => {
@@ -464,24 +465,24 @@ async function historyAndNotices(ctx) {
     await ctx.send(codex, '/status');
     await ctx.settle();
     const updated = cardWith(ctx, codex, '会话控制');
-    trace.check('原面板和新面板均显示等待提醒已关闭，其他选项仍开启', () => {
+    trace.check('原面板和新面板均显示通知已暂停', () => {
       assert.deepEqual(callback.result, { toast: { type: 'success', content: '已确认' } });
       for (const message of [notice, updated]) {
-        assert.match(message.card.bodyText, /通知：开启（完成：开 · 等待：关 · 失败：开）/);
-        assert.equal(action(message, 'notice_settings', 'waiting').label, '开启等待提醒');
+        assert.match(message.card.bodyText, /通知：已暂停/);
+        assert.equal(action(message, 'notice_settings', 'paused').label, '恢复通知');
       }
     });
   });
 
-  await trace.step('5.5 点击「开启等待提醒」恢复此话题的通知设置', async () => {
+  await trace.step('5.5 点击「恢复通知」恢复此话题的通知设置', async () => {
     const current = ctx.cards(codex).findLast(({ card }) => card?.title === '会话控制');
-    await ctx.click(current, '开启等待提醒');
+    await ctx.click(current, '恢复通知');
     await ctx.settle();
     const notice = cardWith(ctx, codex, '会话控制');
-    trace.check('等待提醒可以恢复', () => {
+    trace.check('通知可以恢复', () => {
       assert.equal(notice.id, current.id);
       assert.equal(notice.method, 'im.message.patch');
-      assert.match(notice.card.bodyText, /等待：开/);
+      assert.match(notice.card.bodyText, /通知：开启/);
     });
   });
 }

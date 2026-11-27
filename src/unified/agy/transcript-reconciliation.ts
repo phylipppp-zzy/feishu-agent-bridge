@@ -76,7 +76,7 @@ export function reconcilePersistedAgyHistory<T extends History>(observed: T, per
   const live = [...persisted.values()].filter(message => message.source === 'agy' && !transcriptRow(message) &&
     !observedLiveTurns.has(message.turnId)).sort((a, b) => a.sequence - b.sequence);
   const assistants = new Map(live.filter(message => message.role === 'assistant').map(message => [message.turnId, message]));
-  const prompts = live.filter(message => message.role === 'user' && assistants.has(message.turnId))
+  const prompts = live.filter(message => message.role === 'user')
     .map(message => ({ message, text: agyPromptText(message) }));
   if (!prompts.length) return { snapshot: observed, updated: [], conflicts: [] };
 
@@ -112,14 +112,18 @@ export function reconcilePersistedAgyHistory<T extends History>(observed: T, per
     const finalized = reply.length > 0 && reply.every(step => step.final);
     const samePrompt = (prompt: typeof prompts[number], i: number) => i >= nextPrompt && prompt.text === text;
     // Repeated native prompts might include a CLI turn or divergent replay.
-    // Only deduplicate when reply evidence agrees (or when reply is not yet finalized).
-    const match = text ? prompts.findIndex((prompt, i) => samePrompt(prompt, i) &&
-      (!finalized || replyMatches(assistants.get(prompt.message.turnId)!, reply))) : -1;
+    // Only deduplicate when reply evidence agrees (or when reply is not yet finalized / live turn had no assistant yet).
+    const match = text ? prompts.findIndex((prompt, i) => {
+      if (!samePrompt(prompt, i)) return false;
+      const liveAssistant = assistants.get(prompt.message.turnId);
+      if (!liveAssistant) return true;
+      return !finalized || replyMatches(liveAssistant, reply);
+    }) : -1;
 
     if (match < 0) {
       // Check if there is a same-prompt live record whose reply diverges from the finalized native reply,
       // unless a later unconsumed native turn already matches that live record cleanly (making this an external CLI turn).
-      const divergentIdx = text && finalized ? prompts.findIndex(samePrompt) : -1;
+      const divergentIdx = text && finalized ? prompts.findIndex((prompt, i) => samePrompt(prompt, i) && assistants.has(prompt.message.turnId)) : -1;
       const hasLaterMatchingNativeTurn = (liveTurnId: string): boolean => {
         const liveAssistant = assistants.get(liveTurnId);
         if (!liveAssistant) return false;
@@ -166,15 +170,23 @@ export function reconcilePersistedAgyHistory<T extends History>(observed: T, per
       }
       continue;
     }
-    for (const step of group) {
-      if (step.role === 'assistant' && !persisted.has(step.messageId)) skippedTurns.add(step.turnId);
-      else messages.push(step);
-    }
-    skippedTurns.add(message.turnId);
-    if (finalized) {
-      const counterpart = assistants.get(prompts[match]!.message.turnId)!;
-      const enriched = reconcileAgyReply(counterpart, reply, false);
-      if (enriched !== counterpart) updated.push(enriched);
+    const matchedAssistant = assistants.get(prompts[match]!.message.turnId);
+    if (matchedAssistant) {
+      for (const step of group) {
+        if (step.role === 'assistant' && !persisted.has(step.messageId)) skippedTurns.add(step.turnId);
+        else messages.push(step);
+      }
+      skippedTurns.add(message.turnId);
+      if (finalized) {
+        const enriched = reconcileAgyReply(matchedAssistant, reply, false);
+        if (enriched !== matchedAssistant) updated.push(enriched);
+        nextPrompt = match + 1;
+      }
+    } else {
+      // Persisted live user prompt had no assistant yet (e.g. interrupted or killed on restart):
+      // absorb the duplicate native user prompt while keeping any native assistant reply steps.
+      for (const step of group) messages.push(step);
+      if (!reply.length) skippedTurns.add(message.turnId);
       nextPrompt = match + 1;
     }
   }

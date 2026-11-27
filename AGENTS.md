@@ -13,7 +13,7 @@
 
 ## 2. 生产运行时不可变约束
 
-- **审批纯原端透传**：保持 `approvalPolicy.enabled = false`，禁止擅自在桥接层开启审批策略覆盖。
+- **审批纯原端透传**：保持 `approvalPolicy.enabled = false`，禁止擅自在桥接层开启审批策略覆盖。需要调整 AGY 默认放行白名单时，必须**同时同步修改** `/home/zhangzy/.gemini/config/config.json`（`userSettings.globalPermissionGrants.allow`，`agy acp` 实际主生效源）与 `/home/zhangzy/.gemini/antigravity-cli/settings.json`（`permissions.allow`），且 `command(...)` 必须匹配实际执行的完整命令前缀（如 `command(python3 ...)`），MCP 工具使用 `mcp(<server>/*)`；改完后新会话或 ACP 重建生效。
 - **AGY 沙箱与宿主机 AppArmor 强耦合**：生产保持 `agy.sandbox = true` 与 `agy.binPath = "/home/zhangzy/.gemini/bin/agy"`。宿主机（Ubuntu 24.04，`kernel.apparmor_restrict_unprivileged_userns=1`）通过 `/etc/apparmor.d/agy-zhangzy` 仅对 `/home/zhangzy/.gemini/bin/agy` 单二进制放行 `userns`；**严禁随意更改 `agy.binPath` 或放宽全局 `sysctl`**。
 - **其余默认项**：保持 `agy.defaultMode = "auto"`、`autoTakeControlOnInput = true`、`autoResumeOnRestart = true`、`Environment=NODE_OPTIONS=--no-warnings`。
 
