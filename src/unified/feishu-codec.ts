@@ -153,6 +153,15 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     }
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
+    case 'compact':
+      if ((value.revision === undefined || counter(value.revision)) && (value.controlGeneration === undefined || counter(value.controlGeneration))) {
+        return {
+          action: 'compact',
+          ...(counter(value.revision) ? { revision: value.revision } : {}),
+          ...(counter(value.controlGeneration) ? { controlGeneration: value.controlGeneration } : {}),
+        };
+      }
+      break;
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
     case 'stop':
       if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration) &&

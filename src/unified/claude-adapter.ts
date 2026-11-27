@@ -1,10 +1,11 @@
-import { summarizeTool, ToolProgressTracker } from './tool-progress.js';
+import { formatThinkingSummary, summarizeTool, ToolProgressTracker } from './tool-progress.js';
 import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
 import { query, listSessions, getSessionMessages, type Query, type Options, type SDKUserMessage, type CanUseTool, type SDKSessionInfo, type SessionMessage } from '@anthropic-ai/claude-agent-sdk';
 import { InputQueue } from '../claude/runner.js';
 import { imageMediaType } from '../image-media.js';
+import { resolveModelMaxContextTokens, type ContextUsageInfo } from './context-usage.js';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
 import { answerDigest, payloadDigest, questionDeclineAction, type ResponseEvidence, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn } from './contracts.js';
 import { contractError } from './errors.js';
@@ -76,6 +77,7 @@ export class ClaudeAdapter implements PlatformPort {
   private readonly listeners = new Set<(o: PlatformObservation) => void>();
   private readonly recent = new Map<string,{offset:number;buffer:Session[];done:boolean;watermark:number;expires:number}>();
   private readonly metadataPending=new Map<string,Promise<unknown>>();
+  private readonly contextUsage = new Map<string, ContextUsageInfo>();
   private sequence = 0;
   private closed = false;
   constructor(
@@ -104,6 +106,10 @@ export class ClaudeAdapter implements PlatformPort {
   hasActiveNativeSession(ref: NativeSessionRef): boolean {
     return !this.closed && ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
       && this.lives.has(ref.nativeSessionId) && !!this.owned.get(ref.nativeSessionId);
+  }
+  async getContextUsage(ref: NativeSessionRef): Promise<ContextUsageInfo | null> {
+    const id = this.check(ref);
+    return this.contextUsage.get(id) ?? null;
   }
   requiresControlRecovery(ref: NativeSessionRef): boolean { return !this.hasActiveNativeSession(ref); }
   private emit(o: PlatformObservation): void { for (const f of this.listeners) f(o); }
@@ -343,13 +349,25 @@ export class ClaudeAdapter implements PlatformPort {
     const ref = this.ref(live.id);
     const tools = new ToolProgressTracker();
     let toolTurn: string | null = null;
+    let thinkingBuf = '';
+    let thinkingActive = false;
+    let lastThinkingEmitAt = 0;
+    const closeClaudeThinking = () => {
+      if (thinkingActive && live.turn) {
+        thinkingActive = false;
+        thinkingBuf = '';
+        lastThinkingEmitAt = 0;
+        const done = tools.observe(ref, live.generation, live.turn, 'phase:thinking', 'succeeded');
+        if (done) this.emit(done);
+      }
+    };
     let streamFailure: {kind:string; exitCode:number|null} | null = null;
     try { for await (const raw of live.query) {
       if (this.closed || this.lives.get(live.id) !== live) break;
       const m = raw as any;
       if(!this.closed && this.lives.get(live.id)===live)live.residual.observe(m);
       if (live.turn && !this.closed && this.lives.get(live.id) === live && !m.parent_tool_use_id && !m.parent_agent_id) {
-        if (toolTurn !== live.turn) { tools.clear(); toolTurn = live.turn; }
+        if (toolTurn !== live.turn) { tools.clear(); toolTurn = live.turn; thinkingBuf = ''; thinkingActive = false; lastThinkingEmitAt = 0; }
         const blocks = m.type === 'stream_event' && m.event?.type === 'content_block_start'
           ? [m.event.content_block]
           : (m.type === 'assistant' || m.type === 'user') && Array.isArray(m.message?.content) ? m.message.content : [];
@@ -373,6 +391,61 @@ export class ClaudeAdapter implements PlatformPort {
         }
       }
       if (providerEvent && !this.closed && this.lives.get(live.id)===live) { const now = new Date().toISOString(), sequence = ++this.sequence; this.emit({ type: 'event', ref, connectionGeneration:live.generation, event: { schemaVersion: 1, eventId: randomUUID(), sessionId: live.id, objectId: live.turn ?? live.id, objectRevision: 0, sequence, type: providerEvent.type, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: providerEvent.data } }); }
+      const recordClaudeUsage = (usage: any, modelHint?: unknown, maxHint?: unknown) => {
+        if (!usage || typeof usage !== 'object') return;
+        const input = safeNumber(usage.input_tokens) ?? 0;
+        const cacheRead = safeNumber(usage.cache_read_input_tokens) ?? 0;
+        const cacheCreate = safeNumber(usage.cache_creation_input_tokens) ?? 0;
+        const output = safeNumber(usage.output_tokens) ?? 0;
+        const usedTokens = input + cacheRead + cacheCreate + output;
+        if (usedTokens <= 0) return;
+        const model = typeof modelHint === 'string' && modelHint.trim() ? modelHint.trim() : (live.turnModel ?? live.model);
+        const maxTokens = typeof maxHint === 'number' && Number.isFinite(maxHint) && maxHint > 0
+          ? Math.round(maxHint)
+          : resolveModelMaxContextTokens(model, 'claude');
+        if (this.contextUsage.size >= 512) this.contextUsage.delete(this.contextUsage.keys().next().value!);
+        this.contextUsage.set(live.id, { usedTokens, maxTokens, ...(model ? { model } : {}) });
+      };
+      if (!m.parent_tool_use_id && !m.parent_agent_id) {
+        if (m.type === 'stream_event' && m.event?.type === 'message_start' && m.event.message?.usage) {
+          recordClaudeUsage(m.event.message.usage, m.event.message.model);
+        } else if (m.type === 'assistant' && m.message?.usage) {
+          recordClaudeUsage(m.message.usage, m.message.model);
+        } else if (m.type === 'result' && m.modelUsage && typeof m.modelUsage === 'object') {
+          // m.modelUsage is cumulative across the entire session (not current context occupancy).
+          // Only refine maxTokens (contextWindow) on an existing per-request entry.
+          const existing = this.contextUsage.get(live.id);
+          const entries = Object.entries(m.modelUsage as Record<string, any>);
+          if (existing && entries.length) {
+            const [modelKey, info] = entries[0]!;
+            const cw = typeof info?.contextWindow === 'number' && Number.isFinite(info.contextWindow) && info.contextWindow > 0
+              ? Math.round(info.contextWindow)
+              : existing.maxTokens;
+            this.contextUsage.set(live.id, { ...existing, maxTokens: cw, ...(modelKey ? { model: modelKey } : {}) });
+          }
+        }
+        if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta' && typeof m.event.delta.thinking === 'string' && live.turn) {
+          thinkingBuf = (thinkingBuf + m.event.delta.thinking).slice(-600);
+          const now = Date.now();
+          if (!thinkingActive || now - lastThinkingEmitAt >= 1_500) {
+            const obs = tools.observe(ref, live.generation, live.turn, 'phase:thinking', 'running', {
+              tool: 'thinking',
+              summary: formatThinkingSummary(thinkingBuf),
+            });
+            if (obs) {
+              thinkingActive = true;
+              lastThinkingEmitAt = now;
+              this.emit(obs);
+            }
+          }
+        } else if (
+          (m.type === 'stream_event' && m.event?.type === 'content_block_start' && m.event.content_block?.type !== 'thinking') ||
+          m.type === 'assistant' ||
+          m.type === 'result'
+        ) {
+          closeClaudeThinking();
+        }
+      }
       if(m.type==='stream_event' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id)===live) { const event=m.event; if(event?.type==='message_start' && typeof event.message?.id==='string') live.stream={id:event.message.id,blocks:new Map(),sequence:++this.sequence,revision:0,current:null,stopped:false}; const stream=live.stream; if(stream && event?.type==='content_block_start' && event.content_block?.type==='text' && typeof event.index==='number') {stream.blocks.set(event.index,typeof event.content_block.text==='string'?event.content_block.text:'');stream.current=event.index;} if(stream && !stream.stopped && event?.type==='content_block_delta' && event.delta?.type==='text_delta' && typeof event.delta.text==='string' && stream.blocks.has(event.index)) { stream.blocks.set(event.index,stream.blocks.get(event.index)!+event.delta.text); const text=[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n'); const value:Message={messageId:stream.id,sessionId:live.id,turnId:live.turn ?? stream.id,role:'assistant',blocks:[{type:'text',text}],sequence:stream.sequence,revision:++stream.revision,final:false,source:'claude'}; live.messages=live.messages.filter(x=>x.messageId!==value.messageId); live.messages.push(value); this.emit({type:'message',ref,message:value,connectionGeneration:live.generation}); } if(stream && event?.type==='message_stop' && !stream.stopped) {stream.stopped=true; const text=[...stream.blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,v])=>v).join('\n'); if(text) {const value:Message={messageId:stream.id,sessionId:live.id,turnId:live.turn ?? stream.id,role:'assistant',blocks:[{type:'text',text}],sequence:stream.sequence,revision:++stream.revision,final:true,source:'claude'};live.messages=live.messages.filter(x=>x.messageId!==value.messageId);live.messages.push(value);this.emit({type:'message',ref,message:value,connectionGeneration:live.generation});} } }
       if (m.type === 'assistant' && !m.parent_tool_use_id && !m.parent_agent_id && this.lives.get(live.id) === live) {
         const normalized = this.normalize(live.id, { ...m, session_id: live.id, parent_tool_use_id: null, parent_agent_id: null }, ++this.sequence);

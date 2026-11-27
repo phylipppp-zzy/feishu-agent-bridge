@@ -1,5 +1,6 @@
 import { payloadDigest } from '../contracts.js';
-import { summarizeTool, type ToolProgress } from '../tool-progress.js';
+import { extractAgyContextUsageFromRows, type ContextUsageInfo } from '../context-usage.js';
+import { formatThinkingSummary, summarizeTool, type ToolProgress } from '../tool-progress.js';
 import type { SessionSubagentActivity } from '../turn-progress-card.js';
 import {
   isAncestorChainAuthorizedForProject,
@@ -27,6 +28,7 @@ export interface ReadonlyLiveTurnView {
   previewText: string;
   tools: ToolProgress[];
   activeSubagents: SessionSubagentActivity[];
+  contextUsage?: ContextUsageInfo | null;
   signature: string;
 }
 
@@ -199,8 +201,13 @@ export function readReadonlyAgyLiveTurn(
   let lastRowWasFinalTextOnly = false;
   let callOrdinal = 0;
 
+  let latestThinking = '';
   for (const row of turnRows) {
     if (row.type === 'PLANNER_RESPONSE') {
+      const rawThinking = typeof row.thinking === 'string' ? row.thinking.trim() : '';
+      if (rawThinking) {
+        latestThinking = rawThinking;
+      }
       const rawContent = typeof row.content === 'string' ? row.content.trim() : '';
       const rawCalls = Array.isArray(row.tool_calls) ? row.tool_calls : [];
       if (rawContent) interimTexts.push(rawContent);
@@ -236,11 +243,21 @@ export function readReadonlyAgyLiveTurn(
   }
 
   const running = summaryRunning || activeSubagents.length > 0 || (sawTrailingUnresolvedCalls && !lastRowWasFinalTextOnly);
+  if (latestThinking) {
+    tools.unshift({
+      turnId: anchorId,
+      callId: `${anchorId}:thinking`,
+      phase: running && !sawTrailingUnresolvedCalls ? 'running' : 'succeeded',
+      tool: 'thinking',
+      summary: formatThinkingSummary(latestThinking),
+    });
+  }
   if (!running && !tools.length && !activeSubagents.length && !rows.length) return null;
 
+  const contextUsage = extractAgyContextUsageFromRows(rows);
   const previewText = running ? interimTexts.join('\n\n') : '';
   const state = running ? 'running' : 'idle';
-  const signature = payloadDigest([anchorId, state, previewText, tools, activeSubagents]);
+  const signature = payloadDigest([anchorId, state, previewText, tools, activeSubagents, contextUsage]);
   return {
     state,
     anchorId,
@@ -248,6 +265,7 @@ export function readReadonlyAgyLiveTurn(
     previewText,
     tools,
     activeSubagents,
+    ...(contextUsage ? { contextUsage } : {}),
     signature,
   };
 }

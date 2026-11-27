@@ -81,8 +81,8 @@ function findDetailsOutsideFences(text: string): DetailsRange[] {
 }
 
 function hasRichMarkdownV2(card: ChannelCard): boolean {
-  if (card.sections?.length || card.headerTags?.length || card.subtitle) return true;
   if (card.format === 'plain' || card.table) return false;
+  if (card.sections?.length || card.headerTags?.length || card.subtitle) return true;
   if (card.executionLog) return true;
   return GFM_TABLE_RE.test(card.text) || findDetailsOutsideFences(card.text).length > 0;
 }
@@ -239,19 +239,55 @@ function cardElements(card: ChannelCard, omitEmpty = false, schema: CardSchema =
   ];
 }
 
+function formatExecutionLine(line: string, index: number, numbered: boolean): string {
+  const escaped = escapeCardMarkdown(line);
+  if (!numbered || line.startsWith('已省略较早的 ')) return escaped;
+  const iconMatch = /^([✓✗⏳—])\s+(.+)$/u.exec(line);
+  if (!iconMatch) return `${index}. ${escaped}`;
+  const icon = iconMatch[1]!;
+  const rest = iconMatch[2]!;
+  const statusEmoji = icon === '✓' ? '✅' : icon === '✗' ? '❌' : icon === '⏳' ? '⏳' : '➖';
+  const sepIdx = rest.indexOf(' · ');
+  if (sepIdx > 0) {
+    const action = escapeCardMarkdown(rest.slice(0, sepIdx));
+    const detail = escapeCardMarkdown(rest.slice(sepIdx + 3));
+    return `${index}. ${statusEmoji} **${action}** · ${detail}`;
+  }
+  return `${index}. ${statusEmoji} **${escapeCardMarkdown(rest)}**`;
+}
+
 function executionElements(log: ChannelCard['executionLog'], schema: CardSchema): unknown[] {
-  if (!log || (!log.count && !log.lines.length && !log.runningNote)) return [];
-  const title = `执行记录（${log.count} 项${log.failedCount ? `，失败 ${log.failedCount} 项` : ''}）`;
-  const lines = log.lines.map(escapeCardMarkdown);
-  const status = log.runningNote ? [markdown(escapeCardMarkdown(log.runningNote))] : [];
-  if (schema === '1.0') return [...status, markdown([`**${title}**`, ...lines].join('\n'))];
-  return [...status, {
-    tag: 'collapsible_panel',
-    element_id: 'execution_log',
-    expanded: false,
-    header: { title: markdown(title) },
-    elements: lines.length ? [markdown(lines.join('\n'))] : [],
-  }];
+  if (!log || (!log.count && !log.lines.length && !log.runningNote && !log.thinking)) return [];
+  const richTop = log.position === 'top';
+  let stepNum = 0;
+  const lines = log.lines.map((line) => {
+    if (!line.startsWith('已省略较早的 ')) stepNum += 1;
+    return formatExecutionLine(line, stepNum, richTop);
+  });
+  const topBlocks: unknown[] = [];
+  if (log.thinking?.trim()) {
+    const cleanThinking = escapeCardMarkdown(log.thinking.trim());
+    topBlocks.push(markdown(`**🧠 思考过程**\n${cleanThinking}`));
+  }
+  if (log.runningNote) {
+    const escapedNote = escapeCardMarkdown(log.runningNote);
+    topBlocks.push(markdown(richTop ? `**${escapedNote}**` : escapedNote));
+  }
+  const hasSteps = lines.length > 0;
+  if (!hasSteps) return topBlocks;
+  const label = richTop ? '执行步骤' : '执行记录';
+  const title = `${label}（${log.count} 项${log.failedCount ? `，失败 ${log.failedCount} 项` : ''}）`;
+  if (schema === '1.0') return [...topBlocks, markdown([`**${title}**`, ...lines].join('\n'))];
+  return [
+    ...topBlocks,
+    {
+      tag: 'collapsible_panel',
+      element_id: 'execution_log',
+      expanded: log.expanded ?? false,
+      header: { title: markdown(richTop ? `**${title}**` : title) },
+      elements: lines.length ? [markdown(lines.join('\n'))] : [],
+    },
+  ];
 }
 
 function questionElements(form: QuestionForm): unknown[] {
@@ -361,16 +397,28 @@ function encodeV2(card: ChannelCard, form?: QuestionForm): Record<string, unknow
             ? cardElements(card, !!form, '2.0', panelCounter)
             : []))
     : cardElements(card, !!form, '2.0', panelCounter);
+  const execElems = executionElements(card.executionLog, '2.0');
+  const execOnTop = card.executionLog?.position === 'top' && execElems.length > 0;
+  const contentBlocks = execOnTop
+    ? [
+        ...execElems,
+        ...(baseBody.length > 0 ? [{ tag: 'hr' }, ...baseBody] : []),
+      ]
+    : [
+        ...baseBody,
+        ...(sectioned ? sectioned.elements : []),
+        ...(form ? questionElements(form) : []),
+        ...execElems,
+      ];
   return {
     schema: '2.0',
     config: { update_multi: true },
     header: header(card, '2.0'),
     body: {
       elements: [
-        ...baseBody,
-        ...(sectioned ? sectioned.elements : []),
-        ...(form ? questionElements(form) : []),
-        ...executionElements(card.executionLog, '2.0'),
+        ...contentBlocks,
+        ...(execOnTop && sectioned ? sectioned.elements : []),
+        ...(execOnTop && form ? questionElements(form) : []),
         ...(sectioned?.renderedActions ? [] : actionsV2(card.actions)),
       ],
     },
@@ -389,11 +437,19 @@ export function encodeCard(card: ChannelCard, forceSchema?: CardSchema): Record<
   const baseElements = sectioned
     ? (card.table || (card.text.trim() && !card.sections?.some(s => s.text?.trim())) ? cardElements(card) : [])
     : cardElements(card);
-  const elements = [
-    ...baseElements,
-    ...(sectioned ? sectioned.elements : []),
-    ...executionElements(card.executionLog, '1.0'),
-  ];
+  const execElems = executionElements(card.executionLog, '1.0');
+  const execOnTop = card.executionLog?.position === 'top' && execElems.length > 0;
+  const elements = execOnTop
+    ? [
+        ...execElems,
+        ...(baseElements.length > 0 ? [{ tag: 'hr' }, ...baseElements] : []),
+        ...(sectioned ? sectioned.elements : []),
+      ]
+    : [
+        ...baseElements,
+        ...(sectioned ? sectioned.elements : []),
+        ...execElems,
+      ];
   if (!sectioned?.renderedActions && card.actions.length) {
     elements.push({
       tag: 'action',

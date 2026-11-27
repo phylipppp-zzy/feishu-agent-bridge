@@ -24,7 +24,7 @@ import { queryAgyQuota, type AgyQuotaSnapshot } from './agy-quota.js';
 import { buildAgyStatusCard } from './agy-status-card.js';
 import { collectAgyStatusSnapshot, type AgyStatusSnapshot } from './agy/session-status.js';
 import type { ReadonlyLiveTurnView } from './agy/readonly-live-turn.js';
-import { turnProgressCard } from './turn-progress-card.js';
+import { formatCompactModelBadge, turnProgressCard } from './turn-progress-card.js';
 import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
 import { inputConfirmationCard, needsOperationNotice, operationFromReceipt, patchOperationCard, pendingSessionAuthorization, publishOperationFeedback, suppressInputFailure, SUPPRESSED_COMPLETED_ACTIONS } from './feishu-operation-notices.js';
 import { BindingExpired, ReadAuthorizationRevoked, TOPIC_TITLE_SCHEMA, setCustomTopicTitle, syncTopicRootTitle } from './topic-title-sync.js';
@@ -106,6 +106,7 @@ export type ChannelAction = (
  | { action: 'quota' }
  | { action: 'agy_status' }
  | { action: 'rename'; title: string }
+ | { action: 'compact'; revision?: number; controlGeneration?: number }
  | { action: 'health' }) & { bindingId?: string };
 
 /** Standalone channel database. Never opens core's tables. */
@@ -723,7 +724,7 @@ export class FeishuChannel {
       return this.sessionBinding.beginInteractiveAttach(e,bound,executionScope,guard,reply);
     }
     if (a.action === 'finish') return this.sessionBinding.finish(e,a.operationId,bound,guard,reply);
-    if (!bound && (['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','full_reply','history','export','swarm'].includes(a.action) ||
+    if (!bound && (['models','legacy_model','legacy_stop','stop','project_files','artifacts','file','full_reply','history','export','swarm','compact'].includes(a.action) ||
       (a.action === 'input' && this.port.isTopicDestination?.(e.destination) === false))) {
       await reply(buildMainChatTopicOnlyGuidanceCard(a.action === 'swarm' || a.action === 'input' ? a.action : undefined));
       return {status:'guidance'};
@@ -743,11 +744,70 @@ export class FeishuChannel {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
       const mode=this.accessMode(e.destination);
       const work=mode === 'interactive' ? await this.service.getWorkState(bound) : null;
-      const quotaOption = session.native.provider === 'agy' && this.channelOptions.readQuota
-        ? { quota: await this.readQuotaSnapshot(false) }
+      const quota = session.native.provider === 'agy' && this.channelOptions.readQuota
+        ? await this.readQuotaSnapshot(false)
         : undefined;
-      await reply(buildSessionPanel(session,this.noticePanel(e.destination,bound,executionScope,session),work,quotaOption));
+      let contextUsage = null;
+      try { contextUsage = await this.service.getContextUsage?.(bound) ?? null; } catch { contextUsage = null; }
+      let modelBadge = '';
+      try {
+        const settings = await this.service.getConfirmedSettings?.(bound);
+        modelBadge = formatCompactModelBadge(
+          settings?.model ?? contextUsage?.model,
+          settings?.preferences?.reasoningEffort ?? settings?.preferences?.effort,
+        );
+      } catch {
+        modelBadge = formatCompactModelBadge(contextUsage?.model);
+      }
+      const panelOptions = {
+        ...(quota !== undefined ? { quota } : {}),
+        ...(contextUsage ? { contextUsage } : {}),
+        ...(modelBadge ? { modelBadge } : {}),
+      };
+      await reply(buildSessionPanel(session,this.noticePanel(e.destination,bound,executionScope,session),work,panelOptions));
       return work ? {running:work.runningTurns.length,queued:work.queuedInputs.length} : {accessMode:mode};
+    }
+    if (a.action === 'compact') {
+      if (this.accessMode(e.destination) === 'read_only') {
+        await reply({
+          title: '无法压缩只读会话',
+          text: '当前话题为只读镜像，无法执行 /compact。点击下方按钮一键接入后即可使用。',
+          actions: [{ label: '一键接入并续聊', value: { action: 'upgrade' } }],
+        });
+        return { status: 'read_only' };
+      }
+      await guard();
+      let beforeUsage = null;
+      try { beforeUsage = await this.service.getContextUsage?.(bound) ?? null; } catch { beforeUsage = null; }
+      const compactAutoQueue = shouldAutoQueueInput(session);
+      const compactMode: 'new' | 'queue' = compactAutoQueue ? 'queue' : 'new';
+      const op = await this.service.submitInput({
+        context: current(),
+        mode: compactMode,
+        blocks: [{ type: 'text', text: '/compact' }],
+        channelScope,
+      });
+      if (op.operationId && op.status !== 'failed') {
+        this.turnCards.recordCompactBaseline(
+          bound,
+          op.operationId,
+          beforeUsage,
+          op.status === 'queued' || compactMode === 'queue',
+        );
+      }
+      if (op.status === 'queued' || (compactMode === 'queue' && op.status === 'received')) {
+        const card = inputConfirmationCard('queue', '/compact');
+        if (op.operationId) {
+          card.actions.unshift({
+            label: '撤回排队',
+            value: { action: 'cancel', inputId: op.operationId, revision: session.revision, controlGeneration: session.control.generation },
+          });
+        }
+        await reply(card);
+      } else if (needsOperationNotice(op) && !await suppressInputFailure(this.service, op)) {
+        await reply(operationCard(op));
+      }
+      return op;
     }
     if (a.action === 'legacy_stop') {
       await guard();
@@ -870,9 +930,22 @@ export class FeishuChannel {
     let effectiveInputMode: 'new' | 'queue' | 'steer' | undefined;
     let queuedPreviewText: string | undefined;
     if (a.action === 'input') {
+      const isCompactInput = /^\/compact(?:\s|$)/.test(a.text.trim());
+      let beforeUsage = null;
+      if (isCompactInput) {
+        try { beforeUsage = await this.service.getContextUsage?.(bound) ?? null; } catch { beforeUsage = null; }
+      }
       effectiveInputMode = a.mode === 'new' && autoQueue ? 'queue' : a.mode;
       queuedPreviewText = a.text;
       op = await this.service.submitInput({context:current(),mode:effectiveInputMode,blocks:[{type:'text',text:a.text}],channelScope});
+      if (isCompactInput && op.operationId && op.status !== 'failed') {
+        this.turnCards.recordCompactBaseline(
+          bound,
+          op.operationId,
+          beforeUsage,
+          op.status === 'queued' || effectiveInputMode === 'queue',
+        );
+      }
     }
     else if (a.action === 'answer_form') {
       const i = await this.service.getInteraction(a.interactionId);
@@ -905,7 +978,10 @@ export class FeishuChannel {
       }); break;
       case 'control': op = a.release ? await this.service.releaseControl({context:ctx,payload:{owner:a.owner}}) : await this.service.requestControl({context:ctx,payload:{owner:a.owner,strategy:a.strategy}}); break;
       case 'settings': op = await this.service.updateSessionSettings({context:ctx,payload:{model:a.model,preferences:a.preferences}}); break;
-      case 'cancel': op = await this.service.cancelQueuedInput({context:ctx,payload:{inputId:a.inputId}}); break;
+      case 'cancel':
+        this.turnCards.clearCompactBaseline(a.inputId);
+        op = await this.service.cancelQueuedInput({context:ctx,payload:{inputId:a.inputId}});
+        break;
       case 'archive': op = await this.service.archiveSession({context:ctx,payload:{archived:a.archived}}); break;
     } }
     if (a.action === 'answer' || a.action === 'answer_form') {
@@ -1092,6 +1168,7 @@ export class FeishuChannel {
       tools: ReadonlyLiveTurnView['tools'],
       turnId: string,
       now: number,
+      contextUsage?: ReadonlyLiveTurnView['contextUsage'],
     ): Promise<'sent' | 'retry' | 'fallback' | 'unknown'> => {
       const finalMsg = finalCandidates.at(-1)!;
       const finalCard = turnProgressCard({
@@ -1103,6 +1180,7 @@ export class FeishuChannel {
         duration: null,
         files: [],
         turnId,
+        ...(contextUsage ? { contextUsage } : {}),
       });
       const nextSeq = Number(slot.patch_seq) + 1;
       const deliveryId = `ro-live-final:${payloadDigest([scope, destination, sessionId, slot.card_id, finalMsg.messageId, finalMsg.revision, nextSeq])}`;
@@ -1261,6 +1339,7 @@ export class FeishuChannel {
           turnId: live.anchorId,
           activeSubagents: live.activeSubagents,
           allowFullReplyButton: false,
+          ...(live.contextUsage ? { contextUsage: live.contextUsage } : {}),
         });
         if (!activeRow) {
           const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
@@ -1355,6 +1434,7 @@ export class FeishuChannel {
             live?.tools ?? [],
             live?.anchorId ?? existing.anchor_id,
             now,
+            live?.contextUsage,
           );
           if (outcome === 'sent') {
             for (const m of finalCandidates) handledIds.add(m.messageId);
@@ -1385,6 +1465,7 @@ export class FeishuChannel {
           files: [],
           turnId: existing.anchor_id,
           allowFullReplyButton: false,
+          ...(live?.contextUsage ? { contextUsage: live.contextUsage } : {}),
         });
         const nextSeq = Number(existing.patch_seq) + 1;
         const deliveryId = `ro-live-done:${payloadDigest([scope, destination, sessionId, existing.card_id, existing.anchor_id, nextSeq])}`;

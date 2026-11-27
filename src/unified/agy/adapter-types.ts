@@ -128,6 +128,8 @@ export type ActiveTurnState = {
   isWakeup?: boolean;
   wakeupTimer?: ReturnType<typeof setTimeout>;
   lastActivityAt?: number;
+  thinkingText?: string;
+  lastThinkingEmitAt?: number;
   inFlightServerRequests?: number;
   awaitingAsyncWakeup?: boolean;
   inProgressToolCalls: Set<string>;

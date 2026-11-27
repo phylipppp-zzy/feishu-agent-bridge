@@ -62,8 +62,8 @@ async function toolProgress(ctx) {
         assert.ok(message, '缺少工具先于正文时的进度卡');
         assert.equal(message.card.schema, '2.0');
         assert.equal(message.card.template, 'blue');
-        assert.match(message.card.bodyText, /正在处理…\n⏳ 正在执行：Bash · pytest tests\//);
-        assert.equal(message.card.collapsiblePanels[0]?.expanded, false);
+        assert.match(message.card.bodyText, /⏳ 正在执行：Bash · pytest tests\/.*\n正在处理…/);
+        assert.equal(message.card.collapsiblePanels[0]?.expanded, true);
       });
       cardId = message.id;
     });
@@ -89,15 +89,15 @@ async function toolProgress(ctx) {
         assert.equal(current.patchCount - prior.patchCount, 1);
         assert.ok(patchDelayMs >= patchIntervalMs, `卡片更新间隔为 ${patchDelayMs}ms`);
       });
-      trace.check('并行状态在折叠面板外，两个成功及一个失败在默认折叠的执行记录内', () => {
+      trace.check('并行状态在折叠面板外，两个成功及一个失败在顶部展开的执行步骤内', () => {
         assert.match(card.bodyText, /⏳ 正在执行：Bash · git diff（另有 1 项并行）/);
         assert.doesNotMatch(card.bodyText, /✗|✓/);
         const [panel] = card.collapsiblePanels;
-        assert.equal(panel?.expanded, false);
-        assert.equal(panel.title, '执行记录（5 项，失败 1 项）');
-        assert.match(panel.bodyText, /✓ Bash · pytest tests\//);
-        assert.match(panel.bodyText, /✓ Bash · git status/);
-        assert.match(panel.bodyText, /✗ Bash · npm run check/);
+        assert.equal(panel?.expanded, true);
+        assert.equal(panel.title, '**执行步骤（5 项，失败 1 项）**');
+        assert.match(panel.bodyText, /✅ \*\*Bash\*\* · pytest tests\//);
+        assert.match(panel.bodyText, /✅ \*\*Bash\*\* · git status/);
+        assert.match(panel.bodyText, /❌ \*\*Bash\*\* · npm run check/);
       });
       trace.observe('折叠标题里的失败计数措辞', card.collapsiblePanels[0].title);
     });
@@ -134,7 +134,7 @@ async function toolProgress(ctx) {
         assert.match(card.title, /^Codex · 已完成/);
         assert.equal(card.template, 'green');
         assert.equal(card.bodyText.trim(), complete.trim());
-        assert.equal(card.collapsiblePanels[0].title, '执行记录（5 项，失败 1 项）');
+        assert.equal(card.collapsiblePanels[0].title, '**执行步骤（5 项，失败 1 项）**');
       });
     });
   });

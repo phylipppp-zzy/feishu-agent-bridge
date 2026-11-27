@@ -594,6 +594,15 @@ export class UnifiedCore implements UnifiedService {
   async listArtifacts(sessionId: string, query: ListQuery) { const s = this.store.getSession(sessionId); return page([...this.store.stagedArtifacts(sessionId),...(await this.port(s).listArtifacts(s.native)).map(a=>({...a,sessionId}))],query); }
   async readArtifact(sessionId: string, artifactId: string, contentVersion: string) { const s = this.store.getSession(sessionId); return this.store.stagedArtifact(sessionId,artifactId,contentVersion) ?? await this.port(s).readArtifact(s.native,artifactId,contentVersion); }
   async getConfirmedSettings(sessionId: string) { return this.store.confirmedSettings(sessionId); }
+  async getContextUsage(sessionId: string) {
+    try {
+      const s = this.store.getSession(sessionId);
+      if (this.unavailableProviders.has(s.native.provider)) return null;
+      return await this.port(s).getContextUsage?.(s.native) ?? null;
+    } catch {
+      return null;
+    }
+  }
   async listModels(sessionId: string, query: ListQuery) { const s = this.store.getSession(sessionId); return page(await this.port(s).listModels(s.native),query); }
   async health():ReturnType<UnifiedService['health']> {
     const reason = this.observationFailure ?? (this.store.recoveryQuarantineCount() ? 'reconnect and explicitly attach quarantined sessions' :

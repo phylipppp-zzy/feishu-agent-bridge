@@ -2,8 +2,10 @@ import type { UnifiedService } from './adapter.js';
 import type { AgyQuotaSnapshot } from './agy-quota.js';
 import { formatInlineCode, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import type { Session } from './contracts.js';
+import { formatContextUsageBadge, type ContextUsageInfo } from './context-usage.js';
 import { providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
 import { formatQuotaSummary } from './health-card.js';
+import { formatCompactModelBadge } from './turn-progress-card.js';
 
 type Panel = Pick<ChannelCard, 'text' | 'actions'>;
 type NoticeSettings = {paused:boolean; completed:boolean; waiting:boolean; failed:boolean; revision:number};
@@ -26,14 +28,18 @@ export function buildSessionPanel(
   session: Session,
   notice: Panel,
   work: Awaited<ReturnType<UnifiedService['getWorkState']>> | null,
-  options?: { quota?: AgyQuotaSnapshot | null },
+  options?: { quota?: AgyQuotaSnapshot | null; contextUsage?: ContextUsageInfo | null; modelBadge?: string },
 ): ChannelCard {
   const command = formatResumeCommand(session.native);
   const providerLabel = providerDisplayLabel(session.native.provider);
   const shortPath = shortenHomePath(session.project);
+  const modelLabel = options?.modelBadge?.trim() || formatCompactModelBadge(options?.contextUsage?.model);
+  const ctxBadge = formatContextUsageBadge(options?.contextUsage);
   const contextLines = [
     `🤖 Agent：${providerLabel}`,
     `📂 路径：\`${formatInlineCode(shortPath)}\``,
+    ...(modelLabel ? [`🧠 模型：\`${formatInlineCode(modelLabel)}\``] : []),
+    ...(ctxBadge ? [`📏 上下文：${ctxBadge.text}`] : []),
   ];
   const quotaLines = session.native.provider === 'agy' && options && 'quota' in options
     ? formatQuotaSummary(options.quota)
@@ -60,6 +66,9 @@ export function buildSessionPanel(
   }
   if (available && session.capabilities?.queue?.status === 'available') {
     queued.forEach((item,index) => actions.push({label:queued.length === 1 ? '撤回排队' : `撤回排队 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}}));
+  }
+  if (available && !running.length) {
+    actions.push({ label: '压缩上下文 (/compact)', value: { action: 'compact', ...base } });
   }
   actions.push(...notice.actions);
   if (!available) actions.push({label:'重新接入',value:{action:'upgrade'}});

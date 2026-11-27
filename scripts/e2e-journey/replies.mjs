@@ -140,15 +140,18 @@ async function longReplies(ctx) {
       }
       await ctx.finish(codex);
       await waitForPatchWindow(ctx, codex);
-      trace.check('完成卡按原顺序保留三段回复和段落空行', () => {
+      trace.check('完成卡顶部为执行步骤与分隔线，底部按原顺序保留三段回复和段落空行', () => {
         const { card } = completionCard(ctx, codex);
         assert.equal(card.template, 'green');
-        assert.equal(card.raw.body.elements[0].content, parts.join('\n\n'));
+        const elems = card.raw.body.elements;
+        assert.equal(elems[0].tag, 'collapsible_panel');
+        assert.equal(elems[1].tag, 'hr');
+        assert.equal(elems[2].content, parts.join('\n\n'));
       });
-      trace.check('执行记录保留路径标识符并转义 Markdown 格式字符', () => {
+      trace.check('执行步骤保留路径标识符并转义 Markdown 格式字符', () => {
         const { card } = completionCard(ctx, codex);
         assert.equal(card.collapsiblePanels[0].bodyText,
-          '✓ Read · /workspace/feishu-agent-bridge/gui-rl/task_result\n✓ Read · &lt;文件&gt; &amp; \\_字面文本\\_');
+          '1. ✅ **Read** · /workspace/feishu-agent-bridge/gui-rl/task_result\n2. ✅ **Read** · &lt;文件&gt; &amp; \\_字面文本\\_');
       });
     });
 
