@@ -5,7 +5,7 @@ import type { FeishuPort } from './feishu-channel.js';
 import type { ChannelCard } from './feishu-cards.js';
 import { isTerminalTurn, readToolProgress, type ToolProgress } from './tool-progress.js';
 import { aggregateTurnAssistantMessage } from './turn-reply.js';
-import { completionText, replyText, turnProgressCard } from './turn-progress-card.js';
+import { completionText, formatCompactModelBadge, replyText, turnProgressCard } from './turn-progress-card.js';
 import { timestampMs, type TurnTiming, type TurnToolCounts } from './turn-progress-store.js';
 
 function positiveEnvMs(name: string, fallback: number): number {
@@ -385,8 +385,18 @@ export class TurnCardDelivery {
       try { files = await this.service.findRegisteredReplyFiles?.(sessionId, message.blocks) ?? []; }
       catch { /* File actions are optional; the persisted reply can still be delivered. */ }
     }
+    let modelBadge = '';
+    try {
+      const settings = await this.service.getConfirmedSettings?.(sessionId);
+      modelBadge = formatCompactModelBadge(
+        input.turn?.model ?? settings?.model,
+        settings?.preferences?.reasoningEffort ?? settings?.preferences?.effort,
+      );
+    } catch {
+      modelBadge = formatCompactModelBadge(input.turn?.model);
+    }
     await guard();
-    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3] });
+    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3], ...(modelBadge ? { modelBadge } : {}) });
     const learnedDuration = status === 'completed' && elapsed !== null && !old?.title.includes(' · 用时 ');
     if (old?.title && isTerminalTurn(old.status ?? undefined) && !learnedDuration) card.title = old.title;
     const signature = payloadDigest(card);

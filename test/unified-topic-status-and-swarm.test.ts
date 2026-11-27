@@ -9,7 +9,7 @@ import {
   topicRootCard,
 } from '../src/unified/topic-title-sync.js';
 import { readToolProgress, summarizeTool, ToolProgressTracker, type ToolProgress } from '../src/unified/tool-progress.js';
-import { turnProgressCard } from '../src/unified/turn-progress-card.js';
+import { formatCompactModelBadge, turnProgressCard } from '../src/unified/turn-progress-card.js';
 import { parseFeishuText } from '../src/unified/feishu-codec.js';
 import { encodeCard } from '../src/unified/feishu-card-wire.js';
 import { DEFAULT_PROMPT_IDLE_TIMEOUT_MS } from '../src/unified/agy/adapter-types.js';
@@ -301,4 +301,24 @@ test('long V2 markdown replies split across paragraph boundaries without breakin
   assert.equal(mdElements.length, 2);
   assert.ok(mdElements[0]!.content!.includes('第一段分析内容'));
   assert.ok(mdElements[1]!.content!.includes('第二段完整结论'));
+});
+
+test('turn progress card appends compact model + effort badge to header title', () => {
+  assert.equal(formatCompactModelBadge('gemini-4-carbon', 'medium'), 'carbon medium');
+  assert.equal(formatCompactModelBadge('gemini-4-neon-tiered-high'), 'neon high');
+  assert.equal(formatCompactModelBadge('gpt-6.2-sol', 'high'), 'sol high');
+  assert.equal(formatCompactModelBadge('claude-opus-5-5', 'high'), 'opus 5.5 high');
+  assert.equal(formatCompactModelBadge(null, 'medium'), '');
+  const card = turnProgressCard({
+    provider: 'agy',
+    status: 'running',
+    schema: '2.0',
+    message: undefined,
+    tools: [],
+    duration: 17 * 60_000,
+    files: [],
+    turnId: 't-model',
+    modelBadge: formatCompactModelBadge('gemini-4-carbon', 'medium'),
+  });
+  assert.equal(card.title, 'Antigravity · 进行中 · 用时 17分00秒 · carbon medium');
 });
