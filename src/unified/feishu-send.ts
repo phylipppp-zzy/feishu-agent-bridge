@@ -274,7 +274,7 @@ function withReadOnlySqlite<T>(dbPath: string, missingLabel: string, fn: (db: Da
   if (!existsSync(dbPath)) {
     throw new FeishuSendError('target_not_found', `未找到${missingLabel}：${dbPath}`);
   }
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = new DatabaseSync(dbPath, { readOnly: true, timeout: 5000 });
   try {
     return fn(db);
   } finally {
@@ -294,52 +294,44 @@ interface CoreSessionMeta {
 function readCoreSessionMetaMap(coreDbPath: string | null | undefined, sessionIds: readonly string[]): Map<string, CoreSessionMeta> {
   const map = new Map<string, CoreSessionMeta>();
   if (!coreDbPath || !sessionIds.length || !existsSync(coreDbPath)) return map;
-  try {
-    withReadOnlySqlite(coreDbPath, '核心数据库', (db) => {
-      const stmt = db.prepare('SELECT id, value FROM sessions WHERE id = ?');
-      for (const sid of sessionIds) {
-        const row = stmt.get(sid) as { id: string; value: string } | undefined;
-        if (!row) continue;
-        try {
-          const parsed = JSON.parse(row.value) as {
-            title?: unknown;
-            updatedAt?: unknown;
-            native?: { provider?: unknown; nativeSessionId?: unknown };
-          };
-          const meta: CoreSessionMeta = { sessionId: row.id };
-          if (typeof parsed.native?.provider === 'string') meta.provider = parsed.native.provider;
-          if (typeof parsed.native?.nativeSessionId === 'string') meta.nativeSessionId = parsed.native.nativeSessionId;
-          if (typeof parsed.title === 'string') meta.title = parsed.title;
-          if (typeof parsed.updatedAt === 'string' && parsed.updatedAt.trim()) {
-            const trimmed = parsed.updatedAt.trim();
-            meta.updatedAt = trimmed;
-            const parsedMs = Date.parse(trimmed);
-            if (Number.isFinite(parsedMs)) meta.updatedAtMs = parsedMs;
-          }
-          map.set(row.id, meta);
-        } catch {
-          // Ignore malformed session row.
+  withReadOnlySqlite(coreDbPath, '核心数据库', (db) => {
+    const stmt = db.prepare('SELECT id, value FROM sessions WHERE id = ?');
+    for (const sid of sessionIds) {
+      const row = stmt.get(sid) as { id: string; value: string } | undefined;
+      if (!row) continue;
+      try {
+        const parsed = JSON.parse(row.value) as {
+          title?: unknown;
+          updatedAt?: unknown;
+          native?: { provider?: unknown; nativeSessionId?: unknown };
+        };
+        const meta: CoreSessionMeta = { sessionId: row.id };
+        if (typeof parsed.native?.provider === 'string') meta.provider = parsed.native.provider;
+        if (typeof parsed.native?.nativeSessionId === 'string') meta.nativeSessionId = parsed.native.nativeSessionId;
+        if (typeof parsed.title === 'string') meta.title = parsed.title;
+        if (typeof parsed.updatedAt === 'string' && parsed.updatedAt.trim()) {
+          const trimmed = parsed.updatedAt.trim();
+          meta.updatedAt = trimmed;
+          const parsedMs = Date.parse(trimmed);
+          if (Number.isFinite(parsedMs)) meta.updatedAtMs = parsedMs;
         }
+        map.set(row.id, meta);
+      } catch {
+        // Ignore malformed session row JSON.
       }
-    });
-  } catch {
-    // Gracefully skip core metadata enrichment if core.sqlite is unavailable.
-  }
+    }
+  });
   return map;
 }
 
 function lookupSessionIdsByNativeId(coreDbPath: string | null | undefined, nativeQuery: string): string[] {
   if (!coreDbPath || !existsSync(coreDbPath)) return [];
-  try {
-    return withReadOnlySqlite(coreDbPath, '核心数据库', (db) => {
-      const rows = db
-        .prepare("SELECT id FROM sessions WHERE json_extract(value, '$.native.nativeSessionId') = ?")
-        .all(nativeQuery) as Array<{ id: string }>;
-      return rows.map((r) => r.id);
-    });
-  } catch {
-    return [];
-  }
+  return withReadOnlySqlite(coreDbPath, '核心数据库', (db) => {
+    const rows = db
+      .prepare("SELECT id FROM sessions WHERE json_extract(value, '$.native.nativeSessionId') = ?")
+      .all(nativeQuery) as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  });
 }
 
 export function listFeishuTopics(sdkDbPath: string, limit = 20, coreDbPath?: string | null): TopicRouteRow[] {

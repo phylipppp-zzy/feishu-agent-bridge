@@ -1,5 +1,6 @@
-import { execFile } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Identity } from '../contracts.js';
 import { contractError } from '../errors.js';
@@ -81,38 +82,94 @@ export function parseUsageRangeFromText(rawText?: string): UsageRange | undefine
   return undefined;
 }
 
+let exportRunSeq = 0;
+
 function runSubprocessExport(
   pythonBinPath: string,
   exportScriptPath: string,
   snapshotPath: string,
   toolsBinPath: string,
   timeoutMs: number,
+  registerKiller?: (killFn: () => void) => () => void,
 ): Promise<void> {
+  // Isolate output path per invocation so export_usage.py's internal `.tmp` never races usage-dashboard.timer.
+  const privateOut = `${snapshotPath}.hub-${process.pid}-${++exportRunSeq}.json`;
+  const privateTmp = `${snapshotPath}.hub-${process.pid}-${exportRunSeq}.tmp`;
   // Strictly local export only: NEVER pass --publish or --create-gist.
-  const args = [exportScriptPath, '--out', snapshotPath, '--tools-bin', toolsBinPath];
+  const args = [exportScriptPath, '--out', privateOut, '--tools-bin', toolsBinPath];
   if (args.some((arg) => arg === '--publish' || arg === '--create-gist')) {
     return Promise.reject(new Error('forbidden publish flag in UsageHub local collector'));
   }
+  mkdirSync(dirname(snapshotPath), { recursive: true });
   const basePath = process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin';
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PATH: `/home/zhangzy/.local/bin:/home/zhangzy/bin:/home/zhangzy/.gemini/bin:${basePath}`,
   };
   return new Promise<void>((resolve, reject) => {
-    execFile(
-      pythonBinPath,
-      args,
-      {
-        timeout: timeoutMs,
-        killSignal: 'SIGTERM',
-        maxBuffer: 10 * 1024 * 1024,
-        env,
-      },
-      (error) => {
-        if (error) reject(error);
-        else resolve();
-      },
-    );
+    let settled = false;
+    const child = spawn(pythonBinPath, args, {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env,
+    });
+    let stderr = '';
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+      if (stderr.length < 4096) stderr += chunk.slice(0, 4096 - stderr.length);
+    });
+    const killGroup = () => {
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGTERM');
+        } catch {
+          try { child.kill('SIGTERM'); } catch {}
+        }
+      }
+    };
+    const unregister = registerKiller ? registerKiller(killGroup) : () => {};
+    const timer = setTimeout(() => {
+      killGroup();
+      if (!settled) {
+        settled = true;
+        unregister();
+        rmSync(privateOut, { force: true });
+        rmSync(privateTmp, { force: true });
+        reject(new Error('usage collector timed out'));
+      }
+    }, timeoutMs);
+    timer.unref?.();
+
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unregister();
+      try {
+        if (err) {
+          reject(err);
+          return;
+        }
+        if (!existsSync(privateOut)) {
+          reject(new Error('collector did not write output file'));
+          return;
+        }
+        JSON.parse(readFileSync(privateOut, 'utf8'));
+        renameSync(privateOut, snapshotPath);
+        resolve();
+      } catch (e) {
+        reject(e instanceof Error ? e : new Error(String(e)));
+      } finally {
+        rmSync(privateOut, { force: true });
+        rmSync(privateTmp, { force: true });
+      }
+    };
+
+    child.on('error', (err) => finish(err));
+    child.on('close', (code, signal) => {
+      if (code === 0) finish();
+      else finish(new Error(`collector exited code=${code ?? 'null'} signal=${signal ?? 'none'} ${stderr.trim()}`));
+    });
   });
 }
 
@@ -138,6 +195,8 @@ export class UsageHub {
   private lastLiveCollectAtMs: number | null = null;
   private lastCollectedData: UsageDashboardPayload | null = null;
   private readonly reconciledUnknownSlots = new Set<number>();
+  private readonly activeKillers = new Set<() => void>();
+  private readonly cardUpdateSeq = new Map<string, number>();
 
   constructor(options: UsageHubOptions) {
     if (!options?.dbPath?.trim()) throw contractError('invalid_request', 'usage hub dbPath is required');
@@ -194,6 +253,10 @@ export class UsageHub {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    for (const kill of [...this.activeKillers]) {
+      try { kill(); } catch {}
+    }
+    this.activeKillers.clear();
     this.db.close();
   }
 
@@ -269,6 +332,14 @@ export class UsageHub {
           this.snapshotPath,
           this.toolsBinPath,
           this.collectTimeoutMs,
+          (killFn) => {
+            if (this.closed) {
+              killFn();
+              return () => {};
+            }
+            this.activeKillers.add(killFn);
+            return () => this.activeKillers.delete(killFn);
+          },
         );
         const disk = this.readDiskSnapshot();
         if (!disk) throw new Error('snapshot file unavailable after export');
@@ -493,6 +564,16 @@ export class UsageHub {
     }
 
     // action.trigger === 'card'
+    const cardMsgId = envelope.cardMessageId;
+    const myCardSeq = cardMsgId ? (this.cardUpdateSeq.get(cardMsgId) ?? 0) + 1 : 0;
+    if (cardMsgId) {
+      if (this.cardUpdateSeq.size >= 512 && !this.cardUpdateSeq.has(cardMsgId)) {
+        const oldest = this.cardUpdateSeq.keys().next().value;
+        if (oldest !== undefined) this.cardUpdateSeq.delete(oldest);
+      }
+      this.cardUpdateSeq.set(cardMsgId, myCardSeq);
+    }
+
     let range: UsageRange;
     let payload: UsageDashboardPayload | null;
     let sourceNote: string;
@@ -546,7 +627,9 @@ export class UsageHub {
     }
 
     if (envelope.cardMessageId) {
-      await this.port.update(this.destination, envelope.cardMessageId, card, deliveryId);
+      if (this.cardUpdateSeq.get(envelope.cardMessageId) === myCardSeq) {
+        await this.port.update(this.destination, envelope.cardMessageId, card, deliveryId);
+      }
       if (!this.closed) {
         this.db
           .prepare("UPDATE usage_hub_events_v1 SET state = 'sent', message_id = ?, updated_at = ? WHERE event_id = ?")

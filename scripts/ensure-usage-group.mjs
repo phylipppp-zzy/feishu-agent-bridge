@@ -59,6 +59,8 @@ export async function ensureUsageGroup(options = {}) {
         item.chat_status !== 'dissolved' &&
         typeof item.chat_id === 'string' &&
         item.chat_id.trim() &&
+        item.chat_id.trim() !== ctx.defaultChatId &&
+        (!ownerOpenId || typeof item.owner_id !== 'string' || !item.owner_id.trim() || item.owner_id.trim() === ownerOpenId) &&
         typeof item.name === 'string' &&
         item.name.trim() === name,
     );
@@ -99,6 +101,7 @@ export async function ensureUsageGroup(options = {}) {
     data: {
       name,
       description: 'AI 用量与额度每小时自动播报及即时查询群',
+      owner_id: ownerOpenId,
       user_id_list: [ownerOpenId],
       chat_mode: 'group',
       group_message_type: 'chat',

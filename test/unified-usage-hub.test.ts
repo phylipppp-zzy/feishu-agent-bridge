@@ -695,6 +695,8 @@ if "--publish" in args or "--create-gist" in args:
     sys.exit(99)
 if Path(${JSON.stringify(hangMarker)}).exists():
     time.sleep(2.0)
+out_idx = args.index("--out") + 1
+Path(args[out_idx]).write_text(Path(${JSON.stringify(snapshotPath)}).read_text(encoding="utf-8"), encoding="utf-8")
 sys.exit(0)
 `,
   );
@@ -741,7 +743,9 @@ sys.exit(0)
     const loggedArgs = JSON.parse(readFileSync(argvLogPath, 'utf8')) as string[];
     assert.ok(!loggedArgs.includes('--publish'));
     assert.ok(!loggedArgs.includes('--create-gist'));
-    assert.deepEqual(loggedArgs, ['--out', snapshotPath, '--tools-bin', '/home/zhangzy/.local/bin/tools']);
+    assert.equal(loggedArgs[0], '--out');
+    assert.ok(loggedArgs[1]!.startsWith(`${snapshotPath}.hub-`), `expected isolated out path, got ${loggedArgs[1]}`);
+    assert.deepEqual(loggedArgs.slice(2), ['--tools-bin', '/home/zhangzy/.local/bin/tools']);
 
     // 2. Remove hang marker -> subprocess succeeds quickly -> sourceNote is '实时采集'
     rmSync(hangMarker, { force: true });

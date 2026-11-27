@@ -15,7 +15,7 @@ RELEASES_ROOT = Path('/home/zhangzy/.local/share/feishu-unified-bridge/releases'
 CONF_DIR = Path('/home/zhangzy/.config/feishu-unified-bridge')
 CONF_FILE = CONF_DIR / 'config.json'
 UNIT_FILE = Path('/home/zhangzy/.config/systemd/user/feishu-unified-production.service')
-PARENT_RELEASE = 'ebee30d-uxv2-7691b684804b'
+PARENT_RELEASE = '607c887-agy-320eaa1fba6a'
 
 def validate_agy_sandbox(runtime):
     approval_disabled = runtime.get('approvalPolicy', {}).get('enabled') is False

@@ -573,3 +573,27 @@ test('agent-dispatch v3.2 progress visualization, manage_task, failed/interrupte
     rmSync(permDir, { recursive: true, force: true });
   }
 });
+
+test('encodeCard assigns globally unique details_N element_ids across multiple Card 2.0 sections and /new ~ parses cleanly', () => {
+  const parsedHome = parseFeishuText('/new agy ~ 检查主目录配置');
+  assert.deepEqual(parsedHome, {
+    action: 'new_help',
+    provider: 'agy',
+    project: '~',
+    initialPrompt: '检查主目录配置',
+  });
+
+  const multiDetailsCard = encodeCard({
+    schema: '2.0',
+    title: '多折叠面板测试',
+    text: '',
+    actions: [],
+    sections: [
+      { text: '第一段\n<details><summary>折叠一</summary>内容一</details>' },
+      { dividerBefore: true, text: '第二段\n<details><summary>折叠二</summary>内容二</details>' },
+    ],
+  });
+  const body = (multiDetailsCard as { body: { elements: Array<{ tag: string; element_id?: string }> } }).body;
+  const panelIds = body.elements.filter((e) => e.tag === 'collapsible_panel').map((e) => e.element_id);
+  assert.deepEqual(panelIds, ['details_0', 'details_1']);
+});

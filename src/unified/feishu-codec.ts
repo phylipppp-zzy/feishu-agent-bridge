@@ -376,7 +376,7 @@ function parseLeadingPathToken(tail: string): { path: string; rest: string } | n
       if (ch === quote) {
         const after = tail.slice(i + 1);
         if (after.length > 0 && !/^\s/.test(after)) return null;
-        if (!value || (!value.startsWith('/') && !value.startsWith('~/'))) return null;
+        if (!value || (value !== '~' && !value.startsWith('/') && !value.startsWith('~/'))) return null;
         return { path: value, rest: after.trimStart() };
       }
       value += ch;
@@ -387,7 +387,7 @@ function parseLeadingPathToken(tail: string): { path: string; rest: string } | n
   const match = /^(\S+)/.exec(tail);
   if (!match) return null;
   const token = match[1]!;
-  if (!token.startsWith('/') && !token.startsWith('~/')) return null;
+  if (token !== '~' && !token.startsWith('/') && !token.startsWith('~/')) return null;
   return { path: token, rest: tail.slice(token.length).trimStart() };
 }
 

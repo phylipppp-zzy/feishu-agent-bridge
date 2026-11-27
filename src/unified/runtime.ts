@@ -153,17 +153,16 @@ export function validateRuntimeConfig(c:RuntimeConfig):void {
   if (c.usageHub !== undefined) {
     if (!c.usageHub || typeof c.usageHub !== 'object' || Array.isArray(c.usageHub) || typeof c.usageHub.enabled !== 'boolean') throw new Error('invalid usage hub configuration');
     if (c.usageHub.destination !== undefined && typeof c.usageHub.destination !== 'string') throw new Error('invalid usage hub configuration');
-    if (c.usageHub.enabled) {
-      const usageDest = c.usageHub.destination?.trim();
-      if (
-        !usageDest ||
-        c.allowedDestinations.includes(usageDest) ||
-        (c.watchHub?.destination && usageDest === c.watchHub.destination.trim()) ||
-        (c.pendingHub?.destination && usageDest === c.pendingHub.destination.trim()) ||
-        (c.autoMirror?.destination && usageDest === c.autoMirror.destination.trim())
-      ) {
-        throw new Error('invalid usage hub configuration');
-      }
+    const rawUsageDest = c.usageHub.destination?.trim();
+    if (c.usageHub.enabled && !rawUsageDest) throw new Error('invalid usage hub configuration');
+    if (
+      rawUsageDest &&
+      (c.allowedDestinations.includes(rawUsageDest) ||
+        (c.watchHub?.destination && rawUsageDest === c.watchHub.destination.trim()) ||
+        (c.pendingHub?.destination && rawUsageDest === c.pendingHub.destination.trim()) ||
+        (c.autoMirror?.destination && rawUsageDest === c.autoMirror.destination.trim()))
+    ) {
+      throw new Error('invalid usage hub configuration');
     }
     if (c.usageHub.intervalMinutes !== undefined && (!Number.isSafeInteger(c.usageHub.intervalMinutes) || c.usageHub.intervalMinutes < 5 || c.usageHub.intervalMinutes > 1440)) {
       throw new Error('invalid usage hub configuration');
@@ -578,7 +577,7 @@ export class UnifiedRuntime {
     if(this.closed || this.closing) throw new Error('closed');
     this.lastActivityAt=Date.now();
     const intake=(async()=>{
-      const configuredUsageDest = this.config.usageHub?.destination?.trim() || null;
+      const configuredUsageDest = this.config.usageHub?.enabled ? (this.config.usageHub.destination?.trim() || null) : null;
       if (action.action === 'usage_report' || (configuredUsageDest && envelope.destination === configuredUsageDest)) {
         const isOwner = envelope.identity.source === 'feishu' && envelope.identity.subject === this.config.ownerOpenId;
         if (!isOwner || !this._usageHub || !this.config.usageHub?.enabled || envelope.destination !== configuredUsageDest) {

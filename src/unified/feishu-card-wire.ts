@@ -180,13 +180,12 @@ function pushMarkdownChunks(elements: unknown[], text: string): void {
   }
 }
 
-function markdownElementsV2(text: string): unknown[] {
+function markdownElementsV2(text: string, panelCounter = { next: 0 }): unknown[] {
   const cleaned = stripCardMentions(text);
   const ranges = findDetailsOutsideFences(cleaned);
   if (!ranges.length) return splitMarkdownForV2(cleaned).map(chunk => markdown(chunk));
   const elements: unknown[] = [];
   let lastIndex = 0;
-  let panelIndex = 0;
   for (const range of ranges) {
     const before = cleaned.slice(lastIndex, range.start).trim();
     if (before) pushMarkdownChunks(elements, before);
@@ -198,7 +197,7 @@ function markdownElementsV2(text: string): unknown[] {
       : inner).trim();
     elements.push({
       tag: 'collapsible_panel',
-      element_id: `details_${panelIndex++}`,
+      element_id: `details_${panelCounter.next++}`,
       expanded: false,
       header: { title: markdown(title) },
       elements: body ? splitMarkdownForV2(body).map(chunk => markdown(chunk)) : [],
@@ -210,11 +209,11 @@ function markdownElementsV2(text: string): unknown[] {
   return elements;
 }
 
-function cardElements(card: ChannelCard, omitEmpty = false, schema: CardSchema = '1.0'): unknown[] {
+function cardElements(card: ChannelCard, omitEmpty = false, schema: CardSchema = '1.0', panelCounter = { next: 0 }): unknown[] {
   if (!card.table) {
     if (omitEmpty && !card.text.trim()) return [];
     if (card.format === 'plain') return [{ tag: 'div', text: plain(card.text) }];
-    return schema === '2.0' ? markdownElementsV2(card.text) : [markdown(card.text)];
+    return schema === '2.0' ? markdownElementsV2(card.text, panelCounter) : [markdown(card.text)];
   }
   const table = card.table;
   const renderColumns = (cells: string[], bold: boolean) => table.columns.map((col, idx) => ({
@@ -318,14 +317,18 @@ function actionsV2(actions: readonly ChannelCard['actions'][number][]): unknown[
   }];
 }
 
-function sectionElements(sections: NonNullable<ChannelCard['sections']>, schema: CardSchema): { elements: unknown[]; renderedActions: boolean } {
+function sectionElements(
+  sections: NonNullable<ChannelCard['sections']>,
+  schema: CardSchema,
+  panelCounter = { next: 0 },
+): { elements: unknown[]; renderedActions: boolean } {
   const elements: unknown[] = [];
   let renderedActions = false;
   for (const section of sections) {
     if (section.dividerBefore) elements.push({ tag: 'hr' });
     const text = section.text?.trim();
     if (text) {
-      if (schema === '2.0') elements.push(...markdownElementsV2(text));
+      if (schema === '2.0') elements.push(...markdownElementsV2(text, panelCounter));
       else elements.push(markdown(text));
     }
     if (section.actions?.length) {
@@ -349,8 +352,15 @@ function sectionElements(sections: NonNullable<ChannelCard['sections']>, schema:
 }
 
 function encodeV2(card: ChannelCard, form?: QuestionForm): Record<string, unknown> {
-  const sectioned = card.sections?.length ? sectionElements(card.sections, '2.0') : null;
-  const baseBody = sectioned ? (card.table ? cardElements(card, false, '2.0') : (card.text.trim() && !card.sections?.some(s => s.text?.trim()) ? cardElements(card, !!form, '2.0') : [])) : cardElements(card, !!form, '2.0');
+  const panelCounter = { next: 0 };
+  const sectioned = card.sections?.length ? sectionElements(card.sections, '2.0', panelCounter) : null;
+  const baseBody = sectioned
+    ? (card.table
+        ? cardElements(card, false, '2.0', panelCounter)
+        : (card.text.trim() && !card.sections?.some(s => s.text?.trim())
+            ? cardElements(card, !!form, '2.0', panelCounter)
+            : []))
+    : cardElements(card, !!form, '2.0', panelCounter);
   return {
     schema: '2.0',
     config: { update_multi: true },
