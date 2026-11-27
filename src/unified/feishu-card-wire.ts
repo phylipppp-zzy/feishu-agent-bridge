@@ -81,6 +81,7 @@ function findDetailsOutsideFences(text: string): DetailsRange[] {
 }
 
 function hasRichMarkdownV2(card: ChannelCard): boolean {
+  if (card.sections?.length || card.headerTags?.length || card.subtitle) return true;
   if (card.format === 'plain' || card.table) return false;
   if (card.executionLog) return true;
   return GFM_TABLE_RE.test(card.text) || findDetailsOutsideFences(card.text).length > 0;
@@ -106,10 +107,22 @@ export function escapeCardMarkdown(text: string): string {
     .replace(/(^[ \t]*)-(?=[ \t]|-+\s*$|$)/gm, '$1\\-');
 }
 
-function header(card: ChannelCard) {
+function header(card: ChannelCard, schema: CardSchema = '1.0') {
+  const subtitle = card.subtitle?.trim();
+  const tags = schema === '2.0' && card.headerTags?.length
+    ? card.headerTags
+        .filter(t => t.text.trim().length > 0)
+        .map(t => ({
+          tag: 'text_tag',
+          text: plain(t.text.trim()),
+          color: t.color ?? 'neutral',
+        }))
+    : undefined;
   return {
     ...(card.template ? { template: card.template } : {}),
     title: plain(card.title.trim() || '未命名会话'),
+    ...(subtitle ? { subtitle: plain(subtitle) } : {}),
+    ...(tags?.length ? { text_tag_list: tags } : {}),
   };
 }
 
@@ -288,7 +301,7 @@ function questionElements(form: QuestionForm): unknown[] {
   return [{ tag: 'form', name: 'question_form', element_id: 'question_form', direction: 'vertical', vertical_spacing: '8px', elements }];
 }
 
-function actionsV2(actions: ChannelCard['actions']): unknown[] {
+function actionsV2(actions: readonly ChannelCard['actions'][number][]): unknown[] {
   const buttons = actions.map(a => ({
     tag: 'button',
     text: plain(a.label),
@@ -299,21 +312,56 @@ function actionsV2(actions: ChannelCard['actions']): unknown[] {
   return [{
     tag: 'column_set',
     flex_mode: 'flow',
+    horizontal_spacing: '8px',
+    horizontal_align: 'left',
     columns: buttons.map(button => ({ tag: 'column', width: 'auto', elements: [button] })),
   }];
 }
 
+function sectionElements(sections: NonNullable<ChannelCard['sections']>, schema: CardSchema): { elements: unknown[]; renderedActions: boolean } {
+  const elements: unknown[] = [];
+  let renderedActions = false;
+  for (const section of sections) {
+    if (section.dividerBefore) elements.push({ tag: 'hr' });
+    const text = section.text?.trim();
+    if (text) {
+      if (schema === '2.0') elements.push(...markdownElementsV2(text));
+      else elements.push(markdown(text));
+    }
+    if (section.actions?.length) {
+      renderedActions = true;
+      if (schema === '2.0') {
+        elements.push(...actionsV2(section.actions));
+      } else {
+        elements.push({
+          tag: 'action',
+          actions: section.actions.map(a => ({
+            tag: 'button',
+            text: plain(a.label),
+            type: a.type ?? 'default',
+            ...(a.url ? { url: a.url } : { value: a.value }),
+          })),
+        });
+      }
+    }
+  }
+  return { elements, renderedActions };
+}
+
 function encodeV2(card: ChannelCard, form?: QuestionForm): Record<string, unknown> {
+  const sectioned = card.sections?.length ? sectionElements(card.sections, '2.0') : null;
+  const baseBody = sectioned ? (card.table ? cardElements(card, false, '2.0') : (card.text.trim() && !card.sections?.some(s => s.text?.trim()) ? cardElements(card, !!form, '2.0') : [])) : cardElements(card, !!form, '2.0');
   return {
     schema: '2.0',
     config: { update_multi: true },
-    header: header(card),
+    header: header(card, '2.0'),
     body: {
       elements: [
-        ...cardElements(card, !!form, '2.0'),
+        ...baseBody,
+        ...(sectioned ? sectioned.elements : []),
         ...(form ? questionElements(form) : []),
         ...executionElements(card.executionLog, '2.0'),
-        ...actionsV2(card.actions),
+        ...(sectioned?.renderedActions ? [] : actionsV2(card.actions)),
       ],
     },
   };
@@ -327,8 +375,16 @@ export function encodeCard(card: ChannelCard, forceSchema?: CardSchema): Record<
   if ((forceSchema ?? cardSchema(card)) === '2.0') {
     return card.form ? renderQuestionForm(card.form, card) : encodeV2(card);
   }
-  const elements = [...cardElements(card), ...executionElements(card.executionLog, '1.0')];
-  if (card.actions.length) {
+  const sectioned = card.sections?.length ? sectionElements(card.sections, '1.0') : null;
+  const baseElements = sectioned
+    ? (card.table || (card.text.trim() && !card.sections?.some(s => s.text?.trim())) ? cardElements(card) : [])
+    : cardElements(card);
+  const elements = [
+    ...baseElements,
+    ...(sectioned ? sectioned.elements : []),
+    ...executionElements(card.executionLog, '1.0'),
+  ];
+  if (!sectioned?.renderedActions && card.actions.length) {
     elements.push({
       tag: 'action',
       actions: card.actions.map(a => ({
@@ -341,7 +397,7 @@ export function encodeCard(card: ChannelCard, forceSchema?: CardSchema): Record<
   }
   return {
     config: { wide_screen_mode: true, update_multi: true },
-    header: header(card),
+    header: header(card, '1.0'),
     elements,
   };
 }

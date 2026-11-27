@@ -416,7 +416,17 @@ export class FeishuChannel {
   private stampCard(destination:string, card:ChannelCard): ChannelCard {
     const row=this.db.prepare('SELECT binding_id FROM channel_bindings WHERE destination=?').get(destination) as {binding_id:string} | undefined;
     if (!row) return card;
-    return {...card,actions:card.actions.map(action => ['list','new_help','agy_status'].includes(String(action.value.action)) ? action : {...action,value:{...action.value,bindingId:row.binding_id}})};
+    const stampAction = <T extends ChannelCard['actions'][number]>(action: T): T =>
+      ['list','new_help','agy_status','usage_report'].includes(String(action.value.action)) || action.url
+        ? action
+        : { ...action, value: { ...action.value, bindingId: row.binding_id } };
+    return {
+      ...card,
+      actions: card.actions.map(stampAction),
+      ...(card.sections ? {
+        sections: card.sections.map(sec => sec.actions ? { ...sec, actions: sec.actions.map(stampAction) } : sec),
+      } : {}),
+    };
   }
   private async deliver(destination: string, card: ChannelCard, id: string, guard?:()=>Promise<void>): Promise<string | void> {
     await guard?.();
