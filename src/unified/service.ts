@@ -175,7 +175,7 @@ export class UnifiedCore implements UnifiedService {
     const discoveredByKey=new Map<string,Session>();
     const unavailableProviders:Provider[]=[];
     const requestedProvider=q.provider && q.provider!=='all' ? q.provider : undefined;
-    if(this.canDiscover) {
+    if(this.canDiscover && !q.storedOnly) {
       const targetPorts=[...this.providers.values()].filter(port=>!requestedProvider || port.provider===requestedProvider);
       const results=await Promise.all(targetPorts.map(async port=>{
         const discovered:Session[]=[];

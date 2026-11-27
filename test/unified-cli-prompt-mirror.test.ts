@@ -126,8 +126,9 @@ test('FeishuChannel mirrors new CLI user prompts before assistant replies in rea
 
       await channel.sync('topic:cli');
       assert.equal(sent.length, 2);
-      assert.equal(sent[0]!.kind, 'text');
-      assert.match(sent[0]!.body, /^💻 CLI 指令：\n检查线上日志并总结报错$/);
+      assert.equal(sent[0]!.kind, 'card');
+      assert.match(sent[0]!.body, /^检查线上日志并总结报错/);
+      assert.match(sent[0]!.body, /会话状态/);
       assert.equal(sent[1]!.kind, 'card');
       assert.equal(sent[1]!.body, '已检查完毕，无异常。');
 

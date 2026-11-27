@@ -86,7 +86,7 @@ export async function discoverPendingItemsWithMeta(context: Discovery, now: numb
   let cursor: string | undefined;
   const seenCursors = new Set<string>();
   do {
-    const page = await service.listSessions({ limit: 100, ...(cursor ? { cursor } : {}) });
+    const page = await service.listSessions({ limit: 100, storedOnly: true, ...(cursor ? { cursor } : {}) });
     for (const session of page.items) {
       sessionIds.add(session.sessionId);
     }

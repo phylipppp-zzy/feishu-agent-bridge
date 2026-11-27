@@ -66,7 +66,7 @@ export interface AgyRuntimeConfig {
 export interface WatchHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
 export interface PendingHubRuntimeConfig { enabled:boolean; destination:string; dbPath?:string }
 export interface DecisionSyncRuntimeConfig { enabled:boolean; dbPath?:string; markdownPath?:string; protectedReadOnlyPaths?:string[] }
-export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; approvalPolicy?:{enabled?:boolean;extraTrustedRoots?:string[];extraWriteRoots?:string[];codexSharedFilesystem?:boolean;homeDir?:string}; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string;showTitles?:boolean;backfillNativeIds?:Array<{provider:Provider;nativeSessionId:string}>}; autoTakeControlOnInput?:boolean; autoResumeOnRestart?:boolean; taskTopic?:{enabled:boolean}; watchHub?:WatchHubRuntimeConfig; pendingHub?:PendingHubRuntimeConfig; decisionSync?:DecisionSyncRuntimeConfig; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
+export interface RuntimeConfig { coreDb:string; channelDb:string; ownerOpenId:string; allowedDestinations:string[]; hostId:string; claudeServiceId:string; codexServiceId:string; claudeStateDir:string; codexEndpoint:string; intervalMs:number; agy?:AgyRuntimeConfig; catalogSources?:CatalogRoot[]; allowedProjectRoots?:string[]; outputRoots?:string[]; approvalPolicy?:{enabled?:boolean;extraTrustedRoots?:string[];extraWriteRoots?:string[];codexSharedFilesystem?:boolean;homeDir?:string}; artifactStatePath?:string; historyArchive?:{root:string;manifestPath:string;manifestSha256:string}; autoMirror?:{enabled:boolean;destination?:string;showTitles?:boolean;backfillNativeIds?:Array<{provider:Provider;nativeSessionId:string;replayHistory?:boolean}>}; autoTakeControlOnInput?:boolean; autoResumeOnRestart?:boolean; taskTopic?:{enabled:boolean}; watchHub?:WatchHubRuntimeConfig; pendingHub?:PendingHubRuntimeConfig; decisionSync?:DecisionSyncRuntimeConfig; testLane?:{stateDir:string;nativeClaude?:boolean;nativeCodex?:boolean;nativeTTLMinutes?:number} }
 export type PendingHubEntry = 'hub' | 'source' | 'pending_hub';
 export type RuntimeTrustedAction =
   | ChannelAction
@@ -1276,7 +1276,21 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
             if (!serviceId) { backfillDone.add(key); continue; }
             const native: Session['native'] = { provider: entry.provider, hostId: config.hostId, serviceId, nativeSessionId: entry.nativeSessionId };
             const sessionId = `session_${payloadDigest(native)}`;
-            if (r.channel.bindingsForRestore().some(b => b.sessionId === sessionId)) { backfillDone.add(key); continue; }
+            if (r.channel.bindingsForRestore().some(b => b.sessionId === sessionId)) {
+              if (entry.replayHistory) {
+                try {
+                  const replayed = await r.channel.replayReadonlyHistoryOnce(sessionId);
+                  backfillDone.add(key);
+                  if (replayed) break;
+                } catch (err) {
+                  handleAutoFailure(`backfill-replay:${entry.provider}`, err);
+                  break;
+                }
+              } else {
+                backfillDone.add(key);
+              }
+              continue;
+            }
             if (r.store.isDetached(sessionId)) { backfillDone.add(key); continue; }
             const base = bases.find(p => p.provider === entry.provider);
             if (!base) continue;
@@ -1303,7 +1317,7 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
               if (!await r.core.refreshReadOnlySession(session.sessionId, raw)) continue;
               if (!r.acceptsBackgroundWork() || r.channel.bindingsForRestore().some(b => b.sessionId === session!.sessionId)) continue;
               // Silent baseline (provenNew=false): history is readable via /history, zero replay of old messages, future increments deliver normally.
-              await r.channel.prepareAutoBaseline(eventId, session.sessionId, false);
+              await r.channel.prepareAutoBaseline(eventId, session.sessionId, entry.replayHistory === true);
               if (!r.acceptsBackgroundWork()) break;
               await r.channel.handle({ eventId, destination: target, identity: { source: 'feishu', subject: config.ownerOpenId } }, { action: 'bind', sessionId: session.sessionId, mode: 'read_only' });
               await r.channel.applyAutoBaseline(eventId);
