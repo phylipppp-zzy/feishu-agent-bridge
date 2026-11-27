@@ -24,6 +24,12 @@ export function completionText(duration: number, _message?: Message | undefined,
   return `✅ 本轮已完成（用时 ${formatDuration(duration)}），完整结论见上方回复卡。`;
 }
 
+export interface SessionSubagentActivity {
+  conversationId: string;
+  agentName: string;
+  status: string;
+}
+
 type CardState = {
   provider: Provider;
   status: Turn['status'] | undefined;
@@ -34,6 +40,8 @@ type CardState = {
   duration: number | null;
   files: readonly Artifact[];
   turnId?: string | undefined;
+  activeSubagents?: readonly SessionSubagentActivity[] | undefined;
+  allowFullReplyButton?: boolean | undefined;
 };
 
 function formatRunningNote(active: readonly ToolProgress[]): string | undefined {
@@ -49,17 +57,49 @@ function formatRunningNote(active: readonly ToolProgress[]): string | undefined 
   return `⏳ 正在执行：${latest.summary}${extra}`;
 }
 
-function formatDelegatedStatus(tools: readonly ToolProgress[]): string {
-  const recent = tools.filter(({ tool, summary }) => DELEGATED_TOOLS.has(tool) ||
-    tool === 'call_mcp_tool' && summary.startsWith('⚡ Codex MCP')).slice(-8).reverse();
-  if (!recent.length) return '';
-  recent.sort((a, b) => Number(isTerminalTool(a.phase)) - Number(isTerminalTool(b.phase)));
-  const lines = recent.map(({ phase, summary }) =>
-    `- ${TOOL_ICONS[phase]} ${escapeCardMarkdown(summary)}（${TOOL_PHASE_LABELS[phase]}）`);
+function formatDelegatedStatus(
+  tools: readonly ToolProgress[],
+  activeSubagents?: readonly SessionSubagentActivity[],
+): string {
+  const deduped = new Map<string, ToolProgress>();
+  for (const item of tools) {
+    if (DELEGATED_TOOLS.has(item.tool) || (item.tool === 'call_mcp_tool' && item.summary.startsWith('⚡ Codex MCP'))) {
+      deduped.delete(item.callId);
+      deduped.set(item.callId, item);
+    }
+  }
+  const combined: Array<{ active: boolean; line: string }> = [];
+  for (const item of [...deduped.values()].reverse()) {
+    combined.push({
+      active: !isTerminalTool(item.phase),
+      line: `- ${TOOL_ICONS[item.phase]} ${escapeCardMarkdown(item.summary)}（${TOOL_PHASE_LABELS[item.phase]}）`,
+    });
+  }
+  if (activeSubagents?.length) {
+    const seenSubIds = new Set<string>();
+    for (const sub of activeSubagents) {
+      if (seenSubIds.has(sub.conversationId)) continue;
+      seenSubIds.add(sub.conversationId);
+      const label = sub.agentName?.trim() || `子代理 ${sub.conversationId.slice(0, 8)}`;
+      combined.push({
+        active: true,
+        line: `- ⏳ 🤖 会话级活跃子代理：${escapeCardMarkdown(label)}（运行中）`,
+      });
+    }
+  }
+  combined.sort((a, b) => Number(!a.active) - Number(!b.active));
+  const maxItems = 8;
+  const shown = combined.slice(0, maxItems);
+  const lines = shown.map(item => item.line);
+  const omitted = combined.length - shown.length;
+  if (omitted > 0) {
+    lines.push(`- … 另有 ${omitted} 项子代理/Codex 记录`);
+  }
+  if (!lines.length) return '';
   return ['**子代理与 Codex 状态**', ...lines].join('\n');
 }
 
-export function turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration, files, turnId }: CardState): ChannelCard {
+export function turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration, files, turnId, activeSubagents, allowFullReplyButton = true }: CardState): ChannelCard {
   const title = providerDisplayLabel(provider);
   const isWakeup = Boolean(turnId?.startsWith('wakeup:'));
   const visibleTools = tools.filter(tool => !(tool.tool === 'thinking' && tool.phase !== 'running'));
@@ -82,6 +122,7 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
   const activeReal = active.filter(tool => tool.tool !== 'thinking');
   const onlyThinking = active.length > 0 && activeReal.length === 0;
   const runningNote = formatRunningNote(activeReal);
+  const delegatedStatus = running ? formatDelegatedStatus(visibleTools, activeSubagents) : '';
   const idleBody = activeReal.some(tool => tool.tool === 'post_message' || tool.tool === 'read_board')
     ? '🐝 Swarm 多代理协作进行中…'
     : onlyThinking
@@ -89,10 +130,15 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
     : isWakeup
         ? '🤖 后台异步唤醒处理中…'
         : '正在处理…';
-  const text = preview.text || (running ? formatDelegatedStatus(visibleTools) || idleBody : status === 'completed' ?
-      (count ? `完成 ${count} 项工具操作` : '本轮处理完成。') : '本轮未形成完整回复。');
+  const text = running
+    ? (delegatedStatus
+        ? (preview.text ? `${delegatedStatus}\n\n---\n\n${preview.text}` : delegatedStatus)
+        : (preview.text || idleBody))
+    : (preview.text || (status === 'completed'
+        ? (count ? `完成 ${count} 项工具操作` : '本轮处理完成。')
+        : '本轮未形成完整回复。'));
   const actions: ChannelCard['actions'] = [];
-  if (preview.truncated && message) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
+  if (preview.truncated && message && allowFullReplyButton) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
   for (const file of files.slice(0, 3)) {
     const name = [...file.name];
     actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,

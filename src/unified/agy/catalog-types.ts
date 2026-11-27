@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const DEFAULT_AGY_SUMMARIES_DB_PATH = join(homedir(), '.gemini', 'antigravity', 'conversation_summaries.db');
+export const DEFAULT_AGY_CLI_SUMMARIES_DB_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'conversation_summaries.db');
 export const DEFAULT_AGY_BRAIN_DIR = join(homedir(), '.gemini', 'antigravity-cli', 'brain');
 export const DEFAULT_AGY_IDE_BRAIN_DIR = join(homedir(), '.gemini', 'antigravity', 'brain');
 export const CREATED_AT_HEADER_READ_BYTES = 8 * 1024;
@@ -163,6 +164,7 @@ export interface AgyDiscoveredSession {
   killed: boolean;
   subagentCount: number;
   activeSubagentCount: number;
+  activeSubagents?: AgySubagentSummary[];
   isTopLevel: true;
 }
 
@@ -171,6 +173,13 @@ export type AgyCreatedAtSource = 'transcript' | 'unknown';
 export interface AgyCreatedAtInfo {
   createdAt: string | null;
   source: AgyCreatedAtSource;
+}
+
+export interface AgySubagentSummary {
+  conversationId: string;
+  agentName: string;
+  status: AgySessionStatus;
+  lastModifiedAt: string | null;
 }
 
 export interface AgyTokenUsage {
@@ -318,6 +327,59 @@ export function isProtectedConfidentialTarget(canonicalTarget: string): boolean 
  * When a single `brainDir` (ending with `brain`) is specified without `brainDirs` and `appDataDir` is known,
  * also includes the sibling `<parent>/<appDataDir>/brain` (or `<appDataDir>/brain` if absolute).
  */
+export interface AgySummariesDefaultPair {
+  cliPath: string;
+  idePath: string;
+}
+
+export function resolveAgySummariesDbPaths(
+  explicitDbPath?: string,
+  defaultPair?: AgySummariesDefaultPair,
+): string[] {
+  const cliDefault = resolve(expandHomePath(defaultPair?.cliPath ?? DEFAULT_AGY_CLI_SUMMARIES_DB_PATH));
+  const ideDefault = resolve(expandHomePath(defaultPair?.idePath ?? DEFAULT_AGY_SUMMARIES_DB_PATH));
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushRegularDefault = (path: string): boolean => {
+    const abs = resolve(expandHomePath(path));
+    try {
+      const st = lstatSync(abs);
+      if (st.isSymbolicLink() || !st.isFile()) return false;
+      const canonical = realpathSync(abs);
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        candidates.push(abs);
+      }
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        if (!seen.has(abs)) {
+          seen.add(abs);
+          candidates.push(abs);
+        }
+        return true;
+      }
+      return false;
+    }
+  };
+  const resolveDefaults = (): string[] => {
+    const cliOk = pushRegularDefault(cliDefault);
+    const ideOk = pushRegularDefault(ideDefault);
+    if (!candidates.length && (!cliOk || !ideOk)) {
+      candidates.push(cliDefault);
+    }
+    return candidates;
+  };
+  if (!explicitDbPath || !explicitDbPath.trim()) {
+    return resolveDefaults();
+  }
+  const absExplicit = resolve(expandHomePath(explicitDbPath.trim()));
+  if (absExplicit === cliDefault || absExplicit === ideDefault) {
+    return resolveDefaults();
+  }
+  return [absExplicit];
+}
+
 export function resolveAgyBrainDirs(options?: {
   brainDir?: string;
   brainDirs?: readonly string[];
@@ -483,6 +545,34 @@ export function parseTimestampMs(raw: unknown): number | null {
   if (!iso) return null;
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Parse an Antigravity timestamp preserving full nanosecond precision (up to 9 fractional digits)
+ * so sub-millisecond updates across dual summaries databases are ordered accurately.
+ */
+export function parseAgyTimestampNanos(raw: unknown): bigint | null {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith('0001-01-01')) return null;
+    const match =
+      /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$/i.exec(trimmed);
+    if (match) {
+      const year = Number(match[1]);
+      if (!Number.isSafeInteger(year) || year <= 1) return null;
+      let tz = match[8] ?? 'Z';
+      if (/^[+-]\d{4}$/.test(tz)) tz = `${tz.slice(0, 3)}:${tz.slice(3)}`;
+      const wholeIso = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}.000${tz.toUpperCase()}`;
+      const baseMs = Date.parse(wholeIso);
+      if (!Number.isFinite(baseMs)) return null;
+      const dt = new Date(baseMs);
+      if (dt.getUTCFullYear() < 1970) return null;
+      const nanosStr = (match[7] ?? '').slice(0, 9).padEnd(9, '0');
+      return BigInt(Math.trunc(baseMs)) * 1_000_000n + BigInt(nanosStr);
+    }
+  }
+  const ms = parseTimestampMs(raw);
+  return ms === null ? null : BigInt(Math.trunc(ms)) * 1_000_000n;
 }
 
 export function stripHostInjectionBlocks(text: string): string {

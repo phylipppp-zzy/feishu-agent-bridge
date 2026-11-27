@@ -242,6 +242,7 @@ rt['outputRoots'] = [
 rt['autoTakeControlOnInput'] = True
 rt['autoResumeOnRestart'] = True
 agy['binPath'] = '/home/zhangzy/.gemini/bin/agy'
+agy['summariesDbPath'] = '/home/zhangzy/.gemini/antigravity-cli/conversation_summaries.db'
 agy['processPerSession'] = True
 agy['defaultMode'] = 'auto'
 agy['addDirs'] = ['/ssd/zhangzy', '/data/zhangzy']

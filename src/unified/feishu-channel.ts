@@ -23,6 +23,8 @@ import { buildHealthCard, buildQuotaCard } from './health-card.js';
 import { queryAgyQuota, type AgyQuotaSnapshot } from './agy-quota.js';
 import { buildAgyStatusCard } from './agy-status-card.js';
 import { collectAgyStatusSnapshot, type AgyStatusSnapshot } from './agy/session-status.js';
+import type { ReadonlyLiveTurnView } from './agy/readonly-live-turn.js';
+import { turnProgressCard } from './turn-progress-card.js';
 import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
 import { inputConfirmationCard, needsOperationNotice, operationFromReceipt, patchOperationCard, pendingSessionAuthorization, publishOperationFeedback, suppressInputFailure, SUPPRESSED_COMPLETED_ACTIONS } from './feishu-operation-notices.js';
 import { BindingExpired, ReadAuthorizationRevoked, TOPIC_TITLE_SCHEMA, setCustomTopicTitle, syncTopicRootTitle } from './topic-title-sync.js';
@@ -121,9 +123,9 @@ export class FeishuChannel {
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
-  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; autoTakeControlOnInput?: boolean; canReconcileReleasedReadonly?: (session: Session) => boolean; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null; readAgyStatus?: () => Promise<AgyStatusSnapshot> | AgyStatusSnapshot } = {}) {
+  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; autoTakeControlOnInput?: boolean; canReconcileReleasedReadonly?: (session: Session) => boolean; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null; readAgyStatus?: () => Promise<AgyStatusSnapshot> | AgyStatusSnapshot; readReadonlyLiveTurn?: (session: Session) => Promise<ReadonlyLiveTurnView | null> | ReadonlyLiveTurnView | null } = {}) {
     this.db = new DatabaseSync(dbPath);
-    this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL);`);
+    this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_readonly_live_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, anchor_id TEXT NOT NULL, card_id TEXT NOT NULL, signature TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope));`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_health_facts (component TEXT PRIMARY KEY, observed_at TEXT NOT NULL, success_at TEXT, failure_at TEXT, failure_reason TEXT, status TEXT NOT NULL, reason TEXT)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_interaction_view (destination TEXT NOT NULL,session_id TEXT NOT NULL,interaction_id TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(destination,session_id,interaction_id))');
@@ -146,6 +148,11 @@ export class FeishuChannel {
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_restart_resume_queue (session_id TEXT PRIMARY KEY, destination TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, interrupted_at INTEGER NOT NULL)');
     const columns = this.db.prepare('PRAGMA table_info(channel_bindings)').all() as Array<{name:string}>;
     if (!columns.some(c => c.name === 'access_mode')) this.db.exec("ALTER TABLE channel_bindings ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'read_only'");
+    const roColumns = this.db.prepare('PRAGMA table_info(channel_readonly_live_cards)').all() as Array<{name:string}>;
+    if (!roColumns.some(c => c.name === 'patch_seq')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN patch_seq INTEGER NOT NULL DEFAULT 0');
+    if (!roColumns.some(c => c.name === 'baseline_msg_seq')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN baseline_msg_seq INTEGER NOT NULL DEFAULT -1');
+    if (!roColumns.some(c => c.name === 'idle_since')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN idle_since INTEGER');
+    if (!roColumns.some(c => c.name === 'final_reject_count')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN final_reject_count INTEGER NOT NULL DEFAULT 0');
     for(const table of ['channel_interaction_cards','channel_cursors']) {const fields=this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>;if(!fields.some(c=>c.name==='binding_scope')) this.db.exec(`ALTER TABLE ${table} ADD COLUMN binding_scope TEXT NOT NULL DEFAULT ''`);}
     this.db.exec('CREATE INDEX IF NOT EXISTS channel_bindings_session ON channel_bindings(session_id,destination)');
     this.turnCards = new TurnCardDelivery(this.db, service, port, {
@@ -649,6 +656,7 @@ export class FeishuChannel {
       try {
         this.db.prepare('DELETE FROM channel_bindings WHERE destination=?').run(e.destination);
         this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(e.destination);
+        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=?').run(e.destination);
         this.db.exec('COMMIT');
       } catch(error) { this.db.exec('ROLLBACK'); throw error; }
       this.turnCards.discardOtherScopes(e.destination, this.bindingScope(e.destination));
@@ -976,6 +984,395 @@ export class FeishuChannel {
     const known = this.db.prepare('SELECT revision FROM channel_known_messages WHERE destination=? AND session_id=? AND message_id=?');
     const unseen = (m: Message) => Number((known.get(destination,sessionId,m.messageId) as {revision:number}|undefined)?.revision ?? -1) < m.revision;
     const isCliReadonly = (session: Session) => this.accessMode(destination) === 'read_only' || session.status === 'read_only';
+    const readonlyPatchIntervalMs = (() => {
+      const raw = Number(process.env.FEISHU_PATCH_INTERVAL_MS);
+      return Number.isSafeInteger(raw) && raw > 0 ? raw : 1500;
+    })();
+    const readonlyIdleGraceMs = (() => {
+      const raw = Number(process.env.FEISHU_READONLY_IDLE_GRACE_MS);
+      return Number.isSafeInteger(raw) && raw >= 0 ? raw : 15_000;
+    })();
+    const isApiRejectionError = (error: unknown): boolean => {
+      const failure = error as { deliveryKind?: string; platformCode?: number } | null;
+      return Boolean(
+        failure &&
+        (failure.deliveryKind === 'api_rejected' ||
+          (Number.isInteger(failure.platformCode) && failure.platformCode !== 0)),
+      );
+    };
+    type ReadonlyCardRow = {
+      anchor_id: string;
+      card_id: string;
+      signature: string;
+      updated_at: number;
+      patch_seq: number;
+      baseline_msg_seq: number;
+      idle_since: number | null;
+      final_reject_count: number;
+    };
+    const turnScopedFinalCandidates = (allMsgs: readonly Message[], baselineSeq: number, anchorId?: string): Message[] => {
+      const ordered = [...allMsgs].sort((a, b) => a.sequence - b.sequence || a.messageId.localeCompare(b.messageId));
+      const anchorStepMatch = anchorId ? /:user-(\d+)$/.exec(anchorId) : null;
+      const anchorUserStep = anchorStepMatch ? Number(anchorStepMatch[1]) : null;
+      let nextUserSeq: number | undefined;
+      let sawAssistantAfterBaseline = false;
+      let sawFirstUserAfterBaseline = false;
+      for (const m of ordered) {
+        if (m.sequence <= baselineSeq) continue;
+        if (m.role === 'assistant') {
+          sawAssistantAfterBaseline = true;
+        } else if (m.role === 'user') {
+          const msgStepMatch = /^step-(\d+)$/.exec(m.turnId);
+          const msgStep = msgStepMatch ? Number(msgStepMatch[1]) : null;
+          const isNewerUserStep = anchorUserStep !== null && msgStep !== null && msgStep > anchorUserStep;
+          if (sawAssistantAfterBaseline || sawFirstUserAfterBaseline || isNewerUserStep) {
+            nextUserSeq = m.sequence;
+            break;
+          }
+          sawFirstUserAfterBaseline = true;
+        }
+      }
+      return ordered.filter(
+        (m) =>
+          m.role === 'assistant' &&
+          m.final &&
+          m.sequence > baselineSeq &&
+          (nextUserSeq === undefined || m.sequence < nextUserSeq) &&
+          unseen(m) &&
+          !this.turnCards.isBaselinedMessage(scopeKey, m.messageId, m.revision),
+      );
+    };
+    const reconcileReadonlyFinalCard = async (
+      session: Session,
+      slot: ReadonlyCardRow,
+      finalCandidates: readonly Message[],
+      tools: ReadonlyLiveTurnView['tools'],
+      turnId: string,
+      now: number,
+    ): Promise<'sent' | 'retry' | 'fallback' | 'unknown'> => {
+      const finalMsg = finalCandidates.at(-1)!;
+      const finalCard = turnProgressCard({
+        provider: session.native.provider,
+        status: 'completed',
+        schema: '2.0',
+        message: finalMsg,
+        tools,
+        duration: null,
+        files: [],
+        turnId,
+      });
+      const nextSeq = Number(slot.patch_seq) + 1;
+      const deliveryId = `ro-live-final:${payloadDigest([scope, destination, sessionId, slot.card_id, finalMsg.messageId, finalMsg.revision, nextSeq])}`;
+      if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
+        try {
+          await syncGuard();
+          await this.port.update(destination, slot.card_id, this.stampCard(destination, finalCard), deliveryId, syncGuard);
+        } catch (error) {
+          if (isApiRejectionError(error)) {
+            this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
+            const nextRejects = Number(slot.final_reject_count) + 1;
+            if (nextRejects >= 2) {
+              this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+                .run(destination, sessionId, scope);
+              return 'fallback';
+            }
+            this.db.prepare(
+              'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
+            ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
+            return 'retry';
+          }
+          throw error;
+        }
+        await syncGuard();
+        this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
+        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+          .run(destination, sessionId, scope);
+        return 'sent';
+      }
+      // Delivery row already exists (e.g. prior transport timeout left 'unknown'): reconcile via port.lookupDelivery!
+      const prior = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(deliveryId) as { state: string } | undefined;
+      if (prior?.state === 'sent') {
+        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+          .run(destination, sessionId, scope);
+        return 'sent';
+      }
+      if (prior?.state === 'unknown') {
+        const outcome = this.port.lookupDelivery ? await this.port.lookupDelivery(deliveryId) : 'unknown';
+        await syncGuard();
+        if (outcome === 'sent') {
+          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
+          this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+            .run(destination, sessionId, scope);
+          return 'sent';
+        }
+        // In-place PATCH to an existing card_id is idempotent on Feishu (never duplicates a card):
+        // when lookupDelivery returns 'not_sent' or 'unknown' (e.g. FeishuSdkPort after PATCH timeout),
+        // advance patch_seq to retry idempotently (falling back to fresh delivery after 2 retries).
+        this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
+        const nextRejects = Number(slot.final_reject_count) + 1;
+        if (nextRejects >= 2) {
+          this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+            .run(destination, sessionId, scope);
+          return 'fallback';
+        }
+        this.db.prepare(
+          'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
+        ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
+        return 'retry';
+      }
+      return 'unknown';
+    };
+    const syncReadonlyLiveCard = async (
+      session: Session,
+      snapshotMessages: readonly Message[] | null,
+    ): Promise<{ handledIds: Set<string>; deferredIds: Set<string> }> => {
+      const handledIds = new Set<string>();
+      const deferredIds = new Set<string>();
+      if (!this.channelOptions.readReadonlyLiveTurn || !isCliReadonly(session)) {
+        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=?').run(destination);
+        return { handledIds, deferredIds };
+      }
+      this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND binding_scope<>?').run(destination, scope);
+      if (!allowedPush()) {
+        return { handledIds, deferredIds };
+      }
+      let live: ReadonlyLiveTurnView | null = null;
+      try {
+        live = await this.channelOptions.readReadonlyLiveTurn(session);
+      } catch {
+        live = {
+          state: 'unavailable',
+          anchorId: 'unavailable',
+          running: false,
+          previewText: '',
+          tools: [],
+          activeSubagents: [],
+          signature: 'unavailable',
+        };
+      }
+      await syncGuard();
+      const existing = this.db.prepare(
+        `SELECT anchor_id, card_id, signature, updated_at, patch_seq, baseline_msg_seq, idle_since, final_reject_count
+         FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?`,
+      ).get(destination, sessionId, scope) as ReadonlyCardRow | undefined;
+
+      if (live?.state === 'unavailable') {
+        // Keep existing readonly slot intact and defer this turn's final messages until reader recovers
+        // so normal TurnCardDelivery does not emit a duplicate second card while summaries is unreadable.
+        if (existing && snapshotMessages) {
+          for (const m of turnScopedFinalCandidates(snapshotMessages, Number(existing.baseline_msg_seq), existing.anchor_id)) {
+            deferredIds.add(m.messageId);
+          }
+        }
+        return { handledIds, deferredIds };
+      }
+
+      const now = Date.now();
+      const hasWork = Boolean(live && live.state === 'running' && (live.tools.length > 0 || live.activeSubagents.length > 0));
+
+      if (hasWork && live) {
+        let activeRow = existing;
+        // If a NEW turn started while a previous turn's readonly slot is still open, close the old slot first!
+        if (activeRow && activeRow.anchor_id !== live.anchorId) {
+          const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
+          await syncGuard();
+          const prevTurnFinals = turnScopedFinalCandidates(allMsgs, Number(activeRow.baseline_msg_seq), activeRow.anchor_id);
+          if (prevTurnFinals.length > 0) {
+            const outcome = await reconcileReadonlyFinalCard(session, activeRow, prevTurnFinals, [], activeRow.anchor_id, now);
+            if (outcome === 'sent') {
+              for (const m of prevTurnFinals) handledIds.add(m.messageId);
+              activeRow = undefined;
+            } else if (outcome === 'fallback') {
+              activeRow = undefined;
+            } else {
+              for (const m of prevTurnFinals) deferredIds.add(m.messageId);
+              return { handledIds, deferredIds };
+            }
+          } else {
+            this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+              .run(destination, sessionId, scope);
+            activeRow = undefined;
+          }
+        }
+        const interimMessage: Message | undefined = live.previewText
+          ? {
+              messageId: live.anchorId,
+              sessionId,
+              turnId: live.anchorId,
+              role: 'assistant',
+              blocks: [{ type: 'text', text: live.previewText }],
+              sequence: 0,
+              revision: 0,
+              final: false,
+              source: 'readonly_live',
+            }
+          : undefined;
+        const card = turnProgressCard({
+          provider: session.native.provider,
+          status: 'running',
+          schema: '2.0',
+          message: interimMessage,
+          tools: live.tools,
+          duration: null,
+          files: [],
+          turnId: live.anchorId,
+          activeSubagents: live.activeSubagents,
+          allowFullReplyButton: false,
+        });
+        if (!activeRow) {
+          const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
+          await syncGuard();
+          let baselineSeq = -1;
+          for (const m of allMsgs) {
+            if (m.role === 'assistant' && m.final && m.sequence > baselineSeq) baselineSeq = m.sequence;
+          }
+          const deliveryId = `ro-live-send:${payloadDigest([scope, destination, sessionId, live.anchorId])}`;
+          if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
+            let cardId: string | void;
+            try {
+              await syncGuard();
+              cardId = await this.port.send(destination, this.stampCard(destination, card), deliveryId, syncGuard);
+            } catch (error) {
+              if (isApiRejectionError(error)) {
+                this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
+                return { handledIds, deferredIds };
+              }
+              throw error;
+            }
+            await syncGuard();
+            this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
+            if (cardId) {
+              this.db.prepare(
+                `INSERT OR REPLACE INTO channel_readonly_live_cards
+                 (destination, session_id, binding_scope, anchor_id, card_id, signature, updated_at, patch_seq, baseline_msg_seq, idle_since, final_reject_count)
+                 VALUES (?,?,?,?,?,?,?,0,?,NULL,0)`,
+              ).run(destination, sessionId, scope, live.anchorId, cardId, live.signature, now, baselineSeq);
+              activeRow = {
+                anchor_id: live.anchorId,
+                card_id: cardId,
+                signature: live.signature,
+                updated_at: now,
+                patch_seq: 0,
+                baseline_msg_seq: baselineSeq,
+                idle_since: null,
+                final_reject_count: 0,
+              };
+            }
+          }
+        } else {
+          if (activeRow.idle_since !== null) {
+            this.db.prepare('UPDATE channel_readonly_live_cards SET idle_since=NULL WHERE destination=? AND session_id=? AND binding_scope=?')
+              .run(destination, sessionId, scope);
+            activeRow = { ...activeRow, idle_since: null };
+          }
+          if (activeRow.signature !== live.signature && now - Number(activeRow.updated_at) >= readonlyPatchIntervalMs) {
+            const nextSeq = Number(activeRow.patch_seq) + 1;
+            const deliveryId = `ro-live-upd:${payloadDigest([scope, destination, sessionId, activeRow.card_id, nextSeq])}`;
+            if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
+              try {
+                await syncGuard();
+                await this.port.update(destination, activeRow.card_id, this.stampCard(destination, card), deliveryId, syncGuard);
+              } catch (error) {
+                if (isApiRejectionError(error)) {
+                  this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
+                  this.db.prepare(
+                    'UPDATE channel_readonly_live_cards SET patch_seq=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
+                  ).run(nextSeq, now, destination, sessionId, scope);
+                  return { handledIds, deferredIds };
+                }
+                throw error;
+              }
+              await syncGuard();
+              this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
+              this.db.prepare(
+                'UPDATE channel_readonly_live_cards SET signature=?, updated_at=?, patch_seq=?, idle_since=NULL WHERE destination=? AND session_id=? AND binding_scope=?',
+              ).run(live.signature, now, nextSeq, destination, sessionId, scope);
+            }
+          }
+        }
+        // Defer ONLY this turn's post-baseline intermediate final messages while running.
+        if (activeRow && snapshotMessages) {
+          for (const m of turnScopedFinalCandidates(snapshotMessages, Number(activeRow.baseline_msg_seq), activeRow.anchor_id)) {
+            deferredIds.add(m.messageId);
+          }
+        }
+        return { handledIds, deferredIds };
+      }
+
+      if (existing && (!live || live.state === 'idle')) {
+        const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
+        await syncGuard();
+        const finalCandidates = turnScopedFinalCandidates(allMsgs, Number(existing.baseline_msg_seq), existing.anchor_id);
+
+        if (finalCandidates.length > 0) {
+          const outcome = await reconcileReadonlyFinalCard(
+            session,
+            existing,
+            finalCandidates,
+            live?.tools ?? [],
+            live?.anchorId ?? existing.anchor_id,
+            now,
+          );
+          if (outcome === 'sent') {
+            for (const m of finalCandidates) handledIds.add(m.messageId);
+          } else if (outcome === 'retry' || outcome === 'unknown') {
+            for (const m of finalCandidates) deferredIds.add(m.messageId);
+          }
+          // outcome === 'fallback': slot deleted, neither handled nor deferred -> TurnCardDelivery sends fresh card.
+          return { handledIds, deferredIds };
+        }
+
+        // Summaries may flip to IDLE slightly before Core history refresh delivers the final assistant message.
+        const idleSince = existing.idle_since ?? now;
+        if (existing.idle_since === null) {
+          this.db.prepare('UPDATE channel_readonly_live_cards SET idle_since=? WHERE destination=? AND session_id=? AND binding_scope=?')
+            .run(idleSince, destination, sessionId, scope);
+        }
+        if (now - idleSince < readonlyIdleGraceMs) {
+          return { handledIds, deferredIds };
+        }
+
+        const doneCard = turnProgressCard({
+          provider: session.native.provider,
+          status: 'completed',
+          schema: '2.0',
+          message: undefined,
+          tools: live?.tools ?? [],
+          duration: null,
+          files: [],
+          turnId: existing.anchor_id,
+          allowFullReplyButton: false,
+        });
+        const nextSeq = Number(existing.patch_seq) + 1;
+        const deliveryId = `ro-live-done:${payloadDigest([scope, destination, sessionId, existing.card_id, existing.anchor_id, nextSeq])}`;
+        if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
+          try {
+            await syncGuard();
+            await this.port.update(destination, existing.card_id, this.stampCard(destination, doneCard), deliveryId, syncGuard);
+          } catch (error) {
+            if (isApiRejectionError(error)) {
+              this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
+              const nextRejects = Number(existing.final_reject_count) + 1;
+              if (nextRejects >= 2) {
+                this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+                  .run(destination, sessionId, scope);
+              } else {
+                this.db.prepare(
+                  'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
+                ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
+              }
+              return { handledIds, deferredIds };
+            }
+            throw error;
+          }
+          await syncGuard();
+          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
+          this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
+            .run(destination, sessionId, scope);
+        }
+      }
+      return { handledIds, deferredIds };
+    };
     const deliverCliPrompts = async (session: Session, candidates: readonly Message[]) => {
       if (!isCliReadonly(session) || !candidates.length) return;
       const ordered = [...candidates].sort((a, b) => a.sequence - b.sequence || a.messageId.localeCompare(b.messageId));
@@ -1018,8 +1415,13 @@ export class FeishuChannel {
             this.db.prepare('SELECT 1 FROM channel_interaction_cards WHERE destination=? AND session_id=? AND binding_scope=? LIMIT 1')
               .get(destination, sessionId, scope),
           );
-          if (!hasPendingCards && !hasInteractionCards) {
+          const hasReadonlyLiveCard = Boolean(
+            this.db.prepare('SELECT 1 FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=? LIMIT 1')
+              .get(destination, sessionId, scope),
+          );
+          if (!hasPendingCards && !hasInteractionCards && !hasReadonlyLiveCard) {
             const session = await this.service.getSession(sessionId); await syncGuard();
+            await syncReadonlyLiveCard(session, null);
             await syncTopicRootTitle(this.db, this.port, destination, scope, session, card => this.stampCard(destination, card), syncGuard);
             if (reconcileReleasedReadonly(session)) return true;
             return false;
@@ -1031,11 +1433,27 @@ export class FeishuChannel {
         const userMessages = snapshot.value.messages.filter(message => message.role === 'user' && messageIds.has(message.messageId) && unseen(message));
         await deliverCliPrompts(snapshot.value.session, userMessages);
         const messages = snapshot.value.messages.filter(message => message.role === 'assistant' && messageIds.has(message.messageId) && unseen(message));
-        await this.turnCards.sync(scopeKey, snapshot.value, events.events, messages, allowedPush);
+        const roResult = await syncReadonlyLiveCard(snapshot.value.session, snapshot.value.messages);
+        const unseenPostDeferred = snapshot.value.messages.filter(
+          (message) =>
+            message.role === 'assistant' &&
+            message.final &&
+            unseen(message) &&
+            !this.turnCards.isBaselinedMessage(scopeKey, message.messageId, message.revision) &&
+            !roResult.handledIds.has(message.messageId) &&
+            !roResult.deferredIds.has(message.messageId) &&
+            !messages.some((existingMsg) => existingMsg.messageId === message.messageId),
+        );
+        const remainingMessages = [
+          ...messages.filter(message => !roResult.handledIds.has(message.messageId) && !roResult.deferredIds.has(message.messageId)),
+          ...unseenPostDeferred,
+        ];
+        await this.turnCards.sync(scopeKey, snapshot.value, events.events, remainingMessages, allowedPush);
         await syncGuard();
         await syncTitle(snapshot.value);
         if (reconcileReleasedReadonly(snapshot.value.session)) return true;
-        for (const message of messages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
+        for (const message of remainingMessages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
+        for (const message of snapshot.value.messages) if (message.final && roResult.handledIds.has(message.messageId)) remember.run(destination,sessionId,message.messageId,message.revision);
         let retryCount=0; let firstRetry='';
         const visible=events.events.filter(event=>!eventTypes.length || eventTypes.includes(event.type));
         const hasTurnFailure=visible.some(event=>event.type==='turn.updated' && (event.data as {status?:string}|null)?.status==='failed');

@@ -23,7 +23,7 @@ import {
   paginatePendingItems,
   renderPendingItemCard,
 } from './pending-cards.js';
-import { discoverPendingItems } from './pending-discovery.js';
+import { discoverPendingItems, discoverPendingItemsWithMeta, type PendingDiscoveryResult } from './pending-discovery.js';
 import { executePendingSubmit } from './pending-submit.js';
 import {
   DEFAULT_PENDING_ROOT_KEY,
@@ -77,6 +77,7 @@ export class PendingHub {
   private readonly shouldDeliverSource: PendingHubOptions['shouldDeliverSource'];
   private readonly discoverCliNotices: PendingHubOptions['discoverCliNotices'];
   private readonly refLocks = new Map<string, Promise<void>>();
+  private syncLock = Promise.resolve();
   private summaryLock = Promise.resolve();
   private rootCreation: Promise<PendingHubRoot> | undefined;
   private summaryVersion = 0;
@@ -375,6 +376,19 @@ export class PendingHub {
     return null;
   }
 
+  private collectAuthoritativePendingWithMeta(now: number): Promise<PendingDiscoveryResult> {
+    const hubDest = this.getRoot()?.topicDestination ?? this.destination;
+    const boundSources = this.db.prepare('SELECT session_id, source_destination FROM pending_hub_sessions_v1')
+      .all() as Array<{ session_id: string; source_destination: string }>;
+    return discoverPendingItemsWithMeta({
+      service: this.service,
+      decisionStore: this.decisionStore,
+      boundSources,
+      discoverCliNotices: this.discoverCliNotices,
+      resolveSourceLink: (sessionId) => this.resolveSourceLink(sessionId, hubDest),
+    }, now);
+  }
+
   private collectAuthoritativePending(now: number): Promise<PendingItemView[]> {
     const hubDest = this.getRoot()?.topicDestination ?? this.destination;
     const boundSources = this.db.prepare('SELECT session_id, source_destination FROM pending_hub_sessions_v1')
@@ -501,10 +515,29 @@ export class PendingHub {
     });
   }
 
+  private withSyncLock<T>(fn: () => Promise<T>): Promise<T> {
+    const work = this.syncLock.then(fn);
+    this.syncLock = work.then(() => {}, () => {});
+    return work;
+  }
+
+  private getNoticeSignature(refId: string): string | null {
+    const row = this.db
+      .prepare('SELECT signature FROM pending_hub_notice_signatures_v1 WHERE ref_id=?')
+      .get(refId) as { signature: string } | undefined;
+    return row?.signature ?? null;
+  }
+
   private async deliverActionableItem(item: PendingItemView, hubDest: string, hubBindingId: string): Promise<void> {
     const existing = this.getRef(item.refId);
+    const hubCard = this.renderHubItemCard(item, 'hub', hubBindingId);
+    const noticeSig = item.readonlyNotice
+      ? payloadDigest([hubCard.title, hubCard.text, hubCard.actions])
+      : null;
+    const prevNoticeSig = item.readonlyNotice ? this.getNoticeSignature(item.refId) : null;
+    const noticeChanged = Boolean(item.readonlyNotice && prevNoticeSig !== noticeSig);
     const itemRevision = item.readonlyNotice
-      ? existing ? existing.revision + (existing.card_active ? 0 : 1) : 1
+      ? existing ? existing.revision + (!existing.card_active || noticeChanged ? 1 : 0) : 1
       : item.provider === 'decision' ? item.version : item.revision;
     const itemConnGen = item.readonlyNotice || item.provider === 'decision' ? null : item.connectionGeneration;
 
@@ -523,7 +556,6 @@ export class PendingHub {
       }
     }
 
-    const hubCard = this.renderHubItemCard(item, 'hub', hubBindingId);
     if (!hubCardMessageId) {
       const deliveryId = `pending-hub:${payloadDigest([item.refId, hubDest, itemRevision])}`;
       hubCardMessageId = await this.deliverOnce(hubDest, hubCard, deliveryId);
@@ -568,10 +600,26 @@ export class PendingHub {
         now,
         now,
       );
+    if (noticeSig !== null) {
+      this.db
+        .prepare(
+          `INSERT INTO pending_hub_notice_signatures_v1(ref_id, signature, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(ref_id) DO UPDATE SET signature=excluded.signature, updated_at=excluded.updated_at`,
+        )
+        .run(item.refId, noticeSig, now);
+    }
   }
 
   /** Revalidate each interaction inside the same lock used for targeted updates. */
-  async sync(options: { nowMs?: number; query?: PendingQuery } = {}): Promise<{
+  sync(options: { nowMs?: number; query?: PendingQuery } = {}): Promise<{
+    activeCount: number;
+    withdrawnRefs: string[];
+  }> {
+    return this.withSyncLock(() => this.syncUnlocked(options));
+  }
+
+  private async syncUnlocked(options: { nowMs?: number; query?: PendingQuery } = {}): Promise<{
     activeCount: number;
     withdrawnRefs: string[];
   }> {
@@ -581,7 +629,7 @@ export class PendingHub {
     const hubBindingId = createHash('sha256').update(this.rootKey).digest('hex').slice(0, 16);
 
     const version = this.summaryVersion;
-    const candidates = await this.collectAuthoritativePending(nowMs);
+    const { items: candidates, unknownRefIds } = await this.collectAuthoritativePendingWithMeta(nowMs);
     const candidateIds = new Set(candidates.map((item) => item.refId));
     const active: PendingItemView[] = [];
     const withdrawnRefs: string[] = [];
@@ -594,14 +642,18 @@ export class PendingHub {
     for (const ref of tracked) {
       if (candidateIds.has(ref.ref_id)) continue;
       if (isCliNoticeRefId(ref.ref_id)) {
+        if (unknownRefIds.has(ref.ref_id)) continue;
         const reason = '终端已无待审批信号';
-        const result = await this.withRefLock(ref.ref_id, () =>
-          this.updateRefCards(this.getRef(ref.ref_id)!, reason, ref.revision, {
+        const result = await this.withRefLock(ref.ref_id, async () => {
+          const latest = this.getRef(ref.ref_id);
+          if (!latest || latest.card_active === 0) return { sourceUpdated: false, hubUpdated: false };
+          return this.updateRefCards(latest, reason, latest.revision, {
             title: '【终端待审批 · 提醒已撤回】',
             template: 'grey',
             text: `${reason}。`,
             actions: [],
-          }));
+          });
+        });
         if (result.hubUpdated) withdrawnRefs.push(ref.ref_id);
         continue;
       }

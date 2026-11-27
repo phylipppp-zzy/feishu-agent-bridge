@@ -29,6 +29,14 @@ export class AgyCatalog {
 
   constructor(private readonly options: AgyCatalogOptions = {}) {}
 
+  get dbPath(): string | undefined {
+    return this.options.dbPath;
+  }
+
+  get brainDir(): string | undefined {
+    return this.options.brainDir;
+  }
+
   refresh(): AgyDiscoveredSession[] {
     const titles = new Map<string, AgyTitleCacheEntry>();
     const list = readAgySummaries(this.options, { previous: this.titles, next: titles });

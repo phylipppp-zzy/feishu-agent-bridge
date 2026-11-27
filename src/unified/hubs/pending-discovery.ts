@@ -72,8 +72,13 @@ export async function readWaitingClaudePresence(directories: readonly string[], 
     processAlive(record.pid, record.pidStartTime));
 }
 
+export interface PendingDiscoveryResult {
+  items: PendingItemView[];
+  unknownRefIds: Set<string>;
+}
+
 /** Discover candidates outside the per-card lock. The caller revalidates before delivery. */
-export async function discoverPendingItems(context: Discovery, now: number): Promise<PendingItemView[]> {
+export async function discoverPendingItemsWithMeta(context: Discovery, now: number): Promise<PendingDiscoveryResult> {
   const { service, decisionStore, boundSources, resolveSourceLink } = context;
   const boundDestinations = new Map(boundSources.map(bound => [bound.session_id, bound.source_destination]));
   const sessionIds = new Set<string>();
@@ -94,11 +99,17 @@ export async function discoverPendingItems(context: Discovery, now: number): Pro
 
   const items: PendingItemView[] = [];
   const notices = new Map<string, PendingCliNotice>();
+  const unknownRefIds = new Set<string>();
   const addNotice = (notice: PendingCliNotice) => {
     const key = `cli_notice:${notice.provider}:${notice.nativeSessionId}` as const;
     if (!notices.has(key)) notices.set(key, notice);
   };
-  for (const notice of await context.discoverCliNotices?.() ?? []) {
+  const discoveredCli = await context.discoverCliNotices?.();
+  const cliNotices = Array.isArray(discoveredCli) ? discoveredCli : (discoveredCli?.notices ?? []);
+  if (!Array.isArray(discoveredCli) && discoveredCli?.unknownRefIds) {
+    for (const refId of discoveredCli.unknownRefIds) unknownRefIds.add(refId);
+  }
+  for (const notice of cliNotices) {
     if (!notice.sourceSessionId || sessionIds.has(notice.sourceSessionId)) addNotice(notice);
   }
   for (const sessionId of sessionIds) {
@@ -152,5 +163,9 @@ export async function discoverPendingItems(context: Discovery, now: number): Pro
       items.push(buildDecisionPendingItem(decision, sourceTopicUrl));
     }
   }
-  return items.sort((a, b) => a.refId.localeCompare(b.refId));
+  return { items: items.sort((a, b) => a.refId.localeCompare(b.refId)), unknownRefIds };
+}
+
+export async function discoverPendingItems(context: Discovery, now: number): Promise<PendingItemView[]> {
+  return (await discoverPendingItemsWithMeta(context, now)).items;
 }
