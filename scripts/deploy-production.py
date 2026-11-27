@@ -241,6 +241,17 @@ rt['outputRoots'] = [
 ]
 rt['autoTakeControlOnInput'] = True
 rt['autoResumeOnRestart'] = True
+auto_mirror = rt.setdefault('autoMirror', {})
+auto_mirror['backfillNativeIds'] = [
+    {'provider': 'agy', 'nativeSessionId': '47bb480b-e598-4e78-80b4-3db372213afa'},
+    {'provider': 'agy', 'nativeSessionId': '8ab91e11-eaf9-4096-b29a-d296057018d9'},
+    {'provider': 'agy', 'nativeSessionId': '15bc9da6-0419-42ac-acb2-4d8479269a5a'},
+    {'provider': 'agy', 'nativeSessionId': '67786faa-02c1-4e62-bb8e-a5fbe7374c1b'},
+    {'provider': 'agy', 'nativeSessionId': 'a9ee387f-53d4-4038-9c04-43dd452f167b'},
+    {'provider': 'agy', 'nativeSessionId': 'b59ff0ab-8a4e-4eec-ad00-522df9899dfc'},
+    {'provider': 'agy', 'nativeSessionId': 'efe2c202-5b10-4532-b581-25bf54fa6db2'},
+    {'provider': 'agy', 'nativeSessionId': '189ba079-f241-49ab-8d45-613cc97fe41a'},
+]
 agy['binPath'] = '/home/zhangzy/.gemini/bin/agy'
 agy['summariesDbPath'] = '/home/zhangzy/.gemini/antigravity-cli/conversation_summaries.db'
 agy['processPerSession'] = True
