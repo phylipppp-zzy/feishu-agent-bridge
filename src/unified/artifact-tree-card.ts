@@ -25,7 +25,8 @@ export function buildProjectFilesCard(listing: DirectoryListing): ChannelCard {
         : `${branch} ${x.name} (${formatHumanSize(x.size)})`;
     });
     const body = treeLines.length ? treeLines.join('\n') : '(空目录)';
-    text = `📁 ${listing.path}\n${body}\n显示 ${listing.entries.length}/${listing.total} 项，隐藏 ${listing.hidden} 项`;
+    const tip = listing.total > 0 ? '\n💡 发送 /file <相对路径> 可直接把文件发到飞书，/ls -a 查看隐藏文件' : '';
+    text = `📁 ${listing.path}\n${body}\n显示 ${listing.entries.length}/${listing.total} 项，隐藏 ${listing.hidden} 项${tip}`;
   }
   return { title: '项目目录', format: 'plain', text, actions: [] };
 }

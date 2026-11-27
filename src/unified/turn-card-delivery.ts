@@ -5,7 +5,7 @@ import type { FeishuPort } from './feishu-channel.js';
 import type { ChannelCard } from './feishu-cards.js';
 import { isTerminalTurn, readToolProgress, type ToolProgress } from './tool-progress.js';
 import { aggregateTurnAssistantMessage } from './turn-reply.js';
-import { completionText, formatCompactModelBadge, replyText, turnProgressCard } from './turn-progress-card.js';
+import { completionText, formatCompactModelBadge, replyText, turnProgressCard, type SessionSubagentActivity } from './turn-progress-card.js';
 import { timestampMs, type TurnTiming, type TurnToolCounts } from './turn-progress-store.js';
 
 function positiveEnvMs(name: string, fallback: number): number {
@@ -35,6 +35,7 @@ interface Dependencies {
   guard(key: BindingKey): Promise<void>;
   stamp(destination: string, card: ChannelCard): ChannelCard;
   wake(destination: string): void;
+  readActiveSubagents?(session: SessionSnapshot['session']): Promise<readonly SessionSubagentActivity[] | undefined> | readonly SessionSubagentActivity[] | undefined;
 }
 
 interface TurnView {
@@ -46,6 +47,7 @@ interface TurnView {
   toolCounts?: TurnToolCounts | undefined;
   provider: SessionSnapshot['session']['native']['provider'];
   sessionConnected?: boolean;
+  activeSubagents?: readonly SessionSubagentActivity[] | undefined;
 }
 
 export function eventSequence(sessionId: string, cursor: string | undefined): number {
@@ -396,8 +398,12 @@ export class TurnCardDelivery {
       modelBadge = formatCompactModelBadge(input.turn?.model);
     }
     await guard();
-    const card = turnProgressCard({ provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3], ...(modelBadge ? { modelBadge } : {}) });
-    const learnedDuration = status === 'completed' && elapsed !== null && !old?.title.includes(' · 用时 ');
+    const card = turnProgressCard({
+      provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3],
+      ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
+      ...(modelBadge ? { modelBadge } : {}),
+    });
+    const learnedDuration = isTerminalTurn(status) && card.title.includes(' · 用时 ') && !old?.title.includes(' · 用时 ');
     if (old?.title && isTerminalTurn(old.status ?? undefined) && !learnedDuration) card.title = old.title;
     const signature = payloadDigest(card);
     const heartbeat = () => {
@@ -572,6 +578,18 @@ export class TurnCardDelivery {
       items.push(message);
       replies.set(id, items);
     }
+    let activeSubagents: readonly SessionSubagentActivity[] | undefined;
+    const serviceGetSubagents = (this.service as {
+      getActiveSubagents?: (id: string) => Promise<readonly SessionSubagentActivity[] | undefined> | readonly SessionSubagentActivity[] | undefined;
+    }).getActiveSubagents;
+    const subagentReader = this.deps.readActiveSubagents
+      ? () => this.deps.readActiveSubagents!(session)
+      : typeof serviceGetSubagents === 'function'
+      ? () => serviceGetSubagents.call(this.service, sessionId)
+      : undefined;
+    if (subagentReader && (session.status === 'running' || [...ids].some(id => !isTerminalTurn(turns.get(id)?.status)))) {
+      try { activeSubagents = await subagentReader(); } catch { /* Optional subagent snapshot */ }
+    }
     for (const id of ids) {
       const slot: SlotKey = [...key, id];
       const previous = this.slot(slot);
@@ -581,7 +599,7 @@ export class TurnCardDelivery {
       if (message && previous && message.sequence < previous.latest_sequence) continue;
       if (!message && !previous && turn?.status !== 'completed' && (!calls.length || !turn || turn.status === 'queued')) continue;
       const input = { key: slot, turn, message, timing: timing.get(id), tools: calls, toolCounts: toolCounts.get(id),
-        provider: session.native.provider, sessionConnected };
+        provider: session.native.provider, sessionConnected, ...(activeSubagents?.length ? { activeSubagents } : {}) };
       if (turn && isTerminalTurn(turn.status)) {
         // The cursor can advance ahead of a throttled PATCH. Keep the terminal
         // decision recoverable independently of the card's dirty flag.

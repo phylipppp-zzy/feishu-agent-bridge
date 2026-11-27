@@ -684,7 +684,7 @@ for (const failure of ['before registration', 'after registration'] as const) {
       await channel!.handle({...e,eventId:'draft'},command);
       const messageId = 'draft:new-draft';
       const open = cards.get(messageId)!;
-      assert.deepEqual(open.actions.map(action => action.label),['Codex','✓ Claude','v1/app','v2/app',dir.split('/').at(-1)]);
+      assert.deepEqual(open.actions.map(action => action.label),['Codex','✓ Claude','v1/app','v2/app',dir]);
       assert.ok(open.text.includes(prompt));
       for (const action of open.actions) {
         assert.ok(Buffer.byteLength(JSON.stringify(action.value)) <= 256);
@@ -700,7 +700,7 @@ for (const failure of ['before registration', 'after registration'] as const) {
       const op = await channel!.handle({...e,eventId:'pick',cardMessageId:messageId},currentPick) as {operationId:string};
       const duplicate = await channel!.handle({...e,eventId:'duplicate-pick',cardMessageId:messageId},currentPick) as {operationId:string};
       assert.equal(duplicate.operationId,op.operationId);
-      assert.equal(patches.filter(title => title === '正在创建会话…').length,1);
+      assert.equal(patches.filter(title => title === '正在创建 Codex 会话…').length,1);
       await core!.dispatch(op.operationId);
       assert.deepEqual(created,[v2]);
       const submit = core!.submitInput.bind(core!);

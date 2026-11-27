@@ -7,7 +7,11 @@ import type { TurnToolCounts } from './turn-progress-store.js';
 import { formatCardReplyBody } from './turn-reply.js';
 
 const LOG_SIZE = 15;
-const DELEGATED_TOOLS = new Set(['invoke_subagent', 'run_workflow', 'swarm', 'swarm_wait', 'manage_subagents', 'send_message']);
+const DELEGATED_TOOLS = new Set([
+  'invoke_subagent', 'run_workflow', 'swarm', 'swarm_wait', 'manage_subagents', 'manage_task', 'send_message',
+]);
+const isDispatchSummary = (summary: string): boolean =>
+  summary.startsWith('⚡ Codex MCP') || summary.startsWith('⚡ Agent Dispatch');
 const TOOL_ICONS = { succeeded: '✓', failed: '✗', running: '⏳', pending: '⏳', cancelled: '—' };
 const TOOL_PHASE_LABELS = { succeeded: '已完成', failed: '失败', running: '进行中', pending: '等待开始', cancelled: '已取消' };
 
@@ -78,7 +82,7 @@ function formatRunningNote(active: readonly ToolProgress[]): string | undefined 
   if (!active.length) return undefined;
   const latest = active.at(-1)!;
   const extra = active.length > 1 ? `（另有 ${active.length - 1} 项并行）` : '';
-  if (/^(?:⚡ Codex MCP|🤖|🐝)/u.test(latest.summary)) {
+  if (/^(?:⚡ (?:Codex MCP|Agent Dispatch)|🤖|🐝)/u.test(latest.summary)) {
     return `⏳ ${latest.summary}${extra}`;
   }
   if (latest.tool === 'thinking') {
@@ -93,7 +97,7 @@ function formatDelegatedStatus(
 ): string {
   const deduped = new Map<string, ToolProgress>();
   for (const item of tools) {
-    if (DELEGATED_TOOLS.has(item.tool) || (item.tool === 'call_mcp_tool' && item.summary.startsWith('⚡ Codex MCP'))) {
+    if (DELEGATED_TOOLS.has(item.tool) || ((item.tool === 'call_mcp_tool' || item.tool.startsWith('mcp_')) && isDispatchSummary(item.summary))) {
       deduped.delete(item.callId);
       deduped.set(item.callId, item);
     }
@@ -138,11 +142,12 @@ export function turnProgressCard({ provider, status, schema, message, tools, too
   const failedCount = toolCounts?.failedTools ?? visibleTools.filter(tool => tool.phase === 'failed').length;
   const running = status === 'running' || status === 'queued' || status === undefined && !message?.final;
   const elapsed = duration === null ? '' : ` · 用时 ${formatDuration(duration)}`;
+  const interruptedElapsed = duration !== null && duration >= 5000 ? elapsed : '';
   const badge = modelBadge?.trim() ? ` · ${modelBadge.trim()}` : '';
   const header: Pick<ChannelCard, 'title' | 'template'> = status === 'completed'
     ? { title: `${title} · ${isWakeup ? '后台唤醒已完成' : '已完成'}${elapsed}${badge}`, template: 'green' }
-    : status === 'failed' ? { title: `${title} · 执行失败${badge}`, template: 'red' }
-      : status === 'interrupted' ? { title: `${title} · 已中断${badge}`, template: 'grey' }
+    : status === 'failed' ? { title: `${title} · 执行失败${elapsed}${badge}`, template: 'red' }
+      : status === 'interrupted' ? { title: `${title} · 已中断${interruptedElapsed}${badge}`, template: 'grey' }
         : running
           ? { title: `${title} · ${isWakeup ? '后台唤醒进行中' : '进行中'}${elapsed}${badge}`, template: 'blue' }
           : { title: `${title} · 回复${badge}` };

@@ -1,10 +1,11 @@
 import { realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
+import { formatInlineCode, shortenHomePath } from './card-formatters.js';
 import type { Provider, WriteContext } from './contracts.js';
-import type { ChannelCard } from './feishu-cards.js';
-import { stripCardMentions } from './feishu-card-wire.js';
+import { providerBadgeColor, type ChannelCard, type ChannelCardSection } from './feishu-cards.js';
+import { escapeCardMarkdown, stripCardMentions } from './feishu-card-wire.js';
 import type { Authorize, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import type { FeishuSessionBinding } from './feishu-session-binding.js';
 import type { NewSessionDraft, NewSessionDrafts } from './new-session-drafts.js';
@@ -72,29 +73,116 @@ function button(label: string, value: NewSessionAction): ChannelCard['actions'][
   return { label, value };
 }
 
-function draftCard(draft: NewSessionDraft, providers: Provider[], explicitProject?: string): ChannelCard {
+export function draftCard(draft: NewSessionDraft, providers: Provider[], roots: readonly string[] = []): ChannelCard {
+  const explicitProject = draft.explicit_project;
   const preview = [...stripCardMentions(draft.initial_prompt ?? '')];
-  const labels = labelsFor(draft.projects);
+  const previewText = preview.length ? `${preview.slice(0, 180).join('')}${preview.length > 180 ? '…' : ''}` : '';
+  const providerActions: ChannelCard['actions'] = providers.map(p => ({
+    ...button(`${p === draft.provider ? '✓ ' : ''}${providerNames[p]}`, { action: 'new_provider', t: draft.token, r: draft.revision, p }),
+    type: p === draft.provider ? 'primary' as const : 'default' as const,
+  }));
+  const sections: ChannelCardSection[] = [
+    {
+      text: [
+        `🤖 **第 1 步 · 选择执行 Agent**\n当前后端：${providerNames[draft.provider]}`,
+        previewText ? `> 💬 首句任务：${escapeCardMarkdown(previewText)}` : '',
+      ].filter(Boolean).join('\n'),
+      actions: providerActions,
+    },
+  ];
+
+  const home = homedir();
+  const rootSet = new Set(roots);
+  type IndexedProject = { proj: string; index: number };
+  let explicitItem: IndexedProject | undefined;
+  const subprojects: IndexedProject[] = [];
+  const topWorkspaceRoots: IndexedProject[] = [];
+
+  draft.projects.forEach((proj, index) => {
+    if (explicitProject && proj === explicitProject) {
+      explicitItem = { proj, index };
+      return;
+    }
+    const hasStrictChild = draft.projects.some(other => other !== proj && within(other, proj))
+      || roots.some(other => other !== proj && within(other, proj));
+    const isTopRoot = rootSet.has(proj) && (
+      proj === home || dirname(proj) === home || hasStrictChild
+    );
+    if (isTopRoot) topWorkspaceRoots.push({ proj, index });
+    else subprojects.push({ proj, index });
+  });
+
+  if (explicitItem) {
+    const explicitLabel = explicitItem.proj === home
+      ? '~ (主目录)'
+      : (basename(explicitItem.proj) || shortenHomePath(explicitItem.proj));
+    sections.push({
+      dividerBefore: true,
+      text: `🎯 **指定目标文件夹**：\`${formatInlineCode(shortenHomePath(explicitItem.proj))}\`（点击下方按钮立即创建）`,
+      actions: [{
+        ...button(explicitLabel, { action: 'new_pick', t: draft.token, r: draft.revision, i: explicitItem.index }),
+        type: 'primary',
+      }],
+    });
+  }
+
+  const grouped = new Map<string, IndexedProject[]>();
+  for (const item of subprojects) {
+    const nonHomeAncestors = roots
+      .filter(r => r !== item.proj && r !== home && within(item.proj, r))
+      .sort((a, b) => b.length - a.length);
+    const groupRoot = nonHomeAncestors[0]
+      ?? (dirname(item.proj) === home && rootSet.has(home) ? home : dirname(item.proj));
+    const bucket = grouped.get(groupRoot) ?? [];
+    bucket.push(item);
+    grouped.set(groupRoot, bucket);
+  }
+
+  let groupIdx = 0;
+  for (const [groupRoot, items] of grouped.entries()) {
+    const relLabels = items.map(item => relative(groupRoot, item.proj).split(sep).join('/') || basename(item.proj) || item.proj);
+    const uniqueRel = new Set(relLabels).size === relLabels.length;
+    const finalLabels = uniqueRel ? relLabels : labelsFor(items.map(item => item.proj));
+    const stepHeader = groupIdx === 0
+      ? '**📂 第 2 步 · 选择会话所属文件夹**（点击即创建新话题）\n'
+      : '';
+    sections.push({
+      dividerBefore: groupIdx === 0,
+      text: `${stepHeader}📁 所属路径：\`${formatInlineCode(shortenHomePath(groupRoot))}\``,
+      actions: items.map((item, idx) =>
+        button(finalLabels[idx]!, { action: 'new_pick', t: draft.token, r: draft.revision, i: item.index }),
+      ),
+    });
+    groupIdx += 1;
+  }
+
+  if (topWorkspaceRoots.length > 0) {
+    const stepHeader = groupIdx === 0 && !explicitItem
+      ? '**📂 第 2 步 · 选择会话所属文件夹**（点击即创建新话题）\n'
+      : '';
+    sections.push({
+      dividerBefore: true,
+      text: `${stepHeader}🏠 **直接进入顶层工作区目录**`,
+      actions: topWorkspaceRoots.map(item =>
+        button(
+          item.proj === home ? '~ (主目录)' : shortenHomePath(item.proj),
+          { action: 'new_pick', t: draft.token, r: draft.revision, i: item.index },
+        ),
+      ),
+    });
+  }
+
+  const actions = sections.flatMap(sec => sec.actions ? [...sec.actions] : []);
+  const text = sections.map(sec => sec.text).filter(Boolean).join('\n\n');
   return {
+    schema: '2.0',
     title: '新建会话',
+    subtitle: '第 1 步选执行 Agent · 第 2 步点文件夹开启话题',
+    headerTags: [{ text: `Agent：${providerNames[draft.provider]}`, color: providerBadgeColor(draft.provider) }],
     template: 'blue',
-    format: 'plain',
-    text: [
-      `当前后端：${providerNames[draft.provider]}`,
-      explicitProject ? `指定目录：${explicitProject}` : '',
-      preview.length ? `首句任务：${preview.slice(0, 180).join('')}${preview.length > 180 ? '…' : ''}` : '',
-      '选择一个目录即可创建新会话。',
-    ].filter(Boolean).join('\n'),
-    actions: [
-      ...providers.map(p => ({
-        ...button(`${p === draft.provider ? '✓ ' : ''}${providerNames[p]}`, { action: 'new_provider', t: draft.token, r: draft.revision, p }),
-        type: p === draft.provider ? 'primary' as const : 'default' as const,
-      })),
-      ...labels.map((label, i) => ({
-        ...button(label, { action: 'new_pick', t: draft.token, r: draft.revision, i }),
-        ...(explicitProject && draft.projects[i] === explicitProject ? { type: 'primary' as const } : {}),
-      })),
-    ],
+    text,
+    sections,
+    actions,
   };
 }
 
@@ -165,8 +253,8 @@ export class NewSessionFlow {
       if (projects.size >= MAX_NEW_SESSION_PROJECTS) break;
     }
     await x.guard();
-    const draft = this.drafts.open(e, x.scope, a.provider ?? providers[0]!, [...projects], a.initialPrompt);
-    const messageId = await x.reply(draftCard(draft, providers, explicitProject), 'new-draft');
+    const draft = this.drafts.open(e, x.scope, a.provider ?? providers[0]!, [...projects], a.initialPrompt, explicitProject);
+    const messageId = await x.reply(draftCard(draft, providers, roots), 'new-draft');
     if (messageId) this.drafts.setCardMessage(draft.token, messageId);
     return { status: 'draft' };
   }
@@ -186,6 +274,7 @@ export class NewSessionFlow {
     }
     await x.guard();
     const providers = this.providers();
+    const roots = this.roots();
     if (a.action === 'new_provider') {
       if (!providers.includes(a.p)) return unavailable();
       const selected = this.drafts.selectProvider(a.t, a.r, a.p, e, x.scope);
@@ -195,12 +284,11 @@ export class NewSessionFlow {
         const current = this.drafts.get(a.t);
         if (current?.revision !== selected.revision || current.state !== 'open') throw new BindingExpired('draft changed');
       };
-      await this.port.update(e.destination, e.cardMessageId, draftCard(selected, providers), `new-provider:${a.t}:${selected.revision}`, guard);
+      await this.port.update(e.destination, e.cardMessageId, draftCard(selected, providers, roots), `new-provider:${a.t}:${selected.revision}`, guard);
       return { status: 'draft' };
     }
     const createOperationId = `new-session:${a.t}`;
     const context = {...x.context, operationId:createOperationId, idempotencyKey:createOperationId};
-    const roots = this.roots();
     const claimed = this.drafts.claim(a.t, a.r, a.i, e, x.scope, context,
       (provider, project) => providers.includes(provider) && realDirectory(project) === project && roots.some(root => within(project, root)),
       () => this.binding.recordPending(createOperationId, e, null, 'session', 'interactive', true));

@@ -39,7 +39,7 @@ function transport(dir: string) {
   let messageNumber = 0;
   const message: { create: (request: CardRequest) => Promise<unknown>; reply: () => Promise<unknown>; patch?: (request: CardRequest) => Promise<unknown> } = {
     create: async request => {
-      if (request.data.content.includes('Codex · /tmp · 空闲')) creates.push(titleOf(request));
+      if (request.data.content.includes('Codex · `/tmp` · 空闲')) creates.push(titleOf(request));
       return { code: 0, data: { message_id: `root-${++messageNumber}` } };
     },
     reply: async () => ({ code: 0, data: { message_id: 'reply' } }),
@@ -119,8 +119,12 @@ for (const rejectedWith of ['response', 'axios error'] as const) {
       assert.deepEqual(JSON.parse(requests[1]!.data.content), {
         schema: '2.0',
         config: { update_multi: true },
-        header: { title: { tag: 'plain_text', content: '🟢 旧话题的真实标题' } },
-        body: { elements: [{ tag: 'markdown', content: '**旧话题的真实标题**\nCodex · /tmp · 空闲' }] },
+        header: {
+          title: { tag: 'plain_text', content: '🟢 旧话题的真实标题' },
+          subtitle: { tag: 'plain_text', content: '/tmp · 空闲' },
+          text_tag_list: [{ tag: 'text_tag', text: { tag: 'plain_text', content: 'Codex' }, color: 'turquoise' }],
+        },
+        body: { elements: [{ tag: 'markdown', content: '**旧话题的真实标题**\nCodex · `/tmp` · 空闲' }] },
       });
       assert.ok(requests.every(request => request.path.message_id === 'legacy-root'));
 

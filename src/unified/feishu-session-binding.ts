@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import type { UnifiedService } from './adapter.js';
+import { formatInlineCode, shortenHomePath } from './card-formatters.js';
 import { shouldAutoQueueInput, type Operation, type Session, type WriteContext } from './contracts.js';
-import { operationCard, sessionCard, type ChannelCard } from './feishu-cards.js';
+import { operationCard, providerDisplayLabel, sessionCard, type ChannelCard } from './feishu-cards.js';
 import type { Authorize, AuthorizeBindingAdmin, ChannelAction, FeishuPort, TrustedEnvelope } from './feishu-channel.js';
 import { needsOperationNotice, operationFromReceipt, pendingSessionAuthorization } from './feishu-operation-notices.js';
 import type { NewSessionDraft, NewSessionDrafts } from './new-session-drafts.js';
@@ -404,8 +405,14 @@ export class FeishuSessionBinding {
   }
 
   async showDraftProgress(e: TrustedEnvelope, draft: NewSessionDraft, guard: Guard): Promise<void> {
+    const providerLabel = providerDisplayLabel(draft.provider);
+    const chosenProject = draft.chosen_index !== null ? draft.projects[draft.chosen_index] : undefined;
+    const folderLine = chosenProject ? `\n📂 **文件夹**：\`${formatInlineCode(shortenHomePath(chosenProject))}\`` : '';
     await this.patch(e.destination,e.cardMessageId!,{
-      title:'正在创建会话…',template:'blue',text:'新话题建立后可以直接打开。',
+      schema:'2.0',
+      title:`正在创建 ${providerLabel} 会话…`,
+      template:'blue',
+      text:`🤖 **Agent**：${providerLabel}${folderLine}\n新话题建立后可以直接打开。`,
       actions:[],
     },`${draft.create_operation_id}:draft-progress`,guard);
   }
@@ -788,9 +795,25 @@ export class FeishuSessionBinding {
                   this.channel.scope(draft.destination) !== draft.scope) throw new ReadAuthorizationRevoked('draft authorization changed');
             };
             const url = await this.port.topicLinkForSession?.(draft.destination,row.session_id);
+            let session: Session | undefined;
+            try { session = await this.service.getSession(row.session_id); } catch { /* fallback to draft metadata */ }
+            const provider = session?.native.provider ?? draft.provider;
+            const providerLabel = provider ? providerDisplayLabel(provider) : '';
+            const chosenProject = session?.project ?? (draft.chosen_index !== null ? draft.projects[draft.chosen_index] : undefined);
+            const shortPath = chosenProject ? formatInlineCode(shortenHomePath(chosenProject)) : '';
+            const contextLine = providerLabel && shortPath
+              ? `🤖 **Agent**：${providerLabel}  ｜  📂 **路径**：\`${shortPath}\`\n`
+              : providerLabel
+              ? `🤖 **Agent**：${providerLabel}\n`
+              : shortPath
+              ? `📂 **路径**：\`${shortPath}\`\n`
+              : '';
             try {
               await this.patch(draft.destination,draft.card_message_id,{
-                title:'会话已创建',template:'green',text:'在新话题中继续对话。',
+                schema:'2.0',
+                title:providerLabel ? `会话已创建 · ${providerLabel}` : '会话已创建',
+                template:'green',
+                text:`${contextLine}在新话题中继续对话。`,
                 actions:url ? [{label:'打开话题',value:{},url}] : [],
               },`${row.delivery_id}:draft`,draftGuard);
             } catch (error) {
