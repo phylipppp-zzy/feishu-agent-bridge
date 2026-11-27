@@ -1,6 +1,6 @@
 import type { QuestionForm } from './feishu-question-forms.js';
 import { questionDeclineAction, type Interaction, type Operation, type Provider, type Session } from './contracts.js';
-import { compactCardField, formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { compactCardField, formatApprovalAction, formatInlineCode, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 
 export function providerDisplayLabel(provider: Provider): string {
@@ -9,6 +9,43 @@ export function providerDisplayLabel(provider: Provider): string {
 
 export function providerTitlePrefix(provider: Provider): string {
   return provider === 'codex' ? 'Codex' : provider === 'agy' ? 'Antigravity' : 'Claude';
+}
+
+export type ChannelCardTagColor =
+  | 'blue'
+  | 'turquoise'
+  | 'green'
+  | 'orange'
+  | 'red'
+  | 'purple'
+  | 'indigo'
+  | 'wathet'
+  | 'yellow'
+  | 'carmine'
+  | 'violet'
+  | 'lime'
+  | 'neutral';
+
+export function providerBadgeColor(provider: Provider): ChannelCardTagColor {
+  return provider === 'agy' ? 'purple' : provider === 'codex' ? 'turquoise' : 'orange';
+}
+
+export interface ChannelCardHeaderTag {
+  text: string;
+  color?: ChannelCardTagColor;
+}
+
+export interface ChannelCardAction {
+  label: string;
+  value: Record<string, unknown>;
+  url?: string;
+  type?: 'primary' | 'default';
+}
+
+export interface ChannelCardSection {
+  text?: string;
+  dividerBefore?: boolean;
+  actions?: readonly ChannelCardAction[];
 }
 
 export interface ChannelCardTable {
@@ -20,13 +57,16 @@ export interface ChannelCardTable {
 export interface ChannelCard {
   schema?: '1.0' | '2.0';
   template?: 'blue' | 'green' | 'orange' | 'red' | 'grey';
+  subtitle?: string;
+  headerTags?: readonly ChannelCardHeaderTag[];
+  sections?: readonly ChannelCardSection[];
   format?: 'markdown' | 'plain';
   executionLog?: { count: number; lines: readonly string[]; failedCount?: number; runningNote?: string };
   form?: QuestionForm;
   title: string;
   text: string;
   table?: ChannelCardTable;
-  actions: Array<{ label: string; value: Record<string, unknown>; url?: string; type?: 'primary' | 'default' }>;
+  actions: ChannelCardAction[];
 }
 export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only' | 'interactive' = 'unbound',
   statusLabel = sessionStatusLabel(session.status)): ChannelCard {
@@ -41,13 +81,23 @@ export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only
   const template = accessMode === 'interactive' ? connected ? 'green' : 'orange'
     : accessMode === 'read_only' ? 'grey' : sessionStatusTemplate(session.status);
   const command = accessMode === 'unbound' ? null : formatResumeCommand(session.native);
-  return { title:session.title, ...(template ? { template } : {}), text:`${providerDisplayLabel(session.native.provider)} · ${escapeCardMarkdown(shortenHomePath(session.project))} · ${statusLabel}${access}${command ? `\n电脑端接回：\`${command}\`` : ''}`, actions:[
-    { label:'查看历史', value:{action:'history'} },
-    ...(accessMode === 'interactive' && connected ? [{ label:'切换模型', value:{action:'models'} }] : []),
-    ...controls,
-    { label:'查看文件', value:{action:'artifacts',sessionId:session.sessionId} },
-    { label:'会话控制', value:{action:'panel',sessionId:session.sessionId} },
-  ] };
+  const providerLabel = providerDisplayLabel(session.native.provider);
+  const shortProject = shortenHomePath(session.project);
+  return {
+    schema: '2.0',
+    title: session.title,
+    subtitle: `${shortProject} · ${statusLabel}`,
+    headerTags: [{ text: providerLabel, color: providerBadgeColor(session.native.provider) }],
+    ...(template ? { template } : {}),
+    text: `🤖 **${providerLabel}** · 📂 \`${formatInlineCode(shortProject)}\` · ${statusLabel}${access}${command ? `\n电脑端接回：\`${command}\`` : ''}`,
+    actions: [
+      { label:'查看历史', value:{action:'history'} },
+      ...(accessMode === 'interactive' && connected ? [{ label:'切换模型', value:{action:'models'} }] : []),
+      ...controls,
+      { label:'查看文件', value:{action:'artifacts',sessionId:session.sessionId} },
+      { label:'会话控制', value:{action:'panel',sessionId:session.sessionId} },
+    ],
+  };
 }
 
 function wasQuestionSkipped(interaction: Interaction): boolean {

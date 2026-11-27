@@ -25,6 +25,7 @@ const WAVE2_BINDING_EXEMPT_ACTIONS = new Set([
   'bind',
   'list',
   'agy_status',
+  'usage_report',
   'new_help',
   'new_provider',
   'new_pick',
@@ -138,6 +139,18 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     case 'pending':
     case 'agy_status':
     case 'pending_open': return {action:value.action};
+    case 'usage_report': {
+      const trigger = value.trigger === 'message' ? 'message' : value.trigger === 'card' || value.trigger === undefined ? 'card' : null;
+      const range = value.range === undefined ? undefined : (value.range === 'today' || value.range === 'd7' || value.range === 'd30' ? value.range : null);
+      if (trigger && range !== null) {
+        return {
+          action: 'usage_report',
+          trigger,
+          ...(range ? { range } : {}),
+        } as unknown as RuntimeTrustedAction;
+      }
+      break;
+    }
     case 'history': if (value.cursor === undefined || str(value.cursor)) { const taskScope = parseTaskScope(value, false); return {action:'history',...(str(value.cursor) ? {cursor:value.cursor}:{}),...(taskScope ?? {})}; } break;
     case 'upgrade': return {action:'upgrade'};
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
@@ -292,7 +305,7 @@ export const KNOWN_BRIDGE_COMMANDS: ReadonlySet<string> = new Set([
   '/attach', '/stop', '/cancel', '/control', '/settings', '/notifications', '/archive',
   '/create', '/answer', '/queue', '/steer', '/', '/status', '/menu', '/panel', '/ls',
   '/deliver', '/export', '/history', '/file', '/files', '/models', '/pending', '/ops',
-  '/health', '/quota', '/agy', '/agy-status', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
+  '/health', '/quota', '/agy', '/agy-status', '/rename', '/upgrade', '/unbind', '/task', '/handoff', '/finish', '/reconcile',
 ]);
 
 export function isBridgeCommand(command: string): boolean {
@@ -363,7 +376,7 @@ function parseLeadingPathToken(tail: string): { path: string; rest: string } | n
       if (ch === quote) {
         const after = tail.slice(i + 1);
         if (after.length > 0 && !/^\s/.test(after)) return null;
-        if (!value || (!value.startsWith('/') && !value.startsWith('~/'))) return null;
+        if (!value || (value !== '~' && !value.startsWith('/') && !value.startsWith('~/'))) return null;
         return { path: value, rest: after.trimStart() };
       }
       value += ch;
@@ -374,7 +387,7 @@ function parseLeadingPathToken(tail: string): { path: string; rest: string } | n
   const match = /^(\S+)/.exec(tail);
   if (!match) return null;
   const token = match[1]!;
-  if (!token.startsWith('/') && !token.startsWith('~/')) return null;
+  if (token !== '~' && !token.startsWith('/') && !token.startsWith('~/')) return null;
   return { path: token, rest: tail.slice(token.length).trimStart() };
 }
 
@@ -459,7 +472,8 @@ export function parseFeishuText(text: string, options?: { passthroughUnknownSlas
     case '/export': if (!rest) return {action:'export'}; break;
     case '/history': return {action:'history',...(rest ? {cursor:rest}:{})};
     case '/file':
-    case '/files': return {action:'artifacts'};
+    case '/files':
+      return rest ? {action:'deliver_files',args:input.slice(command.length).trim()} : {action:'artifacts'};
     case '/models': return {action:'models'};
     case '/pending': if (!parts.length) return {action:'pending_open'}; break;
     case '/ops': if (!parts.length) return {action:'pending'}; break;

@@ -12,7 +12,7 @@ type DraftRow = {
   create_operation_id: string | null; chosen_index: number | null; create_context: WriteContext | null;
 };
 type DraftSqlRow = Omit<DraftRow, 'projects' | 'create_context'> & { projects: string; create_context: string | null };
-export type NewSessionDraft = DraftRow;
+export type NewSessionDraft = DraftRow & { explicit_project?: string };
 export type FirstPrompt = {
   create_operation_id: string; child_operation_id: string; destination: string;
   session_id: string; final_scope: string; identity: string; prompt_text: string;
@@ -20,6 +20,8 @@ export type FirstPrompt = {
 };
 
 export class NewSessionDrafts {
+  private readonly explicitProjects = new Map<string, string>();
+
   constructor(private readonly db: DatabaseSync) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS channel_new_session_drafts (
@@ -37,7 +39,12 @@ export class NewSessionDrafts {
   }
 
   private decode(row: DraftSqlRow | undefined): NewSessionDraft | undefined {
-    return row && { ...row, projects: JSON.parse(row.projects), create_context: row.create_context && JSON.parse(row.create_context) };
+    return row && {
+      ...row,
+      projects: JSON.parse(row.projects),
+      create_context: row.create_context && JSON.parse(row.create_context),
+      ...(this.explicitProjects.has(row.token) ? { explicit_project: this.explicitProjects.get(row.token)! } : {}),
+    };
   }
 
   get(token: string): NewSessionDraft | undefined {
@@ -49,10 +56,26 @@ export class NewSessionDrafts {
       .get(operationId) as DraftSqlRow | undefined);
   }
 
-  open(e: TrustedEnvelope, scope: string, provider: Provider, projects: string[], initialPrompt?: string): NewSessionDraft {
+  open(
+    e: TrustedEnvelope,
+    scope: string,
+    provider: Provider,
+    projects: string[],
+    initialPrompt?: string,
+    explicitProject?: string,
+  ): NewSessionDraft {
     const token = randomBytes(16).toString('base64url');
     const now = Date.now();
+    const expired = this.db.prepare("SELECT token FROM channel_new_session_drafts WHERE state='open' AND expires_at<=?").all(now) as Array<{ token: string }>;
+    for (const item of expired) this.explicitProjects.delete(item.token);
     this.db.prepare("DELETE FROM channel_new_session_drafts WHERE state='open' AND expires_at<=?").run(now);
+    if (explicitProject) {
+      if (this.explicitProjects.size >= 512) {
+        const oldest = this.explicitProjects.keys().next().value;
+        if (oldest !== undefined) this.explicitProjects.delete(oldest);
+      }
+      this.explicitProjects.set(token, explicitProject);
+    }
     this.db.prepare(`
       INSERT INTO channel_new_session_drafts
         (token,event_id,owner,destination,scope,provider,projects,initial_prompt,revision,expires_at,state)

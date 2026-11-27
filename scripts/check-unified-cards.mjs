@@ -13,6 +13,10 @@ import { packCardCallbacks } from '../dist/src/unified/feishu-callback-values.js
 import { turnProgressCard } from '../dist/src/unified/turn-progress-card.js';
 import { summarizeTool } from '../dist/src/unified/tool-progress.js';
 import { renderPendingItemCard } from '../dist/src/unified/hubs/pending-cards.js';
+import { renderUsageDashboardCard } from '../dist/src/unified/hubs/usage-cards.js';
+import { sessionCard } from '../dist/src/unified/feishu-cards.js';
+import { sessionListCard } from '../dist/src/unified/session-list-card.js';
+import { topicRootCard } from '../dist/src/unified/topic-title-sync.js';
 
 async function readEnv() {
   for (const name of ['feishu-claude-bridge', 'feishu-codex-bridge']) {
@@ -135,6 +139,69 @@ const channelCards = {
     text: '终端已无待审批信号。',
     actions: [],
   },
+  usageDashboardV2: renderUsageDashboardCard({
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    summary: {
+      today: { requests: 120, input: 5_000_000, output: 120_000, cached: 4_500_000, total_tokens: 5_120_000, cache_hit_ratio: 0.9, cost_usd: 18.5 },
+      yesterday: { requests: 100, input: 4_000_000, output: 100_000, cached: 3_600_000, total_tokens: 4_100_000, cache_hit_ratio: 0.9, cost_usd: 15.0 },
+      d7: { requests: 800, input: 35_000_000, output: 900_000, cached: 31_000_000, total_tokens: 35_900_000, cache_hit_ratio: 0.89, cost_usd: 120.0 },
+      d30: { requests: 3000, input: 150_000_000, output: 4_000_000, cached: 135_000_000, total_tokens: 154_000_000, cache_hit_ratio: 0.9, cost_usd: 450.0 },
+    },
+    backends: [
+      {
+        id: 'antigravity',
+        name: 'Antigravity',
+        status: 'ok',
+        quota: { stale: false, windows: [{ group: 'Gemini', label: 'Gemini 5小时', window_type: '5h', remaining_percent: 78, resets_at: new Date(Date.now() + 7200_000).toISOString() }] },
+        today: { requests: 60, total_tokens: 2_500_000, cost_usd: 10.5 },
+        models_today: [
+          { model: 'gemini-4-carbon', requests: 40, total_tokens: 2_000_000, cache_hit_ratio: 0.92, cost_usd: 9.0 },
+          { model: 'gemini-4-hydrogen', requests: 20, total_tokens: 500_000, cache_hit_ratio: 0.85, cost_usd: 1.5 },
+        ],
+      },
+      {
+        id: 'codex',
+        name: 'Codex',
+        status: 'ok',
+        quota: { stale: false, windows: [{ group: 'Codex', label: '周额度', window_type: 'weekly', remaining_percent: 42, resets_at: new Date(Date.now() + 86400_000).toISOString() }] },
+        today: { requests: 60, total_tokens: 2_620_000, cost_usd: 8.0 },
+        models_today: [{ model: 'gpt-6.2-astra', requests: 60, total_tokens: 2_620_000, cache_hit_ratio: 0.95, cost_usd: 8.0 }],
+      },
+    ],
+    claude_cycles: [{ period: '11-24 ~ 12-01', current: true, total_requests: 50, total_tokens: 1_200_000, local_cost_usd: 6.2, site_cost_usd: 6.1 }],
+  }),
+  sessionListV2WithSections: sessionListCard([{
+    sessionId: 'sess_1',
+    native: { provider: 'agy', hostId: 'local', serviceId: 'svc', nativeSessionId: 'uuid-1' },
+    project: '/home/zhangzy/workspace/feishu-agent-bridge',
+    title: '重构新建对话卡片',
+    status: 'idle',
+    revision: 1,
+    updatedAt: new Date().toISOString(),
+    capabilities: { view: { status: 'available' } },
+    control: { serviceId: 'svc', owner: 'feishu', input: 'available', generation: 1, operationId: null, reason: null },
+  }], { providerFilters: true, provider: 'all' }),
+  sessionInteractiveV2: sessionCard({
+    sessionId: 'sess_1',
+    native: { provider: 'agy', hostId: 'local', serviceId: 'svc', nativeSessionId: 'uuid-1' },
+    project: '/home/zhangzy/workspace/feishu-agent-bridge',
+    title: '重构新建对话卡片',
+    status: 'idle',
+    revision: 1,
+    capabilities: { view: { status: 'available' } },
+    control: { serviceId: 'svc', owner: 'feishu', input: 'available', generation: 1, operationId: null, reason: null },
+  }, 'interactive'),
+  topicRootV2: topicRootCard({
+    sessionId: 'sess_1',
+    native: { provider: 'agy', hostId: 'local', serviceId: 'svc', nativeSessionId: 'uuid-1' },
+    project: '/home/zhangzy/workspace/feishu-agent-bridge',
+    title: '重构新建对话卡片',
+    status: 'running',
+    revision: 1,
+    capabilities: { view: { status: 'available' } },
+    control: { serviceId: 'svc', owner: 'feishu', input: 'available', generation: 1, operationId: null, reason: null },
+  }),
 };
 
 let failed = 0;

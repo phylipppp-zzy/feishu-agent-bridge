@@ -18,8 +18,21 @@ const codexAutoAllowMcpTools = new Set([
   'codex_engineer',
   'codex_review',
   'codex_followup',
+  'codex_agent',
+  'agent_dispatch',
+  'agent_job',
+  'agent_status',
 ]);
-const trustedCodexServers = new Set(['codex', 'codex-bridge', 'codex_bridge', 'codex-bridge_codex']);
+const trustedCodexServers = new Set([
+  'codex',
+  'codex-bridge',
+  'codex_bridge',
+  'codex-bridge_codex',
+  'codex-bridge_mcp',
+  'agent-dispatch',
+  'agent_dispatch',
+  'agent-dispatch_mcp',
+]);
 const safeReadOnlyKinds = new Set(['read', 'search', 'fetch', 'other']);
 const safeCodexMcpKinds = new Set([...safeReadOnlyKinds, 'execute', 'edit', 'call', 'mcp']);
 const mcpWrapperTools = new Set(['call_mcp_tool', 'mcp_call', 'use_mcp_tool']);
@@ -238,6 +251,16 @@ function matchTrustedReadOnlyTool(rawName: string, serverName?: string): string 
   if (mcpSlash && trustedCodexServers.has(mcpSlash[1]!) && codexAutoAllowMcpTools.has(mcpSlash[2]!)) {
     if (normalizedServer && normalizedServer !== mcpSlash[1]) return null;
     return mcpSlash[2]!;
+  }
+  for (const trusted of trustedCodexServers) {
+    const singlePrefix = `mcp_${trusted}_`;
+    if (lower.startsWith(singlePrefix)) {
+      const leaf = lower.slice(singlePrefix.length);
+      if (codexAutoAllowMcpTools.has(leaf)) {
+        if (normalizedServer && normalizedServer !== trusted) return null;
+        return leaf;
+      }
+    }
   }
   return null;
 }

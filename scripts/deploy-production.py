@@ -15,7 +15,7 @@ RELEASES_ROOT = Path('/home/zhangzy/.local/share/feishu-unified-bridge/releases'
 CONF_DIR = Path('/home/zhangzy/.config/feishu-unified-bridge')
 CONF_FILE = CONF_DIR / 'config.json'
 UNIT_FILE = Path('/home/zhangzy/.config/systemd/user/feishu-unified-production.service')
-PARENT_RELEASE = 'ebee30d-uxv2-7691b684804b'
+PARENT_RELEASE = '607c887-agy-320eaa1fba6a'
 
 def validate_agy_sandbox(runtime):
     approval_disabled = runtime.get('approvalPolicy', {}).get('enabled') is False
@@ -129,7 +129,15 @@ try:
     proj_roots = r['allowedProjectRoots']
     ok(isinstance(proj_roots, list) and len(proj_roots) >= 1 and all(Path(x).is_dir() and Path(x).resolve().is_relative_to('/home/zhangzy') for x in proj_roots))
     paths = [r['coreDb'], r['channelDb'], r['artifactStatePath'], c['sdkDb']]
-    ok(len(set(paths)) == 4 and all(Path(x).parent.resolve() == STATE.resolve() for x in paths))
+    usage_hub = r.get('usageHub')
+    if isinstance(usage_hub, dict) and usage_hub.get('enabled') is True:
+        usage_dest = usage_hub.get('destination')
+        ok(isinstance(usage_dest, str) and bool(usage_dest.strip()) and usage_dest.strip() not in r['allowedDestinations'])
+        usage_db = usage_hub.get('dbPath', str(STATE / 'usage-hub.sqlite'))
+        ok(isinstance(usage_db, str) and bool(usage_db.strip()))
+        paths.append(usage_db)
+    resolved_paths = [Path(x).resolve() for x in paths]
+    ok(len(set(resolved_paths)) == len(paths) and all(x.parent == STATE.resolve() for x in resolved_paths))
     ok(Path(r['claudeStateDir']).is_dir())
     allowed_output_bases = (Path('/home/zhangzy').resolve(), Path('/data/zhangzy').resolve(), Path('/ssd/zhangzy').resolve())
     ok(all(Path(x).is_dir() and any(Path(x).resolve().is_relative_to(base) for base in allowed_output_bases) for x in r['outputRoots']))
@@ -262,6 +270,13 @@ agy['extraWriteRoots'] = [
     '/data/zhangzy/outputs',
     '/data/zhangzy/staging',
 ]
+usage_hub = rt.setdefault('usageHub', {
+    'enabled': True,
+    'destination': 'oc_d7baeebbf218aebad70265c1b0f1a104',
+})
+if isinstance(usage_hub, dict):
+    usage_hub.setdefault('dbPath', '/home/zhangzy/.local/state/feishu-unified-bridge/usage-hub.sqlite')
+    usage_hub.setdefault('intervalMinutes', 60)
 
 validate_agy_sandbox(rt)
 tmp_cfg = None

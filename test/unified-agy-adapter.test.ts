@@ -1796,7 +1796,7 @@ test('Three-backend coexistence (/sessions, /new, /create, /health) & createLive
       assert.match(listAllCard.text, /Claude Task/);
       assert.match(listAllCard.text, /Codex Task/);
       assert.match(listAllCard.text, /Agy Existing Work/);
-      assert.match(listAllCard.text, /Antigravity · proj/);
+      assert.match(listAllCard.text, /Antigravity · `[^`]*proj`/);
       assert.ok(listAllCard.actions.some((a) => a.label === 'Antigravity'));
 
       await sendCmd('ev-list-agy', 'chat-main', { action: 'list', search: 'antigravity' });

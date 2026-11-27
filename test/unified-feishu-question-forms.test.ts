@@ -111,7 +111,7 @@ test('SDK PATCH honors persisted schema pins when a form is replaced after resta
   await port.update(destination,'root',{...ordinary,schema:'2.0'},'title');
   assert.deepEqual(patches.map(card=>card.schema),['2.0',undefined]);
   const {elements}=patches[0]!.body as {elements:Array<Record<string,unknown>>};
-  assert.deepEqual(elements[1],{tag:'column_set',flex_mode:'flow',columns:[
+  assert.deepEqual(elements[1],{tag:'column_set',flex_mode:'flow',horizontal_spacing:'8px',horizontal_align:'left',columns:[
    {tag:'column',width:'auto',elements:[{tag:'button',text:{tag:'plain_text',content:'打开'},type:'default',behaviors:[{type:'open_url',default_url:actions[0]!.url}]}]},
    {tag:'column',width:'auto',elements:[{tag:'button',text:{tag:'plain_text',content:'返回'},type:'default',behaviors:[{type:'callback',value:{action:'history'}}]}]},
   ]});

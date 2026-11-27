@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DispatchGuard, PlatformObservation, PlatformPort } from '../src/unified/adapter.js';
-import { formatApprovalAction } from '../src/unified/card-formatters.js';
+import { formatApprovalAction, shortenHomePath } from '../src/unified/card-formatters.js';
 import {
   payloadDigest,
   type Answer,
@@ -213,9 +213,10 @@ test('formatApprovalAction renders MCP and structured non-shell/file tools witho
     JSON.stringify({ name: 'write_file', args: { Path: '/home/zhangzy/scripts/codex_dispatch.py', Content: 'hidden-body' } }),
     'this_request',
   );
+  const expectedShortPath = shortenHomePath('/home/zhangzy/scripts/codex_dispatch.py');
   assert.equal(writeFileView.toolLabel, '写入文件');
-  assert.equal(writeFileView.compactTarget, '/home/zhangzy/scripts/codex_dispatch.py');
-  assert.ok(writeFileView.text.includes('/home/zhangzy/scripts/codex_dispatch.py'));
+  assert.equal(writeFileView.compactTarget, expectedShortPath);
+  assert.ok(writeFileView.text.includes(expectedShortPath));
   assert.doesNotMatch(writeFileView.text, /hidden-body/);
 
   const emptyView = formatApprovalAction('unknown_tool', '{}', 'this_request');

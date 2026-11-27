@@ -7,12 +7,14 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   FeishuSendError,
   MAX_FEISHU_IMAGE_BYTES,
+  inferFeishuUploadFileType,
   inspectSendableFiles,
   listFeishuTopics,
   parseEnvFile,
   resolveFeishuTarget,
   sendToFeishu,
   type FeishuSendTransport,
+  type FeishuUploadFileType,
   type ResolvedSendTarget,
 } from '../src/unified/feishu-send.js';
 import { runFeishuSendCli } from '../src/unified/feishu-send-cli.js';
@@ -102,8 +104,8 @@ function createMockTransport() {
       calls.push({ kind: 'image', target, detail: { fileName, size: content.length } });
       return { messageId: `om_msg_${++seq}`, imageKey: `img_key_${seq}` };
     },
-    async sendFile(target, fileName, content) {
-      calls.push({ kind: 'file', target, detail: { fileName, size: content.length } });
+    async sendFile(target, fileName, content, fileType) {
+      calls.push({ kind: 'file', target, detail: { fileName, size: content.length, fileType } });
       return { messageId: `om_msg_${++seq}`, fileKey: `file_key_${seq}` };
     },
   };
@@ -305,6 +307,142 @@ test('runFeishuSendCli handles --list-topics, --json, and error exit codes', asy
     });
     assert.equal(failCode, 1);
     assert.equal(JSON.parse(errOut.join('\n')).code, 'invalid_argument');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('listFeishuTopics and --latest exclude internal hub/task routes and prioritize core.sqlite updatedAt DESC', async () => {
+  const { dir, dbPath, coreDbPath, configPath, envPath } = makeTempEnv();
+  try {
+    const sdkDb = new DatabaseSync(dbPath);
+    sdkDb.prepare('INSERT INTO sdk_topic_routes VALUES (?, ?, ?, ?, ?)').run(
+      'topic:om_watch_root',
+      'oc_main_chat',
+      'om_watch_root',
+      'omt_watch',
+      'watch-hub:root',
+    );
+    sdkDb.prepare('INSERT INTO sdk_topic_routes VALUES (?, ?, ?, ?, ?)').run(
+      'topic:om_pending_root',
+      'oc_main_chat',
+      'om_pending_root',
+      'omt_pending',
+      'pending-hub:root',
+    );
+    sdkDb.prepare('INSERT INTO sdk_topic_routes VALUES (?, ?, ?, ?, ?)').run(
+      'topic:om_task_root',
+      'oc_main_chat',
+      'om_task_root',
+      'omt_task',
+      'task:alpha',
+    );
+    sdkDb.close();
+
+    const coreDb = new DatabaseSync(coreDbPath);
+    // Give older rowid om_root_1 a NEWER updatedAt than om_root_3
+    coreDb.prepare('INSERT OR REPLACE INTO sessions VALUES (?, ?)').run(
+      'agy:local:default:aaaa-1111',
+      JSON.stringify({
+        sessionId: 'agy:local:default:aaaa-1111',
+        title: '最近活跃会话',
+        updatedAt: '2026-11-27T15:30:00.000Z',
+        native: { provider: 'agy', hostId: 'local', serviceId: 'default', nativeSessionId: 'aaaa-1111' },
+      }),
+    );
+    coreDb.prepare('INSERT OR REPLACE INTO sessions VALUES (?, ?)').run(
+      'session_deadbeef1234',
+      JSON.stringify({
+        sessionId: 'session_deadbeef1234',
+        title: '较早会话',
+        updatedAt: '2026-11-27T08:00:00.000Z',
+        native: { provider: 'agy', hostId: 'local', serviceId: 'default', nativeSessionId: 'e1530534-test-uuid' },
+      }),
+    );
+    coreDb.close();
+
+    const topics = listFeishuTopics(dbPath, 20, coreDbPath);
+    assert.equal(topics.length, 3);
+    assert.ok(topics.every((t) => !t.sessionId.startsWith('watch-hub:') && !t.sessionId.startsWith('pending-hub:') && !t.sessionId.startsWith('task:')));
+    assert.equal(topics[0]!.rootId, 'om_root_1');
+    assert.equal(topics[1]!.rootId, 'om_root_3');
+
+    const latestTarget = resolveFeishuTarget({ latest: true, sdkDbPath: dbPath, coreDbPath });
+    assert.equal(latestTarget.kind, 'topic');
+    assert.equal(latestTarget.rootMessageId, 'om_root_1');
+
+    const { transport, calls } = createMockTransport();
+    const sent = await sendToFeishu({
+      latest: true,
+      caption: '仅发送纯文本进度简报',
+      configPath,
+      envPath,
+      transport,
+    });
+    assert.equal(sent.target.kind, 'topic');
+    assert.equal(sent.target.rootMessageId, 'om_root_1');
+    assert.equal(sent.files.length, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.kind, 'text');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('inferFeishuUploadFileType maps document/media extensions and sendToFeishu supports standalone caption/title', async () => {
+  const expected: Array<[string, FeishuUploadFileType]> = [
+    ['paper.PDF', 'pdf'],
+    ['draft.doc', 'doc'],
+    ['draft.docx', 'doc'],
+    ['table.xls', 'xls'],
+    ['table.xlsx', 'xls'],
+    ['slides.ppt', 'ppt'],
+    ['slides.pptx', 'ppt'],
+    ['demo.mp4', 'mp4'],
+    ['voice.opus', 'opus'],
+    ['notes.md', 'stream'],
+    ['archive.tar.gz', 'stream'],
+  ];
+  for (const [name, ft] of expected) {
+    assert.equal(inferFeishuUploadFileType(name), ft);
+  }
+
+  const { dir, configPath, envPath } = makeTempEnv();
+  try {
+    const pdfPath = join(dir, 'paper.pdf');
+    const xlsxPath = join(dir, 'metrics.xlsx');
+    writeFileSync(pdfPath, '%PDF-1.7 test content');
+    writeFileSync(xlsxPath, 'PK\x03\x04xlsx content');
+
+    const { transport, calls } = createMockTransport();
+    const fileRes = await sendToFeishu({
+      files: [pdfPath, xlsxPath],
+      configPath,
+      envPath,
+      transport,
+    });
+    assert.equal(fileRes.files[0]!.fileType, 'pdf');
+    assert.equal(fileRes.files[1]!.fileType, 'xls');
+    assert.equal(calls[0]!.detail.fileType, 'pdf');
+    assert.equal(calls[1]!.detail.fileType, 'xls');
+
+    // Standalone card without files
+    const cardOnly = await sendToFeishu({
+      title: '实验完成通知',
+      caption: '全部指标已收敛通过',
+      configPath,
+      envPath,
+      transport,
+    });
+    assert.equal(cardOnly.files.length, 0);
+    assert.ok(cardOnly.captionMessageId);
+    assert.equal(calls[2]!.kind, 'card');
+
+    // Neither files nor caption/title -> invalid_argument
+    await assert.rejects(
+      () => sendToFeishu({ files: [], configPath, envPath, transport }),
+      (err: unknown) => err instanceof FeishuSendError && err.code === 'invalid_argument',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
