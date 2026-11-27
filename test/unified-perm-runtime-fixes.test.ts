@@ -357,6 +357,10 @@ test('adapter-permission: ArtifactMetadata, read-only MCP/search_web, brain/<ses
       { kind: 'execute', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_engineer' } },
       { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_review' } },
       { kind: 'edit', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_followup' } },
+      { kind: 'execute', name: 'call_mcp_tool', rawInput: { ServerName: 'codex-bridge_codex', ToolName: 'codex_agent' } },
+      { kind: 'execute', name: 'call_mcp_tool', rawInput: { ServerName: 'agent-dispatch_mcp', ToolName: 'agent_dispatch' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'agent-dispatch_mcp', ToolName: 'agent_job' } },
+      { kind: 'other', name: 'call_mcp_tool', rawInput: { ServerName: 'agent-dispatch_mcp', ToolName: 'agent_status' } },
     ]) {
       assert.equal((await classifyAgyPermission(tool, project, scope)).kind, 'allow_once', JSON.stringify(tool));
       assert.equal((await classifyAgyPermission(tool, project, { enabled: false })).kind, 'ask', JSON.stringify(tool));

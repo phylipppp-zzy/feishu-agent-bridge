@@ -233,7 +233,8 @@ function extractPrefixedMcpToolName(tool: string, detail?: Record<string, unknow
 function formatPrefixedMcpLabel(raw: string): string {
   const withoutPrefix = raw.replace(/^mcp_/iu, '');
   if (withoutPrefix.startsWith('agy-fast_fast_')) return `MCP · agy-fast/${withoutPrefix.slice('agy-fast_fast_'.length)}`;
-  if (withoutPrefix.startsWith('codex-bridge_codex_')) return `MCP · codex/${withoutPrefix.slice('codex-bridge_codex_'.length)}`;
+  if (withoutPrefix.startsWith('agent-dispatch_mcp_')) return `MCP · agent-dispatch/${withoutPrefix.slice('agent-dispatch_mcp_'.length)}`;
+  if (withoutPrefix.startsWith('codex-bridge_codex_')) return `MCP · agent-dispatch/${withoutPrefix.slice('codex-bridge_codex_'.length)}`;
   return `MCP · ${shorten(withoutPrefix, 24, '…')}`;
 }
 

@@ -78,7 +78,7 @@ function formatRunningNote(active: readonly ToolProgress[]): string | undefined 
   if (!active.length) return undefined;
   const latest = active.at(-1)!;
   const extra = active.length > 1 ? `（另有 ${active.length - 1} 项并行）` : '';
-  if (/^(?:⚡ Codex MCP|🤖|🐝)/u.test(latest.summary)) {
+  if (/^(?:⚡ (?:Agent|Codex) MCP|🤖|🐝)/u.test(latest.summary)) {
     return `⏳ ${latest.summary}${extra}`;
   }
   if (latest.tool === 'thinking') {
@@ -93,7 +93,7 @@ function formatDelegatedStatus(
 ): string {
   const deduped = new Map<string, ToolProgress>();
   for (const item of tools) {
-    if (DELEGATED_TOOLS.has(item.tool) || (item.tool === 'call_mcp_tool' && item.summary.startsWith('⚡ Codex MCP'))) {
+    if (DELEGATED_TOOLS.has(item.tool) || (item.tool === 'call_mcp_tool' && /^⚡ (?:Agent|Codex) MCP/u.test(item.summary))) {
       deduped.delete(item.callId);
       deduped.set(item.callId, item);
     }

@@ -12,6 +12,10 @@ const commandTools = new Set(['execute', 'run_command']);
 const readTools = new Set(['read', 'read_file', 'view_file', 'list_directory', 'list_dir', 'search', 'grep_search']);
 const builtinAutoAllowTools = new Set(['search_web', 'list_resources', 'read_resource']);
 const codexAutoAllowMcpTools = new Set([
+  'agent_dispatch',
+  'agent_job',
+  'agent_status',
+  'codex_agent',
   'codex_lookup',
   'codex_status',
   'codex_job',
@@ -19,7 +23,15 @@ const codexAutoAllowMcpTools = new Set([
   'codex_review',
   'codex_followup',
 ]);
-const trustedCodexServers = new Set(['codex', 'codex-bridge', 'codex_bridge', 'codex-bridge_codex']);
+const trustedCodexServers = new Set([
+  'agent-dispatch',
+  'agent_dispatch',
+  'agent-dispatch_mcp',
+  'codex',
+  'codex-bridge',
+  'codex_bridge',
+  'codex-bridge_codex',
+]);
 const safeReadOnlyKinds = new Set(['read', 'search', 'fetch', 'other']);
 const safeCodexMcpKinds = new Set([...safeReadOnlyKinds, 'execute', 'edit', 'call', 'mcp']);
 const mcpWrapperTools = new Set(['call_mcp_tool', 'mcp_call', 'use_mcp_tool']);

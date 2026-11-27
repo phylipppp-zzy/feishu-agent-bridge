@@ -107,7 +107,11 @@ test('Swarm, subagent, thinking, and wakeup progress cards render clear Chinese 
   assert.equal(summarizeTool('swarm_wait', { since: 10 }).summary, '🐝 Swarm 等待成员回报');
   assert.equal(summarizeTool('post_message', { text: 'hi' }).summary, '🐝 Swarm 协作板发帖');
   assert.equal(summarizeTool('invoke_subagent', { Role: 'Codebase Auditor' }).summary, '🤖 派发子代理：Codebase Auditor');
-  assert.equal(summarizeTool('call_mcp_tool', { ToolName: 'codex_engineer' }).summary, '⚡ Codex MCP (工程实现)');
+  assert.equal(summarizeTool('call_mcp_tool', { ToolName: 'codex_engineer' }).summary, '⚡ Agent MCP (工程实现)');
+  assert.equal(
+    summarizeTool('call_mcp_tool', { ServerName: 'agent-dispatch_mcp', ToolName: 'agent_dispatch', Arguments: { model: 'carbon-high' } }).summary,
+    '⚡ Agent MCP (carbon-high · 跨模型调度)',
+  );
 
   const swarmCard = turnProgressCard({
     provider: 'agy',
@@ -148,26 +152,27 @@ test('Swarm, subagent, thinking, and wakeup progress cards render clear Chinese 
   assert.equal(wakeupCard.text, '🤖 后台异步唤醒处理中…');
 });
 
-test('Codex MCP progress uses only allowlisted metadata and recognizes delegation helpers', () => {
+test('Agent MCP progress uses only allowlisted metadata and recognizes delegation helpers', () => {
   const actions = {
+    agent_dispatch: '跨模型调度', codex_agent: '跨模型调度',
     codex_engineer: '工程实现', codex_review: '代码审查', codex_followup: '续接会话',
-    codex_lookup: '低成本检索', codex_status: '状态查询',
+    codex_lookup: '低成本检索', agent_status: '状态查询', codex_status: '状态查询',
   };
   for (const [ToolName, label] of Object.entries(actions)) {
     assert.equal(summarizeTool('call_mcp_tool', {
-      ServerName: 'codex-bridge_codex', ToolName,
+      ServerName: 'agent-dispatch_mcp', ToolName,
       Arguments: { tier: 'astra-deep', prompt: 'private prompt', api_key: 'secret token' },
-    }).summary, `⚡ Codex MCP (astra-deep · ${label})`);
+    }).summary, `⚡ Agent MCP (astra-deep · ${label})`);
   }
   for (const [action, label] of Object.entries({ wait: '等待作业', query: '查询作业', cancel: '取消作业' })) {
     assert.equal(summarizeTool('call_mcp_tool', {
-      server_name: 'codex-bridge_codex', tool_name: 'codex_job',
+      server_name: 'agent-dispatch_mcp', tool_name: 'agent_job',
       arguments: { action, tier: 'private prompt', job_id: 'job-20261125-175934-314ddb40' },
-    }).summary, `⚡ Codex MCP (${label} …314ddb40)`);
+    }).summary, `⚡ Agent MCP (${label} …314ddb40)`);
   }
   assert.equal(summarizeTool('call_mcp_tool', {
     ServerName: 'codex-bridge_codex', ToolName: 'unrecognized', Arguments: { tier: 'secret', job_id: 'sk-credentials' },
-  }).summary, '⚡ Codex MCP (工具调用)');
+  }).summary, '⚡ Agent MCP (工具调用)');
   assert.equal(summarizeTool('call_mcp_tool', { ToolName: 'lookup_paper' }).summary, '🔌 MCP：lookup_paper');
   assert.equal(summarizeTool('manage_subagents', {}).summary, '🤖 管理子代理');
   assert.equal(summarizeTool('send_message', { message: 'private prompt' }).summary, '🤖 通知子代理');
@@ -189,14 +194,14 @@ test('turn progress keeps active delegated calls before main completion and coll
   assert.equal(lines.length, 10);
   assert.deepEqual(lines.slice(0, 5), [
     '**子代理与 Codex 状态**',
-    '- ⏳ ⚡ Codex MCP \\(astra · 代码审查\\)（进行中）',
+    '- ⏳ ⚡ Agent MCP \\(astra · 代码审查\\)（进行中）',
     '- ⏳ 🤖 派发子代理：Astra Auditor（进行中）',
     '- ⏳ 🤖 派发子代理：Early Long Runner（进行中）',
     '- ✓ 🤖 派发子代理：Auditor 7（已完成）',
   ]);
   assert.match(card.text, /另有 3 项子代理\/Codex 记录/);
   assert.doesNotMatch(card.text, /Auditor [012]|lookup_paper/);
-  assert.equal(card.executionLog?.runningNote, '⏳ ⚡ Codex MCP (astra · 代码审查)（另有 2 项并行）');
+  assert.equal(card.executionLog?.runningNote, '⏳ ⚡ Agent MCP (astra · 代码审查)（另有 2 项并行）');
   const interimReply = turnProgressCard({ ...state, message: {
     messageId: 'reply', sessionId: 'session', turnId: 't1', role: 'assistant',
     final: false, revision: 1, sequence: 1, source: 'agy', blocks: [{ type: 'text', text: '阶段过渡说明' }],
@@ -233,7 +238,7 @@ test('tool tracker keeps the Codex MCP summary when completion omits or clears A
     ToolName: 'codex_job',
     Arguments: { action: 'wait', job_id: 'job-20261126-111851-314ddb40' },
   });
-  assert.equal(jobWait.summary, '⚡ Codex MCP (等待作业 …314ddb40)');
+  assert.equal(jobWait.summary, '⚡ Agent MCP (等待作业 …314ddb40)');
   tracker.observe(ref, 1, 'turn', 'mcp-job', 'running', jobWait);
   const jobEmpty = summarizeTool('call_mcp_tool', {
     ServerName: 'codex-bridge_codex',
@@ -242,7 +247,7 @@ test('tool tracker keeps the Codex MCP summary when completion omits or clears A
   });
   const jobDone = tracker.observe(ref, 1, 'turn', 'mcp-job', 'succeeded', jobEmpty);
   assert.ok(jobDone?.type === 'event');
-  assert.equal((jobDone.event.data as ToolProgress).summary, '⚡ Codex MCP (等待作业 …314ddb40)');
+  assert.equal((jobDone.event.data as ToolProgress).summary, '⚡ Agent MCP (等待作业 …314ddb40)');
 
   // P2: Unified 8-item budget shared between delegated tools and active session subagents.
   const eightDoneTools: ToolProgress[] = Array.from({ length: 8 }, (_, idx) => ({
