@@ -25,6 +25,7 @@ const WAVE2_BINDING_EXEMPT_ACTIONS = new Set([
   'bind',
   'list',
   'agy_status',
+  'usage_report',
   'new_help',
   'new_provider',
   'new_pick',

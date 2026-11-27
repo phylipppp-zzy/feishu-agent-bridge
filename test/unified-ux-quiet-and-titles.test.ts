@@ -97,7 +97,7 @@ test('interactive bind, attach and upgrade only send the finished session panel'
     await channel.advanceCompleted();
     assert.equal(sent.length, 1);
     assert.equal(sent[0]!.template, 'green');
-    assert.equal(sent[0]!.text, 'Codex · /project · 空闲\n✅ 已接入，现在可直接发送消息续聊\n电脑端接回：`codex resume n`');
+    assert.equal(sent[0]!.text, '🤖 **Codex** · 📂 `/project` · 空闲\n✅ 已接入，现在可直接发送消息续聊\n电脑端接回：`codex resume n`');
     assert.deepEqual(sent[0]!.actions.map(action => action.label), ['查看历史', '切换模型', '查看文件', '会话控制']);
   } finally { x.close(); }
 });

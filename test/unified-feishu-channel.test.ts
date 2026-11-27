@@ -156,7 +156,7 @@ for (const [provider,command] of [['claude','claude --resume native'],['codex','
   await channel.handle(env('p'),parseFeishuText('/panel turn queue'));
   const panel=cards.at(-1)!;
   assert.ok(panel.text.split('\n').includes(`电脑端接回：\`${command}\``));
-  assert.match(panel.text,/通知：开启（完成：开 · 等待：开 · 失败：开）/);
+  assert.match(panel.text,/^通知：开启$/m);
   assert.doesNotMatch(panel.text,/当前不支持|旧版/);
   const json=toFeishuCard(panel) as {elements:Array<{actions?:Array<{value:unknown}>}>};
   for (const [i,button] of json.elements[1]!.actions!.entries()) await channel.handle(env(`a${i}`),parseFeishuAction(button.value));

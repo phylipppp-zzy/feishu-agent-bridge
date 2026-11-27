@@ -1,6 +1,6 @@
 import type { QuestionForm } from './feishu-question-forms.js';
 import { questionDeclineAction, type Interaction, type Operation, type Provider, type Session } from './contracts.js';
-import { compactCardField, formatApprovalAction, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
+import { compactCardField, formatApprovalAction, formatInlineCode, formatResumeCommand, sessionStatusLabel, sessionStatusTemplate, shortenHomePath } from './card-formatters.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 
 export function providerDisplayLabel(provider: Provider): string {
@@ -89,7 +89,7 @@ export function sessionCard(session: Session, accessMode: 'unbound' | 'read_only
     subtitle: `${shortProject} · ${statusLabel}`,
     headerTags: [{ text: providerLabel, color: providerBadgeColor(session.native.provider) }],
     ...(template ? { template } : {}),
-    text: `🤖 **${providerLabel}** · 📂 \`${escapeCardMarkdown(shortProject)}\` · ${statusLabel}${access}${command ? `\n电脑端接回：\`${command}\`` : ''}`,
+    text: `🤖 **${providerLabel}** · 📂 \`${formatInlineCode(shortProject)}\` · ${statusLabel}${access}${command ? `\n电脑端接回：\`${command}\`` : ''}`,
     actions: [
       { label:'查看历史', value:{action:'history'} },
       ...(accessMode === 'interactive' && connected ? [{ label:'切换模型', value:{action:'models'} }] : []),
