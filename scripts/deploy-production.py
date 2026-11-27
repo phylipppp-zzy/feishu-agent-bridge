@@ -129,7 +129,15 @@ try:
     proj_roots = r['allowedProjectRoots']
     ok(isinstance(proj_roots, list) and len(proj_roots) >= 1 and all(Path(x).is_dir() and Path(x).resolve().is_relative_to('/home/zhangzy') for x in proj_roots))
     paths = [r['coreDb'], r['channelDb'], r['artifactStatePath'], c['sdkDb']]
-    ok(len(set(paths)) == 4 and all(Path(x).parent.resolve() == STATE.resolve() for x in paths))
+    usage_hub = r.get('usageHub')
+    if isinstance(usage_hub, dict) and usage_hub.get('enabled') is True:
+        usage_dest = usage_hub.get('destination')
+        ok(isinstance(usage_dest, str) and bool(usage_dest.strip()) and usage_dest.strip() not in r['allowedDestinations'])
+        usage_db = usage_hub.get('dbPath', str(STATE / 'usage-hub.sqlite'))
+        ok(isinstance(usage_db, str) and bool(usage_db.strip()))
+        paths.append(usage_db)
+    resolved_paths = [Path(x).resolve() for x in paths]
+    ok(len(set(resolved_paths)) == len(paths) and all(x.parent == STATE.resolve() for x in resolved_paths))
     ok(Path(r['claudeStateDir']).is_dir())
     allowed_output_bases = (Path('/home/zhangzy').resolve(), Path('/data/zhangzy').resolve(), Path('/ssd/zhangzy').resolve())
     ok(all(Path(x).is_dir() and any(Path(x).resolve().is_relative_to(base) for base in allowed_output_bases) for x in r['outputRoots']))
@@ -262,6 +270,9 @@ agy['extraWriteRoots'] = [
     '/data/zhangzy/outputs',
     '/data/zhangzy/staging',
 ]
+if isinstance(rt.get('usageHub'), dict):
+    rt['usageHub'].setdefault('dbPath', '/home/zhangzy/.local/state/feishu-unified-bridge/usage-hub.sqlite')
+    rt['usageHub'].setdefault('intervalMinutes', 60)
 
 validate_agy_sandbox(rt)
 tmp_cfg = None

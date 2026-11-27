@@ -17,6 +17,7 @@ import { imageMediaType } from '../image-media.js';
 import {TaskTopicStore,type TaskTopicToken} from './task-topic-store.js';
 import {attachmentDisplayName,decodeTextAttachment,MAX_TEXT_ATTACHMENT_BYTES} from './text-attachment.js';
 import { BindingExpired } from './topic-title-sync.js';
+import { parseUsageRangeFromText } from './hubs/usage-hub.js';
 import type { Readable } from 'node:stream';
 
 const ROOTLESS_TASK_READ_COMMANDS = new Set(['/help', '/health', '/sessions', '/quota', '/agy', '/agy-status']);
@@ -128,8 +129,19 @@ function stageInboundLocalFile(eventId: string, displayName: string, content: Bu
 type ResourceMetadata={name?:string;mime?:string};
 type MessageEvent = Parameters<NonNullable<Lark.EventHandles['im.message.receive_v1']>>[0];
 /** Only call with an SDK authenticated WS event, never an HTTP body. */
-export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:string, destinations:ReadonlySet<string>, download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>, handle:(e:TrustedEnvelope,a:ChannelAction)=>Promise<unknown>, queueResource?:(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',metadata?:ResourceMetadata)=>void|Promise<void>, resolveDestination?:(chatId:string,rootId?:string,parentId?:string,threadId?:string)=>string):Promise<void> {
+export async function receiveSdkMessage(data:MessageEvent, botId:string, owner:string, destinations:ReadonlySet<string>, download:(messageId:string,key:string,type:'image'|'file')=>Promise<Readable>, handle:(e:TrustedEnvelope,a:ChannelAction)=>Promise<unknown>, queueResource?:(e:TrustedEnvelope,messageId:string,key:string,type:'image'|'file',metadata?:ResourceMetadata)=>void|Promise<void>, resolveDestination?:(chatId:string,rootId?:string,parentId?:string,threadId?:string)=>string, usageDestinations?:ReadonlySet<string>):Promise<void> {
   const m=parseIncoming(data,botId,true); if (!m) return;
+  if (usageDestinations?.has(m.chatId)) {
+    if (m.senderOpenId !== owner) {
+      if (m.mentionedBot) throw new Error('unauthorized');
+      return;
+    }
+    const rawText = m.text?.trim() ?? '';
+    const range = rawText ? parseUsageRangeFromText(rawText) : undefined;
+    const envelope: TrustedEnvelope = { eventId: `message:${m.messageId}`, destination: m.chatId, identity: { source: 'feishu', subject: m.senderOpenId } };
+    await handle(envelope, { action: 'usage_report', trigger: 'message', ...(range ? { range } : {}), ...(rawText ? { rawText } : {}) } as unknown as ChannelAction);
+    return;
+  }
   const threadId=(data.message as unknown as {thread_id?:string}).thread_id;
   const inTopic=Boolean(m.rootId || m.parentId || threadId);
   const msgType = data.message.message_type;
@@ -239,13 +251,30 @@ async function downloadAndIntake(envelope:TrustedEnvelope,messageId:string,key:s
   await handle(envelope,{action:'attachment',name:rawName?attachmentDisplayName(rawName):`image.${ext}`,mediaType,content,mode:'new'},scope);
 }
 
+function parseCardCallbackAction<T extends RuntimeTrustedAction = ChannelAction>(rawValue: unknown, formValues?: unknown): T {
+  const injectUsageBinding =
+    !!rawValue &&
+    typeof rawValue === 'object' &&
+    !Array.isArray(rawValue) &&
+    (rawValue as Record<string, unknown>).action === 'usage_report' &&
+    (rawValue as Record<string, unknown>).bindingId === undefined;
+  const parsed = parseFeishuAction<T>(
+    injectUsageBinding ? { ...(rawValue as Record<string, unknown>), bindingId: '__usage_hub__' } : rawValue,
+    formValues,
+  );
+  if (injectUsageBinding && parsed && typeof parsed === 'object' && 'bindingId' in parsed) {
+    const { bindingId: _omitted, ...rest } = parsed as Record<string, unknown>;
+    return rest as T;
+  }
+  return parsed;
+}
 /** Extract callback only from a verified SDK WS event; form values are persisted as input, never identity. */
 export function parseSdkCardCallback<T extends RuntimeTrustedAction = ChannelAction>(data:Lark.RawCardActionEvent, owner:string, resolve:(chatId:string,messageId:string)=>string): {envelope:TrustedEnvelope;action:T} | null {
   const a=parseCardAction(data); if (!a || !a.eventId) return null;
   if (a.openId !== owner) throw new Error('unauthorized');
-  return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseFeishuAction<T>(a.value,a.formValues)};
+  return {envelope:{eventId:`card:${a.eventId}`,destination:resolve(a.chatId,a.openMessageId),identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})},action:parseCardCallbackAction<T>(a.value,a.formValues)};
 }
-const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target', 'cancel', 'archive', 'notice_settings', 'control']);
+const CONFIRM_TOAST_ACTIONS = new Set(['decision_answer', 'settings', 'confirm_handoff', 'switch_target', 'cancel', 'archive', 'notice_settings', 'control', 'usage_report']);
 function isAlreadyHandledCardError(error: unknown): boolean {
   const obj = typeof error === 'object' && error !== null ? (error as { code?: unknown; detail?: unknown }) : null;
   const code = obj && 'code' in obj ? String(obj.code ?? '') : '';
@@ -261,7 +290,7 @@ export async function handleSdkCardCallback<T extends RuntimeTrustedAction = Cha
   const a=parseCardAction(data); if (!a || !a.eventId) return undefined;
   if (a.openId !== owner || !destinations.has(a.chatId)) throw new Error('unauthorized');
   let action:T;
-  try { action=parseFeishuAction<T>(expandValue ? expandValue(a.openMessageId,a.value) : a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
+  try { action=parseCardCallbackAction<T>(expandValue ? expandValue(a.openMessageId,a.value) : a.value,a.formValues); } catch { return {toast:{type:'info',content:'旧卡或卡片操作已失效，请发送 /sessions 重新选择会话。'}}; }
   let destination:string; try {destination=resolve(a.chatId,a.openMessageId);} catch(error) {return error instanceof TaskPendingRoute ? {toast:{type:'info',content:'任务话题待核查，写入暂不可用。'}} : error instanceof ClosedTestRoute ? {toast:{type:'info',content:'此测试话题已关闭。'}} : error instanceof UnknownTestRoute ? {toast:{type:'info',content:'测试话题创建结果待核查，请联系管理员。'}} : error instanceof UnknownCardRoute ? {toast:{type:'info',content:'卡片已失效，请发送 /sessions 重新选择会话。'}} : {toast:{type:'info',content:'暂时无法处理卡片，请稍后查看会话状态。'}};}
   const envelope:TrustedEnvelope={eventId:`card:${a.eventId}`,destination,identity:{source:'feishu',subject:a.openId},...(a.openMessageId ? {cardMessageId:a.openMessageId} : {})};
   try {await handle(envelope,action);} catch (error) {return isAlreadyHandledCardError(error) ? {toast:{type:'info',content:'该项已处理完成，无需重复操作。'}} : {toast:{type:'info',content:'操作状态未确认，请查看会话状态后再操作。'}};}
@@ -287,8 +316,10 @@ export class FeishuSdkPort implements FeishuPort {
   private readonly linkCache=new Map<string,{url:string;expires:number}>();
   private readonly linkFlights=new Map<string,Promise<string|null>>();
   private dbClosed = false;
-  constructor(credentials: {appId:string; appSecret:string}, dbPath:string, private readonly destinations: ReadonlySet<string>, private readonly owner:string,private readonly taskEnabled=false,private readonly taskTopicRuntimeEnabled=false) {
+  private readonly callbackDestinations: ReadonlySet<string>;
+  constructor(credentials: {appId:string; appSecret:string}, dbPath:string, private readonly destinations: ReadonlySet<string>, private readonly owner:string,private readonly taskEnabled=false,private readonly taskTopicRuntimeEnabled=false,private readonly usageDestinations: ReadonlySet<string> = new Set()) {
     if (!credentials.appId || !credentials.appSecret || !destinations.size || !owner) throw new Error('missing SDK configuration');
+    this.callbackDestinations = new Set([...destinations, ...usageDestinations]);
     this.appId=credentials.appId;
     const base = { appId: credentials.appId, appSecret: credentials.appSecret, appType:Lark.AppType.SelfBuild, domain:Lark.Domain.Feishu };
     this.client = new Lark.Client(base); this.ws = new Lark.WSClient({...base, loggerLevel:Lark.LoggerLevel.error});
@@ -421,7 +452,7 @@ export class FeishuSdkPort implements FeishuPort {
   private laneReserved(destination:string):boolean { return !!this.db.prepare('SELECT 1 FROM sdk_lane_registry WHERE destination=?').get(destination); }
   public authorizedDestination(destination:string):boolean {
     if (this.laneReserved(destination)) return false;
-    if (this.destinations.has(destination)) return true;
+    if (this.destinations.has(destination) || this.usageDestinations.has(destination)) return true;
     const route=this.db.prepare('SELECT chat_id FROM sdk_topic_routes WHERE destination=?').get(destination) as {chat_id:string}|undefined;
     return !!route && this.destinations.has(route.chat_id);
   }
@@ -445,7 +476,7 @@ export class FeishuSdkPort implements FeishuPort {
     const destination=[...found][0]!;if(!this.authorizedDestination(destination)){const task=this.taskToken(destination);if(task&&task.chatId===chatId)return destination;const token=this.testToken(destination);if(!this.testHandler || !token || token.chatId!==chatId)throw new UnknownTopic('test topic unavailable');}return destination;
   }
   public callbackDestination(chatId:string,messageId:string):string {
-    if (!this.destinations.has(chatId)) throw new Error('destination unauthorized');
+    if (!this.destinations.has(chatId) && !this.usageDestinations.has(chatId)) throw new Error('destination unauthorized');
     const reservedRoot=this.db.prepare('SELECT state,lane_id FROM sdk_lane_registry WHERE root_id=?').get(messageId) as {state:string;lane_id:string}|undefined;
     if(reservedRoot?.state==='closed') {if(reservedRoot.lane_id==='task')throw new UnknownCardRoute('task topic closed');throw new ClosedTestRoute('test topic closed');}
     const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;
@@ -480,11 +511,13 @@ export class FeishuSdkPort implements FeishuPort {
   }
   async createTopic(destination:string,sessionId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<string> {
     this.allowed(destination); const chat=this.route(destination)?.chat_id ?? destination;
+    if (!this.destinations.has(chat)) throw new Error('destination unauthorized');
     const existing=this.db.prepare('SELECT destination FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string}|undefined;
     if(existing) return existing.destination;
     // An uncertain root creation must never be replayed automatically.
     if (!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes) throw new Error('topic creation outcome unknown');
     await guard?.(); this.allowed(destination);
+    if (!this.destinations.has(chat)) throw new Error('destination unauthorized');
     const schema = cardSchema(card);
     const {content,references} = packCardCallbacks(encodeCard(card,schema));
     const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content}});
@@ -710,9 +743,9 @@ export class FeishuSdkPort implements FeishuPort {
     const botId = bot.bot?.open_id;
     if (!botId) throw new Error('bot identity unavailable');
     const handles: Partial<Lark.EventHandles> & {'card.action.trigger':(data:Lark.RawCardActionEvent)=>Promise<any>} = {
-      'im.message.receive_v1': async data => { try {if(await this.guideTaskPending(data,botId))return;await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),async (e,a)=>{if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId))return this.guideTaskPending(data,botId);return this.dispatchLane(e,a,handle);},async (e,id,key,type,metadata)=>{if(await this.guideTaskPending(data,botId))return;const task=this.taskToken(e.destination);if(task){if(e.identity.source!=='feishu'||e.identity.subject!==this.owner)throw Error('task topic unauthorized');if(!this.taskTopicRuntimeEnabled){this.taskStore.holdResource(task,e,e.eventId,id,key,type,metadata);await this.handleTask(e,task);return;}const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;this.queueResource(e,id,key,type,scope,metadata);return;}const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);const scope=await handler.capture(e,token);if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);this.queueTestResource(e,id,key,type,scope,token,metadata);}else{const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId)){await this.guideTaskPending(data,botId);return;}this.queueResource(e,id,key,type,scope,metadata);}},(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread));}catch(error){if(error instanceof UnknownTopic && await this.guideTaskPending(data,botId,true))return;if(error instanceof UnknownTopic && await this.guideTestUnavailable(data,botId))return;throw error;} },
+      'im.message.receive_v1': async data => { try {if(await this.guideTaskPending(data,botId))return;await receiveSdkMessage(data,botId,this.owner,this.destinations,async (messageId,key,type) => (await this.client.im.messageResource.get({params:{type},path:{message_id:messageId,file_key:key}})).getReadableStream(),async (e,a)=>{if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId))return this.guideTaskPending(data,botId);return this.dispatchLane(e,a,handle);},async (e,id,key,type,metadata)=>{if(await this.guideTaskPending(data,botId))return;const task=this.taskToken(e.destination);if(task){if(e.identity.source!=='feishu'||e.identity.subject!==this.owner)throw Error('task topic unauthorized');if(!this.taskTopicRuntimeEnabled){this.taskStore.holdResource(task,e,e.eventId,id,key,type,metadata);await this.handleTask(e,task);return;}const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;this.queueResource(e,id,key,type,scope,metadata);return;}const token=this.testToken(e.destination);if(token){const handler=this.testHandler;if(!handler)throw new Error('test lane unavailable');this.validateTestToken(token);const scope=await handler.capture(e,token);if(this.testHandler!==handler)throw new Error('test lane unavailable');this.validateTestToken(token);this.queueTestResource(e,id,key,type,scope,token,metadata);}else{const scope=await captureScope(e);if(await this.guideTaskPending(data,botId))return;if(this.rootlessTaskWritePending(data,botId)){await this.guideTaskPending(data,botId);return;}this.queueResource(e,id,key,type,scope,metadata);}},(chat,root,parent,thread)=>this.resolveDestination(chat,root,parent,thread),this.usageDestinations);}catch(error){if(error instanceof UnknownTopic && await this.guideTaskPending(data,botId,true))return;if(error instanceof UnknownTopic && await this.guideTestUnavailable(data,botId))return;throw error;} },
       'card.action.trigger': async data => {
-        const work = handleSdkCardCallback<RuntimeTrustedAction>(data,this.owner,this.destinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle),(message,value)=>this.callbackValues.resolve(message,value));
+        const work = handleSdkCardCallback<RuntimeTrustedAction>(data,this.owner,this.callbackDestinations,(chat,message)=>this.callbackDestination(chat,message),(e,a)=>this.dispatchLane(e,a,handle),(message,value)=>this.callbackValues.resolve(message,value));
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<{toast:{type:'info';content:string}}>(resolve => {
           timer = setTimeout(() => resolve({toast:{type:'info',content:'正在处理…'}}), 1500);

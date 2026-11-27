@@ -16,6 +16,42 @@ export const MAX_FEISHU_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MiB (Feishu IM ima
 
 const SENSITIVE_PATH_SEGMENT_RE = /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|feishu-claude-bridge\/env)(?:\/|$)/i;
 
+const INTERNAL_TOPIC_SESSION_PREFIXES = [
+  'task:',
+  'pending-hub:',
+  'watch-hub:',
+  'mock-test:',
+  'native-test:',
+] as const;
+
+export type FeishuUploadFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
+
+export function isInternalTopicSessionId(sessionId: string): boolean {
+  return INTERNAL_TOPIC_SESSION_PREFIXES.some((prefix) => sessionId.startsWith(prefix));
+}
+
+export function inferFeishuUploadFileType(fileName: string): FeishuUploadFileType {
+  switch (extname(fileName).toLowerCase()) {
+    case '.pdf':
+      return 'pdf';
+    case '.doc':
+    case '.docx':
+      return 'doc';
+    case '.xls':
+    case '.xlsx':
+      return 'xls';
+    case '.ppt':
+    case '.pptx':
+      return 'ppt';
+    case '.mp4':
+      return 'mp4';
+    case '.opus':
+      return 'opus';
+    default:
+      return 'stream';
+  }
+}
+
 export interface FeishuCredentials {
   appId: string;
   appSecret: string;
@@ -39,6 +75,7 @@ export interface TopicRouteRow {
   provider?: string;
   nativeSessionId?: string;
   title?: string;
+  updatedAt?: string;
 }
 
 export type ResolvedSendTarget =
@@ -72,6 +109,7 @@ export interface InspectedSendFile {
   name: string;
   size: number;
   mode: 'image' | 'file';
+  fileType?: FeishuUploadFileType;
   mediaType: string | null;
   downgradedToFile?: boolean;
   warning?: string;
@@ -88,11 +126,16 @@ export interface FeishuSendTransport {
   sendText(target: ResolvedSendTarget, text: string): Promise<{ messageId: string }>;
   sendCard(target: ResolvedSendTarget, title: string, text: string): Promise<{ messageId: string }>;
   sendImage(target: ResolvedSendTarget, fileName: string, content: Buffer): Promise<{ messageId: string; imageKey: string }>;
-  sendFile(target: ResolvedSendTarget, fileName: string, content: Buffer): Promise<{ messageId: string; fileKey: string }>;
+  sendFile(
+    target: ResolvedSendTarget,
+    fileName: string,
+    content: Buffer,
+    fileType?: FeishuUploadFileType,
+  ): Promise<{ messageId: string; fileKey: string }>;
 }
 
 export interface SendToFeishuOptions {
-  files: readonly string[];
+  files?: readonly string[];
   session?: string;
   rootMessageId?: string;
   chatId?: string;
@@ -117,6 +160,7 @@ export interface SentFileOutcome {
   name: string;
   size: number;
   mode: 'image' | 'file';
+  fileType?: FeishuUploadFileType;
   status: 'sent' | 'dry_run';
   messageId?: string;
   fileKey?: string;
@@ -243,6 +287,8 @@ interface CoreSessionMeta {
   provider?: string;
   nativeSessionId?: string;
   title?: string;
+  updatedAt?: string;
+  updatedAtMs?: number;
 }
 
 function readCoreSessionMetaMap(coreDbPath: string | null | undefined, sessionIds: readonly string[]): Map<string, CoreSessionMeta> {
@@ -257,12 +303,19 @@ function readCoreSessionMetaMap(coreDbPath: string | null | undefined, sessionId
         try {
           const parsed = JSON.parse(row.value) as {
             title?: unknown;
+            updatedAt?: unknown;
             native?: { provider?: unknown; nativeSessionId?: unknown };
           };
           const meta: CoreSessionMeta = { sessionId: row.id };
           if (typeof parsed.native?.provider === 'string') meta.provider = parsed.native.provider;
           if (typeof parsed.native?.nativeSessionId === 'string') meta.nativeSessionId = parsed.native.nativeSessionId;
           if (typeof parsed.title === 'string') meta.title = parsed.title;
+          if (typeof parsed.updatedAt === 'string' && parsed.updatedAt.trim()) {
+            const trimmed = parsed.updatedAt.trim();
+            meta.updatedAt = trimmed;
+            const parsedMs = Date.parse(trimmed);
+            if (Number.isFinite(parsedMs)) meta.updatedAtMs = parsedMs;
+          }
           map.set(row.id, meta);
         } catch {
           // Ignore malformed session row.
@@ -291,34 +344,48 @@ function lookupSessionIdsByNativeId(coreDbPath: string | null | undefined, nativ
 
 export function listFeishuTopics(sdkDbPath: string, limit = 20, coreDbPath?: string | null): TopicRouteRow[] {
   const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
-  const topics = withReadOnlySqlite(sdkDbPath, '路由数据库', (db) => {
+  const rawTopics = withReadOnlySqlite(sdkDbPath, '路由数据库', (db) => {
     const rows = db
       .prepare(
-        'SELECT destination, chat_id, root_id, thread_id, session_id FROM sdk_topic_routes ORDER BY rowid DESC LIMIT ?',
+        'SELECT rowid, destination, chat_id, root_id, thread_id, session_id FROM sdk_topic_routes ORDER BY rowid DESC',
       )
-      .all(safeLimit) as Array<{
+      .all() as Array<{
+      rowid: number;
       destination: string;
       chat_id: string;
       root_id: string;
       thread_id: string | null;
       session_id: string;
     }>;
-    return rows.map((row) => ({
-      destination: row.destination,
-      chatId: row.chat_id,
-      rootId: row.root_id,
-      threadId: row.thread_id,
-      sessionId: row.session_id,
-    }));
+    return rows
+      .filter((row) => !isInternalTopicSessionId(row.session_id))
+      .map((row) => ({
+        rowid: Number(row.rowid),
+        destination: row.destination,
+        chatId: row.chat_id,
+        rootId: row.root_id,
+        threadId: row.thread_id,
+        sessionId: row.session_id,
+      }));
   });
-  const metaMap = readCoreSessionMetaMap(coreDbPath, topics.map((t) => t.sessionId));
-  return topics.map((t) => {
+  const metaMap = readCoreSessionMetaMap(coreDbPath, rawTopics.map((t) => t.sessionId));
+  rawTopics.sort((a, b) => {
+    const aUpdated = metaMap.get(a.sessionId)?.updatedAtMs;
+    const bUpdated = metaMap.get(b.sessionId)?.updatedAtMs;
+    const aHas = aUpdated !== undefined && Number.isFinite(aUpdated);
+    const bHas = bUpdated !== undefined && Number.isFinite(bUpdated);
+    if (aHas && bHas && aUpdated !== bUpdated) return bUpdated - aUpdated;
+    if (aHas !== bHas) return aHas ? -1 : 1;
+    return b.rowid - a.rowid;
+  });
+  return rawTopics.slice(0, safeLimit).map(({ rowid: _rowid, ...t }) => {
     const meta = metaMap.get(t.sessionId);
     return {
       ...t,
       ...(meta?.provider ? { provider: meta.provider } : {}),
       ...(meta?.nativeSessionId ? { nativeSessionId: meta.nativeSessionId } : {}),
       ...(meta?.title ? { title: meta.title } : {}),
+      ...(meta?.updatedAt ? { updatedAt: meta.updatedAt } : {}),
     };
   });
 }
@@ -420,7 +487,7 @@ export function resolveFeishuTarget(options: TargetResolutionOptions): ResolvedS
         .prepare('SELECT destination, chat_id, root_id, thread_id, session_id FROM sdk_topic_routes ORDER BY rowid DESC')
         .all() as Array<{ destination: string; chat_id: string; root_id: string; session_id: string }>;
       const suffixMatches = allRows.filter(
-        (row) => row.session_id.endsWith(`:${query}`) || row.session_id === query,
+        (row) => !isInternalTopicSessionId(row.session_id) && (row.session_id.endsWith(`:${query}`) || row.session_id === query),
       );
       if (suffixMatches.length === 1) {
         const hit = suffixMatches[0]!;
@@ -451,7 +518,7 @@ export function resolveFeishuTarget(options: TargetResolutionOptions): ResolvedS
     if (!options.sdkDbPath) {
       throw new FeishuSendError('target_not_found', '未配置 sdkDb 路径，无法使用 --latest。');
     }
-    const topics = listFeishuTopics(options.sdkDbPath, 1);
+    const topics = listFeishuTopics(options.sdkDbPath, 1, options.coreDbPath);
     const hit = topics[0];
     if (!hit) {
       throw new FeishuSendError('target_not_found', '路由表中没有任何飞书话题记录。');
@@ -545,12 +612,15 @@ export async function inspectSendableFiles(
       warning = 'SVG 无法作为飞书图片消息上传，已按普通文件发送（飞书手机端可能无法直接预览 SVG，建议先导出 PNG）。';
     }
 
+    const fileType = mode === 'file' ? inferFeishuUploadFileType(name) : undefined;
+
     inspected.push({
       inputPath,
       resolvedPath,
       name,
       size: content.length,
       mode,
+      ...(fileType ? { fileType } : {}),
       mediaType: detectedImage,
       ...(downgradedToFile ? { downgradedToFile: true } : {}),
       ...(warning ? { warning } : {}),
@@ -629,9 +699,9 @@ export function createLarkSendTransport(credentials: FeishuCredentials): FeishuS
       const messageId = await dispatchMessage(target, 'image', JSON.stringify({ image_key: imageKey }));
       return { messageId, imageKey };
     },
-    async sendFile(target, fileName, content) {
+    async sendFile(target, fileName, content, fileType = inferFeishuUploadFileType(fileName)) {
       const uploaded = await client.im.file.create({
-        data: { file_type: 'stream', file_name: fileName, file: content },
+        data: { file_type: fileType, file_name: fileName, file: content },
       });
       const fileKey = uploaded?.file_key;
       if (!fileKey) {
@@ -644,6 +714,16 @@ export function createLarkSendTransport(credentials: FeishuCredentials): FeishuS
 }
 
 export async function sendToFeishu(options: SendToFeishuOptions): Promise<SendToFeishuResult> {
+  const caption = options.caption?.trim();
+  const title = options.title?.trim();
+  const fileList = options.files ?? [];
+  if (fileList.length === 0 && !caption && !title) {
+    throw new FeishuSendError(
+      'invalid_argument',
+      '请至少提供一个要发送的文件路径，或通过 -m/--caption、-t/--title 提供说明消息。',
+    );
+  }
+
   const ctx = loadDefaultFeishuContext({
     ...(options.configPath ? { configPath: options.configPath } : {}),
     ...(options.envPath ? { envPath: options.envPath } : {}),
@@ -659,11 +739,14 @@ export async function sendToFeishu(options: SendToFeishuOptions): Promise<SendTo
     defaultChatId: ctx.defaultChatId,
   });
 
-  const inspected = await inspectSendableFiles(options.files, {
-    ...(options.asFile ? { asFile: true } : {}),
-    ...(options.allowSensitive ? { allowSensitive: true } : {}),
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-  });
+  const inspected =
+    fileList.length > 0
+      ? await inspectSendableFiles(fileList, {
+          ...(options.asFile ? { asFile: true } : {}),
+          ...(options.allowSensitive ? { allowSensitive: true } : {}),
+          ...(options.cwd ? { cwd: options.cwd } : {}),
+        })
+      : [];
 
   if (options.dryRun) {
     return {
@@ -676,6 +759,7 @@ export async function sendToFeishu(options: SendToFeishuOptions): Promise<SendTo
         name: item.name,
         size: item.size,
         mode: item.mode,
+        ...(item.fileType ? { fileType: item.fileType } : {}),
         status: 'dry_run',
         ...(item.downgradedToFile ? { downgradedToFile: true } : {}),
         ...(item.warning ? { warning: item.warning } : {}),
@@ -696,11 +780,10 @@ export async function sendToFeishu(options: SendToFeishuOptions): Promise<SendTo
   }
 
   let captionMessageId: string | undefined;
-  const caption = options.caption?.trim();
-  const title = options.title?.trim();
   if (caption || title) {
     if (title) {
-      const res = await transport.sendCard(target, title, caption || `共发送 ${inspected.length} 个文件`);
+      const cardBody = caption || (inspected.length > 0 ? `共发送 ${inspected.length} 个文件` : title);
+      const res = await transport.sendCard(target, title, cardBody);
       captionMessageId = res.messageId;
     } else if (caption) {
       const res = await transport.sendText(target, caption);
@@ -724,13 +807,14 @@ export async function sendToFeishu(options: SendToFeishuOptions): Promise<SendTo
         ...(item.warning ? { warning: item.warning } : {}),
       });
     } else {
-      const res = await transport.sendFile(target, item.name, item.content);
+      const res = await transport.sendFile(target, item.name, item.content, item.fileType);
       outcomes.push({
         inputPath: item.inputPath,
         resolvedPath: item.resolvedPath,
         name: item.name,
         size: item.size,
         mode: 'file',
+        ...(item.fileType ? { fileType: item.fileType } : {}),
         status: 'sent',
         messageId: res.messageId,
         fileKey: res.fileKey,

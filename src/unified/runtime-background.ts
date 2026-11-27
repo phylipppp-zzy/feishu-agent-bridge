@@ -44,6 +44,10 @@ export async function runBackgroundWork(
   if (runtime.watchHub?.listOutbox().some(row => row.state === 'pending')) {
     await isolate(async () => { await runtime.watchHub?.flush(); });
   }
+  if (runtime.usageHub?.shouldFlushScheduled()) {
+    await isolate(async () => { await runtime.usageHub?.flushScheduled(); });
+  }
+  runtime.scheduleUsageWake();
   await isolate(() => syncPendingHub(runtime));
   if (runtime.decisionSync?.listDocOutbox().some(row => row.state === 'pending_sync')) {
     await isolate(async () => { runtime.decisionSync?.retryPendingSyncs(); });

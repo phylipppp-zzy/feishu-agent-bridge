@@ -14,21 +14,21 @@ export interface CliIo {
 }
 
 const HELP_TEXT = `用法:
-  feishu-send [选项] <文件1> [文件2 ...]
+  feishu-send [选项] [文件1 文件2 ...]
   feishu-send --list-topics [数量] [--json]
 
 说明:
-  将本地文件或图片直接发送到飞书（支持按会话话题路由，图片自动内嵌预览，文档/PDF/代码走可在线预览的文件消息）。
+  将本地文件、图片或简报消息直接发送到飞书（支持按会话话题路由，图片自动内嵌预览，文档/PDF/表格/代码走对应在线预览文件消息；不传文件时可通过 -m/-t 单独发送纯文本或卡片简报）。
 
 目标选项（四选一；省略时默认发到主群）:
   -s, --session <id>        发到指定会话对应的飞书话题（支持完整 session_id 或原生 UUID）
   -r, --root <message_id>   发到指定根消息对应的话题（reply_in_thread）
   -c, --chat <chat_id>      发到指定群聊主信息流
-      --latest              发到最近创建的飞书话题
+      --latest              发到最近活跃的用户对话飞书话题（自动排除内部系统话题）
 
 消息与文件选项:
-  -m, --caption <text>      在文件前附带说明文案
-  -t, --title <text>        以带标题的卡片发送说明文案（配合 --caption 使用）
+  -m, --caption <text>      附带说明文案（不传文件时直接发送纯文本消息）
+  -t, --title <text>        以带标题的卡片发送说明文案（可单独或配合 -m 使用）
       --as-file             图片也强制按原文件消息发送（保留原图不走图片消息）
       --allow-sensitive     允许发送匹配敏感文件规则的文件（默认拦截 .env/私钥/凭据等）
       --dry-run             仅校验文件与解析路由，不实际调用飞书接口
@@ -213,6 +213,8 @@ export async function runFeishuSendCli(args: readonly string[], io?: CliIo): Pro
       out(`${result.dryRun ? '[DRY-RUN] 计划发送到' : '已发送到'} ${targetDesc}`);
       if (result.captionMessageId) {
         out(`  说明消息: message_id=${result.captionMessageId}`);
+      } else if (result.dryRun && (caption?.trim() || title?.trim())) {
+        out(`  说明消息: [dry_run] ${title?.trim() ? `卡片 "${title.trim()}"` : '纯文本'}`);
       }
       for (const f of result.files) {
         const idPart = f.messageId ? ` message_id=${f.messageId}` : '';
