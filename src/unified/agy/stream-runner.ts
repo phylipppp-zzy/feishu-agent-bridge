@@ -10,6 +10,7 @@ import {
   resolveBin,
   resolvePositiveMs,
   terminateChildProcess,
+  trackAgyChildForExit,
   writeNdjsonLine,
   type AgyStreamEvent,
   type AgyStreamInitPayload,
@@ -79,9 +80,11 @@ export class AgyStreamJsonRunner {
 
     const proc = spawn(this.agyBin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
       ...(this.options.cwd !== undefined ? { cwd: this.options.cwd } : {}),
       ...(this.options.env !== undefined ? { env: this.options.env } : {}),
     });
+    trackAgyChildForExit(proc);
     this.child = proc;
 
     const events: AgyStreamEvent[] = [];
