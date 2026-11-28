@@ -16,7 +16,7 @@ export interface CompactTurnInfo {
   maxTokens?: number | null;
 }
 
-const AGY_CONTEXT_TAIL_BYTES = 128 * 1024;
+const AGY_CONTEXT_TAIL_BYTES = 512 * 1024;
 const ONE_MILLION_BINARY = 1_048_576;
 
 /**
@@ -78,6 +78,30 @@ export function formatContextUsageBadge(
     pct,
     color,
   };
+}
+
+/**
+ * Format a compact, always-visible status banner line for turn cards so users
+ * can monitor live context growth during running turns and decide when to /compact.
+ */
+export function formatContextStatusLine(
+  usage?: ContextUsageInfo | null,
+  options?: { modelBadge?: string | null },
+): string | null {
+  const badge = formatContextUsageBadge(usage);
+  if (!badge) return null;
+  const slots = 10;
+  const filled = Math.max(0, Math.min(slots, Math.round((badge.pct / 100) * slots)));
+  const bar = '▓'.repeat(filled) + '░'.repeat(slots - filled);
+  const icon = badge.pct >= 92 ? '🔴' : badge.pct >= 80 ? '🟠' : badge.pct >= 65 ? '🟡' : '🟢';
+  const hint = badge.pct >= 92
+    ? ' · 接近上限，建议立即压缩'
+    : badge.pct >= 80
+      ? ' · 建议压缩'
+      : '';
+  const model = options?.modelBadge?.trim();
+  const modelSuffix = model ? ` · 模型 \`${model}\`` : '';
+  return `${icon} 上下文：\`${badge.text}\` \`${bar}\`${hint}${modelSuffix}`;
 }
 
 function safePositiveInt(value: unknown): number {

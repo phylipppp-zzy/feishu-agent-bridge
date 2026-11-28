@@ -59,6 +59,7 @@ export interface ChannelCard {
   template?: 'blue' | 'green' | 'orange' | 'red' | 'grey';
   subtitle?: string;
   headerTags?: readonly ChannelCardHeaderTag[];
+  statusBanner?: string;
   sections?: readonly ChannelCardSection[];
   format?: 'markdown' | 'plain';
   executionLog?: {

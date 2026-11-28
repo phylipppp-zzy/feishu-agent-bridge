@@ -67,8 +67,11 @@ export function buildSessionPanel(
   if (available && session.capabilities?.queue?.status === 'available') {
     queued.forEach((item,index) => actions.push({label:queued.length === 1 ? '撤回排队' : `撤回排队 ${index+1}`,value:{action:'cancel',inputId:item.inputId,...base}}));
   }
-  if (available && !running.length) {
-    actions.push({ label: '压缩上下文 (/compact)', value: { action: 'compact', ...base } });
+  if (available) {
+    actions.push({
+      label: running.length ? '排队压缩上下文 (/compact)' : '压缩上下文 (/compact)',
+      value: { action: 'compact', ...base },
+    });
   }
   actions.push(...notice.actions);
   if (!available) actions.push({label:'重新接入',value:{action:'upgrade'}});

@@ -516,8 +516,10 @@ export class TurnCardDelivery {
     }
     const compactInfo = this.resolveCompactInfo(sessionId, input.turn, key[3], start, contextUsage);
     await guard();
+    const allowCompactButton = sessionConnected && !key[2].includes('"access_mode":"read_only"');
     const card = turnProgressCard({
       provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3],
+      allowCompactButton,
       ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
       ...(modelBadge ? { modelBadge } : {}),
       ...(contextUsage ? { contextUsage } : {}),
