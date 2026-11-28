@@ -30,17 +30,30 @@ def check_active_work(core_db: Path) -> bool:
     except FileNotFoundError:
         return False
 
-    queries = (
-        ('Turn', "SELECT session_id, id, json_extract(value,'$.status'), json_extract(value,'$.startedAt') "
-                 "FROM turns WHERE json_extract(value,'$.status') IN ('running','queued')"),
-        ('Outbox', "SELECT operation_id, kind, state FROM outbox WHERE state IN ('pending','in_flight') "
-                   "UNION ALL SELECT operation_id, kind, state FROM steer_outbox_v1 WHERE state IN ('pending','in_flight')"),
-        ('Interaction awaiting answer', "SELECT id, session_id, json_extract(value,'$.kind') "
-                                        "FROM interactions WHERE json_extract(value,'$.status')='awaiting_answer'"),
-    )
     with closing(sqlite3.connect(core_db.resolve().as_uri() + '?mode=ro', uri=True)) as db:
         db.execute('PRAGMA query_only=ON')
         db.execute('BEGIN')
+        tables = {name for name, in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        session_join = ''
+        interactive = ''
+        if 'sessions' in tables:
+            session_join = ' JOIN sessions s ON s.id=w.session_id'
+            interactive = (" AND json_extract(s.value,'$.status') IS NOT 'read_only'"
+                           " AND COALESCE(json_extract(s.value,'$.control.input')='available', 1)")
+            if 'tracking_state' in tables:
+                session_join += ' LEFT JOIN tracking_state t ON t.session_id=s.id'
+                interactive += ' AND t.detached IS NOT 1'
+        outbox = "SELECT operation_id, kind, state FROM outbox WHERE state IN ('pending','in_flight')"
+        if 'steer_outbox_v1' in tables:
+            outbox += " UNION ALL SELECT operation_id, kind, state FROM steer_outbox_v1 WHERE state IN ('pending','in_flight')"
+        queries = (
+            ('Turn', "SELECT w.session_id, w.id, json_extract(w.value,'$.status'), json_extract(w.value,'$.startedAt') "
+                     f"FROM turns w{session_join} WHERE json_extract(w.value,'$.status') IN ('running','queued'){interactive}"),
+            ('Outbox', outbox),
+            ('Interaction', "SELECT w.id, w.session_id, json_extract(w.value,'$.kind') "
+                            f"FROM interactions w{session_join} WHERE json_extract(w.value,'$.status') "
+                            f"IN ('awaiting_answer','answer_pending_delivery'){interactive}"),
+        )
         active = [(label, db.execute(sql).fetchall()) for label, sql in queries]
 
     if not any(rows for _, rows in active):
@@ -151,7 +164,11 @@ if args.check_active_only:
 RELEASES_ROOT.mkdir(parents=True, exist_ok=True)
 # Hold through staging, unit publication and GC so deploys cannot prune each other's releases.
 deploy_lock = os.open(RELEASES_ROOT, os.O_RDONLY | os.O_DIRECTORY)
-fcntl.flock(deploy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+try:
+    fcntl.flock(deploy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print('Another production deployment is already in progress.', file=sys.stderr)
+    sys.exit(1)
 previous_unit = UNIT_FILE.read_text(encoding='utf-8') if UNIT_FILE.exists() else ''
 
 commit = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'], text=True).strip()
@@ -336,7 +353,7 @@ ExecStart=/usr/local/node-v24.11.1-linux-x64/bin/node --no-warnings {release_dir
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
-KillMode=control-group
+KillMode=mixed
 SendSIGKILL=yes
 UMask=0077
 [Install]
@@ -430,6 +447,7 @@ try:
         os.fchmod(f.fileno(), 0o644)
         f.write(unit_content)
     os.replace(tmp_unit, UNIT_FILE)
+    tmp_unit = None
 finally:
     if tmp_unit is not None:
         tmp_unit.unlink(missing_ok=True)

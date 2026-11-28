@@ -13,6 +13,7 @@ import { setImmediate } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { AgyCatalog } from '../src/unified/agy/catalog.js';
 import { agyFileFingerprint, readAgySummaryHierarchy } from '../src/unified/agy/catalog-summaries.js';
+import { readCachedAgyTranscript, type AgyTranscriptCacheEntry } from '../src/unified/agy/catalog-transcript.js';
 import { readReadonlyAgyLiveTurn } from '../src/unified/agy/readonly-live-turn.js';
 import { type Capabilities, type Interaction, type Session, type Turn } from '../src/unified/contracts.js';
 import type { FeishuPort } from '../src/unified/feishu-channel.js';
@@ -81,6 +82,8 @@ test('compact event keys preserve external replay, conflicts and stream failure 
 
   const legacy = store.appendEvent(inputEvent('legacy', 's'));
   const legacyInput = inputEvent('legacy', 's');
+  const legacyObserved = inputEvent(randomUUID(), 's', 'interaction.updated', {});
+  assert.equal(store.appendObservedEvent(legacyObserved), true);
   const unsupported = inputEvent(randomUUID(), 's', 'interaction.unsupported', { reason: 'Unsupported URL elicitation' });
   const nativeTool = inputEvent(randomUUID(), 's', 'tool.updated', {
     turnId: turn.turnId, callId: 'step-1', phase: 'running', tool: 'read_file', summary: 'read_file',
@@ -108,7 +111,11 @@ test('compact event keys preserve external replay, conflicts and stream failure 
 
   // Seed identical legacy rows so both historical replay and batched slimming run through real SQLite.
   const legacyWrite = db.prepare('UPDATE event_keys SET value=? WHERE event_id=?');
-  for (const event of [legacy, internal, failedEvent, ...legacyProviderEvents]) {
+  const history = store.subscribeEvents('s', store.initialCursor('s'), 100);
+  assert.equal(history.status, 'events');
+  const legacyObservedEvent = history.events.find(event => event.eventId === legacyObserved.eventId);
+  assert.ok(legacyObservedEvent);
+  for (const event of [legacy, legacyObservedEvent, failedEvent, ...legacyProviderEvents]) {
     assert.equal(legacyWrite.run(JSON.stringify(event), event.eventId).changes, 1);
   }
   const conflict = (err: unknown) => err instanceof StoreError && err.detail.code === 'idempotency_conflict';
@@ -117,7 +124,8 @@ test('compact event keys preserve external replay, conflicts and stream failure 
   assert.equal(store.slimLegacyEventKeys(1), 1);
   assert.equal(store.slimLegacyEventKeys(), 4);
   assert.equal(store.slimLegacyEventKeys(), 0);
-  assert.equal(summary(internal.eventId).i, 1);
+  assert.equal(summary(legacyObserved.eventId)._k, 1);
+  assert.equal(summary(legacyObserved.eventId).i, undefined);
   assert.equal(summary(failure.eventId).t, 'adapter.stream_failed');
   assert.equal(summary(failure.eventId).o, turn.turnId);
   assert.equal(summary(failure.eventId).u, 1);
@@ -133,6 +141,7 @@ test('compact event keys preserve external replay, conflicts and stream failure 
   assert.deepEqual(store.appendEvent(external), original);
   assert.deepEqual(store.appendEvent(failure), failedEvent);
   assert.equal(store.appendObservedEvent(observed), false);
+  assert.equal(store.appendObservedEvent(legacyObserved), false);
   assert.equal(store.appendObservedEvent(unsupported), false);
   assert.equal(store.appendObservedEvent(nativeTool), false);
   assert.throws(() => store.appendEvent({ ...external, data: { text: 'changed' } }), conflict);
@@ -268,34 +277,36 @@ test('catalog reads unchanged transcripts without bytes and processes appends on
   assert.ok(reads.every(read => read.start >= Buffer.byteLength(prefix) - 4096));
   reads.length = 0;
 
-  appendFileSync(compact, next.slice(-8) + '\n');
+  appendFileSync(compact, next.slice(-8));
   const appended = await catalog.readTranscript(id);
   assert.equal(appended.truncatedTrailingLine, false);
   assert.equal(appended.nextLine, first.nextLine + 1);
   assert.deepEqual(appended.messages.map(message => message.text), ['x'.repeat(9000), 'next λ response']);
-  assert.ok(reads.some(read => read.start === Buffer.byteLength(prefix) && read.bytes === Buffer.byteLength(next + '\n')));
+  assert.ok(reads.some(read => read.start === Buffer.byteLength(prefix) && read.bytes === Buffer.byteLength(next)));
   assert.ok(reads.every(read => read.start >= Buffer.byteLength(prefix) - 4096));
+  appendFileSync(compact, '\n');
+  assert.deepEqual(await catalog.readTranscript(id), appended);
 
   const truncated = reply(3, 'partial', ['content']);
   appendFileSync(compact, JSON.stringify(truncated) + '\n');
   assert.equal((await catalog.readTranscript(id)).messages.at(-1)?.text, 'partial');
-  writeFileSync(full, JSON.stringify(reply(3, 'partial recovered from the full transcript')) + '\n');
+  writeFileSync(full, JSON.stringify({ ...reply(3, 'partial recovered without timestamp'), created_at: undefined }) + '\n');
   const resolved = await catalog.readTranscript(id);
-  assert.equal(resolved.messages.at(-1)?.text, 'partial recovered from the full transcript');
+  assert.equal(resolved.messages.at(-1)?.text, 'partial recovered without timestamp');
   assert.equal(resolved.messages.at(-1)?.resolvedFromFull, true);
 
   const offset = statSync(compact).size;
   const compactAppend = JSON.stringify(reply(4, 'another prefix', ['content'])) + '\n';
-  appendFileSync(full, JSON.stringify(reply(4, 'another prefix completed in full')) + '\n');
+  appendFileSync(full, [reply(3, 'exact timestamp wins'), reply(4, 'another prefix completed in full')]
+    .map(row => JSON.stringify(row)).join('\n') + '\n');
   appendFileSync(compact, compactAppend);
   reads.length = 0;
   const bothGrew = await catalog.readTranscript(id);
   assert.deepEqual(bothGrew.messages.slice(-2).map(message => [message.text, message.resolvedFromFull]), [
-    ['partial recovered from the full transcript', true],
+    ['exact timestamp wins', true],
     ['another prefix completed in full', true],
   ]);
-  assert.ok(reads.some(read => read.start === offset && read.bytes === Buffer.byteLength(compactAppend)));
-  assert.ok(reads.every(read => read.start >= offset - 4096));
+  assert.ok(reads.some(read => read.start === 0 && read.bytes === offset + Buffer.byteLength(compactAppend)));
 
   // In-place shrink and a larger replacement invalidate the committed prefix independently.
   writeFileSync(compact, JSON.stringify(reply(4, 'shortened')) + '\n');
@@ -321,6 +332,25 @@ test('catalog reads unchanged transcripts without bytes and processes appends on
   const corrected = await catalog.readTranscript(id);
   assert.equal(corrected.parseErrors, 0);
   assert.equal(corrected.messages.at(-1)?.text, 'corrected');
+});
+
+test('oversized resolved transcript bypasses the cache and preserves existing entries', async t => {
+  const root = tempDir(t);
+  const small = transcriptPaths(root, 'small');
+  const oversized = transcriptPaths(root, 'oversized');
+  writeFileSync(small.compact, JSON.stringify(reply(1, 'small')) + '\n');
+  writeFileSync(oversized.compact, JSON.stringify(reply(1, 'prefix', ['content'])) + '\n');
+  const text = '前'.repeat(600);
+  writeFileSync(oversized.full, JSON.stringify(reply(1, text)) + '\n');
+  const cache = new Map<string, AgyTranscriptCacheEntry>();
+  const read = (id: string) => readCachedAgyTranscript(id, { brainDir: small.brainDir }, cache, 3000);
+  const cached = await read('small');
+  assert.ok(cache.has('small'));
+  const resolved = await read('oversized');
+  assert.equal(resolved.messages[0]?.text, text);
+  assert.ok(statSync(oversized.compact).size + Buffer.byteLength(text) < 3000, 'either parsed collection alone fits');
+  assert.deepEqual([...cache.keys()], ['small']);
+  assert.equal(await read('small'), cached);
 });
 
 function openSummariesDb(t: TestContext, dbPath: string): DatabaseSync {

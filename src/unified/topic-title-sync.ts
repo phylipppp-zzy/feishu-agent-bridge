@@ -231,8 +231,11 @@ export async function syncTopicRootTitle(
     const lastTitleCore = lastApplied ? stripLegacyTitlePrefix(lastApplied.synced_title.split('\n', 1)[0] ?? '') : '';
     const sameSession = lastApplied?.session_id === session.sessionId;
     const privacyMaskingTransition = !customTitle && isGenericSessionTitle(session.title) && Boolean(lastTitleCore) && !isGenericSessionTitle(lastTitleCore);
-    // Only patch an already-synced same-session root on status transition, explicit /rename change, or privacy masking.
-    if (!unsettled && lastApplied && sameSession && !privacyMaskingTransition && lastStatus === effectiveStatus && lastApplied.synced_custom_title === normalizedCustom) return;
+    const initialTitleTransition = !customTitle && Boolean(lastTitleCore) && isGenericSessionTitle(lastTitleCore) && !isGenericSessionTitle(session.title);
+    const lastExternallyWorking = lastApplied?.synced_title.split('\n')[1]?.endsWith(' · 终端运行中') ?? false;
+    const externallyWorking = session.status === 'read_only' && options?.externallyWorking === true;
+    if (!unsettled && lastApplied && sameSession && !privacyMaskingTransition && !initialTitleTransition &&
+        lastStatus === effectiveStatus && lastExternallyWorking === externallyWorking && lastApplied.synced_custom_title === normalizedCustom) return;
     if (row && row.retry_after > Date.now()) return;
 
     const rememberTitle = () => db.prepare(`

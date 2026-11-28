@@ -674,8 +674,8 @@ export class WatchHub {
     const root = await this.ensureRoot(auth);
     const targetDestination = root.topicDestination ?? root.chatDestination;
     const pendingRows = this.db
-      .prepare("SELECT * FROM watch_hub_outbox_v1 WHERE state='pending' ORDER BY rowid")
-      .all() as unknown as WatchOutboxRow[];
+      .prepare("SELECT outbox_id, object_id, delivery_id, action, target_message_id FROM watch_hub_outbox_v1 WHERE state='pending' ORDER BY rowid")
+      .all() as unknown as Pick<WatchOutboxRow, 'outbox_id' | 'object_id' | 'delivery_id' | 'action' | 'target_message_id'>[];
 
     const results: WatchDeliveryResult[] = [];
     const guard = async () => {
@@ -687,40 +687,36 @@ export class WatchHub {
     };
 
     for (const row of pendingRows) {
-      let action = row.action;
-      let targetMessageId = row.target_message_id;
-      let card = JSON.parse(row.card_json) as ChannelCard;
-      let hadUnknown = row.had_unknown === 1 || root.hadUnknownHistory;
-
-      if (action === 'send' && !targetMessageId) {
-        const priorUnknown = this.db
-          .prepare(
-            "SELECT delivery_id FROM watch_hub_outbox_v1 WHERE object_id=? AND state='unknown' ORDER BY rowid DESC LIMIT 1",
-          )
-          .get(row.object_id) as { delivery_id: string } | undefined;
-        if (priorUnknown) {
-          hadUnknown = true;
-          const recoveredMsgId = (await this.port.lookupMessageId?.(priorUnknown.delivery_id)) ?? null;
-          if (recoveredMsgId) {
-            action = 'update';
-            targetMessageId = recoveredMsgId;
-          }
-        }
-      }
-
-      if (hadUnknown) {
-        card = appendUnknownHistoryNotice(card);
-      }
+      const priorUnknown = row.action === 'send' && !row.target_message_id ? this.db
+        .prepare("SELECT delivery_id FROM watch_hub_outbox_v1 WHERE object_id=? AND state='unknown' ORDER BY rowid DESC LIMIT 1")
+        .get(row.object_id) as { delivery_id: string } | undefined : undefined;
+      const recoveredMsgId = priorUnknown ? (await this.port.lookupMessageId?.(priorUnknown.delivery_id)) ?? null : null;
+      let action: WatchOutboxRow['action'];
+      let targetMessageId: string | null;
+      let card: ChannelCard;
+      let hadUnknown: boolean;
 
       this.db.exec('BEGIN IMMEDIATE');
       try {
-        const claimed = this.db
+        const latest = this.db
+          .prepare("SELECT action, target_message_id, card_json, had_unknown FROM watch_hub_outbox_v1 WHERE outbox_id=? AND state='pending'")
+          .get(row.outbox_id) as Pick<WatchOutboxRow, 'action' | 'target_message_id' | 'card_json' | 'had_unknown'> | undefined;
+        if (!latest) {
+          this.db.exec('COMMIT');
+          continue;
+        }
+        const recover = latest.action === 'send' && !latest.target_message_id && !!priorUnknown;
+        targetMessageId = recover ? recoveredMsgId : latest.target_message_id;
+        action = recover && recoveredMsgId ? 'update' : latest.action;
+        hadUnknown = latest.had_unknown === 1 || root.hadUnknownHistory || recover;
+        card = JSON.parse(latest.card_json) as ChannelCard;
+        if (hadUnknown) card = appendUnknownHistoryNotice(card);
+        this.db
           .prepare(
             "UPDATE watch_hub_outbox_v1 SET state='unknown', action=?, target_message_id=?, card_json=?, had_unknown=?, updated_at=? WHERE outbox_id=? AND state='pending'",
           )
           .run(action, targetMessageId, JSON.stringify(card), hadUnknown ? 1 : 0, this.now(), row.outbox_id);
         this.db.exec('COMMIT');
-        if (!claimed.changes) continue;
       } catch (error) {
         this.db.exec('ROLLBACK');
         throw error;
@@ -764,6 +760,11 @@ export class WatchHub {
           });
         }
       } catch (error) {
+        if ((error as { deliveryKind?: string } | null)?.deliveryKind === 'cancelled_before_send') {
+          this.db.prepare("UPDATE watch_hub_outbox_v1 SET state='pending', updated_at=? WHERE outbox_id=? AND state='unknown'")
+            .run(this.now(), row.outbox_id);
+          break;
+        }
         const msg = error instanceof Error ? error.message : String(error);
         this.db
           .prepare("UPDATE watch_hub_outbox_v1 SET state='unknown', had_unknown=1, last_error=?, updated_at=? WHERE outbox_id=?")

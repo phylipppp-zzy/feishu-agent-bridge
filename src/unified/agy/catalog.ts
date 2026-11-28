@@ -137,15 +137,16 @@ export class AgyCatalog {
       return readAgyTranscript(conversationId, readOpts);
     }
     const previous = this.transcriptCache.get(conversationId);
-    const result = await readCachedAgyTranscript(conversationId, readOpts, this.transcriptCache);
+    const maxCacheBytes = 64 * 1024 * 1024;
+    const result = await readCachedAgyTranscript(conversationId, readOpts, this.transcriptCache, maxCacheBytes);
     if (previous?.result === result || !this.transcriptCache.has(conversationId)) return result;
-    // Bound retained histories by both entry count and total source bytes.
+    // Bound retained histories by entry count and the size of source and parsed rows.
     let bytes = 0;
-    for (const entry of this.transcriptCache.values()) bytes += entry.compactStat.size;
+    for (const entry of this.transcriptCache.values()) bytes += entry.retainedBytes;
     for (const [id, entry] of this.transcriptCache) {
-      if (this.transcriptCache.size <= 128 && bytes <= 64 * 1024 * 1024) break;
+      if (this.transcriptCache.size <= 128 && bytes <= maxCacheBytes) break;
       this.transcriptCache.delete(id);
-      bytes -= entry.compactStat.size;
+      bytes -= entry.retainedBytes;
     }
     return result;
   }

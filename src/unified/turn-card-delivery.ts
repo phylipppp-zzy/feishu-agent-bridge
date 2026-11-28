@@ -507,8 +507,7 @@ export class TurnCardDelivery {
     const schema = old?.schema ?? (current ? '1.0' : '2.0');
     const start = timing?.startedMs ?? timestampMs(input.turn?.startedAt);
     const end = timing?.endedMs ?? timestampMs(input.turn?.endedAt);
-    const elapsed = start !== null && (terminal ? end !== null && end >= start : ticking && now >= start)
-      ? (terminal ? end! - start : Math.floor((now - start) / HEARTBEAT_MS) * HEARTBEAT_MS) : null;
+    const elapsed = start !== null && end !== null && end >= start ? end - start : null;
     let files: Artifact[] = [];
     if (message && (terminal || !input.turn && message.final)) {
       try { files = await this.service.findRegisteredReplyFiles?.(sessionId, message.blocks) ?? []; }
@@ -534,7 +533,7 @@ export class TurnCardDelivery {
     await guard();
     const allowCompactButton = sessionConnected && !key[2].includes('"access_mode":"read_only"');
     const card = turnProgressCard({
-      provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3],
+      provider, status, schema, message, tools, toolCounts, duration: terminal ? elapsed : null, files, turnId: key[3],
       allowCompactButton,
       ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
       ...(modelBadge ? { modelBadge } : {}),

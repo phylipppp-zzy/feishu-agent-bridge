@@ -57,6 +57,17 @@ export interface FeishuPort {
   topicLinkForSession?(destination:string,sessionId:string):Promise<string | null>;
   topicLinkForTask?(destination:string,taskId:string):Promise<string | null>;
 }
+function isExternallyWorking(snap: SessionSnapshot): boolean {
+  if (snap.session.status !== 'read_only') return false;
+  if (snap.turns?.some(t => t.status === 'running')) return true;
+  const latest = snap.messages.at(-1);
+  if (latest?.role === 'user' && snap.session.updatedAt) {
+    const ageMs = Date.now() - Date.parse(snap.session.updatedAt);
+    if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 120_000) return true;
+  }
+  return false;
+}
+
 class BindingManagementDenied extends Error {}
 export type AuthorizeBindingAdmin = (identity: Identity, destination: string, sessionId: string) => Promise<boolean>;
 export type Authorize = (identity: Identity, destination: string, sessionId: string | null) => Promise<boolean>;
@@ -905,8 +916,12 @@ export class FeishuChannel {
       await (cursor ? replyOrUpdate : reply)(card); return page;
     }
     if (a.action === 'rename') {
+      const externallyWorking = session.status === 'read_only' &&
+        (this.topicTitleIsRunning(e.destination, bound, executionScope) ||
+          isExternallyWorking((await this.service.getSnapshot(bound)).value));
+      await guard();
       const cleaned = setCustomTopicTitle(this.db, e.destination, bound, a.title);
-      await syncTopicRootTitle(this.db, this.port, e.destination, executionScope, session, card => this.stampCard(e.destination, card), guard);
+      await syncTopicRootTitle(this.db, this.port, e.destination, executionScope, session, card => this.stampCard(e.destination, card), guard, { externallyWorking });
       await reply({ title: '话题标题已更新', text: `已将当前话题标题设为：**${escapeCardMarkdown(cleaned)}**`, actions: [] });
       return { status: 'completed', title: cleaned };
     }
@@ -1076,20 +1091,18 @@ export class FeishuChannel {
     return work;
   }
 
+  private topicTitleIsRunning(destination: string, sessionId: string, scope: string): boolean {
+    // The title table may still have the legacy schema until the first title sync.
+    const row = this.db.prepare(
+      'SELECT * FROM channel_topic_titles WHERE destination=? AND session_id=? AND binding_scope=?',
+    ).get(destination, sessionId, scope);
+    return (row?.synced_status || (String(row?.synced_title ?? '').startsWith('🔵') ? 'running' : '')) === 'running';
+  }
+
   private async syncTopic(destination: string): Promise<boolean> {
     const row=this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;binding_id:string;revision:number;access_mode:'read_only'|'interactive'}|undefined; if(!row) throw new Error('destination is not bound'); const sessionId=row.session_id, scope=JSON.stringify(row);
     const syncGuard=()=>this.checkBinding(destination,sessionId,scope);
-    const isExternallyWorking = (snap: SessionSnapshot): boolean => {
-      if (snap.session.status !== 'read_only') return false;
-      if (snap.turns?.some(t => t.status === 'running')) return true;
-      const latest = snap.messages.at(-1);
-      if (latest?.role === 'user' && snap.session.updatedAt) {
-        const ageMs = Date.now() - Date.parse(snap.session.updatedAt);
-        if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 120_000) return true;
-      }
-      return false;
-    };
-    const syncTitle=(snap:SessionSnapshot)=>syncTopicRootTitle(this.db,this.port,destination,scope,snap.session,card=>this.stampCard(destination,card),syncGuard,{externallyWorking:isExternallyWorking(snap)});
+    const syncTitle=(snap:SessionSnapshot, liveRunning = false)=>syncTopicRootTitle(this.db,this.port,destination,scope,snap.session,card=>this.stampCard(destination,card),syncGuard,{externallyWorking:liveRunning || isExternallyWorking(snap)});
     const reconcileReleasedReadonly = (session: Session): boolean => {
       if (!this.channelOptions.autoTakeControlOnInput || row.access_mode !== 'interactive' ||
           session.status !== 'read_only' || session.control.owner !== null || session.control.input !== 'unavailable') return false;
@@ -1260,16 +1273,16 @@ export class FeishuChannel {
     const syncReadonlyLiveCard = async (
       session: Session,
       snapshotMessages: readonly Message[] | null,
-    ): Promise<{ handledIds: Set<string>; deferredIds: Set<string> }> => {
+    ): Promise<{ handledIds: Set<string>; deferredIds: Set<string>; liveRunning: boolean }> => {
       const handledIds = new Set<string>();
       const deferredIds = new Set<string>();
       if (!this.channelOptions.readReadonlyLiveTurn || !isCliReadonly(session)) {
         this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=?').run(destination);
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning: false };
       }
       this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND binding_scope<>?').run(destination, scope);
       if (!allowedPush()) {
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning: false };
       }
       let live: ReadonlyLiveTurnView | null = null;
       try {
@@ -1299,9 +1312,10 @@ export class FeishuChannel {
             deferredIds.add(m.messageId);
           }
         }
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning: false };
       }
 
+      const liveRunning = live?.state === 'running';
       const now = Date.now();
       const hasWork = Boolean(live && live.state === 'running' && (live.tools.length > 0 || live.activeSubagents.length > 0));
 
@@ -1321,7 +1335,7 @@ export class FeishuChannel {
               activeRow = undefined;
             } else {
               for (const m of prevTurnFinals) deferredIds.add(m.messageId);
-              return { handledIds, deferredIds };
+              return { handledIds, deferredIds, liveRunning };
             }
           } else {
             this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
@@ -1371,7 +1385,7 @@ export class FeishuChannel {
             } catch (error) {
               if (isApiRejectionError(error)) {
                 this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-                return { handledIds, deferredIds };
+                return { handledIds, deferredIds, liveRunning };
               }
               throw error;
             }
@@ -1414,7 +1428,7 @@ export class FeishuChannel {
                   this.db.prepare(
                     'UPDATE channel_readonly_live_cards SET patch_seq=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
                   ).run(nextSeq, now, destination, sessionId, scope);
-                  return { handledIds, deferredIds };
+                  return { handledIds, deferredIds, liveRunning };
                 }
                 throw error;
               }
@@ -1432,7 +1446,7 @@ export class FeishuChannel {
             deferredIds.add(m.messageId);
           }
         }
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning };
       }
 
       if (existing && (!live || live.state === 'idle')) {
@@ -1456,7 +1470,7 @@ export class FeishuChannel {
             for (const m of finalCandidates) deferredIds.add(m.messageId);
           }
           // outcome === 'fallback': slot deleted, neither handled nor deferred -> TurnCardDelivery sends fresh card.
-          return { handledIds, deferredIds };
+          return { handledIds, deferredIds, liveRunning };
         }
 
         // Summaries may flip to IDLE slightly before Core history refresh delivers the final assistant message.
@@ -1466,7 +1480,7 @@ export class FeishuChannel {
             .run(idleSince, destination, sessionId, scope);
         }
         if (now - idleSince < readonlyIdleGraceMs) {
-          return { handledIds, deferredIds };
+          return { handledIds, deferredIds, liveRunning };
         }
 
         const doneCard = turnProgressCard({
@@ -1499,7 +1513,7 @@ export class FeishuChannel {
                   'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
                 ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
               }
-              return { handledIds, deferredIds };
+              return { handledIds, deferredIds, liveRunning };
             }
             throw error;
           }
@@ -1509,7 +1523,7 @@ export class FeishuChannel {
             .run(destination, sessionId, scope);
         }
       }
-      return { handledIds, deferredIds };
+      return { handledIds, deferredIds, liveRunning };
     };
     const deliverCliPrompts = async (session: Session, candidates: readonly Message[]) => {
       if (this.accessMode(destination) !== 'read_only' || !candidates.length) return;
@@ -1574,8 +1588,13 @@ export class FeishuChannel {
           );
           if (!hasPendingCards && !hasInteractionCards && !hasReadonlyLiveCard) {
             const session = await this.service.getSession(sessionId); await syncGuard();
-            await syncReadonlyLiveCard(session, null);
-            await syncTopicRootTitle(this.db, this.port, destination, scope, session, card => this.stampCard(destination, card), syncGuard);
+            const { liveRunning } = await syncReadonlyLiveCard(session, null);
+            const externallyWorking = session.status === 'read_only' && (liveRunning ||
+              (this.topicTitleIsRunning(destination, sessionId, scope) &&
+                isExternallyWorking((await this.service.getSnapshot(sessionId)).value)));
+            await syncGuard();
+            await syncTopicRootTitle(this.db, this.port, destination, scope, session,
+              card => this.stampCard(destination, card), syncGuard, { externallyWorking });
             if (reconcileReleasedReadonly(session)) return true;
             return false;
           }
@@ -1603,7 +1622,7 @@ export class FeishuChannel {
         ];
         await this.turnCards.sync(scopeKey, snapshot.value, events.events, remainingMessages, allowedPush);
         await syncGuard();
-        await syncTitle(snapshot.value);
+        await syncTitle(snapshot.value, roResult.liveRunning);
         if (reconcileReleasedReadonly(snapshot.value.session)) return true;
         for (const message of remainingMessages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
         for (const message of snapshot.value.messages) if (message.final && roResult.handledIds.has(message.messageId)) remember.run(destination,sessionId,message.messageId,message.revision);

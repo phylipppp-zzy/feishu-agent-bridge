@@ -63,9 +63,62 @@ test('deploy active check blocks each work source and supports force and idle', 
   }
   assert.equal((await run()).status, 0);
   db.exec('DROP TABLE steer_outbox_v1');
+  assert.equal((await run()).status, 0, 'minimal databases need no steer outbox');
+  db.exec('DROP TABLE interactions');
   const invalid = await run();
   assert.equal(invalid.status, 1);
-  assert.match(invalid.stderr, /steer_outbox_v1/);
+  assert.match(invalid.stderr, /interactions/);
+});
+
+test('deploy gates interactive work and keeps graceful systemd shutdown', async t => {
+  const script = readFileSync('scripts/deploy-production.py', 'utf8');
+  assert.match(script, /^TimeoutStopSec=30\nKillMode=mixed\nSendSIGKILL=yes$/m);
+  const core = join(tempDir(t), 'core.sqlite');
+  using db = new DatabaseSync(core);
+  const run = () => runPython(['scripts/deploy-production.py', '--check-active-only', '--core-db', core]);
+  db.exec(`
+    CREATE TABLE sessions(id TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE tracking_state(session_id TEXT PRIMARY KEY, detached INTEGER);
+    CREATE TABLE turns(session_id TEXT, id TEXT, value TEXT, PRIMARY KEY(session_id, id));
+    CREATE TABLE interactions(id TEXT PRIMARY KEY, session_id TEXT, value TEXT);
+    CREATE TABLE outbox(operation_id TEXT PRIMARY KEY, kind TEXT, state TEXT);
+    INSERT INTO sessions VALUES
+      ('readonly', '{"status":"read_only","control":{"input":"available"}}'),
+      ('unavailable', '{"status":"running","control":{"input":"unavailable"}}'),
+      ('detached', '{"status":"running","control":{"input":"available"}}'),
+      ('interactive', '{"status":"running","control":{"input":"available"}}');
+    INSERT INTO tracking_state VALUES ('detached', 1);
+    INSERT INTO turns SELECT id, 'same-step', '{"status":"running"}' FROM sessions WHERE id <> 'interactive';
+    INSERT INTO interactions SELECT id || '-answer', id, '{"status":"answer_pending_delivery","kind":"question"}'
+      FROM sessions WHERE id <> 'interactive';
+  `);
+  assert.equal((await run()).status, 0);
+  db.exec(`INSERT INTO turns VALUES ('interactive', 'same-step', '{"status":"running"}')`);
+  const running = await run();
+  assert.equal(running.status, 2);
+  assert.match(running.stderr, /Turn: interactive \/ same-step \/ running/);
+  db.exec(`DELETE FROM turns WHERE session_id='interactive';
+    INSERT INTO interactions VALUES ('interactive-answer', 'interactive', '{"status":"answer_pending_delivery","kind":"question"}')`);
+  const answering = await run();
+  assert.equal(answering.status, 2);
+  assert.match(answering.stderr, /interactive-answer \/ interactive \/ question/);
+});
+
+test('a held production deploy lock exits cleanly', async t => {
+  const result = await runPython(['-c', `
+import fcntl, os, re, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+script = Path('scripts/deploy-production.py')
+source = re.sub(r'^RELEASES_ROOT = .*$', lambda _: f'RELEASES_ROOT = Path({str(root)!r})',
+                script.read_text(), count=1, flags=re.M)
+fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+sys.argv = [str(script), '--force']
+exec(compile(source, str(script), 'exec'))
+`, tempDir(t)]);
+  assert.deepEqual(result, { status: 1, stdout: '', stderr: 'Another production deployment is already in progress.\n' });
 });
 
 test('release GC retains the new, unit, running, and newest old releases', { skip: process.platform !== 'linux' }, async () => {

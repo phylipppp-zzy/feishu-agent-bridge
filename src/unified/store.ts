@@ -39,8 +39,6 @@ function isCompactEventKey(value: Event | EventKey): value is EventKey {
   return '_k' in value && value._k === 1;
 }
 
-const legacyInternalEventId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const legacyInternalEventType = /^(?:(?:message|session|tool|turn)\.updated|(?:operation|interaction)\..+)$/;
 
 /** Isolated store; callers authenticate identities and mediate all native effects. */
 export class UnifiedStore {
@@ -1090,12 +1088,8 @@ export class UnifiedStore {
       for (const row of rows) {
         const eventId = String(row.event_id);
         const { schemaVersion, sequence, cursor: _cursor, ...input } = parse<Event>(row.value);
-        // These provider events also used UUID-v4 keys before provenance was recorded.
-        const observedTool = input.type === 'tool.updated' && input.objectRevision === 0 && input.operationId === null &&
-          readToolProgress(input.data)?.callId === input.objectId;
-        const internal = input.type !== 'interaction.unsupported' && !observedTool &&
-          legacyInternalEventId.test(eventId) && legacyInternalEventType.test(input.type);
-        update.run(JSON.stringify(compactEventKey(input, sequence, schemaVersion, internal)), eventId);
+        // Legacy event keys carry no provenance, even when their IDs are UUIDs.
+        update.run(JSON.stringify(compactEventKey(input, sequence, schemaVersion, false)), eventId);
       }
       return rows.length;
     });

@@ -1,13 +1,25 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import type { UnifiedService } from '../src/unified/adapter.js';
 import type { Message, Session, Turn } from '../src/unified/contracts.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
+import { FeishuChannel } from '../src/unified/feishu-channel.js';
 import { FeishuApiRejected, FeishuSdkPort } from '../src/unified/feishu-sdk-port.js';
+import { WatchHub } from '../src/unified/hubs/watch-hub.js';
+import type { WatchEvent } from '../src/unified/hubs/watch-types.js';
 import { setCustomTopicTitle, syncTopicRootTitle } from '../src/unified/topic-title-sync.js';
 import { TurnCardDelivery } from '../src/unified/turn-card-delivery.js';
+
+function tempDir(t: TestContext): string {
+  const dir = mkdtempSync(join(tmpdir(), 'feishu-delivery-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 
 test('running card heartbeats skip elapsed-only writes and preserve the exact final duration', async t => {
   const start = Date.parse('2026-11-27T00:00:00Z');
@@ -18,9 +30,10 @@ test('running card heartbeats skip elapsed-only writes and preserve the exact fi
     CREATE TABLE channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER);
   `);
   const patches: ChannelCard[] = [];
+  const sends: ChannelCard[] = [];
   let wakes = 0;
   const delivery = new TurnCardDelivery(db, {} as UnifiedService, {
-    async send() { return 'card'; },
+    async send(_destination, card) { sends.push(card); return 'card'; },
     async update(_destination, _id, card) { patches.push(card); },
     async sendFile() {},
   }, {
@@ -37,6 +50,8 @@ test('running card heartbeats skip elapsed-only writes and preserve the exact fi
     key: ['chat', 's', 'scope', 't'], turn, message, tools: [], provider: 'codex', sessionConnected: true,
   };
   await delivery.renderStreamMessage(input);
+  assert.match(sends[0]!.title, /进行中/);
+  assert.doesNotMatch(sends[0]!.title, /用时/);
   for (let i = 1; i <= 3; i++) {
     t.mock.timers.tick(60_000);
     assert.equal(wakes, i);
@@ -47,6 +62,7 @@ test('running card heartbeats skip elapsed-only writes and preserve the exact fi
   input.tools = [{ turnId: 't', callId: 'tool', phase: 'running', tool: 'Bash', summary: 'Bash · tests' }];
   await delivery.renderStreamMessage(input);
   assert.match(patches[0]!.executionLog!.runningNote!, /Bash/);
+  assert.doesNotMatch(patches[0]!.title, /用时/);
   input.message = { ...message, blocks: [{ type: 'text', text: 'updated' }], revision: 2 };
   t.mock.timers.tick(2499);
   await delivery.renderStreamMessage(input);
@@ -95,7 +111,7 @@ test('legacy topic title skips upstream drift and follows status, rename and ren
     syncTopicRootTitle(db, port, 'topic', scope, { ...session, status, title }, card => card, async () => {},
       { ...(externallyWorking === undefined ? {} : { externallyWorking }) });
   await sync('idle', 'upstream drift');
-  assert.deepEqual(titles, []);
+  assert.equal(titles.length, 0);
   await sync('running', 'upstream drift');
   await sync('running', 'upstream drift · agents 2');
   await sync('idle', 'new upstream title');
@@ -110,6 +126,19 @@ test('legacy topic title skips upstream drift and follows status, rename and ren
     '🟢 restored upstream title', '🔵 restored upstream title', '⚪ restored upstream title']);
   assert.deepEqual({ ...db.prepare('SELECT synced_status,synced_custom_title FROM channel_topic_titles').get() },
     { synced_status: 'read_only', synced_custom_title: '' });
+
+  const subtitles: Array<string | undefined> = [];
+  port.update = async (_destination, _id, updated) => { titles.push(updated.title); subtitles.push(updated.subtitle); };
+  const placeholder = 'Codex 会话 · 0123abcd';
+  await sync('read_only', placeholder, true);
+  await sync('read_only', 'first real title', true);
+  await sync('read_only', 'later title drift', true);
+  db.exec("UPDATE channel_bindings SET revision=2, access_mode='interactive'");
+  const interactiveScope = JSON.stringify(db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings').get());
+  await syncTopicRootTitle(db, port, 'topic', interactiveScope, { ...session, status: 'running', title: 'first real title' },
+    card => card, async () => {});
+  assert.deepEqual(titles.slice(-3), [`🔵 ${placeholder}`, '🔵 first real title', '🔵 first real title']);
+  assert.deepEqual(subtitles, ['/work · 终端运行中', '/work · 终端运行中', '/work · 运行中']);
   assert.equal(db.prepare('PRAGMA integrity_check').get()?.integrity_check, 'ok');
   assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
 });
@@ -119,6 +148,104 @@ function deferred<T>() {
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
 }
+
+test('readonly topic keeps its live or snapshot running status with no new events', async t => {
+  const path = join(tempDir(t), 'channel.sqlite');
+  const identity = { source: 'feishu', subject: 'owner' };
+  const session = { sessionId: 's', project: '/work', title: 'Terminal session', status: 'read_only',
+    native: { provider: 'codex' }, capabilities: {}, control: { input: 'unavailable' } } as Session;
+  const turn = { status: 'running' } as Turn;
+  let turns: Turn[] = [];
+  let live = false;
+  const getSnapshot = t.mock.fn(async () => ({ cursor: '0', value: { session, turns, messages: [], interactions: [] } }));
+  const service = {
+    async getSession() { return session; }, getSnapshot,
+    async subscribeEvents() { return { status: 'events' as const, cursor: '0', events: [] }; },
+  } as Pick<UnifiedService, 'getSession' | 'getSnapshot' | 'subscribeEvents'> as UnifiedService;
+  const patches: ChannelCard[] = [];
+  const channel = new FeishuChannel(service, {
+    isTopicDestination: () => true, rootMessageId: () => 'root',
+    async send() { return 'reply'; }, async sendFile() {},
+    async update(_destination, _id, card) { patches.push(card); },
+  }, async () => true, path, undefined, false, {
+    readReadonlyLiveTurn: () => live ? {
+      state: 'running', running: true, anchorId: 'cli', previewText: '', tools: [], activeSubagents: [], signature: 'cli',
+    } : null,
+  });
+  t.after(() => channel.close());
+  using db = new DatabaseSync(path);
+  db.exec("INSERT INTO channel_bindings(destination,session_id,binding_id,revision,access_mode,owner_source,owner_subject) VALUES ('topic','s','binding',1,'read_only','feishu','owner')");
+  const scope = JSON.stringify(db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings').get());
+  db.prepare("INSERT INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES ('topic','s','0',?)").run(scope);
+  await channel.sync('topic');
+  assert.equal(getSnapshot.mock.callCount(), 0);
+  assert.match(patches.at(-1)!.title, /^⚪/u);
+  live = true;
+  await channel.sync('topic');
+  assert.equal(getSnapshot.mock.callCount(), 0);
+  assert.match(patches.at(-1)!.subtitle!, /终端运行中/);
+  await channel.handle({ destination: 'topic', identity, eventId: 'rename' }, { action: 'rename', title: 'Renamed' });
+  assert.equal(patches.at(-1)!.title, '🔵 Renamed');
+  live = false;
+  turns = [turn];
+  await channel.sync('topic');
+  assert.equal(getSnapshot.mock.callCount(), 1);
+  assert.equal(patches.at(-1)!.title, '🔵 Renamed');
+  turns = [];
+  await channel.sync('topic');
+  await channel.sync('topic');
+  assert.equal(getSnapshot.mock.callCount(), 2);
+  assert.equal(patches.at(-1)!.title, '⚪ Renamed');
+});
+
+test('Watch claims the latest coalesced state and leaves pre-send cancellations pending', async t => {
+  const path = join(tempDir(t), 'watch.sqlite');
+  const lookupStarted = deferred<void>();
+  const receipt = deferred<string | null>();
+  const delivered: Array<{ id: string; card: ChannelCard }> = [];
+  let cancel = false;
+  let cancelledAttempts = 0;
+  const hub = new WatchHub({
+    dbPath: path, owner: { source: 'feishu', subject: 'owner' }, destination: 'chat',
+    port: {
+      async send(_destination, _card, id) {
+        if (cancel) {
+          cancelledAttempts++;
+          throw Object.assign(new Error('stopped before send'), { deliveryKind: 'cancelled_before_send' });
+        }
+        return 'message:' + id;
+      },
+      async update(_destination, id, card) { delivered.push({ id, card }); },
+      async lookupMessageId() { lookupStarted.resolve(); return receipt.promise; },
+    },
+  });
+  t.after(() => hub.close());
+  await hub.ensureRoot();
+  using db = new DatabaseSync(path);
+  const event: WatchEvent = { eventId: 'first', objectId: 'agent', source: 'codex_status', state: 'alert', severity: 'normal',
+    title: 'Agent', summary: 'original alert', occurredAt: '2026-11-27T00:00:00Z' };
+  const first = await hub.ingest(event);
+  db.prepare("UPDATE watch_hub_outbox_v1 SET state='unknown' WHERE outbox_id=?").run(first.outboxId);
+  await hub.ingest({ ...event, eventId: 'second', occurredAt: '2026-11-27T00:00:01Z' });
+  const flushing = hub.flush();
+  await lookupStarted.promise;
+  await hub.ingest({ ...event, eventId: 'recovery', state: 'recovered', summary: 'recovery while claiming',
+    occurredAt: '2026-11-27T00:00:02Z' });
+  receipt.resolve('known-message');
+  assert.equal((await flushing)[0]?.status, 'sent');
+  assert.equal(delivered[0]?.id, 'known-message');
+  assert.match(delivered[0]!.card.text, /recovery while claiming/);
+
+  const unsentIds = ['cancelled', 'untouched'];
+  for (const id of unsentIds) await hub.ingest({ ...event, eventId: id, objectId: id });
+  cancel = true;
+  assert.deepEqual(await hub.flush(), []);
+  assert.equal(cancelledAttempts, 1);
+  assert.deepEqual(db.prepare("SELECT object_id,state,had_unknown FROM watch_hub_outbox_v1 WHERE object_id<>'agent' ORDER BY rowid")
+    .all().map(row => [row.object_id, row.state, row.had_unknown]), unsentIds.map(id => [id, 'pending', 0]));
+  cancel = false;
+  assert.equal((await hub.flush()).filter(result => result.status === 'sent').length, 2);
+});
 
 const card = (title: string): ChannelCard => ({ title, text: title, actions: [] });
 
@@ -134,11 +261,11 @@ function sdkFixture(t: TestContext, alertInterval = '60000') {
     if (env[key] === undefined) delete process.env[key];
     else process.env[key] = env[key];
   }
-  const { im: { message } } = (sdk as unknown as { client: { im: { message: {
+  const { im: { message, file } } = (sdk as unknown as { client: { im: { message: {
     create: (request: { data: { content: string } }) => Promise<{ code: number; data?: { message_id: string } }>;
     patch: (request: { data: { content: string }; path: { message_id: string } }) => Promise<{ code: number }>;
-  } } } }).client;
-  return { sdk, message, destinations };
+  }; file: { create: () => Promise<{ file_key: string }> } } } }).client;
+  return { sdk, message, file, destinations };
 }
 
 test('alert 230429 cooldown leaves terminal and interactive usage PATCHes ready', { timeout: 3000 }, async t => {
@@ -219,7 +346,7 @@ test('stopReceiving aborts paced delivery and late SDK receipts cannot access th
   };
   await sdk.send('chat', card('first'), 'watch-first');
   const paced = sdk.send('chat', card('paced'), 'watch:second');
-  const pacedRejection = assert.rejects(paced, /SDK port closing/);
+  const pacedRejection = assert.rejects(paced, { message: 'SDK port closing', deliveryKind: 'cancelled_before_send' });
   const inFlight = sdk.send('chat', card('in flight'), 'usage-msg:user');
   const receiptRejection = assert.rejects(inFlight, /SDK port closing/);
   await started.promise;
@@ -229,8 +356,59 @@ test('stopReceiving aborts paced delivery and late SDK receipts cannot access th
   sdk.close();
   release.resolve({ code: 0, data: { message_id: 'late' } });
   await receiptRejection;
-  await assert.rejects(sdk.update('chat', 'first', card('closed'), 'watch:closed'), /SDK port closing/);
+  await assert.rejects(sdk.update('chat', 'first', card('closed'), 'watch:closed'),
+    { message: 'SDK port closing', deliveryKind: 'cancelled_before_send' });
   assert.deepEqual(calls, ['first', 'in flight']);
+});
+
+test('stopping intake during the alert PATCH guard cancels without a PATCH', { timeout: 3000 }, async t => {
+  const { sdk, message } = sdkFixture(t, '0');
+  const guardStarted = deferred<void>();
+  const releaseGuard = deferred<void>();
+  message.create = async () => ({ code: 0, data: { message_id: 'existing' } });
+  const patch = message.patch = t.mock.fn(async () => ({ code: 0 }));
+  const id = await sdk.send('chat', card('existing'), 'setup');
+  const rejected = assert.rejects(sdk.update('chat', id, card('alert'), 'watch:update', async () => {
+    guardStarted.resolve();
+    await releaseGuard.promise;
+  }), { deliveryKind: 'cancelled_before_send' });
+  await guardStarted.promise;
+  sdk.stopReceiving();
+  releaseGuard.resolve();
+  await rejected;
+  assert.equal(patch.mock.callCount(), 0);
+});
+
+test('stopping intake after an alert file upload cancels before sending the message', { timeout: 3000 }, async t => {
+  const { sdk, message, file } = sdkFixture(t, '0');
+  const guardStarted = deferred<void>();
+  const releaseGuard = deferred<void>();
+  const upload = file.create = t.mock.fn(async () => ({ file_key: 'uploaded' }));
+  const send = message.create = t.mock.fn(async () => ({ code: 0, data: { message_id: 'unexpected' } }));
+  const rejected = assert.rejects(sdk.sendFile('chat', 'alert.txt', Buffer.from('alert'), 'watch:file', async () => {
+    if (!upload.mock.callCount()) return;
+    guardStarted.resolve();
+    await releaseGuard.promise;
+  }), { deliveryKind: 'cancelled_before_send' });
+  await guardStarted.promise;
+  sdk.stopReceiving();
+  releaseGuard.resolve();
+  await rejected;
+  assert.equal(upload.mock.callCount(), 1);
+  assert.equal(send.mock.callCount(), 0);
+});
+
+test('stopping intake preserves an in-flight message receipt until the SDK DB closes', async t => {
+  const { sdk, message } = sdkFixture(t);
+  const release = deferred<{ code: number; data: { message_id: string } }>();
+  const started = deferred<void>();
+  message.create = async () => { started.resolve(); return release.promise; };
+  const inFlight = sdk.send('chat', card('in flight'), 'watch:receipt');
+  await started.promise;
+  sdk.stopReceiving();
+  release.resolve({ code: 0, data: { message_id: 'sent' } });
+  assert.equal(await inFlight, 'sent');
+  assert.equal(await sdk.lookupMessageId('watch:receipt'), 'sent');
 });
 
 test('a terminal PATCH can supersede an older alert waiting on the same message', { timeout: 3000 }, async t => {

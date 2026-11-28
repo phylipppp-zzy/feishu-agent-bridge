@@ -48,14 +48,15 @@ const INCOMPLETE_LINE_WARNING = 'transcript has an incomplete trailing JSONL lin
 export interface AgyTranscriptCacheEntry {
   compactPath: string;
   compactStat: Stats;
-  fullStat: Stats | null;
   fullStatSig: string;
   maxBytes: number;
+  retainedBytes: number;
   byteOffset: number;
   nextLine: number;
   boundarySha256: string;
   prefixHash: Hash;
   hasUnresolvedTruncatedFields: boolean;
+  hasTrailingLineWithoutNewline: boolean;
   dependsOnFullTranscript: boolean;
   result: AgyTranscriptReadResult;
 }
@@ -394,7 +395,7 @@ export async function readAgyTranscriptCreatedAt(
   return null;
 }
 
-function splitCompleteJsonlLines(text: string): { lines: string[]; truncatedTrailingLine: boolean } {
+function splitCompleteJsonlLines(text: string): { lines: string[]; truncatedTrailingLine: boolean; hasTrailingLineWithoutNewline?: true } {
   if (!text) return { lines: [], truncatedTrailingLine: false };
   const endsWithNewline = text.endsWith('\n');
   const rawLines = text.split(/\r?\n/);
@@ -410,7 +411,7 @@ function splitCompleteJsonlLines(text: string): { lines: string[]; truncatedTrai
   try {
     const parsed: unknown = JSON.parse(last);
     if (isPlainRecord(parsed)) {
-      return { lines: rawLines, truncatedTrailingLine: false };
+      return { lines: rawLines, truncatedTrailingLine: false, hasTrailingLineWithoutNewline: true };
     }
   } catch {
     // Half-written trailing JSONL line during active session flush: leave it for the next read.
@@ -537,14 +538,16 @@ export async function readCachedAgyTranscript(
   conversationId: string,
   options: AgyReadTranscriptOptions,
   cache: Map<string, AgyTranscriptCacheEntry>,
+  maxCacheBytes: number,
 ): Promise<AgyTranscriptReadResult> {
-  return readTranscript(conversationId, options, cache);
+  return readTranscript(conversationId, options, cache, maxCacheBytes);
 }
 
 async function readTranscript(
   conversationId: string,
   options: AgyReadTranscriptOptions,
   cache?: Map<string, AgyTranscriptCacheEntry>,
+  maxCacheBytes = 0,
 ): Promise<AgyTranscriptReadResult> {
   assertValidConversationId(conversationId);
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_TRANSCRIPT_BYTES;
@@ -639,13 +642,11 @@ async function readTranscript(
       cache?.set(conversationId, prior);
       return prior.result;
     }
-    // AGY appends to both logs. Keep previously resolved fields on growth within the same byte budget.
-    const fullGrew = fullStat?.isFile() && prior.fullStat?.isFile() &&
-      fullStat.dev === prior.fullStat.dev && fullStat.ino === prior.fullStat.ino &&
-      fullStat.size > prior.fullStat.size && (fullStat.size <= maxBytes) === (prior.fullStat.size <= maxBytes);
-    if (compactStat.dev === prior.compactStat.dev && compactStat.ino === prior.compactStat.ino &&
+    // The cached result includes a valid unterminated row. Reparse it with its
+    // original prefix if the file changes, as the row may be extended in place.
+    if (!prior.hasTrailingLineWithoutNewline && compactStat.dev === prior.compactStat.dev && compactStat.ino === prior.compactStat.ino &&
         compactStat.size > prior.compactStat.size && prior.byteOffset > 0 &&
-        (fullUnchanged || fullGrew || !prior.dependsOnFullTranscript)) {
+        (fullUnchanged || !prior.dependsOnFullTranscript)) {
       const path = await validateTranscriptPath(compactPath, canonicalSessionDir, compactStat);
       if (prior.dependsOnFullTranscript && fullStat) await validateTranscriptPath(fullPath, canonicalSessionDir, fullStat);
       append = await readTranscriptAppend(path, compactStat, prior);
@@ -705,14 +706,11 @@ async function readTranscript(
   }
 
   const cacheable = cache && compactStat && compactBuf && !primaryTailDegraded;
-  // Cached reads commit only newline-terminated records, including when the writer is between flushes.
+  // Return a complete final record immediately, but keep the append boundary at the last newline.
   const completeEnd = cacheable ? primaryBuf.lastIndexOf(0x0a) + 1 : 0;
   const completeBytes = primaryBuf.subarray(0, completeEnd);
-  const parsedLines = splitCompleteJsonlLines((cacheable ? completeBytes : primaryBuf).toString('utf8'));
-  const { lines } = parsedLines;
-  const truncatedTrailingLine = cacheable
-    ? primaryBuf.subarray(completeEnd).toString('utf8').trim().length > 0
-    : parsedLines.truncatedTrailingLine;
+  const { lines, truncatedTrailingLine, hasTrailingLineWithoutNewline } =
+    splitCompleteJsonlLines(primaryBuf.toString('utf8'));
   if (primaryTailDegraded && expectedPrefixDigest !== null && startLine > 0) {
     throw new Error('stale or invalid cursor');
   }
@@ -769,6 +767,7 @@ async function readTranscript(
 
   const steps: AgyTranscriptStep[] = base?.result.steps.slice() ?? [];
   const messages: AgyTranscriptMessage[] = base?.result.messages.slice() ?? [];
+  let retainedBytes = cacheable ? compactStat.size + (base ? base.retainedBytes - base.compactStat.size : 0) : 0;
   const messageIndexById = new Map(messages.map((message, index) => [message.messageId, index]));
   let parseErrors = 0;
   let lastCreatedAt: string | null = base?.result.lastCreatedAt ?? carriedCreatedAt;
@@ -877,6 +876,7 @@ async function readTranscript(
       resolvedFromFull,
     };
     steps.push(step);
+    if (cacheable) retainedBytes += Buffer.byteLength(JSON.stringify(step));
 
     if (createdAt) lastCreatedAt = createdAt;
     if (stepIndex !== null) lastStepIndex = stepIndex;
@@ -910,6 +910,10 @@ async function readTranscript(
         resolvedFromFull,
       };
       const existingIdx = messageIndexById.get(messageId);
+      if (cacheable) {
+        retainedBytes += Buffer.byteLength(JSON.stringify(message));
+        if (existingIdx !== undefined) retainedBytes -= Buffer.byteLength(JSON.stringify(messages[existingIdx]!));
+      }
       if (existingIdx !== undefined) {
         messages[existingIdx] = message;
       } else {
@@ -955,7 +959,7 @@ async function readTranscript(
     truncatedTrailingLine,
   };
 
-  if (cacheable) {
+  if (cacheable && retainedBytes <= maxCacheBytes) {
     const [currentCompact, currentFull] = await Promise.all([transcriptStat(compactPath), transcriptStat(fullPath)]);
     if (primaryBuf.length + (base?.byteOffset ?? 0) === compactStat.size &&
         transcriptStatSignature(currentCompact) === transcriptStatSignature(compactStat) &&
@@ -969,14 +973,15 @@ async function readTranscript(
       cache.set(conversationId, {
         compactPath,
         compactStat,
-        fullStat,
         fullStatSig,
         maxBytes,
+        retainedBytes,
         byteOffset: (base?.byteOffset ?? 0) + (retry ? 0 : completeEnd),
         nextLine: retry ? base?.nextLine ?? 0 : nextLine,
         boundarySha256,
         prefixHash: retry ? base?.prefixHash ?? createHash('sha256') : prefixHash,
         hasUnresolvedTruncatedFields: retry,
+        hasTrailingLineWithoutNewline: hasTrailingLineWithoutNewline === true,
         dependsOnFullTranscript,
         result,
       });

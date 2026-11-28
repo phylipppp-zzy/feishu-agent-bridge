@@ -8,7 +8,7 @@
 - **标准发布流程**：
   1. 跑完 `npm run check && npm run build && npm test && npm run test:journey`。
   2. 若涉及 SQLite schema 变更，**必须先对生产 `core.sqlite` 备份副本做迁移干跑**，并核验 `PRAGMA integrity_check` 为 `ok`、`PRAGMA foreign_key_check` 为空。
-  3. 通过 `scripts/deploy-production.py` 打包不可变 release 并执行离线 `preflight.py`。
+  3. 通过 `scripts/deploy-production.py` 打包不可变 release 并执行离线 `preflight.py`。脚本默认在存在交互会话的活动回合、待回答或待送达回复的交互，以及待发送或发送中的 outbox 工作时阻止发布。`--check-active-only` 只检查活动工作（空闲返回 0，阻止发布返回 2，检查失败返回 1），`--force` 跳过该检查，`--keep-releases` 指定保留的最新旧 release 数量（默认 8）。
   4. 执行 `systemctl --user daemon-reload`，再通过 `systemd-run --user --on-active=10s --unit=feishu-bridge-delayed-restart-<shortsha> systemctl --user restart feishu-unified-production.service` 安排 10 秒延迟平滑重启。
 
 ## 2. 生产运行时不可变约束
