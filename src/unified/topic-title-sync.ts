@@ -31,7 +31,7 @@ export const TOPIC_TITLE_SCHEMA = `
 `;
 
 type TopicTitleRow = {
-  rowid: number; synced_title: string; retry_after: number;
+  rowid: number; session_id?: string; synced_title: string; retry_after: number;
   synced_status: Session['status'] | ''; synced_custom_title: string;
 };
 const inFlightRoots = new WeakMap<FeishuPort, Set<string>>();
@@ -222,14 +222,17 @@ export async function syncTopicRootTitle(
       WHERE destination=? AND session_id=? AND binding_scope=? AND root_message_id=?
     `).get(...titleKey, rootId) as TopicTitleRow | undefined;
     const lastApplied = db.prepare(`
-      SELECT rowid,synced_title,retry_after,synced_status,synced_custom_title FROM channel_topic_titles
+      SELECT rowid,session_id,synced_title,retry_after,synced_status,synced_custom_title FROM channel_topic_titles
       WHERE destination=? AND root_message_id=? AND synced_title<>''
       ORDER BY rowid DESC LIMIT 1
     `).get(destination, rootId) as TopicTitleRow | undefined;
     const legacyDot = lastApplied?.synced_title.match(/^[🔵🟡🟢🔴⚪]/u)?.[0];
-    const lastStatus = lastApplied?.synced_status || (legacyDot && LEGACY_DOT_STATUS[legacyDot]);
-    // A reused root keeps the last confirmed status and manual title across binding scopes.
-    if (!unsettled && lastApplied && lastStatus === effectiveStatus && lastApplied.synced_custom_title === normalizedCustom) return;
+    const lastStatus = legacyDot ? (lastApplied?.synced_status || LEGACY_DOT_STATUS[legacyDot]) : undefined;
+    const lastTitleCore = lastApplied ? stripLegacyTitlePrefix(lastApplied.synced_title.split('\n', 1)[0] ?? '') : '';
+    const sameSession = lastApplied?.session_id === session.sessionId;
+    const privacyMaskingTransition = !customTitle && isGenericSessionTitle(session.title) && Boolean(lastTitleCore) && !isGenericSessionTitle(lastTitleCore);
+    // Only patch an already-synced same-session root on status transition, explicit /rename change, or privacy masking.
+    if (!unsettled && lastApplied && sameSession && !privacyMaskingTransition && lastStatus === effectiveStatus && lastApplied.synced_custom_title === normalizedCustom) return;
     if (row && row.retry_after > Date.now()) return;
 
     const rememberTitle = () => db.prepare(`

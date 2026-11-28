@@ -128,12 +128,12 @@ for (const rejectedWith of ['response', 'axios error'] as const) {
       });
       assert.ok(requests.every(request => request.path.message_id === 'legacy-root'));
 
-      f.sessions.set('s', session('s', '改名后的标题'));
+      f.sessions.set('s', { ...session('s', '改名后的标题'), status: 'running' });
       await f.channel.sync('topic:legacy');
       await f.channel.sync('topic:legacy');
       assert.equal(requests.length, 3);
       assert.equal(JSON.parse(requests[2]!.data.content).schema, '2.0');
-      assert.equal(titleOf(requests[2]!), '🟢 改名后的标题');
+      assert.equal(titleOf(requests[2]!), '🔵 改名后的标题');
     } finally {
       f.cleanup();
     }
@@ -183,7 +183,11 @@ test('new topics remember the serialized root header and patch on status or titl
       await f.channel.sync(destination);
       await f.channel.sync(destination);
     }
-    assert.deepEqual(f.patches.map(patch => patch.title), ['🔵 会话 第一版', ...['你好', '新的话题名', '你好', '新的话题名'].map(title => `🔵 ${title}`)]);
+    assert.deepEqual(f.patches.map(patch => patch.title), ['🔵 会话 第一版']);
+    f.sessions.set('s', { ...f.sessions.get('s')!, status: 'idle' });
+    await f.channel.sync(destination);
+    await f.channel.sync(destination);
+    assert.deepEqual(f.patches.map(patch => patch.title), ['🔵 会话 第一版', '🟢 新的话题名']);
     assert.ok(f.patches.every(patch => patch.root === 'root-1'));
   } finally {
     f.cleanup();
@@ -394,7 +398,7 @@ for (const invalidation of ['authorization', 'binding'] as const) {
     const f = fixture();
     try {
       const destination = await f.bind('chat');
-      f.title('权限变动前的标题');
+      f.sessions.set('s', { ...f.sessions.get('s')!, status: 'running', title: '权限变动前的标题' });
       const update = f.sdk.update.bind(f.sdk);
       f.sdk.update = async (...args) => {
         if (invalidation === 'authorization') f.revoke();
