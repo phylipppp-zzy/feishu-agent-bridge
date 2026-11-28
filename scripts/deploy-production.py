@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Build a sealed production release of feishu-agent-bridge and update config + systemd unit."""
+import argparse
+import fcntl
 import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -16,6 +21,93 @@ CONF_DIR = Path('/home/zhangzy/.config/feishu-unified-bridge')
 CONF_FILE = CONF_DIR / 'config.json'
 UNIT_FILE = Path('/home/zhangzy/.config/systemd/user/feishu-unified-production.service')
 PARENT_RELEASE = '607c887-agy-320eaa1fba6a'
+CORE_DB = Path('/home/zhangzy/.local/state/feishu-unified-bridge/core.sqlite')
+
+
+def check_active_work(core_db: Path) -> bool:
+    try:
+        core_db.stat()
+    except FileNotFoundError:
+        return False
+
+    queries = (
+        ('Turn', "SELECT session_id, id, json_extract(value,'$.status'), json_extract(value,'$.startedAt') "
+                 "FROM turns WHERE json_extract(value,'$.status') IN ('running','queued')"),
+        ('Outbox', "SELECT operation_id, kind, state FROM outbox WHERE state IN ('pending','in_flight') "
+                   "UNION ALL SELECT operation_id, kind, state FROM steer_outbox_v1 WHERE state IN ('pending','in_flight')"),
+        ('Interaction awaiting answer', "SELECT id, session_id, json_extract(value,'$.kind') "
+                                        "FROM interactions WHERE json_extract(value,'$.status')='awaiting_answer'"),
+    )
+    with closing(sqlite3.connect(core_db.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+        db.execute('PRAGMA query_only=ON')
+        db.execute('BEGIN')
+        active = [(label, db.execute(sql).fetchall()) for label, sql in queries]
+
+    if not any(rows for _, rows in active):
+        return False
+    print('Deploy blocked by active bridge work:', file=sys.stderr)
+    for label, rows in active:
+        for row in rows:
+            print(f'  {label}: ' + ' / '.join(str(value) for value in row if value is not None), file=sys.stderr)
+    print('Drain active work before deploying, or pass --force to bypass this check.', file=sys.stderr)
+    return True
+
+
+def release_from_path(path: Path) -> Path | None:
+    root = RELEASES_ROOT.resolve()
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
+        return None
+    relative = resolved.relative_to(root)
+    return root / relative.parts[0] if relative.parts else None
+
+
+def unit_releases(unit_content: str) -> set[Path]:
+    # The generated unit uses absolute, unquoted paths without spaces.
+    return {release for value in re.findall(r'(?<=[=\s"])/[^\s"]+', unit_content)
+            if (release := release_from_path(Path(value))) is not None}
+
+
+def running_releases() -> set[Path]:
+    protected = set()
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            argv = [os.fsdecode(arg) for arg in (proc / 'cmdline').read_bytes().split(b'\0') if arg]
+            launcher = next((arg for arg in argv if Path(arg).name == 'unified-start.mjs'), None)
+            if launcher is not None:
+                script = Path(launcher)
+                if not script.is_absolute():
+                    script = (proc / 'cwd').readlink() / script
+                if (release := release_from_path(script)) is not None:
+                    protected.add(release)
+            elif argv and Path(argv[0]).name == 'feishu-unified-bridge':
+                if (release := release_from_path((proc / 'cwd').readlink())) is not None:
+                    protected.add(release)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            # Processes can disappear during the scan or belong to another user.
+            continue
+    return protected
+
+
+def prune_releases(release_dir: Path, previous_unit: str, keep: int) -> None:
+    release_pattern = re.compile(r'[0-9a-f]{7,40}(?:-[a-zA-Z0-9-]+)?')
+    candidates = sorted(
+        (p for p in RELEASES_ROOT.resolve().iterdir()
+         if release_pattern.fullmatch(p.name) and not p.is_symlink() and p.is_dir()),
+        key=lambda p: (p.stat().st_mtime_ns, p.name),
+        reverse=True,
+    )
+    protected = (unit_releases(previous_unit) | unit_releases(UNIT_FILE.read_text(encoding='utf-8'))
+                 | running_releases() | {release_dir.resolve()})
+    # The new release is retained separately from the requested old releases.
+    newest_old = [path for path in candidates if path != release_dir.resolve()][:keep]
+    for candidate in candidates:
+        if candidate not in protected and candidate not in newest_old:
+            shutil.rmtree(candidate)
+            print(f'PRUNED_RELEASE={candidate.name}')
+
 
 def validate_agy_sandbox(runtime):
     approval_disabled = runtime.get('approvalPolicy', {}).get('enabled') is False
@@ -38,6 +130,29 @@ def validate_agy_sandbox(runtime):
             (not sep and index + 1 < len(args) and args[index + 1] in disabled)
         )):
             raise RuntimeError('agy.extraArgs must preserve the sandbox when approvalPolicy.enabled is false')
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--force', action='store_true', help='Bypass the active-work check')
+parser.add_argument('--core-db', type=Path, default=CORE_DB, help='Path to the bridge core SQLite database')
+parser.add_argument('--keep-releases', type=int, default=8, help='Number of newest old releases to keep (default: 8)')
+parser.add_argument('--check-active-only', action='store_true', help='Check for active work without deploying')
+args = parser.parse_args()
+if args.keep_releases < 0:
+    parser.error('--keep-releases must be non-negative')
+try:
+    if not args.force and check_active_work(args.core_db):
+        sys.exit(2)
+except (OSError, sqlite3.Error) as exc:
+    print(f'Cannot check active bridge work in {args.core_db}: {exc}', file=sys.stderr)
+    sys.exit(1)
+if args.check_active_only:
+    sys.exit(0)
+
+RELEASES_ROOT.mkdir(parents=True, exist_ok=True)
+# Hold through staging, unit publication and GC so deploys cannot prune each other's releases.
+deploy_lock = os.open(RELEASES_ROOT, os.O_RDONLY | os.O_DIRECTORY)
+fcntl.flock(deploy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+previous_unit = UNIT_FILE.read_text(encoding='utf-8') if UNIT_FILE.exists() else ''
 
 commit = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'], text=True).strip()
 branch = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--abbrev-ref', 'HEAD'], text=True).strip()
@@ -76,10 +191,15 @@ source_manifest = build_manifest(staging, source_files)
 source_manifest_sha = hashlib.sha256(source_manifest.encode('utf-8')).hexdigest()
 start_script_sha = sha256_file(staging / 'scripts/unified-start.mjs')
 
-release_name = f"{commit}-agy-{source_manifest_sha[:12]}"
+release_base = f"{commit}-agy-{source_manifest_sha[:12]}"
+release_name = release_base
 release_dir = RELEASES_ROOT / release_name
-if release_dir.exists():
-    shutil.rmtree(release_dir)
+# A previous deployment of the same source may still be running or referenced.
+sequence = 1
+while release_dir.exists() or release_dir.is_symlink():
+    sequence += 1
+    release_name = f"{release_base}-{sequence}"
+    release_dir = RELEASES_ROOT / release_name
 
 generation = {
     "commit": commit,
@@ -216,7 +336,8 @@ ExecStart=/usr/local/node-v24.11.1-linux-x64/bin/node --no-warnings {release_dir
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
-KillMode=mixed
+KillMode=control-group
+SendSIGKILL=yes
 UMask=0077
 [Install]
 WantedBy=default.target
@@ -301,7 +422,19 @@ finally:
         tmp_cfg.unlink(missing_ok=True)
 
 # 4. Update systemd user unit
-UNIT_FILE.write_text(unit_content, encoding='utf-8')
+tmp_unit = None
+try:
+    with NamedTemporaryFile(mode='w', encoding='utf-8', dir=UNIT_FILE.parent,
+                            prefix=f'.{UNIT_FILE.name}.', delete=False) as f:
+        tmp_unit = Path(f.name)
+        os.fchmod(f.fileno(), 0o644)
+        f.write(unit_content)
+    os.replace(tmp_unit, UNIT_FILE)
+finally:
+    if tmp_unit is not None:
+        tmp_unit.unlink(missing_ok=True)
+
+prune_releases(release_dir, previous_unit, args.keep_releases)
 
 print(f"DEPLOYED_RELEASE={release_name}")
 print(f"RELEASE_DIR={release_dir}")

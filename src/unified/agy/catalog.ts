@@ -13,7 +13,7 @@ import {
 } from './catalog-types.js';
 import { readAgySummaries, type AgyTitleCacheEntry } from './catalog-summaries.js';
 import { refreshAgyCatalog } from './catalog-refresh.js';
-import { readAgyTranscript, readAgyTranscriptCreatedAt } from './catalog-transcript.js';
+import { readAgyTranscript, readAgyTranscriptCreatedAt, readCachedAgyTranscript, type AgyTranscriptCacheEntry } from './catalog-transcript.js';
 import { discoverAgyArtifacts, readAgyArtifact } from './catalog-artifacts.js';
 
 /**
@@ -24,6 +24,7 @@ export class AgyCatalog {
   private sessions = new Map<string, AgyDiscoveredSession>();
   private orderedIds: string[] = [];
   private titles = new Map<string, AgyTitleCacheEntry>();
+  private readonly transcriptCache = new Map<string, AgyTranscriptCacheEntry>();
   private refreshing?: Promise<AgyDiscoveredSession[]>;
   private version = 0;
 
@@ -131,7 +132,22 @@ export class AgyCatalog {
     if (readOpts.maxBytes === undefined && this.options.maxTranscriptBytes !== undefined) {
       readOpts.maxBytes = this.options.maxTranscriptBytes;
     }
-    return readAgyTranscript(conversationId, readOpts);
+    if (options.cursor !== undefined || options.afterLine !== undefined || options.sinceTimestamp !== undefined ||
+        options.afterStepIndex !== undefined) {
+      return readAgyTranscript(conversationId, readOpts);
+    }
+    const previous = this.transcriptCache.get(conversationId);
+    const result = await readCachedAgyTranscript(conversationId, readOpts, this.transcriptCache);
+    if (previous?.result === result || !this.transcriptCache.has(conversationId)) return result;
+    // Bound retained histories by both entry count and total source bytes.
+    let bytes = 0;
+    for (const entry of this.transcriptCache.values()) bytes += entry.compactStat.size;
+    for (const [id, entry] of this.transcriptCache) {
+      if (this.transcriptCache.size <= 128 && bytes <= 64 * 1024 * 1024) break;
+      this.transcriptCache.delete(id);
+      bytes -= entry.compactStat.size;
+    }
+    return result;
   }
 
   async readTranscriptCreatedAt(

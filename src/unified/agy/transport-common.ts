@@ -85,6 +85,8 @@ export interface AgyAcpHealthSnapshot {
 export interface AgyAcpTransportOptions {
   /** Path to the `agy` binary (defaults to `$HOME/.gemini/bin/agy`). */
   agyBin?: string;
+  /** Directory for versioned binaries (defaults to FEISHU_AGY_STABLE_BIN_DIR when set). */
+  stableBinDir?: string;
   /** Optional args inserted before `acp --stdio` (e.g. a test script path when `agyBin` is `node`). */
   prependArgs?: readonly string[];
   /** Whether to pass `--process-per-session` to `agy acp` (defaults to `true`). */
@@ -362,6 +364,49 @@ export function writeNdjsonLine(proc: ChildProcess, payload: unknown): boolean {
   }
 }
 
+export function killProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = proc.pid;
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 1) return;
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ESRCH' && code !== 'EPERM') throw err;
+    }
+  }
+
+  try {
+    proc.kill(signal);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ESRCH' && code !== 'EPERM') throw err;
+  }
+}
+
+const agyChildren = new Set<ChildProcess>();
+
+function killAgyChildrenAtExit(): void {
+  for (const proc of agyChildren) killProcessTree(proc, 'SIGKILL');
+}
+
+export function trackAgyChildForExit(proc: ChildProcess): void {
+  // ACP can have many live children. Keep one parent exit listener for all of them.
+  if (agyChildren.size === 0) process.once('exit', killAgyChildrenAtExit);
+  agyChildren.add(proc);
+  const unregister = () => {
+    proc.off('exit', unregister);
+    proc.off('close', unregister);
+    agyChildren.delete(proc);
+    if (agyChildren.size === 0) process.off('exit', killAgyChildrenAtExit);
+  };
+  proc.once('exit', unregister);
+  proc.once('close', unregister); // Failed spawns may only emit close.
+}
+
 export async function terminateChildProcess(
   proc: ChildProcess,
   sigtermGraceMs: number,
@@ -410,9 +455,7 @@ export async function terminateChildProcess(
     const scheduleSigkill = () => {
       sigkillTimer = setTimeout(() => {
         if (proc.exitCode === null && proc.signalCode === null) {
-          try {
-            proc.kill('SIGKILL');
-          } catch {}
+          killProcessTree(proc, 'SIGKILL');
           finalTimer = setTimeout(() => finish(proc.exitCode, proc.signalCode), 250);
         }
       }, sigkillGraceMs);
@@ -420,9 +463,7 @@ export async function terminateChildProcess(
 
     const sendSigterm = () => {
       if (proc.exitCode !== null || proc.signalCode !== null) return;
-      try {
-        proc.kill('SIGTERM');
-      } catch {}
+      killProcessTree(proc, 'SIGTERM');
       scheduleSigkill();
     };
 

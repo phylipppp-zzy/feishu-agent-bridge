@@ -40,10 +40,8 @@ export async function runBackgroundWork(
   for (const binding of runtime.taskChannel?.listActiveBindings() ?? []) {
     await isolate(() => interactive.syncTask(binding.taskId));
   }
+  await isolate(async () => { runtime.compactEventHistory(); });
   runtime.syncUnknownDeliveryAlerts();
-  if (runtime.watchHub?.listOutbox().some(row => row.state === 'pending')) {
-    await isolate(async () => { await runtime.watchHub?.flush(); });
-  }
   if (runtime.usageHub?.shouldFlushScheduled()) {
     await isolate(async () => { await runtime.usageHub?.flushScheduled(); });
   }
@@ -51,6 +49,10 @@ export async function runBackgroundWork(
   await isolate(() => syncPendingHub(runtime));
   if (runtime.decisionSync?.listDocOutbox().some(row => row.state === 'pending_sync')) {
     await isolate(async () => { runtime.decisionSync?.retryPendingSyncs(); });
+  }
+  // Send after channel and hub synchronization. The background pass drains on close.
+  if (runtime.watchHub?.listOutbox().some(row => row.state === 'pending')) {
+    await isolate(async () => { await runtime.watchHub?.flush(); });
   }
   if (failed) throw new Error('isolated work failed');
 }
