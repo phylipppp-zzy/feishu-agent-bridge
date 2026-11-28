@@ -310,7 +310,7 @@ export function turnProcessCard(state: TurnCardState): ChannelCard {
   const runningNote = formatRunningNote(runningTools.filter(tool => tool.tool !== 'thinking'));
   const executionLog = {
     count, lines, failedCount, position: 'top' as const, expanded: running,
-    ...(thinking ? { thinking } : {}),
+    ...(running && thinking ? { thinking } : {}),
     ...(runningNote ? { runningNote } : {}),
     collapseSummary: true,
   };
@@ -340,13 +340,14 @@ export function turnProcessCard(state: TurnCardState): ChannelCard {
     : status === 'interrupted' ? '执行过程已中断' : '执行过程已完成';
   const steps = count > 0 ? ` · ${count} 步` : '';
   const elapsed = duration === null ? '' : ` · 用时 ${formatDuration(duration)}`;
+  const thinkingBlock = thinking ? `**🧠 思考过程**\n${escapeCardMarkdown(thinking)}` : '';
   return {
     schema: state.schema,
     title: `${prefix} · ${heading}${steps}${elapsed}${badge}`,
     template: status === 'failed' ? 'red' : status === 'interrupted' ? 'grey' : 'green',
     ...(headerTags ? { headerTags } : {}),
     executionLog,
-    text: ['过程已归档，最终回复见下方卡片。', delegatedStatus].filter(Boolean).join('\n\n'),
+    text: [thinkingBlock, delegatedStatus, '过程已归档，最终回复见下方卡片。'].filter(Boolean).join('\n\n'),
     actions: [],
   };
 }
