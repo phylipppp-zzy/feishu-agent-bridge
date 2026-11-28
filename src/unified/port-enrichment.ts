@@ -134,6 +134,10 @@ export class EnrichedPort implements PlatformPort {
   async respond(...args:Parameters<PlatformPort['respond']>) { await this.writable(args[0]); return this.base.respond(...args); }
   async control(...args:Parameters<PlatformPort['control']>) { await this.writable(args[0]); return this.base.control(...args); }
   async updateSettings(...args:Parameters<PlatformPort['updateSettings']>) { await this.writable(args[0]); return this.base.updateSettings(...args); }
+  async getContextUsage(ref: NativeSessionRef) {
+    if (ref.provider !== this.provider) throw contractError('invalid_request');
+    return this.base.getContextUsage ? await this.base.getContextUsage(ref) : null;
+  }
   async listModels(ref:NativeSessionRef) { if (await this.isExternal(ref)) throw contractError('unsupported'); return this.base.listModels(ref); }
 
 }

@@ -15,6 +15,8 @@ import {
 import { contractError } from '../errors.js';
 import type { GateDecision } from '../approval-policy.js';
 import { agyApprovalFingerprint, agyOnceOption, agyPermissionOutcome, classifyAgyPermission, hasAgyToolCallConflicts, mergeAgyToolCall } from './adapter-permission.js';
+import { readSafeTranscriptTail } from './catalog-summaries.js';
+import { isPlainRecord } from './catalog-types.js';
 import {
   ack,
   convertSchemaValue,
@@ -327,6 +329,78 @@ function findUniquePermissionOption(options: unknown, kind: 'allow_always' | 'al
   return isString(id) && raw.filter(row => row.optionId === id).length === 1 ? id : null;
 }
 
+const AGY_GENERIC_NETWORK_ERROR_RE = /^⚠\uFE0F?\s*There was a network issue connecting to the server,?\s*please try again\.?$/i;
+
+function sanitizeNetworkErrorReason(raw: string): string {
+  const clean = raw
+    .replace(/[\p{Cc}\p{Cf}\p{Cs}]+/gu, ' ')
+    .replace(/\?[^\s"']+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const hostMatch = /lookup\s+([a-z0-9.-]{1,128})/i.exec(clean);
+  const safeHost = hostMatch?.[1] && !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostMatch[1]) ? `（${hostMatch[1]}）` : '';
+  if (/127\.0\.0\.53:53/.test(clean) && /(?:i\/o timeout|server misbehaving|no such host)/i.test(clean)) {
+    return `本机 DNS 解析超时或异常${safeHost}（127.0.0.53:53）`;
+  }
+  if (hostMatch && /(?:i\/o timeout|server misbehaving|no such host)/i.test(clean)) {
+    return `DNS 解析失败${safeHost}`;
+  }
+  if (/stream reading error:\s*unexpected EOF/i.test(clean) || /:\s*EOF\b/i.test(clean)) {
+    return '上游 SSE 流式连接中途断开（unexpected EOF）';
+  }
+  if (/(?:context deadline exceeded|client\.timeout|i\/o timeout|timed out)/i.test(clean)) {
+    return '上游 API 请求超时';
+  }
+  if (/(?:connection refused|connection reset|broken pipe)/i.test(clean)) {
+    return '上游网络连接被拒绝或重置';
+  }
+  if (/(?:tls:|x509:|certificate)/i.test(clean)) {
+    return '上游 TLS/证书握手失败';
+  }
+  const statusMatch = /\b(?:http|status(?:\s+code)?)\s*[:=]?\s*([45]\d{2})\b/i.exec(clean);
+  if (statusMatch?.[1]) {
+    return `上游 API 返回 HTTP ${statusMatch[1]} 错误`;
+  }
+  // Never echo uncategorized raw upstream error strings (may contain proxy creds, tokens, internal IPs or local paths).
+  return '上游网络请求异常（详情见本机 transcript 日志）';
+}
+
+function diagnoseAgyNetworkError(ctx: AdapterContext, id: string): string | null {
+  try {
+    const summary = ctx.catalog.get(id);
+    const brainDir = (ctx.catalog as { brainDir?: string }).brainDir;
+    const tail = readSafeTranscriptTail(id, 64 * 1024, {
+      ...(brainDir ? { brainDir } : {}),
+      ...(summary?.appDataDir ? { appDataDir: summary.appDataDir } : {}),
+    });
+    if (!tail) return null;
+    const lines = tail.split('\n');
+    let latestError = '';
+    let attempts = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const trimmed = lines[i]?.trim();
+      if (!trimmed) continue;
+      let row: unknown;
+      try { row = JSON.parse(trimmed); } catch { continue; }
+      if (!isPlainRecord(row)) continue;
+      if (row.type === 'USER_INPUT' || row.source === 'USER' || row.source === 'USER_EXPLICIT') break;
+      if (row.type === 'PLANNER_RESPONSE' && row.status === 'DONE') break;
+      const isApiErrorRow = row.type === 'ERROR_MESSAGE' || (row.type === 'PLANNER_RESPONSE' && row.status === 'ERROR');
+      if (!isApiErrorRow) continue;
+      const errText = typeof row.error === 'string' && row.error.trim() ? row.error.trim() : '';
+      if (errText) {
+        if (!latestError) latestError = errText;
+        if (row.type === 'ERROR_MESSAGE') attempts += 1;
+      }
+    }
+    if (!latestError) return null;
+    const summaryReason = sanitizeNetworkErrorReason(latestError);
+    return attempts > 1 ? `${summaryReason}（已自动重试 ${attempts} 次）` : summaryReason;
+  } catch {
+    return null;
+  }
+}
+
 export function handlePromptCompleted(
   ctx: AdapterContext,
   id: string,
@@ -346,6 +420,7 @@ export function handlePromptCompleted(
       ? res.stopReason.trim()
       : null;
 
+  let isGenericNetworkError = false;
   if (!turnState.assistantFinalized) {
     const response = typeof res.response === 'string' ? res.response : '';
     const text = turnState.assistantText;
@@ -354,6 +429,16 @@ export function handlePromptCompleted(
       else if (turnState.needsParagraphBreak && !text.trimEnd().endsWith(response.trim())) {
         turnState.assistantText = appendParagraph(text, response);
       }
+    }
+    if (AGY_GENERIC_NETWORK_ERROR_RE.test(turnState.assistantText.trim())) {
+      isGenericNetworkError = true;
+      const reason = diagnoseAgyNetworkError(ctx, id);
+      turnState.assistantText = [
+        '⚠️ Antigravity 上游连接失败（原提示：There was a network issue connecting to the server, please try again.）',
+        ...(reason ? ['', `**底层原因**：${reason}`] : []),
+        '',
+        '**建议**：确认网络/DNS 恢复后发送「继续」即可从当前进度续跑。',
+      ].join('\n');
     }
     if (turnState.assistantText) {
       turnState.assistantMessageId ??= randomUUID();
@@ -385,9 +470,11 @@ export function handlePromptCompleted(
   const status: Turn['status'] =
     rawStopReason === 'cancelled'
       ? 'interrupted'
-      : rawStopReason === 'end_turn'
-        ? 'completed'
-        : 'failed';
+      : isGenericNetworkError
+        ? 'failed'
+        : rawStopReason === 'end_turn'
+          ? 'completed'
+          : 'failed';
 
   const endedAt = new Date().toISOString();
   if (rawStopReason !== 'end_turn' || turnState.cancelRequested) {
@@ -588,7 +675,6 @@ const ASYNC_WAKEUP_TOOLS = new Set([
   'invoke_subagent',
   'run_workflow',
   'schedule',
-  'call_mcp_tool',
 ]);
 
 function releaseToolCall(ctx: AdapterContext, sessionId: string, turn: ActiveTurnState, toolCallId: string): void {
@@ -656,7 +742,7 @@ export function handleAcpNotification(
         const thoughtChunk = extractTextFromUpdateContent(update.content);
         const hadThinking = thinkingPhaseActive.has(existingTurn);
         if (thoughtChunk) {
-          const combined = ((existingTurn.thinkingText ?? '') + thoughtChunk).slice(-600);
+          const combined = ((existingTurn.thinkingText ?? '') + thoughtChunk).slice(-2400);
           existingTurn.thinkingText = combined;
         }
         const now = Date.now();
@@ -742,7 +828,11 @@ export function handleAcpNotification(
       }
       const progress = agyToolProgress(call, ctx.knownSessions.get(sessionId)?.cwd, kind === 'tool_call');
       if (progress) {
-        if (ASYNC_WAKEUP_TOOLS.has(progress.detail.tool)) {
+        if (
+          ASYNC_WAKEUP_TOOLS.has(progress.detail.tool) ||
+          (progress.detail.tool === 'call_mcp_tool' &&
+            (progress.detail.summary.startsWith('⚡ Codex MCP') || progress.detail.summary.startsWith('⚡ Agent Dispatch')))
+        ) {
           turnState.awaitingAsyncWakeup = true;
         }
         let tracker = toolProgress.get(turnState);

@@ -17,11 +17,14 @@ import {
   isInside,
   isPlainRecord,
   isTruthyFlag,
+  parseAgyTimestamp,
   type AgySummariesDefaultPair,
 } from './catalog-types.js';
+import { readDispatchJobsForConversation } from './delegated-status.js';
 
 const READONLY_TAIL_BYTES = 128 * 1024;
 const READONLY_VIEW_CACHE_MAX_ENTRIES = 256;
+const STALE_NOT_FULLY_IDLE_MS = 10 * 60_000;
 
 export interface ReadonlyLiveTurnView {
   state: 'running' | 'idle' | 'unavailable';
@@ -40,6 +43,7 @@ export interface ReadonlyAgyLiveTurnOptions {
   brainDir?: string;
   brainDirs?: readonly string[];
   appDataDir?: string;
+  dispatchScratchDir?: string;
 }
 
 const readonlyViewCache = new Map<string, { fingerprint: string; view: ReadonlyLiveTurnView | null }>();
@@ -144,22 +148,37 @@ export function readReadonlyAgyLiveTurn(
   const appDataDir =
     options.appDataDir ||
     (typeof rootRow.app_data_dir === 'string' ? rootRow.app_data_dir : '');
-  const summaryRunning =
-    ACTIVE_CASCADE_STATUSES.has(rootRow.status) || isTruthyFlag(rootRow.not_fully_idle);
+  const rootStatusActive = ACTIVE_CASCADE_STATUSES.has(rootRow.status);
+  const rootNotFullyIdle = isTruthyFlag(rootRow.not_fully_idle);
 
   const activeSubagents: SessionSubagentActivity[] = [];
-  for (const row of hierarchy.activeDescendantsByRoot.get(conversationId) ?? []) {
+  const descendantIds = new Set<string>();
+  const blockedIds = new Set<string>();
+  for (const row of hierarchy.byId.values()) {
+    if (hierarchy.isTopLevelRow(row)) continue;
     const chainResult = resolveSummaryAncestorChain(row, hierarchy);
     if (chainResult.status !== 'ok' || chainResult.rootRow.conversation_id !== conversationId) continue;
-    if (!isAncestorChainAuthorizedForProject(chainResult.chain, conversationId, project)) continue;
+    if (isTruthyFlag(row.killed) || !isAncestorChainAuthorizedForProject(chainResult.chain, conversationId, project)) {
+      blockedIds.add(row.conversation_id);
+      continue;
+    }
+    descendantIds.add(row.conversation_id);
+  }
+  for (const row of hierarchy.activeDescendantsByRoot.get(conversationId) ?? []) {
+    if (!descendantIds.has(row.conversation_id)) continue;
     activeSubagents.push({
       conversationId: row.conversation_id,
       agentName: typeof row.agent_name === 'string' && row.agent_name.trim()
         ? row.agent_name.trim()
         : (typeof row.title === 'string' && row.title.trim() ? row.title.trim() : row.conversation_id.slice(0, 8)),
       status: row.status,
+      kind: 'subagent',
     });
   }
+  const dispatchJobs = readDispatchJobsForConversation(conversationId, project, descendantIds, blockedIds, {
+    ...(options.dispatchScratchDir !== undefined ? { dispatchScratchDir: options.dispatchScratchDir } : {}),
+  });
+  activeSubagents.push(...dispatchJobs);
 
   const sources = safeTranscriptTailSources(conversationId, {
     ...(options.brainDir !== undefined ? { brainDir: options.brainDir } : {}),
@@ -167,9 +186,13 @@ export function readReadonlyAgyLiveTurn(
     ...(appDataDir ? { appDataDir } : {}),
   });
   const first = sources.next();
+  const rootModifiedIso = parseAgyTimestamp(rootRow.last_modified_time);
+  const rootModifiedMs = rootModifiedIso ? Date.parse(rootModifiedIso) : null;
+  const staleByAge = !rootStatusActive && rootNotFullyIdle && rootModifiedMs !== null && Date.now() - rootModifiedMs > STALE_NOT_FULLY_IDLE_MS;
+  const stableSubagents = activeSubagents.map(({ elapsedSec: _ignored, ...rest }) => rest);
   const fingerprint = JSON.stringify([
     canonicalProject, project, rootRow.status, rootRow.not_fully_idle, rootRow.step_count,
-    rootRow.last_modified_time, rootRow.last_user_input_step_index, activeSubagents,
+    rootRow.last_modified_time, rootRow.last_user_input_step_index, staleByAge, stableSubagents,
     first.done ? null : [first.value.path, first.value.fingerprint],
   ]);
   const cached = readonlyViewCache.get(conversationId);
@@ -266,7 +289,17 @@ export function readReadonlyAgyLiveTurn(
     }
   }
 
-  const running = summaryRunning || activeSubagents.length > 0 || (sawTrailingUnresolvedCalls && !lastRowWasFinalTextOnly);
+  const hasActiveSubagent = activeSubagents.some(sub => {
+    const s = sub.status.trim().toLowerCase();
+    return !s || s === 'running' || s === 'queued' || s === 'busy' || s.includes('running');
+  });
+  const staleIdleFlag =
+    !rootStatusActive
+    && rootNotFullyIdle
+    && !sawTrailingUnresolvedCalls
+    && (lastRowWasFinalTextOnly || staleByAge);
+  const summaryRunning = rootStatusActive || (rootNotFullyIdle && !staleIdleFlag);
+  const running = summaryRunning || hasActiveSubagent || (sawTrailingUnresolvedCalls && !lastRowWasFinalTextOnly);
   if (latestThinking) {
     tools.unshift({
       turnId: anchorId,
@@ -284,7 +317,7 @@ export function readReadonlyAgyLiveTurn(
   const contextUsage = extractAgyContextUsageFromRows(rows);
   const previewText = running ? interimTexts.join('\n\n') : '';
   const state = running ? 'running' : 'idle';
-  const signature = payloadDigest([anchorId, state, previewText, tools, activeSubagents, contextUsage]);
+  const signature = payloadDigest([anchorId, state, previewText, tools, stableSubagents, contextUsage]);
   const view: ReadonlyLiveTurnView = {
     state,
     anchorId,

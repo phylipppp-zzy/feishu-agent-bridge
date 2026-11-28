@@ -9,6 +9,16 @@ import type {
 } from '../adapter.js';
 import type { ContextUsageInfo } from '../context-usage.js';
 import { readAgyContextUsage } from '../context-usage.js';
+import {
+  readAgySummaryHierarchy,
+  readSafeTranscriptTail,
+} from './catalog-summaries.js';
+import {
+  ACTIVE_CASCADE_STATUSES,
+  isPlainRecord,
+  isTruthyFlag,
+} from './catalog-types.js';
+import { readDelegatedSessionActivity } from './delegated-status.js';
 import type { AgyCatalog, AgyDiscoveredSession } from '../agy-catalog.js';
 import type { AgyQuotaClient } from '../agy-quota.js';
 import type { AgyAcpTransport, AgyEffortLevel } from '../agy-transport.js';
@@ -779,6 +789,17 @@ export class AgyAdapter implements PlatformPort {
     const turnId = randomUUID();
     const now = new Date().toISOString();
     const model = this.sessionSettings.get(id)?.model ?? null;
+    let baselineUserStepIndex: number | null = null;
+    try {
+      const dbPath = (this.catalog as { dbPath?: string }).dbPath;
+      const hierarchy = readAgySummaryHierarchy(dbPath);
+      const row = hierarchy.byId.get(id);
+      if (row && typeof row.last_user_input_step_index === 'number' && Number.isSafeInteger(row.last_user_input_step_index)) {
+        baselineUserStepIndex = row.last_user_input_step_index;
+      }
+    } catch {
+      baselineUserStepIndex = null;
+    }
     const turnState: ActiveTurnState = {
       turnId,
       generation,
@@ -791,6 +812,7 @@ export class AgyAdapter implements PlatformPort {
       assistantFinalized: false,
       interrupted: false,
       cancelRequested: false,
+      baselineUserStepIndex,
       inProgressToolCalls: new Set(),
       toolCalls: new Map(),
       fullToolCalls: new Set(),
@@ -1131,8 +1153,100 @@ export class AgyAdapter implements PlatformPort {
     return ack('unsubscribed');
   }
 
+  private reconcileSilentCompletedTurns(now: number): void {
+    const SILENCE_MS = 45_000;
+    const normalizeText = (s: string) => s.replace(/\r\n?/g, '\n').trim();
+    const dbPath = (this.catalog as { dbPath?: string }).dbPath;
+    for (const [id, turnState] of [...this.activeTurns.entries()]) {
+      if (this.closed || !this.transport.connected) break;
+      if (
+        turnState.isWakeup
+        || turnState.assistantFinalized
+        || turnState.cancelRequested
+        || turnState.awaitingAsyncWakeup
+        || (turnState.inFlightServerRequests ?? 0) > 0
+        || turnState.generation !== this.transport.connectionGeneration
+      ) continue;
+      if (turnState.inProgressToolCalls.size > 0 || this.pendingRequests(id).length > 0) continue;
+      const trimmedText = normalizeText(turnState.assistantText);
+      if (!trimmedText) continue;
+      const lastActive = turnState.lastActivityAt ?? 0;
+      if (lastActive <= 0 || now - lastActive < SILENCE_MS) continue;
+
+      let summaryIdle = false;
+      try {
+        const hierarchy = readAgySummaryHierarchy(dbPath);
+        const rootRow = hierarchy.byId.get(id);
+        if (!rootRow) continue;
+        const rootActive = ACTIVE_CASCADE_STATUSES.has(rootRow.status) || isTruthyFlag(rootRow.not_fully_idle);
+        const activeChildren = hierarchy.activeDescendantsByRoot.get(id)?.length ?? 0;
+        summaryIdle = !rootActive && activeChildren === 0;
+      } catch {
+        continue;
+      }
+      if (!summaryIdle) continue;
+
+      const project = this.knownSessions.get(id)?.cwd ?? this.catalog.get(id)?.project ?? '';
+      if (project) {
+        const delegated = readDelegatedSessionActivity(id, project, {
+          ...(dbPath !== undefined ? { summariesDbPath: dbPath } : {}),
+          nowMs: now,
+        });
+        const hasActiveDelegated = delegated.some(item => {
+          const s = item.status.trim().toLowerCase();
+          return !s || s === 'running' || s === 'queued' || s === 'busy' || s.includes('running');
+        });
+        if (hasActiveDelegated) continue;
+      }
+
+      try {
+        const summary = this.catalog.get(id);
+        const brainDir = (this.catalog as { brainDir?: string }).brainDir;
+        const tail = readSafeTranscriptTail(id, 64 * 1024, {
+          ...(brainDir ? { brainDir } : {}),
+          ...(summary?.appDataDir ? { appDataDir: summary.appDataDir } : {}),
+        });
+        if (!tail) continue;
+        const lines = tail.split('\n');
+        const startedAtMs = Date.parse(turnState.startedAt);
+        const baselineStep = turnState.baselineUserStepIndex;
+        let matchedFinalResponse = false;
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i]?.trim();
+          if (!line) continue;
+          let row: unknown;
+          try { row = JSON.parse(line); } catch { continue; }
+          if (!isPlainRecord(row)) continue;
+          if (row.type === 'USER_INPUT' || row.source === 'USER' || row.source === 'USER_EXPLICIT') break;
+          if (row.type === 'PLANNER_RESPONSE') {
+            const rawCalls = Array.isArray(row.tool_calls) ? row.tool_calls : [];
+            const rawContent = typeof row.content === 'string' ? normalizeText(row.content) : '';
+            const stepOk =
+              baselineStep === null || baselineStep === undefined || baselineStep < 0
+                ? true
+                : (typeof row.step_index === 'number' && row.step_index > baselineStep);
+            const createdMs = typeof row.created_at === 'string' ? Date.parse(row.created_at) : Number.NaN;
+            const timeOk = !Number.isFinite(startedAtMs) || !Number.isFinite(createdMs) || createdMs >= startedAtMs - 5_000;
+            if (row.status === 'DONE' && rawCalls.length === 0 && stepOk && timeOk && rawContent === trimmedText) {
+              matchedFinalResponse = true;
+            }
+            break;
+          }
+        }
+        if (matchedFinalResponse) {
+          try { this.transport.notify('session/cancel', { sessionId: id }); } catch {}
+          (this.transport as { abandonSessionPrompt?: (sessionId: string) => boolean }).abandonSessionPrompt?.(id);
+          handlePromptCompleted(this.ctx, id, turnState, { stopReason: 'end_turn' });
+        }
+      } catch {
+        // Leave turn open if transcript verification fails.
+      }
+    }
+  }
+
   async reconcileIdleAndExternalHolders(now: number = Date.now()): Promise<string[]> {
     if (this.closed || !this.transport.connected) return [];
+    this.reconcileSilentCompletedTurns(now);
     const released: string[] = [];
     for (const id of [...this.active]) {
       if (this.closed || !this.transport.connected) break;

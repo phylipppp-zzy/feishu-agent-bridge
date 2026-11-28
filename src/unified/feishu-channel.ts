@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { relative, isAbsolute, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
-import type { Answer, Identity, Operation, Provider, WriteContext, Session, SessionSnapshot, Message, Turn, Event } from './contracts.js';
+import type { Answer, Artifact, Identity, Operation, Provider, WriteContext, Session, SessionSnapshot, Message, Turn, Event } from './contracts.js';
 import { payloadDigest, shouldAutoQueueInput } from './contracts.js';
 import { contractError } from './errors.js';
 import { decodeQuestionForm } from './feishu-question-forms.js';
@@ -25,7 +25,7 @@ import { buildAgyStatusCard } from './agy-status-card.js';
 import { collectAgyStatusSnapshot, type AgyStatusSnapshot } from './agy/session-status.js';
 import { isTerminalTurn, readToolProgress } from './tool-progress.js';
 import type { ReadonlyLiveTurnView } from './agy/readonly-live-turn.js';
-import { formatCompactModelBadge, turnProcessCard } from './turn-progress-card.js';
+import { formatCompactModelBadge, turnProcessCard, type SessionSubagentActivity } from './turn-progress-card.js';
 import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
 import { inputConfirmationCard, needsOperationNotice, operationFromReceipt, patchOperationCard, pendingSessionAuthorization, publishOperationFeedback, suppressInputFailure, SUPPRESSED_COMPLETED_ACTIONS } from './feishu-operation-notices.js';
 import { BindingExpired, ReadAuthorizationRevoked, TOPIC_TITLE_SCHEMA, setCustomTopicTitle, syncTopicRootTitle } from './topic-title-sync.js';
@@ -89,7 +89,7 @@ export type ChannelAction = (
  | { action: 'stop'; turnId: string; revision: number; controlGeneration: number; fallbackCurrent?: boolean; lockTurn?: boolean }
  | { action: 'legacy_stop' }
  | { action: 'control'; owner: string; strategy: 'wait' | 'interrupt'; revision: number; controlGeneration: number; release?: boolean }
- | { action: 'artifacts'; sessionId?: string; cursor?: string }
+ | { action: 'artifacts'; sessionId?: string; cursor?: string; newCard?: boolean; messageId?: string }
  | { action: 'full_reply'; messageId: string }
  | { action: 'file'; artifactId: string; contentVersion: string }
  | { action: 'resource_rejected'; reason:'unsupported'|'size'|'encoding' }
@@ -136,7 +136,7 @@ export class FeishuChannel {
   private readonly observedHealth=new Set<string>();
   private readonly healthFaults=new Set<string>(); private readonly diagnosticFaults=new Set<string>();
   private readonly destinationLocks = new Map<string, Promise<void>>();
-  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; autoTakeControlOnInput?: boolean; canReconcileReleasedReadonly?: (session: Session) => boolean; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null; readAgyStatus?: () => Promise<AgyStatusSnapshot> | AgyStatusSnapshot; readReadonlyLiveTurn?: (session: Session) => Promise<ReadonlyLiveTurnView | null> | ReadonlyLiveTurnView | null } = {}) {
+  constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; autoTakeControlOnInput?: boolean; canReconcileReleasedReadonly?: (session: Session) => boolean; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null; readAgyStatus?: () => Promise<AgyStatusSnapshot> | AgyStatusSnapshot; readReadonlyLiveTurn?: (session: Session) => Promise<ReadonlyLiveTurnView | null> | ReadonlyLiveTurnView | null; readActiveSubagents?: (session: Session) => Promise<readonly SessionSubagentActivity[] | undefined> | readonly SessionSubagentActivity[] | undefined } = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE INDEX IF NOT EXISTS channel_deliveries_state ON channel_deliveries(state); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_readonly_live_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, anchor_id TEXT NOT NULL, card_id TEXT NOT NULL, signature TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope));`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
@@ -179,6 +179,7 @@ export class FeishuChannel {
     this.turnCards = new TurnCardDelivery(this.db, service, port, {
       guard: key => this.checkBinding(...key),
       stamp: (destination, card) => this.stampCard(destination, card),
+      ...(channelOptions.readActiveSubagents ? { readActiveSubagents: channelOptions.readActiveSubagents } : {}),
       wake: destination => {
         if (channelOptions.onProgressWake) channelOptions.onProgressWake(destination);
         else void Promise.resolve(this.topicSyncs.get(destination)).catch(() => {}).then(() => {
@@ -867,13 +868,24 @@ export class FeishuChannel {
     if (a.action === 'history') { await this.applyPendingAutoBaselines(); const hydrate=(this.service as UnifiedService & {hydrateSessionHistory?:(id:string)=>Promise<boolean>}).hydrateSessionHistory; if(this.requireReadonlyHydration && this.accessMode(e.destination)==='read_only' && !this.readonlyHydrated(e.destination,bound) && hydrate) {await guard(); if(await hydrate.call(this.service,bound)) {await guard();await this.baselineReadonlyHistory(e.destination,bound);} await guard();} const page = await this.service.readHistory(bound,{limit:20,...(a.cursor ? {cursor:a.cursor}:{})}); await (a.cursor ? updateReply : reply)(await historyTextCard(this.db,this.port,[e.destination,bound,executionScope],page.items.map(m => `${m.role}: ${m.blocks.map(b => b.type === 'text' ? b.text : `[文件 ${escapeCardMarkdown(b.artifactId)}]`).join(' ')}`).join('\n'),page.nextCursor ? [{label:'下一页',value:{action:'history',cursor:page.nextCursor}}] : [],guard,()=>{effects.started=true;})); return page; }
     if (a.action === 'artifacts') {
       if (a.sessionId && a.sessionId !== bound) throw new Error('session mismatch');
-      const rawItems = await listAllArtifacts(this.service,bound);
-      const { card, items: pageItems, nextCursor } = buildArtifactTreeCard(rawItems, {
+      const rawItems = await listAllArtifacts(this.service, bound);
+      let turnFiles: Artifact[] = [];
+      if (a.messageId) {
+        try {
+          const msg = await readTurnReply(this.service, bound, a.messageId);
+          if (msg) turnFiles = await this.service.findRegisteredReplyFiles?.(bound, msg.blocks) ?? [];
+        } catch { /* Fall back to all session artifacts if reply lookup fails. */ }
+      }
+      const pinnedKeys = turnFiles.map(f => `${f.relativePath || f.name}\0${f.contentVersion}`);
+      const combinedItems = turnFiles.length ? [...turnFiles, ...rawItems] : rawItems;
+      const { card, items: pageItems, nextCursor } = buildArtifactTreeCard(combinedItems, {
         projectDir: session.project,
         ...(a.cursor !== undefined ? { cursor: a.cursor } : {}),
         ...(a.sessionId !== undefined ? { sessionId: a.sessionId } : {}),
+        ...(a.messageId !== undefined ? { messageId: a.messageId } : {}),
+        ...(pinnedKeys.length ? { pinnedKeys } : {}),
       });
-      await replyOrUpdate(card);
+      await (a.newCard ? reply : replyOrUpdate)(card);
       return { items: pageItems, nextCursor };
     }
     if (a.action === 'full_reply') {

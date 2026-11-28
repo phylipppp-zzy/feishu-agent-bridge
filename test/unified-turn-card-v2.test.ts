@@ -341,10 +341,11 @@ test('live context status line and one-click compact button work during running 
   assert.equal(readOnlyCard.actions.some(a => a.value.action === 'compact'), false, 'read-only mirror must not show compact button');
 });
 
-test('P0-3 & P1-2 regressions: long thinking <= 120 code points, no empty panel, and table+subtitle stays 1.0', () => {
-  const longThinking = `分析根因⚠️\uFE0F：` + '深入追踪多段状态机与缓存边界，核对所有异常路径与回滚条件。'.repeat(10);
+test('P0-3 & P1-2 regressions: long thinking <= 1200 code points without mid-word cut, no empty panel, and table+subtitle stays 1.0', () => {
+  const longThinking = `分析根因⚠️\uFE0F：` + '深入追踪多段状态机与缓存边界，核对所有异常路径与回滚条件。'.repeat(60);
   const summary = formatThinkingSummary(longThinking);
-  assert.ok([...summary].length <= 120, 'thinking summary must fit readToolProgress 120 code-point cap');
+  assert.ok([...summary].length <= 1200, 'thinking summary must fit readToolProgress 1200 code-point cap');
+  assert.ok([...summary].length > 200, 'long thinking summary should retain rich context instead of 112-char truncation');
   const parsed = readToolProgress({ turnId: 't-1', callId: 'phase:thinking', phase: 'running', tool: 'thinking', summary });
   assert.ok(parsed, 'readToolProgress must accept formatted long thinking summary');
 
@@ -753,7 +754,7 @@ test('tool turn archives process before delivering the standalone reply and meta
   assert.match(reply!.card.footer!, /850K.*85%.*缓存命中 91%/);
   assert.match(reply!.card.footer!, /🧠 .*carbon.*high.* · 🔧 1 步（失败 1） · ⏱ .* · 🕒 \d{2}:\d{2}/i);
   assert.deepEqual(reply!.card.actions.map(action => action.value.action),
-    ['full_reply', 'file', 'file', 'file', 'compact', 'models', 'panel']);
+    ['full_reply', 'artifacts', 'compact', 'models', 'panel']);
   const compact = reply!.card.actions.find(action => action.value.action === 'compact');
   assert.equal(compact?.type, 'primary');
   assert.match(compact?.label ?? '', /\(85%\)/);

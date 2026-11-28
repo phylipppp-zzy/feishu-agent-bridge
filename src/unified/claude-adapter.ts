@@ -431,7 +431,7 @@ export class ClaudeAdapter implements PlatformPort {
           }
         }
         if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta' && typeof m.event.delta.thinking === 'string' && live.turn) {
-          thinkingBuf = (thinkingBuf + m.event.delta.thinking).slice(-600);
+          thinkingBuf = (thinkingBuf + m.event.delta.thinking).slice(-2400);
           const now = Date.now();
           if (!thinkingActive || now - lastThinkingEmitAt >= 1_500) {
             const obs = tools.observe(ref, live.generation, live.turn, 'phase:thinking', 'running', {

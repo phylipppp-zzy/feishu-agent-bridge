@@ -184,12 +184,20 @@ async function longReplies(ctx) {
         assert.match(body, /^# 核心结论\n/);
         assert.match(body, /FINAL_TAIL_MARKER_99$/);
         assert.doesNotMatch(body, /(?:file|conversation):\/\//);
-        assert.ok(longCard.card.buttons.some(button => button.label === '发送文件：eval_report.md'));
+        assert.ok(longCard.card.buttons.some(button => button.label === '📎 发送文件'));
       });
     });
-    await trace.step('10.2 点击「发送文件：eval_report.md」一次', async () => {
+    await trace.step('10.2 点击「📎 发送文件」打开独立文件卡片并发送 eval_report.md', async () => {
       const mark = wire.uploads.size;
-      await ctx.click(longCard, '发送文件：eval_report.md');
+      const beforeCards = ctx.cards(codex).length;
+      await ctx.click(longCard, '📎 发送文件');
+      await ctx.tick();
+      const pickerCard = ctx.cards(codex).at(-1);
+      assert.ok(ctx.cards(codex).length > beforeCards, '点击发送文件应在下方新发一张文件选择卡片');
+      assert.match(pickerCard.card.bodyText, /eval_report\.md/);
+      const fileBtn = pickerCard.card.buttons.find(button => button.label.includes('eval_report.md'));
+      assert.ok(fileBtn, '文件选择卡片应包含 eval_report.md 按钮');
+      await ctx.click(pickerCard, fileBtn.label);
       await ctx.tick();
       trace.check('按钮上传当前报告的精确字节并在原话题发送文件消息', () => {
         assertFileDelivery(ctx, codex, /^eval_report\.md$/, reportContents, mark);
