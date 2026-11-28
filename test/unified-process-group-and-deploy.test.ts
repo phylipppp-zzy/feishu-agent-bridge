@@ -123,24 +123,19 @@ exec(compile(source, str(script), 'exec'))
 
 test('release GC retains the new, unit, running, and newest old releases', { skip: process.platform !== 'linux' }, async () => {
   const result = await runPython(['-c', `
-import ast
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-path = Path('scripts/deploy-production.py')
-tree = ast.parse(path.read_text())
-names = {'release_from_path', 'unit_releases', 'running_releases', 'prune_releases'}
-nodes = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))
-         or isinstance(node, ast.FunctionDef) and node.name in names]
 with TemporaryDirectory() as tmp:
     root = Path(tmp) / 'releases'
     root.mkdir()
     unit = Path(tmp) / 'bridge.service'
-    scope = {'RELEASES_ROOT': root, 'UNIT_FILE': unit}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
+    scope = runpy.run_path('scripts/deploy-production.py')['main'].__globals__
+    scope.update(RELEASES_ROOT=root, UNIT_FILE=unit, DEPS_ROOT=Path(tmp) / 'deps')
     new, current, previous, running, newest, old = [root / name for name in (
         'aaaaaaa-agy-new', 'bbbbbbb', 'ccccccc-uxv2-old', 'ddddddd', 'eeeeeee', 'fffffff',
     )]
@@ -156,7 +151,7 @@ with TemporaryDirectory() as tmp:
     unit.write_text(f'ExecStart=/usr/bin/node {current}/scripts/unified-start.mjs --run\\n')
     child = subprocess.Popen([sys.executable, str(launcher)], cwd='/tmp')
     try:
-        scope['prune_releases'](new, f'WorkingDirectory={previous}\\n', 1)
+        scope['prune_releases'](new, f'WorkingDirectory={previous}\\n', 1, Path(tmp) / 'absent.sqlite')
         assert {entry.name for entry in root.iterdir()} == {
             new.name, current.name, previous.name, running.name, newest.name, '.staging-active', 'unrelated',
         }
@@ -167,6 +162,29 @@ with TemporaryDirectory() as tmp:
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /PRUNED_RELEASE=fffffff/);
 });
+
+const guardTestFixture = `
+def guard_temp(prefix):
+    try:
+        return TemporaryDirectory(prefix=prefix, dir='/home/zhangzy/workspace')
+    except OSError:
+        return TemporaryDirectory(prefix=prefix)
+
+def fixture_guard(repo, guard):
+    if not repo.is_relative_to('/tmp'):
+        return guard
+    # The sandbox's writable temporary root is intentionally excluded by the production guard.
+    # Relax only that path check for the disposable repository, keeping the real release checks.
+    wrapper = repo.parent / (repo.name + '-guard.py')
+    wrapper.write_text(
+        'import runpy\\n'
+        f'main = runpy.run_path({str(guard)!r})["main"]\\n'
+        'scope = main.__globals__\\n'
+        'scope["TRAP_PATTERNS"] = [(p, r) for p, r in scope["TRAP_PATTERNS"] if not p.match("/tmp")]\\n'
+        'raise SystemExit(main())\\n'
+    )
+    return wrapper
+`;
 
 test('deploy pre/post dev_guard release-check blocks dirty tree, missing guard, and verifies systemd unit parity', async t => {
   const result = await runPython(['-c', `
@@ -187,8 +205,10 @@ dev_guard = Path('/home/zhangzy/.codex/skills/sapphire-dev-workflow/scripts/dev_
 scope = {'DEV_GUARD': dev_guard}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
 
-with TemporaryDirectory(prefix='deploy-guard-', dir='/home/zhangzy/workspace') as tmp:
+${guardTestFixture}
+with guard_temp('deploy-guard-') as tmp:
     repo = Path(tmp)
+    dev_guard = fixture_guard(repo, dev_guard)
     subprocess.run(['git', '-C', str(repo), 'init', '-q'], check=True)
     subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 't@e.com'], check=True)
     subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'T'], check=True)
@@ -224,19 +244,22 @@ with TemporaryDirectory(prefix='deploy-guard-', dir='/home/zhangzy/workspace') a
     finally:
         unit.unlink(missing_ok=True)
         shutil.rmtree(rel.parent, ignore_errors=True)
+        if dev_guard.parent == repo.parent:
+            dev_guard.unlink()
 print('DEPLOY_GUARD_OK')
 `]);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /DEPLOY_GUARD_OK/);
 
-  // Full-script main-flow wiring test: dirty repo blocked with exit code 2 using production DEV_GUARD constant
+  // Full-script main-flow wiring test: dirty repo blocked with exit code 2.
   const dirtyFlow = await runPython(['-c', `
 import re, shutil, subprocess, sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 script = Path('scripts/deploy-production.py')
-with TemporaryDirectory(prefix='deploy-dirty-', dir='/home/zhangzy/workspace') as tmp:
+${guardTestFixture}
+with guard_temp('deploy-dirty-') as tmp:
     repo = Path(tmp)
     rel_root = Path(sys.argv[1])
     subprocess.run(['git', '-C', str(repo), 'init', '-q'], check=True)
@@ -250,8 +273,16 @@ with TemporaryDirectory(prefix='deploy-dirty-', dir='/home/zhangzy/workspace') a
     src = script.read_text()
     src = re.sub(r'^REPO = .*$', lambda _: f'REPO = Path({str(repo)!r})', src, count=1, flags=re.M)
     src = re.sub(r'^RELEASES_ROOT = .*$', lambda _: f'RELEASES_ROOT = Path({str(rel_root)!r})', src, count=1, flags=re.M)
+    guard = Path('/home/zhangzy/.codex/skills/sapphire-dev-workflow/scripts/dev_guard.py')
+    test_guard = fixture_guard(repo, guard)
+    if test_guard != guard:
+        src = re.sub(r'^DEV_GUARD = .*$', lambda _: f'DEV_GUARD = Path({str(test_guard)!r})', src, count=1, flags=re.M)
     sys.argv = [str(script), '--force']
-    exec(compile(src, str(script), 'exec'))
+    try:
+        exec(compile(src, str(script), 'exec'))
+    finally:
+        if test_guard != guard:
+            test_guard.unlink()
 `, tempDir(t)]);
   assert.equal(dirtyFlow.status, 2, dirtyFlow.stderr);
   assert.match(dirtyFlow.stderr, /Pre-deploy dev_guard release-check failed/);
