@@ -57,6 +57,17 @@ export interface FeishuPort {
   topicLinkForSession?(destination:string,sessionId:string):Promise<string | null>;
   topicLinkForTask?(destination:string,taskId:string):Promise<string | null>;
 }
+function isExternallyWorking(snap: SessionSnapshot): boolean {
+  if (snap.session.status !== 'read_only') return false;
+  if (snap.turns?.some(t => t.status === 'running')) return true;
+  const latest = snap.messages.at(-1);
+  if (latest?.role === 'user' && snap.session.updatedAt) {
+    const ageMs = Date.now() - Date.parse(snap.session.updatedAt);
+    if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 120_000) return true;
+  }
+  return false;
+}
+
 class BindingManagementDenied extends Error {}
 export type AuthorizeBindingAdmin = (identity: Identity, destination: string, sessionId: string) => Promise<boolean>;
 export type Authorize = (identity: Identity, destination: string, sessionId: string | null) => Promise<boolean>;
@@ -126,7 +137,7 @@ export class FeishuChannel {
   private readonly destinationLocks = new Map<string, Promise<void>>();
   constructor(private readonly service: UnifiedService, private readonly port: FeishuPort, private readonly authorize: Authorize, dbPath: string, private readonly authorizeBindingAdmin?: AuthorizeBindingAdmin, private readonly requireReadonlyHydration=false, private readonly channelOptions: { defaultCreateProject?: string; allowedProjectRoots?: readonly string[]; enabledProviders?: readonly Provider[]; autoTakeControlOnInput?: boolean; canReconcileReleasedReadonly?: (session: Session) => boolean; onInteractionChanged?: (sessionId:string,interactionId:string) => void; onProgressWake?: (destination: string) => void; readQuota?: () => Promise<AgyQuotaSnapshot | null> | AgyQuotaSnapshot | null; readAgyStatus?: () => Promise<AgyStatusSnapshot> | AgyStatusSnapshot; readReadonlyLiveTurn?: (session: Session) => Promise<ReadonlyLiveTurnView | null> | ReadonlyLiveTurnView | null } = {}) {
     this.db = new DatabaseSync(dbPath);
-    this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_readonly_live_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, anchor_id TEXT NOT NULL, card_id TEXT NOT NULL, signature TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope));`);
+    this.db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS channel_bindings (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, binding_id TEXT NOT NULL, owner_source TEXT NOT NULL, owner_subject TEXT NOT NULL, revision INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox_scope (event_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending_scope (operation_id TEXT PRIMARY KEY, scope TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_inbox (event_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_receipts (event_id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL, result TEXT); CREATE TABLE IF NOT EXISTS channel_cursors (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_deliveries (delivery_id TEXT PRIMARY KEY, state TEXT NOT NULL); CREATE INDEX IF NOT EXISTS channel_deliveries_state ON channel_deliveries(state); CREATE TABLE IF NOT EXISTS channel_interaction_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision INTEGER NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(destination,session_id,interaction_id)); CREATE TABLE IF NOT EXISTS channel_known_messages (destination TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(destination,session_id,message_id)); CREATE TABLE IF NOT EXISTS channel_preferences (destination TEXT PRIMARY KEY, session_id TEXT NOT NULL, enabled INTEGER NOT NULL, event_types TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_pending (operation_id TEXT PRIMARY KEY, destination TEXT NOT NULL, session_id TEXT, kind TEXT NOT NULL, mode TEXT, state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS channel_readonly_live_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL, anchor_id TEXT NOT NULL, card_id TEXT NOT NULL, signature TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope));`);
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_delivery_diagnostics (delivery_id TEXT PRIMARY KEY, kind TEXT NOT NULL, platform_code INTEGER)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_health_facts (component TEXT PRIMARY KEY, observed_at TEXT NOT NULL, success_at TEXT, failure_at TEXT, failure_reason TEXT, status TEXT NOT NULL, reason TEXT)');
     this.db.exec('CREATE TABLE IF NOT EXISTS channel_interaction_view (destination TEXT NOT NULL,session_id TEXT NOT NULL,interaction_id TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(destination,session_id,interaction_id))');
@@ -286,6 +297,20 @@ export class FeishuChannel {
     return !!current && current.accessMode==='interactive' && payloadDigest(current)===payloadDigest(binding) && await this.authorize(current.owner,current.destination,current.sessionId);
   }
   boundDestinations(): string[] { return (this.db.prepare('SELECT destination FROM channel_bindings ORDER BY destination').all() as Array<{destination:string}>).map(x=>x.destination); }
+  minBoundEventCursorBySession(): Map<string, number> {
+    const rows = this.db.prepare(`SELECT b.session_id,b.binding_id,b.revision,b.access_mode,c.cursor,c.binding_scope
+      FROM channel_bindings b LEFT JOIN channel_cursors c
+        ON c.destination=b.destination AND c.session_id=b.session_id`).all() as Array<{
+      session_id:string; binding_id:string; revision:number; access_mode:string; cursor:string|null; binding_scope:string|null;
+    }>;
+    const minimum = new Map<string, number>();
+    for (const { cursor, binding_scope, ...binding } of rows) {
+      const id = binding.session_id;
+      const sequence = eventSequence(id, binding_scope === JSON.stringify(binding) ? cursor ?? undefined : undefined);
+      minimum.set(id, Math.min(minimum.get(id) ?? sequence, sequence));
+    }
+    return minimum;
+  }
   listInteractionCards(): Array<{destination:string;sessionId:string;interactionId:string;revision:number;messageId:string}> {
     return this.db.prepare('SELECT destination,session_id AS sessionId,interaction_id AS interactionId,revision,message_id AS messageId FROM channel_interaction_cards').all() as Array<{destination:string;sessionId:string;interactionId:string;revision:number;messageId:string}>;
   }
@@ -891,8 +916,12 @@ export class FeishuChannel {
       await (cursor ? replyOrUpdate : reply)(card); return page;
     }
     if (a.action === 'rename') {
+      const externallyWorking = session.status === 'read_only' &&
+        (this.topicTitleIsRunning(e.destination, bound, executionScope) ||
+          isExternallyWorking((await this.service.getSnapshot(bound)).value));
+      await guard();
       const cleaned = setCustomTopicTitle(this.db, e.destination, bound, a.title);
-      await syncTopicRootTitle(this.db, this.port, e.destination, executionScope, session, card => this.stampCard(e.destination, card), guard);
+      await syncTopicRootTitle(this.db, this.port, e.destination, executionScope, session, card => this.stampCard(e.destination, card), guard, { externallyWorking });
       await reply({ title: '话题标题已更新', text: `已将当前话题标题设为：**${escapeCardMarkdown(cleaned)}**`, actions: [] });
       return { status: 'completed', title: cleaned };
     }
@@ -1062,20 +1091,18 @@ export class FeishuChannel {
     return work;
   }
 
+  private topicTitleIsRunning(destination: string, sessionId: string, scope: string): boolean {
+    // The title table may still have the legacy schema until the first title sync.
+    const row = this.db.prepare(
+      'SELECT * FROM channel_topic_titles WHERE destination=? AND session_id=? AND binding_scope=?',
+    ).get(destination, sessionId, scope);
+    return (row?.synced_status || (String(row?.synced_title ?? '').startsWith('🔵') ? 'running' : '')) === 'running';
+  }
+
   private async syncTopic(destination: string): Promise<boolean> {
     const row=this.db.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(destination) as {session_id:string;binding_id:string;revision:number;access_mode:'read_only'|'interactive'}|undefined; if(!row) throw new Error('destination is not bound'); const sessionId=row.session_id, scope=JSON.stringify(row);
     const syncGuard=()=>this.checkBinding(destination,sessionId,scope);
-    const isExternallyWorking = (snap: SessionSnapshot): boolean => {
-      if (snap.session.status !== 'read_only') return false;
-      if (snap.turns?.some(t => t.status === 'running')) return true;
-      const latest = snap.messages.at(-1);
-      if (latest?.role === 'user' && snap.session.updatedAt) {
-        const ageMs = Date.now() - Date.parse(snap.session.updatedAt);
-        if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < 120_000) return true;
-      }
-      return false;
-    };
-    const syncTitle=(snap:SessionSnapshot)=>syncTopicRootTitle(this.db,this.port,destination,scope,snap.session,card=>this.stampCard(destination,card),syncGuard,{externallyWorking:isExternallyWorking(snap)});
+    const syncTitle=(snap:SessionSnapshot, liveRunning = false)=>syncTopicRootTitle(this.db,this.port,destination,scope,snap.session,card=>this.stampCard(destination,card),syncGuard,{externallyWorking:liveRunning || isExternallyWorking(snap)});
     const reconcileReleasedReadonly = (session: Session): boolean => {
       if (!this.channelOptions.autoTakeControlOnInput || row.access_mode !== 'interactive' ||
           session.status !== 'read_only' || session.control.owner !== null || session.control.input !== 'unavailable') return false;
@@ -1105,7 +1132,7 @@ export class FeishuChannel {
     const isCliReadonly = (session: Session) => this.accessMode(destination) === 'read_only' || session.status === 'read_only';
     const readonlyPatchIntervalMs = (() => {
       const raw = Number(process.env.FEISHU_PATCH_INTERVAL_MS);
-      return Number.isSafeInteger(raw) && raw > 0 ? raw : 1500;
+      return Number.isSafeInteger(raw) && raw > 0 ? raw : 2500;
     })();
     const readonlyIdleGraceMs = (() => {
       const raw = Number(process.env.FEISHU_READONLY_IDLE_GRACE_MS);
@@ -1246,16 +1273,16 @@ export class FeishuChannel {
     const syncReadonlyLiveCard = async (
       session: Session,
       snapshotMessages: readonly Message[] | null,
-    ): Promise<{ handledIds: Set<string>; deferredIds: Set<string> }> => {
+    ): Promise<{ handledIds: Set<string>; deferredIds: Set<string>; liveRunning: boolean }> => {
       const handledIds = new Set<string>();
       const deferredIds = new Set<string>();
       if (!this.channelOptions.readReadonlyLiveTurn || !isCliReadonly(session)) {
         this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=?').run(destination);
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning: false };
       }
       this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND binding_scope<>?').run(destination, scope);
       if (!allowedPush()) {
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning: false };
       }
       let live: ReadonlyLiveTurnView | null = null;
       try {
@@ -1285,9 +1312,10 @@ export class FeishuChannel {
             deferredIds.add(m.messageId);
           }
         }
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning: false };
       }
 
+      const liveRunning = live?.state === 'running';
       const now = Date.now();
       const hasWork = Boolean(live && live.state === 'running' && (live.tools.length > 0 || live.activeSubagents.length > 0));
 
@@ -1307,7 +1335,7 @@ export class FeishuChannel {
               activeRow = undefined;
             } else {
               for (const m of prevTurnFinals) deferredIds.add(m.messageId);
-              return { handledIds, deferredIds };
+              return { handledIds, deferredIds, liveRunning };
             }
           } else {
             this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
@@ -1357,7 +1385,7 @@ export class FeishuChannel {
             } catch (error) {
               if (isApiRejectionError(error)) {
                 this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-                return { handledIds, deferredIds };
+                return { handledIds, deferredIds, liveRunning };
               }
               throw error;
             }
@@ -1400,7 +1428,7 @@ export class FeishuChannel {
                   this.db.prepare(
                     'UPDATE channel_readonly_live_cards SET patch_seq=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
                   ).run(nextSeq, now, destination, sessionId, scope);
-                  return { handledIds, deferredIds };
+                  return { handledIds, deferredIds, liveRunning };
                 }
                 throw error;
               }
@@ -1418,7 +1446,7 @@ export class FeishuChannel {
             deferredIds.add(m.messageId);
           }
         }
-        return { handledIds, deferredIds };
+        return { handledIds, deferredIds, liveRunning };
       }
 
       if (existing && (!live || live.state === 'idle')) {
@@ -1442,7 +1470,7 @@ export class FeishuChannel {
             for (const m of finalCandidates) deferredIds.add(m.messageId);
           }
           // outcome === 'fallback': slot deleted, neither handled nor deferred -> TurnCardDelivery sends fresh card.
-          return { handledIds, deferredIds };
+          return { handledIds, deferredIds, liveRunning };
         }
 
         // Summaries may flip to IDLE slightly before Core history refresh delivers the final assistant message.
@@ -1452,7 +1480,7 @@ export class FeishuChannel {
             .run(idleSince, destination, sessionId, scope);
         }
         if (now - idleSince < readonlyIdleGraceMs) {
-          return { handledIds, deferredIds };
+          return { handledIds, deferredIds, liveRunning };
         }
 
         const doneCard = turnProgressCard({
@@ -1485,7 +1513,7 @@ export class FeishuChannel {
                   'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
                 ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
               }
-              return { handledIds, deferredIds };
+              return { handledIds, deferredIds, liveRunning };
             }
             throw error;
           }
@@ -1495,7 +1523,7 @@ export class FeishuChannel {
             .run(destination, sessionId, scope);
         }
       }
-      return { handledIds, deferredIds };
+      return { handledIds, deferredIds, liveRunning };
     };
     const deliverCliPrompts = async (session: Session, candidates: readonly Message[]) => {
       if (this.accessMode(destination) !== 'read_only' || !candidates.length) return;
@@ -1560,8 +1588,13 @@ export class FeishuChannel {
           );
           if (!hasPendingCards && !hasInteractionCards && !hasReadonlyLiveCard) {
             const session = await this.service.getSession(sessionId); await syncGuard();
-            await syncReadonlyLiveCard(session, null);
-            await syncTopicRootTitle(this.db, this.port, destination, scope, session, card => this.stampCard(destination, card), syncGuard);
+            const { liveRunning } = await syncReadonlyLiveCard(session, null);
+            const externallyWorking = session.status === 'read_only' && (liveRunning ||
+              (this.topicTitleIsRunning(destination, sessionId, scope) &&
+                isExternallyWorking((await this.service.getSnapshot(sessionId)).value)));
+            await syncGuard();
+            await syncTopicRootTitle(this.db, this.port, destination, scope, session,
+              card => this.stampCard(destination, card), syncGuard, { externallyWorking });
             if (reconcileReleasedReadonly(session)) return true;
             return false;
           }
@@ -1589,7 +1622,7 @@ export class FeishuChannel {
         ];
         await this.turnCards.sync(scopeKey, snapshot.value, events.events, remainingMessages, allowedPush);
         await syncGuard();
-        await syncTitle(snapshot.value);
+        await syncTitle(snapshot.value, roResult.liveRunning);
         if (reconcileReleasedReadonly(snapshot.value.session)) return true;
         for (const message of remainingMessages) if (message.final) remember.run(destination,sessionId,message.messageId,message.revision);
         for (const message of snapshot.value.messages) if (message.final && roResult.handledIds.has(message.messageId)) remember.run(destination,sessionId,message.messageId,message.revision);

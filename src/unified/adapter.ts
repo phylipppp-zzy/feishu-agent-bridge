@@ -3,6 +3,7 @@ import type { ModelOption, ConfirmedSettings, ResponseEvidence, ChannelInputScop
 import type { Artifact, Capabilities, ControlState, EventSubscription, Interaction, Message, Operation, Page, Provider, ResolveInteraction, Session, SessionSnapshot, Snapshot, SubmitInput, WriteContext, Turn, NativeSessionRef, Answer, Event, TurnResidual, CandidateMetadata } from './contracts.js';
 
 export interface ListQuery { cursor?: string; limit: number; search?: string; provider?: Provider | 'all'; stable?: boolean; storedOnly?: boolean }
+export interface PendingInteractionCandidate { session: Session; connectionGeneration: number; interactions: Interaction[] }
 export interface WriteRequest<T> { context: WriteContext; payload: T }
 export interface AttachOptions { allowQuarantineRecovery?: boolean; stillAuthorized?: () => boolean | Promise<boolean> }
 export type InputScopeValidator = (scope:ChannelInputScope, sessionId:string) => boolean;
@@ -16,9 +17,10 @@ export interface UnifiedService {
   registerInputScopeValidator?(validate: InputScopeValidator): () => void;
   hasProvider?(provider: Provider): boolean;
   listSessions(query: ListQuery): Promise<Page<Session>>;
+  listPendingInteractionCandidates?(): Promise<PendingInteractionCandidate[]>;
   unknownCreateProvider?(identity:{source:string;subject:string},destination:string,operationId:string):Promise<Provider|null>;
   inspectUnknownCreateCandidates?(identity:{source:string;subject:string},destination:string,operationId:string,query:{cursor?:string;nativeId?:string}):Promise<{items:CandidateMetadata[];nextCursor:string|null;partial:boolean}>;
-  getSession(sessionId: string): Promise<Session>;
+  getSession(sessionId: string, options?: { discoverableOnly: true }): Promise<Session>;
   capabilities(sessionId: string): Promise<Capabilities>;
   attachSession(request: WriteRequest<{ provider: Provider; hostId: string; serviceId: string; nativeSessionId: string; mode: 'read_only' | 'interactive' }>, options?: AttachOptions): Promise<Operation>;
   detachSession(request: WriteRequest<Record<string, never>>): Promise<Operation>;

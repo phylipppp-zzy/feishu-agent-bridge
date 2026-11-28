@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { answerDigest, questionDeclineAction, canTransitionOperation, payloadDigest, SCHEMA_VERSION, validateResolution, validateWriteContext, type Event, type EventSubscription, type Artifact, type Turn, type Interaction, type Message, type NativeResult, type Operation, type OperationStatus, type ResolveInteraction, type ResponseEvidence, type Session, type SessionSnapshot, type Snapshot, type WriteContext } from './contracts.js';
 import { contractError, type ContractError, type ErrorCode } from './errors.js';
-import type { StopResult } from './adapter.js';
+import type { PendingInteractionCandidate, StopResult } from './adapter.js';
 import { reconcilePersistedAgyHistory } from './agy/transcript-reconciliation.js';
 
 export class StoreError extends Error {
@@ -16,11 +16,29 @@ export const recoveryReleaseConfirmed = 'recovery verification failed; subscript
 const STOPPED_QUEUE = 'queued input cancelled by stop';
 /** Responses have their own lease so the native input waiting for an answer cannot block it. */
 export const responseLeaseKey = (interactionId: string): string => `interaction:${interactionId}`;
-const cursor = (sessionId: string, sequence: number): string => Buffer.from(JSON.stringify([sessionId, sequence])).toString('base64url');
-function readCursor(value: string, sessionId: string): number {
-  try { const c: unknown = JSON.parse(Buffer.from(value, 'base64url').toString()); if (Array.isArray(c) && c.length === 2 && c[0] === sessionId && Number.isSafeInteger(c[1]) && c[1] >= 0 && cursor(sessionId, c[1]) === value) return c[1]; } catch { /* invalid cursor */ }
+export const encodeCursor = (sessionId: string, sequence: number): string => Buffer.from(JSON.stringify([sessionId, sequence])).toString('base64url');
+export function decodeCursor(value: string, sessionId: string): number {
+  try { const c: unknown = JSON.parse(Buffer.from(value, 'base64url').toString()); if (Array.isArray(c) && c.length === 2 && c[0] === sessionId && Number.isSafeInteger(c[1]) && c[1] >= 0 && encodeCursor(sessionId, c[1]) === value) return c[1]; } catch { /* invalid cursor */ }
   return fail('invalid_request', 'invalid cursor');
 }
+
+type EventInput = Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>;
+type EventKey = { _k: 1; s: string; q: number; v?: Event['schemaVersion']; d: string } &
+  ({ i?: 1 } | { t: 'adapter.stream_failed'; o: string; u: 0 | 1 });
+
+function compactEventKey(input: EventInput, sequence: number, version: Event['schemaVersion'], internal: boolean): EventKey {
+  const key = { _k: 1 as const, s: input.sessionId, q: sequence, v: version, d: payloadDigest(input) };
+  if (input.type === 'adapter.stream_failed') {
+    const data = input.data as { definiteFailure?: boolean } | null;
+    return { ...key, t: input.type, o: input.objectId, u: data?.definiteFailure === true ? 0 : 1 };
+  }
+  return internal ? { ...key, i: 1 } : key;
+}
+
+function isCompactEventKey(value: Event | EventKey): value is EventKey {
+  return '_k' in value && value._k === 1;
+}
+
 
 /** Isolated store; callers authenticate identities and mediate all native effects. */
 export class UnifiedStore {
@@ -83,6 +101,18 @@ export class UnifiedStore {
   }
   close(): void { this.db.close(); }
   private transaction<T>(f: () => T): T { const nested=this.migrationLocked; this.db.exec(nested?'SAVEPOINT migration_op':'BEGIN IMMEDIATE'); try { const v=f(); this.db.exec(nested?'RELEASE migration_op':'COMMIT'); return v; } catch(e) { this.db.exec(nested?'ROLLBACK TO migration_op; RELEASE migration_op':'ROLLBACK'); throw e; } }
+  private readTransaction<T>(f: () => T): T {
+    const nested = this.migrationLocked;
+    this.db.exec(nested ? 'SAVEPOINT migration_read' : 'BEGIN DEFERRED');
+    try {
+      const value = f();
+      this.db.exec(nested ? 'RELEASE migration_read' : 'COMMIT');
+      return value;
+    } catch (error) {
+      this.db.exec(nested ? 'ROLLBACK TO migration_read; RELEASE migration_read' : 'ROLLBACK');
+      throw error;
+    }
+  }
   beginMigrationRollback():void { if(this.migrationLocked) throw new Error('migration lock already held'); this.db.exec('BEGIN IMMEDIATE'); this.migrationLocked=true; }
   endMigrationRollback(commit:boolean):void { if(!this.migrationLocked) throw new Error('migration lock not held'); try {this.db.exec(commit?'COMMIT':'ROLLBACK');} catch(e) {if(commit) {try {this.db.exec('ROLLBACK');} catch {}} throw e;} finally {this.migrationLocked=false;} }
   inspectMigrationSession(id:string,sessionId:string):'removable'|'retained'|'absent' { if(!this.migrationLocked) throw new Error('migration lock required'); this.db.exec('SAVEPOINT migration_inspect'); try {const result=this.rollbackMigrationSession(id); if(result==='retained' && !this.row('SELECT 1 AS present FROM sessions WHERE id=?',sessionId)) throw new Error('migration session missing despite receipt; manual review'); this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect'); return result==='removed'?'removable':result==='absent' && this.row('SELECT 1 AS present FROM sessions WHERE id=?',sessionId)?'retained':result;} catch(e) {this.db.exec('ROLLBACK TO migration_inspect; RELEASE migration_inspect');throw e;} }
@@ -111,7 +141,7 @@ export class UnifiedStore {
     const id=String(receipt.session_id); const row=this.row('SELECT value,event_seq,connection_generation FROM sessions WHERE id=?',id);
     if (!row || payloadDigest(parse<Session>(row.value)) !== receipt.digest || Number(row.event_seq) !== 0 || Number(row.connection_generation) !== 0) return 'retained';
     for (const table of ['turns','messages','interactions','staged_artifacts','tracking_state','notification_preferences','session_settings']) if (this.row(`SELECT 1 AS present FROM ${table} WHERE session_id=? LIMIT 1`,id)) return 'retained';
-    if (this.row('SELECT 1 AS present FROM dispatch_leases WHERE session_id=? LIMIT 1',id) || this.row("SELECT 1 AS present FROM operations WHERE json_extract(value,'$.targetId')=? OR json_extract(value,'$.result.sessionId')=? LIMIT 1",id,id) || this.row("SELECT 1 AS present FROM event_keys WHERE json_extract(value,'$.sessionId')=? LIMIT 1",id)) return 'retained';
+    if (this.row('SELECT 1 AS present FROM dispatch_leases WHERE session_id=? LIMIT 1',id) || this.row("SELECT 1 AS present FROM operations WHERE json_extract(value,'$.targetId')=? OR json_extract(value,'$.result.sessionId')=? LIMIT 1",id,id) || this.row("SELECT 1 AS present FROM event_keys WHERE json_extract(value,'$.sessionId')=? OR json_extract(value,'$.s')=? LIMIT 1",id,id)) return 'retained';
     this.run('DELETE FROM sessions WHERE id=?',id); this.run("UPDATE migration_receipts SET state='removed' WHERE migration_id=?",migrationId); return 'removed';
   }); }
   /** A lease is a write fence, not proof that any external client has released control. */
@@ -265,7 +295,11 @@ export class UnifiedStore {
       AND json_extract(value,'$.data.definiteFailure') IS NOT 1`;
     return !!this.row(`SELECT 1 FROM events WHERE session_id=? AND ${predicate} LIMIT 1`,sessionId,turnId) ||
       (this.eventFloor(sessionId) > 0 && !!this.row(`SELECT 1 FROM event_keys
-        WHERE json_extract(value,'$.sessionId')=? AND ${predicate} LIMIT 1`,sessionId,turnId));
+        WHERE (json_extract(value,'$._k')=1 AND json_extract(value,'$.s')=?
+          AND json_extract(value,'$.o')=? AND json_extract(value,'$.t')='adapter.stream_failed'
+          AND json_extract(value,'$.u')=1)
+        OR (json_extract(value,'$._k') IS NULL AND json_extract(value,'$.sessionId')=? AND ${predicate})
+        LIMIT 1`,sessionId,turnId,sessionId,turnId));
   }
   confirmedSettings(id: string): {model:string|null; preferences:Record<string,string>; revision:number} | null { this.session(id); const row=this.row('SELECT value,revision FROM session_settings WHERE session_id=?',id); return row ? {...parse<{model:string|null;preferences:Record<string,string>}>(row.value),revision:Number(row.revision)} : null; }
   settingsBarrier(id: string): 'pending' | 'unknown' | null {
@@ -437,6 +471,32 @@ export class UnifiedStore {
   }); }
   /** Stable insertion ordering supports restart-safe pagination. */
   listSessions(): Session[] { return (this.db.prepare('SELECT value FROM sessions ORDER BY rowid').all() as Record<string, unknown>[]).map(r => parse<Session>(r.value)); }
+  listPendingInteractionCandidates(): PendingInteractionCandidate[] {
+    return this.readTransaction(() => {
+      const pending = this.db.prepare(`
+        SELECT session_id, value FROM interactions
+        WHERE json_extract(value,'$.status') IN ('awaiting_answer','answer_pending_delivery') ORDER BY rowid
+      `).all();
+      const bySession = new Map<string, Interaction[]>();
+      for (const row of pending) {
+        const id = String(row.session_id);
+        let interactions = bySession.get(id);
+        if (!interactions) bySession.set(id, interactions = []);
+        interactions.push(parse<Interaction>(row.value));
+      }
+      const sessions = this.db.prepare(`
+        SELECT id, value, connection_generation FROM sessions
+        WHERE (json_extract(value,'$.status')='waiting_approval' OR id IN (SELECT value FROM json_each(?)))
+          AND NOT EXISTS (SELECT 1 FROM tracking_state WHERE session_id=sessions.id AND detached=1)
+        ORDER BY rowid
+      `).all(JSON.stringify([...bySession.keys()]));
+      return sessions.map(row => ({
+        session: parse<Session>(row.value),
+        connectionGeneration: Number(row.connection_generation),
+        interactions: bySession.get(String(row.id)) ?? [],
+      }));
+    });
+  }
   findSession(native: Session['native']): Session | undefined { const row = this.row("SELECT value FROM sessions WHERE json_extract(value,'$.native.provider')=? AND json_extract(value,'$.native.hostId')=? AND json_extract(value,'$.native.serviceId')=? AND json_extract(value,'$.native.nativeSessionId')=?",native.provider,native.hostId,native.serviceId,native.nativeSessionId); return row ? parse<Session>(row.value) : undefined; }
   connectionGeneration(id: string): number { const row = this.row('SELECT connection_generation FROM sessions WHERE id=?', id); if (!row) return fail('invalid_request', 'unknown session'); return Number(row.connection_generation); }
   hasUnsettledInput(sessionId: string, exceptIds: string | readonly string[]): boolean {
@@ -985,48 +1045,71 @@ export class UnifiedStore {
   }); }
   private eventFor(sessionId: string, objectId: string, revision: number, type: string, operationId: string | null, data: unknown): Event {
     const now = new Date().toISOString();
-    return this.appendEventInTransaction({ eventId: randomUUID(), sessionId, objectId, objectRevision: revision, type, occurredAt: now, receivedAt: now, operationId, data });
+    return this.appendEventInTransaction({ eventId: randomUUID(), sessionId, objectId, objectRevision: revision, type, occurredAt: now, receivedAt: now, operationId, data }, true);
   }
-  appendEvent(input: Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>): Event { return this.transaction(() => this.appendEventInTransaction(input)); }
-  appendObservedEvent(input: Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>, generation?: number): boolean {
+  appendEvent(input: EventInput): Event { return this.transaction(() => this.appendEventInTransaction(input, false)); }
+  appendObservedEvent(input: EventInput, generation?: number): boolean {
     return this.transaction(() => {
       const prior = this.row('SELECT 1 FROM event_keys WHERE event_id=?', input.eventId);
       if (input.type !== 'tool.updated' || prior) {
-        this.appendEventInTransaction(input);
+        this.appendEventInTransaction(input, false);
         return !prior;
       }
       const data = readToolProgress(input.data);
       if (!data || generation === undefined || generation !== this.connectionGeneration(input.sessionId) ||
         !this.turnProgress.acceptsTool(input.sessionId, generation, data)) return false;
-      const event = this.appendEventInTransaction({ ...input, data });
+      const event = this.appendEventInTransaction({ ...input, data }, false);
       this.turnProgress.recordTool(event, generation);
       return true;
     });
   }
-  private appendEventInTransaction(input: Omit<Event, 'schemaVersion' | 'sequence' | 'cursor'>): Event {
+  private appendEventInTransaction(input: EventInput, internal: boolean): Event {
     const prior = this.row('SELECT value FROM event_keys WHERE event_id=?', input.eventId);
-    if (prior) { const event = parse<Event>(prior.value); const { schemaVersion: _v, sequence: _s, cursor: _c, ...original } = event; if (payloadDigest(original) !== payloadDigest(input)) return fail('idempotency_conflict'); return event; }
+    if (prior) {
+      const stored = parse<Event | EventKey>(prior.value);
+      if (isCompactEventKey(stored)) {
+        if (stored.d !== payloadDigest(input)) return fail('idempotency_conflict');
+        return { ...input, schemaVersion: stored.v ?? SCHEMA_VERSION, sequence: stored.q, cursor: encodeCursor(input.sessionId, stored.q) };
+      }
+      const { schemaVersion: _v, sequence: _s, cursor: _c, ...original } = stored;
+      if (payloadDigest(original) !== payloadDigest(input)) return fail('idempotency_conflict');
+      return stored;
+    }
     const row = this.row('SELECT event_seq FROM sessions WHERE id=?', input.sessionId); if (!row) return fail('invalid_request', 'unknown session');
-    const sequence = Number(row.event_seq) + 1; const event: Event = { ...input, schemaVersion: SCHEMA_VERSION, sequence, cursor: cursor(input.sessionId, sequence) };
-    this.run('INSERT INTO event_keys(event_id,value) VALUES(?,?)', input.eventId, JSON.stringify(event));
+    const sequence = Number(row.event_seq) + 1; const event: Event = { ...input, schemaVersion: SCHEMA_VERSION, sequence, cursor: encodeCursor(input.sessionId, sequence) };
+    this.run('INSERT INTO event_keys(event_id,value) VALUES(?,?)', input.eventId, JSON.stringify(compactEventKey(input, sequence, SCHEMA_VERSION, internal)));
     this.run('INSERT INTO events(event_id,session_id,seq,value) VALUES(?,?,?,?)', input.eventId, input.sessionId, sequence, JSON.stringify(event)); this.run('UPDATE sessions SET event_seq=? WHERE id=?', sequence, input.sessionId); return event;
+  }
+  slimLegacyEventKeys(batchLimit = 5000): number {
+    if (!Number.isSafeInteger(batchLimit) || batchLimit < 1) return fail('invalid_request', 'invalid legacy event key batch limit');
+    return this.transaction(() => {
+      const rows = this.db.prepare("SELECT event_id,value FROM event_keys WHERE json_extract(value,'$._k') IS NULL ORDER BY rowid LIMIT ?").all(batchLimit);
+      const update = this.db.prepare('UPDATE event_keys SET value=? WHERE event_id=?');
+      for (const row of rows) {
+        const eventId = String(row.event_id);
+        const { schemaVersion, sequence, cursor: _cursor, ...input } = parse<Event>(row.value);
+        // Legacy event keys carry no provenance, even when their IDs are UUIDs.
+        update.run(JSON.stringify(compactEventKey(input, sequence, schemaVersion, false)), eventId);
+      }
+      return rows.length;
+    });
   }
   eventWatermark(sessionId: string): number {
     const row = this.row('SELECT event_seq FROM sessions WHERE id=?', sessionId);
     if (!row) return fail('invalid_request', 'unknown session');
     return Number(row.event_seq);
   }
-  initialCursor(sessionId:string):string {this.session(sessionId);return cursor(sessionId,0);}
-  snapshot(sessionId: string): Snapshot<SessionSnapshot & { turns: Turn[] }> { return this.transaction(() => {
+  initialCursor(sessionId:string):string {this.session(sessionId);return encodeCursor(sessionId,0);}
+  snapshot(sessionId: string): Snapshot<SessionSnapshot & { turns: Turn[] }> { return this.readTransaction(() => {
     const session = this.session(sessionId);
     const messages = (this.db.prepare('SELECT value FROM messages WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string, unknown>[]).map(r => parse<Message>(r.value));
     const interactions = (this.db.prepare('SELECT value FROM interactions WHERE session_id=? ORDER BY rowid').all(sessionId) as Record<string, unknown>[]).map(r => parse<Interaction>(r.value));
     const row = this.row('SELECT event_seq FROM sessions WHERE id=?', sessionId)!;
-    return { value: { session, messages, interactions, turns: this.listTurns(sessionId), turnProgress: this.turnProgress.snapshot(sessionId) }, cursor: cursor(sessionId, Number(row.event_seq)) };
+    return { value: { session, messages, interactions, turns: this.listTurns(sessionId), turnProgress: this.turnProgress.snapshot(sessionId) }, cursor: encodeCursor(sessionId, Number(row.event_seq)) };
   }); }
   subscribeEvents(sessionId: string, from: string, limit: number): EventSubscription {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) return fail('invalid_request', 'invalid limit');
-    return this.transaction(() => { const sequence = readCursor(from, sessionId); const row = this.row('SELECT event_floor,event_seq FROM sessions WHERE id=?', sessionId); if (!row) return fail('invalid_request', 'unknown session');
+    return this.readTransaction(() => { const sequence = decodeCursor(from, sessionId); const row = this.row('SELECT event_floor,event_seq FROM sessions WHERE id=?', sessionId); if (!row) return fail('invalid_request', 'unknown session');
       if (sequence < Number(row.event_floor)) return { status: 'snapshot_required', error: contractError('snapshot_required') };
       if (sequence > Number(row.event_seq)) return fail('invalid_request', 'future cursor');
       const rows = this.db.prepare('SELECT value FROM events WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?').all(sessionId, sequence, limit) as Record<string, unknown>[]; const events = rows.map(r => parse<Event>(r.value));
@@ -1036,10 +1119,12 @@ export class UnifiedStore {
   /** Retain a watermark even when old events are removed. */
   compactEvents(sessionId: string, throughCursor: string): void {
     this.transaction(() => {
-      const sequence = readCursor(throughCursor, sessionId);
+      const sequence = decodeCursor(throughCursor, sessionId);
       const row = this.row('SELECT event_floor,event_seq FROM sessions WHERE id=?', sessionId);
       if (!row || sequence < Number(row.event_floor) || sequence > Number(row.event_seq)) return fail('invalid_request', 'invalid compaction watermark');
       this.run('DELETE FROM events WHERE session_id=? AND seq<=?', sessionId, sequence);
+      this.run(`DELETE FROM event_keys WHERE json_extract(value,'$._k')=1 AND json_extract(value,'$.i')=1
+        AND json_extract(value,'$.s')=? AND json_extract(value,'$.q')<=?`, sessionId, sequence);
       this.run('UPDATE sessions SET event_floor=? WHERE id=?', sequence, sessionId);
     });
   }

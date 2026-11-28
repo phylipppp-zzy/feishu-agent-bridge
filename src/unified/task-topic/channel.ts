@@ -3,6 +3,7 @@ import type { UnifiedService } from '../adapter.js';
 import type { ChannelInputScope, Identity, Message, NativeSessionRef, Operation, Provider } from '../contracts.js';
 import type { FeishuPort, TrustedEnvelope } from '../feishu-channel.js';
 import type { TaskTopicToken } from '../task-topic-store.js';
+import { eventSequence } from '../turn-card-delivery.js';
 import { drainTaskEventLocked } from './drain.js';
 import { captureTaskResourceScope, intakeTaskEvent } from './intake.js';
 import {
@@ -158,6 +159,23 @@ export class TaskTopicChannel {
         .prepare("SELECT * FROM task_bindings_v1 WHERE state = 'active' ORDER BY rowid")
         .all() as unknown as BindingRow[]
     ).map(toBinding);
+  }
+
+  minBoundEventCursorBySession(): Map<string, number> {
+    const rows = this.db.prepare(`SELECT t.session_id,c.cursor FROM task_targets_v1 t
+      JOIN task_bindings_v1 b ON b.task_id=t.task_id AND b.state='active'
+      LEFT JOIN task_cursors_v1 c
+        ON c.task_id=t.task_id AND c.target_id=t.target_id AND c.target_generation=t.target_generation
+        AND c.session_id=t.session_id AND c.binding_scope=json_object(
+          'taskId',b.task_id,'rootGeneration',b.root_generation,'targetId',t.target_id,
+          'targetGeneration',t.target_generation,'sessionId',t.session_id,'accessMode',t.access_mode)
+      WHERE t.state='active'`).all() as Array<{session_id:string;cursor:string|null}>;
+    const minimum = new Map<string, number>();
+    for (const row of rows) {
+      const sequence = eventSequence(row.session_id, row.cursor ?? undefined);
+      minimum.set(row.session_id, Math.min(minimum.get(row.session_id) ?? sequence, sequence));
+    }
+    return minimum;
   }
 
   listInteractionCards(): Array<{

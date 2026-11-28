@@ -15,7 +15,7 @@ interface Work {
   dirty: boolean;
 }
 
-const STREAM_PROGRESS_INTERVAL_MS = 350;
+const STREAM_PROGRESS_INTERVAL_MS = 500;
 
 /** The inbox commit is the ACK boundary. This scheduler only consumes durable work. */
 export class RuntimeInteractive {

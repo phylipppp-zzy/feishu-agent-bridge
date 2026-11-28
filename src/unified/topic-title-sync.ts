@@ -17,6 +17,8 @@ export const TOPIC_TITLE_SCHEMA = `
     root_message_id TEXT NOT NULL,
     synced_title TEXT NOT NULL,
     retry_after INTEGER NOT NULL DEFAULT 0,
+    synced_status TEXT NOT NULL DEFAULT '',
+    synced_custom_title TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(destination, session_id, binding_scope)
   );
   CREATE TABLE IF NOT EXISTS channel_topic_custom_titles (
@@ -28,8 +30,12 @@ export const TOPIC_TITLE_SCHEMA = `
   );
 `;
 
-type TopicTitleRow = { rowid: number; synced_title: string; retry_after: number };
+type TopicTitleRow = {
+  rowid: number; session_id?: string; synced_title: string; retry_after: number;
+  synced_status: Session['status'] | ''; synced_custom_title: string;
+};
 const inFlightRoots = new WeakMap<FeishuPort, Set<string>>();
+const migratedTitleDbs = new WeakSet<DatabaseSync>();
 const EXPIRED_ROOT_RETRY_AFTER = Number.MAX_SAFE_INTEGER;
 
 const STATUS_DOTS: Record<string, string> = {
@@ -41,6 +47,21 @@ const STATUS_DOTS: Record<string, string> = {
   read_only: '⚪',
   archived: '⚪',
 };
+
+const LEGACY_DOT_STATUS: Record<string, Session['status']> = {
+  '🔵': 'running', '🟡': 'waiting_approval', '🟢': 'idle', '🔴': 'failed', '⚪': 'read_only',
+};
+
+function migrateTitleColumns(db: DatabaseSync): void {
+  if (migratedTitleDbs.has(db)) return;
+  const columns = db.prepare('PRAGMA table_info(channel_topic_titles)').all();
+  for (const name of ['synced_status', 'synced_custom_title']) {
+    if (!columns.some(column => column.name === name)) {
+      db.exec(`ALTER TABLE channel_topic_titles ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`);
+    }
+  }
+  migratedTitleDbs.add(db);
+}
 
 export function sessionStatusDot(status: Session['status']): string {
   return STATUS_DOTS[status] ?? '🟢';
@@ -142,13 +163,16 @@ export async function recordNewTopicRootTitle(
 ): Promise<void> {
   const rootId = await lookupRoot(port, destination, creationDeliveryId);
   if (!rootId || !isCurrentTitleScope(db, destination, session.sessionId, scope)) return;
-  const cardSig = rootCardSignature(topicRootCard(session, getCustomTopicTitle(db, destination, session.sessionId)));
+  migrateTitleColumns(db);
+  const customTitle = getCustomTopicTitle(db, destination, session.sessionId);
+  const cardSig = rootCardSignature(topicRootCard(session, customTitle));
   db.prepare(`
-    INSERT OR IGNORE INTO channel_topic_titles(destination,session_id,binding_scope,root_message_id,synced_title)
-    SELECT ?,?,?,?,? WHERE NOT EXISTS (
+    INSERT OR IGNORE INTO channel_topic_titles
+      (destination,session_id,binding_scope,root_message_id,synced_title,synced_status,synced_custom_title)
+    SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS (
       SELECT 1 FROM channel_topic_titles WHERE destination=? AND root_message_id=?
     )
-  `).run(destination, session.sessionId, scope, rootId, cardSig, destination, rootId);
+  `).run(destination, session.sessionId, scope, rootId, cardSig, session.status, customTitle ?? '', destination, rootId);
 }
 
 function titlePatchRetryAfter(error: unknown): number {
@@ -172,7 +196,10 @@ export async function syncTopicRootTitle(
   const rootId = await lookupRoot(port, destination);
   if (!rootId) return;
   if (!isCurrentTitleScope(db, destination, session.sessionId, scope)) throw new BindingExpired('binding changed');
+  migrateTitleColumns(db);
   const customTitle = getCustomTopicTitle(db, destination, session.sessionId);
+  const normalizedCustom = customTitle ?? '';
+  const effectiveStatus = session.status === 'read_only' && options?.externallyWorking ? 'running' : session.status;
   const card = topicRootCard(session, customTitle, options);
   const cardSig = rootCardSignature(card);
   const titleKey = [destination, session.sessionId, scope] as const;
@@ -191,28 +218,33 @@ export async function syncTopicRootTitle(
       SELECT 1 FROM channel_deliveries WHERE delivery_id GLOB ? AND state='unknown' LIMIT 1
     `).get(rootDeliveries);
     const row = db.prepare(`
-      SELECT rowid,synced_title,retry_after FROM channel_topic_titles
+      SELECT rowid,synced_title,retry_after,synced_status,synced_custom_title FROM channel_topic_titles
       WHERE destination=? AND session_id=? AND binding_scope=? AND root_message_id=?
     `).get(...titleKey, rootId) as TopicTitleRow | undefined;
     const lastApplied = db.prepare(`
-      SELECT rowid,synced_title,retry_after FROM channel_topic_titles
+      SELECT rowid,session_id,synced_title,retry_after,synced_status,synced_custom_title FROM channel_topic_titles
       WHERE destination=? AND root_message_id=? AND synced_title<>''
       ORDER BY rowid DESC LIMIT 1
     `).get(destination, rootId) as TopicTitleRow | undefined;
-    if (!unsettled && row?.rowid === lastApplied?.rowid && row?.synced_title === cardSig) return;
+    const legacyDot = lastApplied?.synced_title.match(/^[🔵🟡🟢🔴⚪]/u)?.[0];
+    const lastStatus = legacyDot ? (lastApplied?.synced_status || LEGACY_DOT_STATUS[legacyDot]) : undefined;
+    const lastTitleCore = lastApplied ? stripLegacyTitlePrefix(lastApplied.synced_title.split('\n', 1)[0] ?? '') : '';
+    const sameSession = lastApplied?.session_id === session.sessionId;
+    const privacyMaskingTransition = !customTitle && isGenericSessionTitle(session.title) && Boolean(lastTitleCore) && !isGenericSessionTitle(lastTitleCore);
+    const initialTitleTransition = !customTitle && Boolean(lastTitleCore) && isGenericSessionTitle(lastTitleCore) && !isGenericSessionTitle(session.title);
+    const lastExternallyWorking = lastApplied?.synced_title.split('\n')[1]?.endsWith(' · 终端运行中') ?? false;
+    const externallyWorking = session.status === 'read_only' && options?.externallyWorking === true;
+    if (!unsettled && lastApplied && sameSession && !privacyMaskingTransition && !initialTitleTransition &&
+        lastStatus === effectiveStatus && lastExternallyWorking === externallyWorking && lastApplied.synced_custom_title === normalizedCustom) return;
     if (row && row.retry_after > Date.now()) return;
 
     const rememberTitle = () => db.prepare(`
-      INSERT OR REPLACE INTO channel_topic_titles(destination,session_id,binding_scope,root_message_id,synced_title)
-      VALUES (?,?,?,?,?)
-    `).run(...titleKey, rootId, cardSig);
+      INSERT OR REPLACE INTO channel_topic_titles
+        (destination,session_id,binding_scope,root_message_id,synced_title,synced_status,synced_custom_title)
+      VALUES (?,?,?,?,?,?,?)
+    `).run(...titleKey, rootId, cardSig, effectiveStatus, normalizedCustom);
     await guard();
     // For old installations with no title history, assume the original generic title.
-    // When a root is reused, use the latest known title across binding scopes.
-    if (!unsettled && lastApplied?.synced_title === cardSig) {
-      rememberTitle();
-      return;
-    }
     if (!unsettled && !row && !lastApplied && !customTitle && isGenericSessionTitle(session.title)) return;
 
     // A title can recur after an intervening rename. The last successful write
@@ -234,13 +266,16 @@ export async function syncTopicRootTitle(
       const retryAfter = titlePatchRetryAfter(error);
       if (retryAfter) {
         db.prepare(`
-          INSERT INTO channel_topic_titles(destination,session_id,binding_scope,root_message_id,synced_title,retry_after)
-          VALUES (?,?,?,?,?,?)
+          INSERT INTO channel_topic_titles
+            (destination,session_id,binding_scope,root_message_id,synced_title,retry_after,synced_status,synced_custom_title)
+          VALUES (?,?,?,?,?,?,?,?)
           ON CONFLICT(destination,session_id,binding_scope) DO UPDATE SET
             root_message_id=excluded.root_message_id,
             synced_title=excluded.synced_title,
-            retry_after=excluded.retry_after
-        `).run(...titleKey, rootId, row?.synced_title ?? '', retryAfter);
+            retry_after=excluded.retry_after,
+            synced_status=excluded.synced_status,
+            synced_custom_title=excluded.synced_custom_title
+        `).run(...titleKey, rootId, row?.synced_title ?? '', retryAfter, row?.synced_status ?? '', row?.synced_custom_title ?? '');
       }
       return;
     }

@@ -1,8 +1,9 @@
-import { existsSync, lstatSync, statSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { summarizeTool } from '../tool-progress.js';
 import {
+  agyFileFingerprint,
   deriveAgySessionTitle,
   isAncestorChainAuthorizedForProject,
   readAgySummaryHierarchy,
@@ -78,15 +79,6 @@ interface StepRow {
 interface CacheEntry {
   fingerprint: string;
   waitingStepIdx: number | null;
-}
-
-function fileFingerprint(path: string): string {
-  try {
-    const st = statSync(path);
-    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
-  } catch {
-    return 'missing';
-  }
 }
 
 function extractTrailingWaitingStep(rows: readonly StepRow[]): number | null {
@@ -214,7 +206,9 @@ export class AgyCliWaitingDetector {
       const dbPath = join(conversationsDir, `${waitingId}.db`);
       if (!existsSync(dbPath)) continue;
 
-      const fingerprint = `${fileFingerprint(dbPath)}|${fileFingerprint(`${dbPath}-wal`)}`;
+      const dbFingerprint = agyFileFingerprint(dbPath);
+      const walFingerprint = agyFileFingerprint(`${dbPath}-wal`);
+      const fingerprint = dbFingerprint && walFingerprint ? `${dbFingerprint}|${walFingerprint}` : null;
       const cached = this.cache.get(waitingId);
       let waitingStepIdx: number | null;
       if (cached && cached.fingerprint === fingerprint) {
@@ -222,7 +216,7 @@ export class AgyCliWaitingDetector {
       } else {
         try {
           waitingStepIdx = readWaitingStepFromDb(dbPath);
-          this.cache.set(waitingId, { fingerprint, waitingStepIdx });
+          if (fingerprint !== null) this.cache.set(waitingId, { fingerprint, waitingStepIdx });
         } catch {
           // Do not cache transient read errors (e.g. SQLITE_BUSY) as "not waiting".
           unknownConversationIds.push(waitingId);

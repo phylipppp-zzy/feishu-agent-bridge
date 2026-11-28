@@ -6,7 +6,7 @@ import type { ChannelCard } from './feishu-cards.js';
 import { isTerminalTurn, readToolProgress, type ToolProgress } from './tool-progress.js';
 import { aggregateTurnAssistantMessage } from './turn-reply.js';
 import type { CompactTurnInfo, ContextUsageInfo } from './context-usage.js';
-import { completionText, formatCompactModelBadge, replyText, turnProgressCard, type SessionSubagentActivity } from './turn-progress-card.js';
+import { completionText, formatCompactModelBadge, formatDuration, replyText, turnProgressCard, type SessionSubagentActivity } from './turn-progress-card.js';
 import { timestampMs, type TurnTiming, type TurnToolCounts } from './turn-progress-store.js';
 
 function positiveEnvMs(name: string, fallback: number): number {
@@ -17,8 +17,8 @@ function positiveEnvMs(name: string, fallback: number): number {
 }
 
 export const LONG_TURN_NOTICE_MS = 120_000;
-const PATCH_INTERVAL_MS = positiveEnvMs('FEISHU_PATCH_INTERVAL_MS', 1500);
-const HEARTBEAT_MS = 15_000;
+const PATCH_INTERVAL_MS = positiveEnvMs('FEISHU_PATCH_INTERVAL_MS', 2_500);
+const HEARTBEAT_MS = 60_000;
 const REJECTION_RETRY_MS = positiveEnvMs('FEISHU_REJECTION_RETRY_MS', 3_000);
 
 type BindingKey = [destination: string, sessionId: string, scope: string];
@@ -29,7 +29,7 @@ type CardAttempt = {
   view: View; message?: SlotMessage | undefined; plain: boolean; retryAfter: number;
   attempts?: number; replaced?: boolean; supersededDeliveries?: string[];
 };
-type View = { schema: '1.0' | '2.0'; status: Turn['status'] | null; title: string; signature: string; delivery: string; dirty: number };
+type View = { schema: '1.0' | '2.0'; status: Turn['status'] | null; title: string; signature: string; content_signature?: string; delivery: string; dirty: number };
 type PendingFinalization = { turn: Turn; timing?: TurnTiming | undefined };
 
 interface Dependencies {
@@ -80,6 +80,7 @@ export class TurnCardDelivery {
     turnId?: string;
   }>();
   private closed = false;
+  private viewSchemaReady = false;
   constructor(private readonly db: DatabaseSync, private readonly service: UnifiedService,
     private readonly port: FeishuPort, private readonly deps: Dependencies) {
     this.db.exec(`
@@ -269,12 +270,21 @@ export class TurnCardDelivery {
       .get(...key) as Slot | undefined;
   }
   private view(key: SlotKey): View | undefined {
+    if (!this.viewSchemaReady) {
+      const columns = this.db.prepare('PRAGMA table_info(channel_turn_card_views)').all();
+      if (!columns.some(column => column.name === 'content_signature')) {
+        this.db.exec("ALTER TABLE channel_turn_card_views ADD COLUMN content_signature TEXT NOT NULL DEFAULT ''");
+      }
+      this.viewSchemaReady = true;
+    }
     return this.db.prepare('SELECT * FROM channel_turn_card_views WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?')
       .get(...key) as View | undefined;
   }
   private saveView(key: SlotKey, view: View): void {
-    this.db.prepare('INSERT OR REPLACE INTO channel_turn_card_views VALUES (?,?,?,?,?,?,?,?,?,?)')
-      .run(...key, view.schema, view.status, view.title, view.signature, view.delivery, view.dirty);
+    this.db.prepare(`INSERT OR REPLACE INTO channel_turn_card_views
+      (destination,session_id,binding_scope,turn_id,schema,status,title,signature,delivery,dirty,content_signature)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(...key, view.schema, view.status, view.title, view.signature, view.delivery, view.dirty, view.content_signature ?? '');
   }
   private async deliveryState(id: string): Promise<'sent' | 'suppressed' | 'rejected' | 'not_sent' | 'unknown' | undefined> {
     const row = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(id) as {state: string} | undefined;
@@ -410,6 +420,12 @@ export class TurnCardDelivery {
         // view because im.message.patch is an idempotent full-card replacement. Discard the stale attempt so
         // completed/failed/interrupted turns never deadlock behind an orphaned running heartbeat PATCH.
         if (cardId !== null && !pending.replaced && !pendingTerminal) {
+          // Keep the stale receipt linked until a replacement PATCH can run.
+          const patchAt = current!.updated_at + PATCH_INTERVAL_MS;
+          if (patchAt > Date.now()) {
+            this.schedule(key, patchAt);
+            return false;
+          }
           if (pending.supersededDeliveries?.length) staleDeliveries.push(...pending.supersededDeliveries);
           staleDeliveries.push(pending.view.delivery);
           this.journal(() => {
@@ -491,8 +507,7 @@ export class TurnCardDelivery {
     const schema = old?.schema ?? (current ? '1.0' : '2.0');
     const start = timing?.startedMs ?? timestampMs(input.turn?.startedAt);
     const end = timing?.endedMs ?? timestampMs(input.turn?.endedAt);
-    const elapsed = start !== null && (terminal ? end !== null && end >= start : ticking && now >= start)
-      ? (terminal ? end! - start : Math.floor((now - start) / HEARTBEAT_MS) * HEARTBEAT_MS) : null;
+    const elapsed = start !== null && end !== null && end >= start ? end - start : null;
     let files: Artifact[] = [];
     if (message && (terminal || !input.turn && message.final)) {
       try { files = await this.service.findRegisteredReplyFiles?.(sessionId, message.blocks) ?? []; }
@@ -518,7 +533,7 @@ export class TurnCardDelivery {
     await guard();
     const allowCompactButton = sessionConnected && !key[2].includes('"access_mode":"read_only"');
     const card = turnProgressCard({
-      provider, status, schema, message, tools, toolCounts, duration: elapsed, files, turnId: key[3],
+      provider, status, schema, message, tools, toolCounts, duration: terminal ? elapsed : null, files, turnId: key[3],
       allowCompactButton,
       ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
       ...(modelBadge ? { modelBadge } : {}),
@@ -528,16 +543,22 @@ export class TurnCardDelivery {
     const learnedDuration = isTerminalTurn(status) && card.title.includes(' · 用时 ') && !old?.title.includes(' · 用时 ');
     if (old?.title && isTerminalTurn(old.status ?? undefined) && !learnedDuration) card.title = old.title;
     const signature = payloadDigest(card);
+    const contentSignature = payloadDigest([status ?? null, {
+      ...card,
+      title: elapsed === null ? card.title : card.title.replace(` · 用时 ${formatDuration(elapsed)}`, ''),
+    }]);
     const heartbeat = () => {
       if (ticking && start !== null) this.schedule(key, Math.max(now + 1, start + (Math.floor((now - start) / HEARTBEAT_MS) + 1) * HEARTBEAT_MS));
     };
-    if (!pending && old?.signature === signature && staleDeliveries.length === 0) {
-      if (old.dirty) this.saveView(key, { ...old, dirty: 0 });
+    if (!pending && old?.status === (status ?? null) && staleDeliveries.length === 0 &&
+      (old.signature === signature || (!terminal && old.status === 'running' && old.content_signature === contentSignature))) {
+      if (old.dirty || !old.content_signature) this.saveView(key, { ...old, dirty: 0, content_signature: contentSignature });
       heartbeat();
       return true;
     }
     if (!pending && current && current.updated_at + PATCH_INTERVAL_MS > now) {
-      this.saveView(key, { schema, status: old?.status ?? null, title: old?.title ?? '', signature: old?.signature ?? '', delivery: old?.delivery ?? firstId, dirty: 1 });
+      this.saveView(key, { schema, status: old?.status ?? null, title: old?.title ?? '', signature: old?.signature ?? '',
+        content_signature: staleDeliveries.length ? '' : old?.content_signature ?? '', delivery: old?.delivery ?? firstId, dirty: 1 });
       this.schedule(key, current.updated_at + PATCH_INTERVAL_MS);
       return false;
     }
@@ -551,7 +572,8 @@ export class TurnCardDelivery {
     const attempt: CardAttempt = {
       ...pending,
       ...(uniqueStale.length ? { supersededDeliveries: uniqueStale } : {}),
-      view: { schema, status: status ?? null, title: card.title, signature, delivery: pending?.view.delivery ?? id, dirty: 1 },
+      view: { schema, status: status ?? null, title: card.title, signature, content_signature: contentSignature,
+        delivery: pending?.view.delivery ?? id, dirty: 1 },
       message: message && { messageId: message.messageId, sequence: message.sequence, revision: message.revision, final: message.final },
       plain: pending?.plain ?? false, retryAfter: 0,
     };

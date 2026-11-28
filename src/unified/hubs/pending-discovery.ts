@@ -2,6 +2,8 @@ import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parsePresence, processAlive, type PresenceRecord } from '../../claude/presence.js';
 import type { UnifiedService } from '../adapter.js';
+import type { SessionSnapshot } from '../contracts.js';
+import { StoreError } from '../store.js';
 import type { DecisionSyncStore } from './decision-store.js';
 import {
   buildDecisionPendingItem,
@@ -77,12 +79,8 @@ export interface PendingDiscoveryResult {
   unknownRefIds: Set<string>;
 }
 
-/** Discover candidates outside the per-card lock. The caller revalidates before delivery. */
-export async function discoverPendingItemsWithMeta(context: Discovery, now: number): Promise<PendingDiscoveryResult> {
-  const { service, decisionStore, boundSources, resolveSourceLink } = context;
-  const boundDestinations = new Map(boundSources.map(bound => [bound.session_id, bound.source_destination]));
+async function listStoredSessionIds(service: UnifiedService): Promise<Set<string>> {
   const sessionIds = new Set<string>();
-
   let cursor: string | undefined;
   const seenCursors = new Set<string>();
   do {
@@ -96,7 +94,25 @@ export async function discoverPendingItemsWithMeta(context: Discovery, now: numb
       seenCursors.add(cursor);
     }
   } while (cursor);
+  return sessionIds;
+}
 
+async function isDiscoverableSource(service: UnifiedService, sessionId: string): Promise<boolean> {
+  try {
+    await service.getSession(sessionId, { discoverableOnly: true });
+    return true;
+  } catch (error) {
+    if (error instanceof StoreError && (error.detail.code === 'invalid_request' || error.detail.code === 'unauthorized')) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/** Discover candidates outside the per-card lock. The caller revalidates before delivery. */
+export async function discoverPendingItemsWithMeta(context: Discovery, now: number): Promise<PendingDiscoveryResult> {
+  const { service, decisionStore, boundSources, resolveSourceLink } = context;
+  const boundDestinations = new Map(boundSources.map(bound => [bound.session_id, bound.source_destination]));
   const items: PendingItemView[] = [];
   const notices = new Map<string, PendingCliNotice>();
   const unknownRefIds = new Set<string>();
@@ -109,14 +125,26 @@ export async function discoverPendingItemsWithMeta(context: Discovery, now: numb
   if (!Array.isArray(discoveredCli) && discoveredCli?.unknownRefIds) {
     for (const refId of discoveredCli.unknownRefIds) unknownRefIds.add(refId);
   }
+  const sessionIds = service.listPendingInteractionCandidates ? null : await listStoredSessionIds(service);
   for (const notice of cliNotices) {
-    if (!notice.sourceSessionId || sessionIds.has(notice.sourceSessionId)) addNotice(notice);
+    if (!notice.sourceSessionId || (sessionIds
+      ? sessionIds.has(notice.sourceSessionId)
+      : await isDiscoverableSource(service, notice.sourceSessionId))) addNotice(notice);
   }
-  for (const sessionId of sessionIds) {
+
+  let candidates: Pick<SessionSnapshot, 'session' | 'connectionGeneration' | 'interactions'>[];
+  if (service.listPendingInteractionCandidates) {
+    candidates = await service.listPendingInteractionCandidates();
+  } else {
+    candidates = [];
+    for (const sessionId of sessionIds ?? []) {
+      const result = await service.getSnapshot(sessionId).catch(() => null);
+      if (result) candidates.push(result.value);
+    }
+  }
+  for (const { session, connectionGeneration, interactions } of candidates) {
+    const sessionId = session.sessionId;
     const sourceDestination = boundDestinations.get(sessionId) ?? null;
-    const result = await service.getSnapshot(sessionId).catch(() => null);
-    if (!result) continue;
-    const { session, connectionGeneration, interactions } = result.value;
     if (session.status === 'waiting_approval' && session.control.input !== 'available') {
       addNotice({
         provider: session.native.provider,

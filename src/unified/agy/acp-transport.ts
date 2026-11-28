@@ -1,5 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
+import { statSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { contractError, type ContractError } from '../errors.js';
+import { prepareStableAgyBin } from './stable-bin.js';
 import {
   buildAgyAcpArgs,
   createLineParser,
@@ -9,12 +14,14 @@ import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   isJsonRpcId,
   isRecord,
+  killProcessTree,
   mapJsonRpcError,
   resolveBin,
   resolvePositiveMs,
   rpcIdKey,
   SERVER_REQUEST_METHODS,
   terminateChildProcess,
+  trackAgyChildForExit,
   writeNdjsonLine,
   type AgyAcpHealthSnapshot,
   type AgyAcpNotification,
@@ -69,6 +76,7 @@ export class AgyAcpTransport {
   private _status: AgyHealthStatus = 'unverified';
   private serial = 0;
   private connectingPromise: Promise<AgyInitializeResult> | null = null;
+  private spawnAbort: AbortController | null = null;
   private closingPromise: Promise<void> | null = null;
   private closing = false;
   private disconnectEmittedForProc: ChildProcess | null = null;
@@ -159,12 +167,23 @@ export class AgyAcpTransport {
     }
 
     const args = this.buildArgs();
+    const abort = new AbortController();
+    this.spawnAbort = abort;
     const runConnect = async (): Promise<AgyInitializeResult> => {
-      const proc = spawn(this.agyBin, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        ...(this.options.cwd !== undefined ? { cwd: this.options.cwd } : {}),
-        ...(this.options.env !== undefined ? { env: this.options.env } : {}),
-      });
+      let proc: ChildProcess;
+      try {
+        proc = await this.spawnAcp(args, abort.signal);
+      } catch (err) {
+        const reason = abort.signal.aborted
+          ? 'ACP connection closed before initialize'
+          : `failed to spawn agy ACP: ${(err as Error).message}`;
+        this.markDegraded(reason);
+        throw contractError('temporarily_unavailable', reason);
+      }
+      if (abort.signal.aborted) {
+        await terminateChildProcess(proc, 0, this.closeTimeoutMs);
+        throw contractError('temporarily_unavailable', 'ACP connection closed before initialize');
+      }
 
       this.child = proc;
       this.established = false;
@@ -184,6 +203,7 @@ export class AgyAcpTransport {
 
       proc.stdin?.on('error', err => {
         if (this.child !== proc || this.closing) return;
+        killProcessTree(proc, 'SIGKILL');
         this.handleProcessDrop(proc, `stdin error: ${err.message}`);
       });
 
@@ -258,12 +278,51 @@ export class AgyAcpTransport {
     };
 
     const promise = runConnect().finally(() => {
+      this.spawnAbort = null;
       if (this.connectingPromise === promise) {
         this.connectingPromise = null;
       }
     });
     this.connectingPromise = promise;
     return promise;
+  }
+
+  private async spawnAcp(args: string[], signal: AbortSignal): Promise<ChildProcess> {
+    const stableBinDir = this.options.stableBinDir ?? process.env.FEISHU_AGY_STABLE_BIN_DIR;
+    const sandbox = args.some(arg => /^--sandbox(?:=|$)/.test(arg));
+    let warned = false;
+    const backoffs = [150, 300];
+    for (let attempt = 0; ; attempt++) {
+      signal.throwIfAborted();
+      try {
+        let execPath = this.agyBin;
+        if (stableBinDir && isAbsolute(execPath) && statSync(execPath, { throwIfNoEntry: false })?.isFile()) {
+          execPath = prepareStableAgyBin(execPath, {
+            stableBinDir,
+            sandbox,
+            onWarning: message => {
+              if (!warned) console.warn(message);
+              warned = true;
+            },
+          }).execPath;
+        }
+        signal.throwIfAborted();
+        const proc = spawn(execPath, args, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          detached: process.platform !== 'win32',
+          ...(this.options.cwd !== undefined ? { cwd: this.options.cwd } : {}),
+          ...(this.options.env !== undefined ? { env: this.options.env } : {}),
+        });
+        trackAgyChildForExit(proc);
+        await once(proc, 'spawn');
+        return proc;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        const backoff = backoffs[attempt];
+        if (backoff === undefined || (code !== 'ENOENT' && code !== 'ETXTBSY')) throw err;
+        await delay(backoff, undefined, { signal });
+      }
+    }
   }
 
   /** Send an arbitrary JSON-RPC 2.0 request over the active ACP connection. */
@@ -388,10 +447,17 @@ export class AgyAcpTransport {
 
     const proc = this.child;
     if (!proc) {
+      this.spawnAbort?.abort();
       this.established = false;
       this.activeGeneration = null;
       this.rejectAllPending(contractError('outcome_unknown', 'ACP transport closed'));
       this.pendingServerRequests.clear();
+      if (this.connectingPromise) {
+        this.closingPromise = this.connectingPromise.then(() => {}, () => {}).finally(() => {
+          this.closingPromise = null;
+        });
+        return this.closingPromise;
+      }
       return;
     }
 

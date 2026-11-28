@@ -256,7 +256,18 @@ export class UnifiedCore implements UnifiedService {
     }
     return {items,nextCursor:selected.nextCursor,...(unavailableProviders.length?{unavailableProviders}:{})};
   }
-  async getSession(id: string) { return this.present(this.store.getSession(id)); }
+  async listPendingInteractionCandidates() {
+    return this.store.listPendingInteractionCandidates()
+      .filter(({ session }) => !this.canDiscover || this.canDiscover(session))
+      .map(candidate => ({ ...candidate, session: this.present(candidate.session) }));
+  }
+  async getSession(id: string, options?: { discoverableOnly: true }) {
+    const session = this.store.getSession(id);
+    if (options?.discoverableOnly && (this.store.isDetached(id) || (this.canDiscover && !this.canDiscover(session)))) {
+      return fail('unauthorized');
+    }
+    return this.present(session);
+  }
   async hasStopRequest(sessionId:string,turnId:string) {this.store.getSession(sessionId);return this.store.hasStopRequest(sessionId,turnId);}
   async wasQueuedInputCancelled(sessionId:string,inputId:string) {return this.store.wasQueuedInputCancelled(sessionId,inputId);}
   async getTurn(sessionId:string,turnId:string) {this.store.getSession(sessionId);return this.store.listTurns(sessionId).find(t=>t.turnId===turnId) ?? null;}
