@@ -107,6 +107,8 @@ export class AgyAdapter implements PlatformPort {
   private readonly lockedSessions = new Map<string, SessionLockState>();
   private readonly recentTerminalTools = new Map<string, Set<string>>();
   private readonly turnResiduals = new Map<string, TurnResidualSnapshot>();
+  private readonly hostedWakeups?: Set<string>;
+  private readonly hostedDelegated = new Set<string>();
   private readonly sessionTurns = new Map<string, Map<string, Turn>>();
   private readonly liveMessages = new Map<string, Message[]>();
   private readonly preLiveTranscriptIds = new Map<string, Set<string>>();
@@ -142,6 +144,8 @@ export class AgyAdapter implements PlatformPort {
       promptIdleTimeoutMs?: number;
       wakeupIdleMs?: number;
       idleReleaseMs?: number;
+      disableIdleSweep?: boolean;
+      onHostedStateChange?: () => void;
       externalHolderDetector?: ExternalAgyHolderDetector;
     } = {},
   ) {
@@ -154,7 +158,8 @@ export class AgyAdapter implements PlatformPort {
     this.idleReleaseMs = options.idleReleaseMs ?? DEFAULT_SESSION_IDLE_RELEASE_MS;
     this.detectExternalHolder = options.externalHolderDetector
       ?? createProcExternalAgyHolderDetector(defaultAgyConversationsDir((catalog as { brainDir?: string }).brainDir));
-    if (this.idleReleaseMs > 0 && Number.isFinite(this.idleReleaseMs)) {
+    if (options.disableIdleSweep) this.hostedWakeups = new Set();
+    if (!options.disableIdleSweep && this.idleReleaseMs > 0 && Number.isFinite(this.idleReleaseMs)) {
       const interval = Math.max(1_000, Math.min(60_000, Math.floor(this.idleReleaseMs / 2)));
       this.idleSweepTimer = setInterval(() => {
         void this.reconcileIdleAndExternalHolders().catch(() => {});
@@ -211,6 +216,7 @@ export class AgyAdapter implements PlatformPort {
         prevNotification(notification);
       } catch {}
       handleAcpNotification(this.ctx, notification);
+      options.onHostedStateChange?.();
     };
 
     transport.onServerRequest = req => {
@@ -231,6 +237,7 @@ export class AgyAdapter implements PlatformPort {
         prevDisconnect(generation, reason);
       } catch {}
       handleTransportDisconnect(this.ctx, generation, reason);
+      options.onHostedStateChange?.();
     };
   }
 
@@ -317,6 +324,55 @@ export class AgyAdapter implements PlatformPort {
     return !this.closed && this.transport.connected &&
       ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId &&
       this.active.has(ref.nativeSessionId) && this.knownSessions.has(ref.nativeSessionId);
+  }
+
+  /** Inspect native state without loading, closing or prompting the session. */
+  exportHostedState(ref: NativeSessionRef) {
+    const id = this.check(ref);
+    const turn = this.activeTurns.get(id);
+    const generation = this.transport.connectionGeneration;
+    const meta = this.knownSessions.get(id);
+    const residuals = [...this.turnResiduals].filter(([key, state]) =>
+      key === `${id}:${state.turnId}` && state.inProgressToolCallIds.size > 0);
+    return structuredClone({
+      session: meta ? this.buildSession(id, null, meta) : null,
+      turns: [...(this.sessionTurns.get(id)?.values() ?? [])],
+      messages: this.liveMessages.get(id) ?? [],
+      interactions: [...this.requests.values()].map(r => r.interaction).filter(i => i.sessionId === id),
+      activeTurnId: turn?.turnId ?? null,
+      connectionGeneration: generation || null,
+      controlGeneration: this.controlEpoch.get(id) ?? 0,
+      pendingWakeup: Boolean(turn?.isWakeup || turn?.wakeupTimer || turn?.awaitingAsyncWakeup ||
+        this.hostedWakeups?.has(id)),
+      pendingSubagent: this.hostedDelegated.has(id),
+      hasResidual: Boolean(this.hostedDelegated.has(id) || turn?.inProgressToolCalls.size ||
+        this.transport.connected && residuals.some(([, state]) => state.generation === generation)),
+      residualUnknown: this.lockedSessions.has(id) || residuals.some(([, state]) =>
+        !this.transport.connected || state.generation !== generation),
+    });
+  }
+
+  /** Keep provider-side silent completion detection available to the host scheduler. */
+  reconcileHostedTurns(ref: NativeSessionRef, now = Date.now()): void {
+    const id = this.check(ref);
+    this.reconcileSilentCompletedTurns(now);
+    const project = this.knownSessions.get(id)?.cwd;
+    if (!project) return;
+    const dbPath = this.catalog.dbPath;
+    try {
+      const hierarchy = readAgySummaryHierarchy(dbPath);
+      const activeChildren = hierarchy.activeDescendantsByRoot.get(id)?.length ?? 0;
+      const activeDelegates = readDelegatedSessionActivity(id, project, {
+        ...(dbPath === undefined ? {} : { summariesDbPath: dbPath }), nowMs: now,
+      }).some(item => {
+        const status = item.status.trim().toLowerCase();
+        return !status || ['queued', 'busy'].includes(status) || status.includes('running');
+      });
+      if (activeChildren > 0 || activeDelegates) this.hostedDelegated.add(id);
+      else this.hostedDelegated.delete(id);
+    } catch {
+      // Keep the last known blockers when the read-only native index is unavailable.
+    }
   }
 
   private emit(observation: PlatformObservation): void {
@@ -453,6 +509,8 @@ export class AgyAdapter implements PlatformPort {
   }
 
   private recordTurnResidual(sessionId: string, turnState: ActiveTurnState): void {
+    if (turnState.awaitingAsyncWakeup) this.hostedWakeups?.add(sessionId);
+    else if (turnState.isWakeup) this.hostedWakeups?.delete(sessionId);
     const key = `${sessionId}:${turnState.turnId}`;
     this.turnResiduals.delete(key);
     this.turnResiduals.set(key, {

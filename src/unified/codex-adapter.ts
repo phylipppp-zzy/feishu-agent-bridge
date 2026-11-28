@@ -11,6 +11,7 @@ import type { ApprovalScope, GateDecision } from './approval-policy.js';
 import { codexApprovalChoices, evaluateCodexApproval } from './codex-approval.js';
 
 type Obj = Record<string, any>;
+type Wire = Parameters<CodexTransport['onMessage']>[0];
 type ApprovalChoices = ReturnType<typeof codexApprovalChoices>;
 type NativeRequest = { id: string | number; generation: number; interaction: Interaction; operationId?: string; declined?: {answerDigest:string}; approvalChoices?: ApprovalChoices };
 type ChangePaths = { paths: string[]; complete: boolean };
@@ -54,6 +55,10 @@ export class CodexAdapter implements PlatformPort {
   private readonly knownSessions = new Map<string, Obj>();
   private requests = new Map<string, NativeRequest>();
   private nativeIndex = new Map<string, string>();
+  private readonly attaching = new Map<string, Wire[]>();
+  private readonly hostedTurns = new Map<string, Map<string, Turn>>();
+  private readonly coldTerminalTurns = new Map<string, Set<string>>();
+  private readonly coldStreamItems = new Set<string>();
   private readonly approvalTurns = new Map<string, ApprovalTurn>();
   private readonly evaluatingApprovals = new Map<string, { thread: string }>();
   private readonly answeredRequests = new Set<string>();
@@ -69,9 +74,12 @@ export class CodexAdapter implements PlatformPort {
   constructor(readonly transport: CodexTransport, readonly hostId: string, readonly serviceId: string,
     private readonly options: CodexAdapterOptions = {}) {
     if (!isString(hostId) || !isString(serviceId)) throw contractError('invalid_request');
-    transport.onMessage = (message, generation) => this.receive(message as Obj, generation);
+    transport.onMessage = (message, generation) => { void this.receive(message, generation); };
     transport.onDisconnect = generation => {
       this.approvalTurns.clear();
+      this.attaching.clear();
+      this.coldTerminalTurns.clear();
+      this.coldStreamItems.clear();
       this.toolProgress.clear();
       this.evaluatingApprovals.clear();
       this.answeredRequests.clear();
@@ -90,6 +98,36 @@ export class CodexAdapter implements PlatformPort {
     return ref.provider === this.provider && ref.hostId === this.hostId && ref.serviceId === this.serviceId
       && this.transport.connected && this.active.has(ref.nativeSessionId);
   }
+  /** This snapshot does not call thread/read or change subscription state. */
+  exportHostedState(ref: NativeSessionRef) {
+    const id = this.check(ref);
+    const info = this.knownSessions.get(id);
+    const turns = [...(this.hostedTurns.get(id)?.values() ?? [])];
+    const live = this.hasActiveNativeSession(ref);
+    const activeTurnId = live ? this.approvalTurns.get(id)?.id ??
+      turns.findLast(turn => turn.status === 'running')?.turnId ?? null : null;
+    return structuredClone({
+      session: info ? this.session(info) : null,
+      turns,
+      messages: [...this.messages.values()].filter(message => message.sessionId === id),
+      interactions: [...this.requests.values()].map(request => request.interaction).filter(i => i.sessionId === id),
+      activeTurnId,
+      connectionGeneration: this.transport.generation || null,
+      controlGeneration: this.controlEpoch.get(id) ?? 0,
+      pendingNativeRequests: [...this.evaluatingApprovals.values()].filter(request => request.thread === id).length,
+      residualTurnIds: turns.filter(turn => turn.status !== 'running' &&
+        this.residualTurns.get(`${id}\0${turn.turnId}`)?.items.size).map(turn => turn.turnId),
+      residualUnknown: live ? info?.status?.type === 'active' && activeTurnId === null :
+        turns.some(turn => turn.status === 'running') || Boolean(this.attaching.get(id)?.length),
+    });
+  }
+
+  private rememberHostedTurn(thread: string, turn: Turn): void {
+    const turns = this.hostedTurns.get(thread) ?? new Map<string, Turn>();
+    turns.set(turn.turnId, turn);
+    this.hostedTurns.set(thread, turns);
+  }
+
   async getContextUsage(ref: NativeSessionRef): Promise<ContextUsageInfo | null> {
     const id = this.check(ref);
     return this.contextUsage.get(id) ?? null;
@@ -189,10 +227,17 @@ export class CodexAdapter implements PlatformPort {
       if (this.evaluatingApprovals.get(key) === work) this.evaluatingApprovals.delete(key);
     }
   }
-  private receive(m: Obj, generation: number): void {
+  private receive(m: Wire, generation: number, replaying = false): void | Promise<void> {
     const p = m.params as Obj | undefined; if (!p || typeof p !== 'object') return;
     const thread = typeof p.threadId === 'string' ? p.threadId : undefined;
     if (!thread || generation !== this.transport.generation) return;
+    const buffered = this.attaching.get(thread);
+    if (buffered && !replaying) {
+      // Stop the connection on an unbounded attach rather than discard native RPC IDs.
+      if (buffered.length >= 65_536) this.transport.close();
+      else buffered.push(m);
+      return;
+    }
     if (m.method === 'serverRequest/resolved' && (typeof p.requestId === 'number' || typeof p.requestId === 'string')) {
       const key = this.key(generation, p.requestId);
       if (this.evaluatingApprovals.get(key)?.thread === thread) {
@@ -215,10 +260,9 @@ export class CodexAdapter implements PlatformPort {
     }
     if (typeof m.id === 'string' || typeof m.id === 'number') {
       if (m.method === 'item/commandExecution/requestApproval' || m.method === 'item/fileChange/requestApproval') {
-        void this.evaluateNativeApproval(thread, m.id, m.method, p, generation).catch(() => {
+        return this.evaluateNativeApproval(thread, m.id, m.method, p, generation).catch(() => {
           // A closed socket or ambiguous write must never replay a native response.
         });
-        return;
       }
       const key = this.key(generation, m.id);
       if (this.nativeIndex.has(key) || this.answeredRequests.has(key)) return;
@@ -312,13 +356,23 @@ export class CodexAdapter implements PlatformPort {
     }
     if((m.method==='item/started' || m.method==='item/completed') && isString(p.turnId) && p.item?.type==='commandExecution' && isString(p.item?.id)) {const tracked=this.residualTurns.get(`${thread}\0${p.turnId}`);if(tracked?.generation===generation && !tracked.items.has(p.item.id)) {if(tracked.items.size>=10000) tracked.overflow=true;else tracked.items.add(p.item.id);tracked.version++;}}
     if ((m.method === 'turn/started' || m.method === 'turn/completed') && isString(p.turn?.id)) {
-      if (m.method === 'turn/completed') closeReasoning(p.turn.id);
+      const terminal = this.coldTerminalTurns.get(thread);
+      if (terminal?.has(p.turn.id)) return;
+      if (m.method === 'turn/completed') {
+        if (replaying) {
+          const completed = terminal ?? new Set<string>();
+          completed.add(p.turn.id);
+          this.coldTerminalTurns.set(thread, completed);
+        }
+        closeReasoning(p.turn.id);
+      }
       const turn = this.turn(thread,p.turn);
       if (m.method === 'turn/completed' && this.approvalTurns.get(thread)?.id === turn.turnId) this.approvalTurns.delete(thread);
       if (info) {
         const threadStates = {running: 'active', failed: 'systemError', interrupted: 'interrupted', completed: 'idle', queued: 'idle'};
         info.status = {type: threadStates[turn.status]};
       }
+      if (info) this.rememberHostedTurn(thread, turn);
       this.emit({ type: 'turn', turn, ref: this.ref(thread), connectionGeneration: generation }); return;
     }
     if (m.method === 'item/completed' && isString(p.turnId)) { const message = this.message(thread, p.turnId, p.item, true); if (message) this.emit({ type: 'message', message, ref: this.ref(thread), connectionGeneration:generation } as PlatformObservation); }
@@ -420,19 +474,120 @@ export class CodexAdapter implements PlatformPort {
     if (session.native.nativeSessionId !== id || !Array.isArray(r.thread.turns)) return invalidNative();
     const info = this.knownSessions.get(id);
     if (info && generation === this.transport.generation && Object.hasOwn(r.thread, 'path')) info.path = r.thread.path;
-    const messages: Message[] = []; for (const turn of r.thread.turns) if (isString(turn.id) && Array.isArray(turn.items)) for (const item of turn.items) { const prior=this.messages.get(`${id}\0${item.id}`); const final=item.type!=='agentMessage' || turn.status!=='inProgress' || !!prior?.final; const message = this.message(id, turn.id, item, final); if (message) messages.push(message); }
-    const turns = r.thread.turns.map((turn: Obj) => this.turn(id,turn));
+    const messages = this.readThreadMessages(id, r.thread.turns);
+    const turns = r.thread.turns.map((turn: Obj) => isString(turn?.id) && this.coldTerminalTurns.get(id)?.has(turn.id)
+      ? this.hostedTurns.get(id)?.get(turn.id) ?? this.turn(id, turn) : this.turn(id, turn));
     return { session, messages, turns, interactions: [...this.requests.values()].map(x => x.interaction).filter(x => x.sessionId === id), connectionGeneration: this.transport.generation };
   }
+
+  private readThreadMessages(id: string, turns: Obj[]): Message[] {
+    const messages: Message[] = [];
+    for (const turn of turns) {
+      if (!isString(turn.id) || !Array.isArray(turn.items)) continue;
+      for (const item of turn.items) {
+        if (!item || !isString(item.id)) continue;
+        const key = `${id}\0${item.id}`;
+        const prior = this.messages.get(key);
+        const final = item.type !== 'agentMessage' || turn.status !== 'inProgress' || !!prior?.final;
+        if (prior && this.coldStreamItems.has(key) && item.type === 'agentMessage') {
+          const block = prior.blocks[0];
+          // The native snapshot can lag the subscription. Do not replace observed
+          // tokens with a shorter transcript or append bytes already present.
+          if (block?.type === 'text' && (
+            typeof item.text !== 'string' || !item.text.includes(block.text) ||
+            !final && item.text !== block.text
+          )) {
+            messages.push(prior);
+            continue;
+          }
+        }
+        const message = this.message(id, turn.id, item, final);
+        if (message) messages.push(message);
+      }
+    }
+    return messages;
+  }
+
+  private seedColdStreamPrefixes(thread: string, turns: Obj[], buffered: Wire[]): void {
+    const deltas = new Map<string, string>();
+    const itemsStarted = new Set<string>();
+    for (const message of buffered) {
+      const p = message.params as Obj;
+      if (message.method === 'item/started' && isString(p.item?.id)) itemsStarted.add(p.item.id);
+      if (message.method === 'item/agentMessage/delta' && isString(p.itemId) && typeof p.delta === 'string') {
+        deltas.set(p.itemId, (deltas.get(p.itemId) ?? '') + p.delta);
+      }
+    }
+    for (const turn of turns) {
+      if (!isString(turn.id) || !Array.isArray(turn.items)) continue;
+      for (const item of turn.items) {
+        if (item?.type !== 'agentMessage' || !isString(item.id) || typeof item.text !== 'string') continue;
+        const streamed = deltas.get(item.id);
+        if (!streamed || itemsStarted.has(item.id) || this.messages.has(`${thread}\0${item.id}`)) continue;
+        // A resume can subscribe mid-item. A suffix match supplies the prefix
+        // without counting the buffered tail a second time.
+        if (item.text.length > streamed.length && item.text.endsWith(streamed)) {
+          this.message(thread, turn.id, { ...item, text: item.text.slice(0, -streamed.length) }, false);
+        }
+      }
+    }
+  }
+
   async resume(ref: NativeSessionRef): Promise<PlatformAcknowledgement> {
     const id = this.check(ref);
-    if (this.active.has(id)) throw contractError('busy','already subscribed');
-    const r = await this.transport.request('thread/resume', { threadId: id }) as Obj;
-    if (!r?.thread || r.thread.id !== id) return invalidNative();
-    this.knownSessions.set(id,r.thread); this.owned.add(id); this.active.add(id); this.controlEpoch.set(id,(this.controlEpoch.get(id) ?? 0)+1);
-    const currentTurn = Array.isArray(r.thread.turns) ? r.thread.turns.findLast((turn: Obj) => turn?.status === 'inProgress') : undefined;
-    if (isString(currentTurn?.id)) this.trackApprovalTurn(id, currentTurn.id, this.transport.generation);
-    return {...ack(id),connectionGeneration:this.transport.generation};
+    if (this.active.has(id) || this.attaching.has(id)) throw contractError('busy', 'already subscribed');
+    const generation = this.transport.generation;
+    const buffered: Wire[] = [];
+    this.attaching.set(id, buffered);
+    try {
+      const r = await this.transport.request('thread/resume', { threadId: id }) as Obj;
+      if (!r?.thread || r.thread.id !== id) return invalidNative();
+      if (!this.transport.connected || this.transport.generation !== generation || this.attaching.get(id) !== buffered) {
+        throw contractError('outcome_unknown', 'subscription connection changed during resume');
+      }
+      this.knownSessions.set(id, r.thread);
+      this.owned.add(id);
+      this.active.add(id);
+      this.controlEpoch.set(id, (this.controlEpoch.get(id) ?? 0) + 1);
+      const nativeTurns: Obj[] = Array.isArray(r.thread.turns) ? r.thread.turns : [];
+      for (const native of nativeTurns) {
+        if (isString(native?.id) && ['inProgress', 'completed', 'failed', 'interrupted'].includes(native.status)) {
+          this.rememberHostedTurn(id, this.turn(id, native));
+        }
+      }
+      const currentTurn = nativeTurns.findLast(turn => turn?.status === 'inProgress');
+      this.seedColdStreamPrefixes(id, nativeTurns, buffered);
+      // The response may already reflect completion. Use the first buffered turn's
+      // identity while processing earlier approvals, then apply the terminal event.
+      const firstTurn = buffered.map(message => {
+        const p = message.params as Obj | undefined;
+        return p?.turnId ?? p?.turn?.id;
+      }).find(isString);
+      const approvalTurn = firstTurn ?? currentTurn?.id;
+      if (isString(approvalTurn)) this.trackApprovalTurn(id, approvalTurn, generation);
+      for (let i = 0; i < buffered.length; i++) {
+        const message = buffered[i]!;
+        const p = message.params as Obj;
+        if (message.method === 'item/agentMessage/delta' && isString(p.itemId)) {
+          this.coldStreamItems.add(`${id}\0${p.itemId}`);
+        }
+        await this.receive(message, generation, true);
+        if (!this.hasActiveNativeSession(ref) || this.transport.generation !== generation) {
+          throw contractError('outcome_unknown', 'subscription connection changed while replaying resume');
+        }
+      }
+      this.readThreadMessages(id, nativeTurns);
+      const trackedApproval = this.approvalTurns.get(id);
+      if (trackedApproval && r.thread.status?.type !== 'active' &&
+        this.hostedTurns.get(id)?.get(trackedApproval.id)?.status !== 'running') this.approvalTurns.delete(id);
+      const lastTurn = this.hostedTurns.get(id)?.get(currentTurn?.id);
+      if (lastTurn?.status === 'running' && !this.approvalTurns.has(id)) {
+        this.trackApprovalTurn(id, lastTurn.turnId, generation);
+      }
+      return { ...ack(id), connectionGeneration: generation };
+    } finally {
+      if (this.attaching.get(id) === buffered) this.attaching.delete(id);
+    }
   }
   async create(cwd: string, model: string | null): Promise<PlatformAcknowledgement> { const r = await this.transport.request('thread/start', { cwd, model }) as Obj; if (!isString(r?.thread?.id)) return invalidNative(); this.knownSessions.set(r.thread.id,r.thread); this.awaitingFirstInput.add(r.thread); this.owned.add(r.thread.id); this.active.add(r.thread.id); this.controlEpoch.set(r.thread.id,0); return {status:'submitted',nativeReference:r.thread.id,createdSession:this.session(r.thread),connectionGeneration:this.transport.generation}; }
   async input(ref: NativeSessionRef, mode: 'new' | 'steer', blocks: PlatformInputBlock[], guard: DispatchGuard, turnId?: string): Promise<PlatformAcknowledgement> {
@@ -461,7 +616,9 @@ export class CodexAdapter implements PlatformPort {
       && this.active.has(id) && this.transport.generation === generation && this.knownSessions.get(id) === info) {
       this.trackApprovalTurn(id, returned, generation);
       info.status = {type: 'active'};
-      this.emit({type:'turn',ref,turn:this.turn(id,r.turn),connectionGeneration:generation});
+      const turn = this.turn(id, r.turn);
+      this.rememberHostedTurn(id, turn);
+      this.emit({ type: 'turn', ref, turn, connectionGeneration: generation });
     }
     if (mode === 'new' && info && this.awaitingFirstInput.delete(info) && this.active.has(id) && this.knownSessions.get(id) === info) {
       const title = this.session(info).title.trim() ? null : deriveTitleFromInputBlocks(blocks);

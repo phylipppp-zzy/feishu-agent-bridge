@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
+import type { ApprovalScope } from '../approval-policy.js';
+import type { NativeSessionRef } from '../contracts.js';
+import { AgySessionHostRunner, type AgySessionHostOptions } from './providers/agy-runner.js';
+import { ClaudeSessionHostRunner } from './providers/claude-runner.js';
+import { CodexSessionHostRunner } from './providers/codex-runner.js';
 import { SessionHostJournal } from './journal.js';
 import { acquireFileLock, clearStaleHost, processStamp, sessionHostUnit } from './launcher.js';
 import {
@@ -36,9 +41,16 @@ function parseArguments(argv: readonly string[]): HostMainOptions {
   };
 }
 
+interface RunnerBootstrap {
+  hostId: string;
+  serviceId: string;
+  ref?: NativeSessionRef;
+  registryPath: string;
+}
+
 export async function runSessionHost(
   options: HostMainOptions,
-  createRunner: (provider: string, config: Fields) => SessionHostRunner = createTestRunner,
+  createRunner: (provider: string, config: Fields, bootstrap: RunnerBootstrap) => SessionHostRunner = createProviderRunner,
 ): Promise<void> {
   process.umask(0o077);
   const paths = runtimePaths(options.runtimeDir, options.key);
@@ -83,7 +95,11 @@ export async function runSessionHost(
       const journal = new SessionHostJournal(options.stateDir, options.key);
       try {
         registry.upsertInstance(options.key, metadata, 'starting');
-        const runner = createRunner(provider, config);
+        const runner = createRunner(provider, config, {
+          hostId, serviceId, registryPath: registry.path,
+          ...(reserved.ref ? { ref: { provider: provider as NativeSessionRef['provider'], hostId, serviceId,
+            nativeSessionId: reserved.ref[3] } } : {}),
+        });
         writePrivateAtomic(paths.secret, secret);
         let state: InstanceState = 'ready';
         let published = false;
@@ -132,6 +148,30 @@ export async function runSessionHost(
   } finally {
     closeSync(lock);
   }
+}
+
+function createProviderRunner(provider: string, config: Fields, bootstrap: RunnerBootstrap): SessionHostRunner {
+  if (provider !== 'agy' && provider !== 'claude' && provider !== 'codex') return createTestRunner(provider);
+  const approval = config.approvalPolicy === undefined ? {} : object(config.approvalPolicy);
+  const approvalPolicy: ApprovalScope = { ...approval, enabled: approval.enabled === true };
+  if (provider === 'agy') {
+    return new AgySessionHostRunner({
+      ...bootstrap, approvalPolicy,
+      ...(config.transport === undefined ? {} : { transport: object(config.transport) as NonNullable<AgySessionHostOptions['transport']> }),
+      ...(config.catalog === undefined ? {} : { catalog: object(config.catalog) }),
+      ...(config.quota === undefined ? {} : { quota: object(config.quota) }),
+      ...(config.adapterOptions === undefined ? {} : { adapterOptions: object(config.adapterOptions) }),
+    });
+  }
+  if (provider === 'claude') {
+    return new ClaudeSessionHostRunner({
+      ...bootstrap, approvalPolicy, stateDir: string(config.claudeStateDir, 'claudeStateDir'),
+      ...(config.claudeBin === undefined ? {} : { claudeBin: string(config.claudeBin, 'claudeBin') }),
+    });
+  }
+  return new CodexSessionHostRunner({
+    ...bootstrap, approvalPolicy, codexEndpoint: string(config.codexEndpoint, 'codexEndpoint'),
+  });
 }
 
 function createTestRunner(provider: string): SessionHostRunner {
