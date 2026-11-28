@@ -1,6 +1,7 @@
 import type { Artifact, Message, Provider, Turn } from './contracts.js';
 import {
   formatCompactTokenCount,
+  formatContextStatusLine,
   formatContextUsageBadge,
   type CompactTurnInfo,
   type ContextUsageInfo,
@@ -81,6 +82,7 @@ type CardState = {
   turnId?: string | undefined;
   activeSubagents?: readonly SessionSubagentActivity[] | undefined;
   allowFullReplyButton?: boolean | undefined;
+  allowCompactButton?: boolean | undefined;
   modelBadge?: string | undefined;
   contextUsage?: ContextUsageInfo | null | undefined;
   compactInfo?: CompactTurnInfo | undefined;
@@ -180,6 +182,7 @@ export function turnProgressCard({
   turnId,
   activeSubagents,
   allowFullReplyButton = true,
+  allowCompactButton = false,
   modelBadge,
   contextUsage,
   compactInfo,
@@ -214,6 +217,7 @@ export function turnProgressCard({
   const headerTags: ChannelCardHeaderTag[] = [];
   if (cleanModelBadge) headerTags.push({ text: cleanModelBadge, color: providerBadgeColor(provider) });
   if (ctxBadge) headerTags.push({ text: `上下文 ${ctxBadge.text}`, color: ctxBadge.color });
+  const statusBanner = formatContextStatusLine(contextUsage, { modelBadge: cleanModelBadge }) ?? undefined;
 
   const raw = message?.blocks.map(block => block.type === 'text' ? block.text :
     `[文件 ${escapeCardMarkdown(block.artifactId)}]`).join('\n') ?? '';
@@ -249,6 +253,15 @@ export function turnProgressCard({
     actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,
       value: { action: 'file', artifactId: file.artifactId, contentVersion: file.contentVersion } });
   }
+  if (allowCompactButton && !isCompact) {
+    const highUsage = Boolean(ctxBadge && ctxBadge.pct >= 80);
+    const pctSuffix = highUsage && ctxBadge ? ` (${ctxBadge.pct}%)` : '';
+    actions.push({
+      label: running ? `🗜️ 排队压缩上下文${pctSuffix}` : `🗜️ 压缩上下文${pctSuffix}`,
+      type: highUsage ? 'primary' : 'default',
+      value: { action: 'compact' },
+    });
+  }
   const logTools = visibleTools.filter(tool => tool.tool !== 'thinking');
   const lines = logTools.slice(-LOG_SIZE).map(tool => `${TOOL_ICONS[tool.phase]} ${tool.summary}`);
   if (count > lines.length && logTools.length > 0) lines.unshift(`已省略较早的 ${count - lines.length} 项`);
@@ -268,6 +281,7 @@ export function turnProgressCard({
     ...header,
     ...(subtitle ? { subtitle } : {}),
     ...(headerTags.length ? { headerTags } : {}),
+    ...(statusBanner ? { statusBanner } : {}),
     text,
     actions,
     ...(executionLog ? { executionLog } : {}),

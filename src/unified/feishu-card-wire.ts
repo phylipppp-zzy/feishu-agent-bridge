@@ -397,14 +397,17 @@ function encodeV2(card: ChannelCard, form?: QuestionForm): Record<string, unknow
             ? cardElements(card, !!form, '2.0', panelCounter)
             : []))
     : cardElements(card, !!form, '2.0', panelCounter);
+  const bannerElems = card.statusBanner?.trim() ? [markdown(card.statusBanner.trim())] : [];
   const execElems = executionElements(card.executionLog, '2.0');
   const execOnTop = card.executionLog?.position === 'top' && execElems.length > 0;
   const contentBlocks = execOnTop
     ? [
+        ...bannerElems,
         ...execElems,
         ...(baseBody.length > 0 ? [{ tag: 'hr' }, ...baseBody] : []),
       ]
     : [
+        ...bannerElems,
         ...baseBody,
         ...(sectioned ? sectioned.elements : []),
         ...(form ? questionElements(form) : []),
@@ -437,15 +440,18 @@ export function encodeCard(card: ChannelCard, forceSchema?: CardSchema): Record<
   const baseElements = sectioned
     ? (card.table || (card.text.trim() && !card.sections?.some(s => s.text?.trim())) ? cardElements(card) : [])
     : cardElements(card);
+  const bannerElems = card.statusBanner?.trim() ? [markdown(card.statusBanner.trim())] : [];
   const execElems = executionElements(card.executionLog, '1.0');
   const execOnTop = card.executionLog?.position === 'top' && execElems.length > 0;
   const elements = execOnTop
     ? [
+        ...bannerElems,
         ...execElems,
         ...(baseElements.length > 0 ? [{ tag: 'hr' }, ...baseElements] : []),
         ...(sectioned ? sectioned.elements : []),
       ]
     : [
+        ...bannerElems,
         ...baseElements,
         ...(sectioned ? sectioned.elements : []),
         ...execElems,

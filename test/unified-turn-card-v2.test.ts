@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   extractAgyContextUsageFromRows,
   formatCompactTokenCount,
+  formatContextStatusLine,
   formatContextUsageBadge,
   resolveModelMaxContextTokens,
 } from '../src/unified/context-usage.js';
@@ -111,11 +112,13 @@ test('turnProgressCard v2 renders model + context in header and places thinking 
   assert.equal(wire.header.text_tag_list?.[1]?.text.content, '上下文 511K / 1M (49%)');
 
   const elements = wire.body.elements;
+  const bannerIdx = elements.findIndex(el => el.tag === 'markdown' && (el.content ?? '').includes('511K / 1M (49%)'));
   const thinkingIdx = elements.findIndex(el => el.tag === 'markdown' && (el.content ?? '').includes('思考过程'));
   const panelIdx = elements.findIndex(el => el.tag === 'collapsible_panel');
   const hrIdx = elements.findIndex(el => el.tag === 'hr');
   const answerIdx = elements.findIndex(el => el.tag === 'markdown' && (el.content ?? '').includes('最终结论'));
-  assert.ok(thinkingIdx >= 0, 'thinking block should exist');
+  assert.equal(bannerIdx, 0, 'live context status banner should appear at top of card body');
+  assert.ok(thinkingIdx > bannerIdx, 'thinking block should follow context status banner');
   assert.ok(panelIdx > thinkingIdx, 'steps panel should follow thinking');
   assert.ok(hrIdx > panelIdx, 'divider should separate process from final answer');
   assert.ok(answerIdx > hrIdx, 'final answer should appear at bottom after divider');
@@ -190,10 +193,92 @@ test('/compact text command, card action, panel metadata, and help cards are wir
       canArchive: false,
     },
   );
-  assert.ok(!runningPanel.actions.some(a => a.value.action === 'compact'));
+  const runningCompactBtn = runningPanel.actions.find(a => a.value.action === 'compact');
+  assert.ok(runningCompactBtn, 'running panel should expose queued compact button');
+  assert.match(runningCompactBtn.label, /排队压缩上下文/);
 
   assert.match(buildSessionHelpCard('agy', 'interactive').text, /\/compact/);
   assert.doesNotMatch(buildTaskTopicHelpCard('agy').text, /\/compact/);
+});
+
+test('live context status line and one-click compact button work during running and completed turns', () => {
+  assert.equal(formatContextStatusLine(null), null);
+  assert.match(
+    formatContextStatusLine({ usedTokens: 84_000, maxTokens: 1_048_576 }, { modelBadge: 'neon medium' }) ?? '',
+    /^🟢 上下文：`84K \/ 1M \(8%\)` `▓░░░░░░░░░` · 模型 `neon medium`$/,
+  );
+  assert.match(
+    formatContextStatusLine({ usedTokens: 860_000, maxTokens: 1_048_576 }, { modelBadge: 'neon medium' }) ?? '',
+    /^🟠 上下文：`860K \/ 1M \(82%\)` `▓▓▓▓▓▓▓▓░░` · 建议压缩 · 模型 `neon medium`$/,
+  );
+  assert.match(
+    formatContextStatusLine({ usedTokens: 980_000, maxTokens: 1_048_576 }) ?? '',
+    /^🔴 上下文：`980K \/ 1M \(93%\)` `▓▓▓▓▓▓▓▓▓░` · 接近上限，建议立即压缩$/,
+  );
+
+  const runningHigh = turnProgressCard({
+    provider: 'agy',
+    status: 'running',
+    schema: '2.0',
+    message: undefined,
+    tools: [{ turnId: 't-run', callId: 'c-1', phase: 'running', tool: 'run_command', summary: '执行命令 · npm test' }],
+    duration: 15_000,
+    files: [],
+    turnId: 't-run',
+    allowCompactButton: true,
+    modelBadge: 'neon medium',
+    contextUsage: { usedTokens: 860_000, maxTokens: 1_048_576 },
+  });
+  assert.match(runningHigh.statusBanner ?? '', /860K \/ 1M \(82%\)/);
+  const runCompactBtn = runningHigh.actions.find(a => a.value.action === 'compact');
+  assert.ok(runCompactBtn);
+  assert.equal(runCompactBtn.label, '🗜️ 排队压缩上下文 (82%)');
+  assert.equal(runCompactBtn.type, 'primary');
+
+  const completedNormal = turnProgressCard({
+    provider: 'agy',
+    status: 'completed',
+    schema: '2.0',
+    message: undefined,
+    tools: [],
+    duration: 5_000,
+    files: [],
+    turnId: 't-done',
+    allowCompactButton: true,
+    contextUsage: { usedTokens: 120_000, maxTokens: 1_048_576 },
+  });
+  const doneCompactBtn = completedNormal.actions.find(a => a.value.action === 'compact');
+  assert.ok(doneCompactBtn);
+  assert.equal(doneCompactBtn.label, '🗜️ 压缩上下文');
+  assert.equal(doneCompactBtn.type, 'default');
+
+  const compactTurn = turnProgressCard({
+    provider: 'agy',
+    status: 'completed',
+    schema: '2.0',
+    message: undefined,
+    tools: [],
+    duration: 5_000,
+    files: [],
+    turnId: 't-cmp',
+    allowCompactButton: true,
+    compactInfo: { isCompact: true, beforeTokens: 860_000, afterTokens: 50_000, maxTokens: 1_048_576 },
+  });
+  assert.equal(compactTurn.actions.some(a => a.value.action === 'compact'), false, 'compact turn itself must not show compact button');
+
+  const readOnlyCard = turnProgressCard({
+    provider: 'agy',
+    status: 'running',
+    schema: '2.0',
+    message: undefined,
+    tools: [],
+    duration: 5_000,
+    files: [],
+    turnId: 't-ro',
+    allowCompactButton: false,
+    contextUsage: { usedTokens: 860_000, maxTokens: 1_048_576 },
+  });
+  assert.equal(readOnlyCard.actions.some(a => a.value.action === 'compact'), false, 'read-only mirror must not show compact button');
 });
 
 test('P0-3 & P1-2 regressions: long thinking <= 120 code points, no empty panel, and table+subtitle stays 1.0', () => {

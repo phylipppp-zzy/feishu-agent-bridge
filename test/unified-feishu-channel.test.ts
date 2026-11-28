@@ -148,7 +148,7 @@ for (const [provider,command] of [['claude','claude --resume native'],['codex','
   session.control={...session.control,owner:null,input:'unavailable',generation:2};
   return makeOp('release')(request);
  };
- const service={getSession:async()=>session,eventWatermark:()=>0,getWorkState:async()=>({runningTurns:[{turnId:'turn'}],queuedInputs:[{inputId:'queue'}],canArchive:true}),interruptTurn:makeOp('stop'),cancelQueuedInput:makeOp('cancel'),requestControl:makeOp('control'),releaseControl,archiveSession:makeOp('archive'),updateSessionSettings:makeOp('settings'),attachSession:makeOp('attach'),listModels:async()=>({items:[{id:'m',label:'Model'}],nextCursor:null})} as unknown as UnifiedService;
+ const service={getSession:async()=>session,eventWatermark:()=>0,getWorkState:async()=>({runningTurns:[{turnId:'turn'}],queuedInputs:[{inputId:'queue'}],canArchive:true}),interruptTurn:makeOp('stop'),cancelQueuedInput:makeOp('cancel'),submitInput:makeOp('compact'),requestControl:makeOp('control'),releaseControl,archiveSession:makeOp('archive'),updateSessionSettings:makeOp('settings'),attachSession:makeOp('attach'),listModels:async()=>({items:[{id:'m',label:'Model'}],nextCursor:null})} as unknown as UnifiedService;
  const port:FeishuPort={send:async(_d,c)=>{cards.push(c);return 'id';},update:async(_d,id,c)=>{patched.set(id,c);},sendFile:async()=>{}};
  const channel=new FeishuChannel(service,port,async()=>true,join(dir,'db')); const env=(eventId:string,subject='owner')=>({eventId,destination:'d',identity:{source:'v',subject}});
  try {
@@ -160,7 +160,7 @@ for (const [provider,command] of [['claude','claude --resume native'],['codex','
   assert.doesNotMatch(panel.text,/当前不支持|旧版/);
   const json=toFeishuCard(panel) as {elements:Array<{actions?:Array<{value:unknown}>}>};
   for (const [i,button] of json.elements[1]!.actions!.entries()) await channel.handle(env(`a${i}`),parseFeishuAction(button.value));
-  assert.deepEqual(calls,['stop','cancel','archive','control']);
+  assert.deepEqual(calls,['stop','cancel','compact','archive','control']);
   session.control.owner=session.control.serviceId;
   session.archived=true;
   await channel.handle(env('owned-panel'),{action:'panel'});
