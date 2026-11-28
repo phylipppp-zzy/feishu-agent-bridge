@@ -22,6 +22,51 @@ CONF_FILE = CONF_DIR / 'config.json'
 UNIT_FILE = Path('/home/zhangzy/.config/systemd/user/feishu-unified-production.service')
 PARENT_RELEASE = '607c887-agy-320eaa1fba6a'
 CORE_DB = Path('/home/zhangzy/.local/state/feishu-unified-bridge/core.sqlite')
+DEV_GUARD = Path('/home/zhangzy/.codex/skills/sapphire-dev-workflow/scripts/dev_guard.py')
+
+
+def _run_dev_guard_cmd(args: list[str], dev_guard: Path, label: str, timeout_s: int = 30) -> None:
+    if not dev_guard.is_file():
+        raise RuntimeError(f'{label}: dev_guard.py not found at {dev_guard} (pass --skip-guard to bypass)')
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(dev_guard), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f'{label}: dev_guard.py timed out after {timeout_s}s') from exc
+    if proc.returncode != 0:
+        detail = (proc.stdout + proc.stderr).strip()
+        raise RuntimeError(f'{label} failed:\n{detail}')
+
+
+def run_pre_deploy_guard(repo: Path, dev_guard: Path = DEV_GUARD) -> None:
+    _run_dev_guard_cmd(['release-check', str(repo), '--pre-deploy'], dev_guard, 'Pre-deploy dev_guard release-check')
+
+
+def run_post_deploy_guard(repo: Path, unit_file: Path, dev_guard: Path = DEV_GUARD) -> None:
+    _run_dev_guard_cmd(
+        ['release-check', str(repo), '--systemd-unit', str(unit_file)],
+        dev_guard,
+        'Post-deploy dev_guard release-check',
+    )
+
+
+def _atomic_restore_bytes(path: Path, data: bytes, mode: int) -> None:
+    tmp = None
+    try:
+        with NamedTemporaryFile(mode='wb', dir=path.parent, prefix=f'.{path.name}.rollback.', delete=False) as f:
+            tmp = Path(f.name)
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def check_active_work(core_db: Path) -> bool:
@@ -149,6 +194,7 @@ parser.add_argument('--force', action='store_true', help='Bypass the active-work
 parser.add_argument('--core-db', type=Path, default=CORE_DB, help='Path to the bridge core SQLite database')
 parser.add_argument('--keep-releases', type=int, default=8, help='Number of newest old releases to keep (default: 8)')
 parser.add_argument('--check-active-only', action='store_true', help='Check for active work without deploying')
+parser.add_argument('--skip-guard', action='store_true', help='Skip dev_guard.py release-check (emergency/test only)')
 args = parser.parse_args()
 if args.keep_releases < 0:
     parser.error('--keep-releases must be non-negative')
@@ -169,6 +215,12 @@ try:
 except BlockingIOError:
     print('Another production deployment is already in progress.', file=sys.stderr)
     sys.exit(1)
+if not args.skip_guard:
+    try:
+        run_pre_deploy_guard(REPO)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 previous_unit = UNIT_FILE.read_text(encoding='utf-8') if UNIT_FILE.exists() else ''
 
 commit = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'], text=True).strip()
@@ -362,6 +414,12 @@ WantedBy=default.target
 (staging / 'feishu-unified-production.service').write_text(unit_content, encoding='utf-8')
 
 os.rename(staging, release_dir)
+if not args.skip_guard:
+    try:
+        run_post_deploy_guard(REPO, release_dir / 'feishu-unified-production.service')
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 
 # 2. Update config.json cleanly (atomic replace with 0600 permissions)
 orig_bytes = CONF_FILE.read_bytes()
@@ -451,6 +509,19 @@ try:
 finally:
     if tmp_unit is not None:
         tmp_unit.unlink(missing_ok=True)
+
+if not args.skip_guard:
+    try:
+        run_post_deploy_guard(REPO, UNIT_FILE)
+    except RuntimeError as exc:
+        # Roll back live unit & config atomically before pruning any previous releases
+        if previous_unit:
+            _atomic_restore_bytes(UNIT_FILE, previous_unit.encode('utf-8'), 0o644)
+        else:
+            UNIT_FILE.unlink(missing_ok=True)
+        _atomic_restore_bytes(CONF_FILE, orig_bytes, 0o600)
+        print(f'{exc}\nRolled back live unit and config cleanly.', file=sys.stderr)
+        sys.exit(2)
 
 prune_releases(release_dir, previous_unit, args.keep_releases)
 
