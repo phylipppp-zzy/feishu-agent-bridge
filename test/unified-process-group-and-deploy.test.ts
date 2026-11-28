@@ -168,6 +168,96 @@ with TemporaryDirectory() as tmp:
   assert.match(result.stdout, /PRUNED_RELEASE=fffffff/);
 });
 
+test('deploy pre/post dev_guard release-check blocks dirty tree, missing guard, and verifies systemd unit parity', async t => {
+  const result = await runPython(['-c', `
+import ast
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+path = Path('scripts/deploy-production.py')
+tree = ast.parse(path.read_text())
+names = {'_run_dev_guard_cmd', 'run_pre_deploy_guard', 'run_post_deploy_guard'}
+nodes = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))
+         or isinstance(node, ast.FunctionDef) and node.name in names]
+dev_guard = Path('/home/zhangzy/.codex/skills/sapphire-dev-workflow/scripts/dev_guard.py')
+scope = {'DEV_GUARD': dev_guard}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
+
+with TemporaryDirectory(prefix='deploy-guard-', dir='/home/zhangzy/workspace') as tmp:
+    repo = Path(tmp)
+    subprocess.run(['git', '-C', str(repo), 'init', '-q'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 't@e.com'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'T'], check=True)
+    (repo / 'a.txt').write_text('ok\\n', encoding='utf-8')
+    subprocess.run(['git', '-C', str(repo), 'add', 'a.txt'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-q', '-m', 'init'], check=True)
+    head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--short', 'HEAD'], text=True).strip()
+
+    # Missing dev_guard.py must fail closed (not silently skip)
+    try:
+        scope['run_pre_deploy_guard'](repo, repo / 'nonexistent_guard.py')
+        raise AssertionError('Expected missing dev_guard.py to fail closed')
+    except RuntimeError as exc:
+        assert 'not found' in str(exc), str(exc)
+
+    # Clean repo passes pre-deploy guard
+    scope['run_pre_deploy_guard'](repo, dev_guard)
+
+    # Matching systemd unit passes post-deploy guard, mismatched fails
+    rel = repo.parent / (repo.name + '-rel') / f'{head}-agy-111'
+    rel.mkdir(parents=True)
+    (rel / 'generation.json').write_text(json.dumps({'commit': head}), encoding='utf-8')
+    unit = repo.parent / (repo.name + '.service')
+    unit.write_text(f'[Service]\\nWorkingDirectory={rel}\\n', encoding='utf-8')
+    try:
+        scope['run_post_deploy_guard'](repo, unit, dev_guard)
+        (rel / 'generation.json').write_text(json.dumps({'commit': '0000000'}), encoding='utf-8')
+        try:
+            scope['run_post_deploy_guard'](repo, unit, dev_guard)
+            raise AssertionError('Expected mismatched commit to fail post-deploy guard')
+        except RuntimeError as exc:
+            assert '不一致' in str(exc), str(exc)
+    finally:
+        unit.unlink(missing_ok=True)
+        shutil.rmtree(rel.parent, ignore_errors=True)
+print('DEPLOY_GUARD_OK')
+`]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /DEPLOY_GUARD_OK/);
+
+  // Full-script main-flow wiring test: dirty repo blocked with exit code 2 using production DEV_GUARD constant
+  const dirtyFlow = await runPython(['-c', `
+import re, shutil, subprocess, sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+script = Path('scripts/deploy-production.py')
+with TemporaryDirectory(prefix='deploy-dirty-', dir='/home/zhangzy/workspace') as tmp:
+    repo = Path(tmp)
+    rel_root = Path(sys.argv[1])
+    subprocess.run(['git', '-C', str(repo), 'init', '-q'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'user.email', 't@e.com'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'config', 'user.name', 'T'], check=True)
+    (repo / 'a.txt').write_text('ok\\n', encoding='utf-8')
+    subprocess.run(['git', '-C', str(repo), 'add', 'a.txt'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-q', '-m', 'init'], check=True)
+    (repo / 'dirty.txt').write_text('uncommitted\\n', encoding='utf-8')
+
+    src = script.read_text()
+    src = re.sub(r'^REPO = .*$', lambda _: f'REPO = Path({str(repo)!r})', src, count=1, flags=re.M)
+    src = re.sub(r'^RELEASES_ROOT = .*$', lambda _: f'RELEASES_ROOT = Path({str(rel_root)!r})', src, count=1, flags=re.M)
+    sys.argv = [str(script), '--force']
+    exec(compile(src, str(script), 'exec'))
+`, tempDir(t)]);
+  assert.equal(dirtyFlow.status, 2, dirtyFlow.stderr);
+  assert.match(dirtyFlow.stderr, /Pre-deploy dev_guard release-check failed/);
+  assert.match(dirtyFlow.stderr, /未提交改动/);
+});
+
 test('termination signals the detached group and never signals a reaped PID', {
   skip: process.platform === 'win32',
   timeout: 5_000,
