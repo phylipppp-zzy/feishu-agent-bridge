@@ -6,7 +6,8 @@ import {
   isAncestorChainAuthorizedForProject,
   parseWorkspaceUris,
   readAgySummaryHierarchy,
-  readSafeTranscriptTail,
+  readTranscriptTailSource,
+  safeTranscriptTailSources,
   resolveSummaryAncestorChain,
 } from './catalog-summaries.js';
 import {
@@ -20,6 +21,7 @@ import {
 } from './catalog-types.js';
 
 const READONLY_TAIL_BYTES = 128 * 1024;
+const READONLY_VIEW_CACHE_MAX_ENTRIES = 256;
 
 export interface ReadonlyLiveTurnView {
   state: 'running' | 'idle' | 'unavailable';
@@ -40,6 +42,16 @@ export interface ReadonlyAgyLiveTurnOptions {
   appDataDir?: string;
 }
 
+const readonlyViewCache = new Map<string, { fingerprint: string; view: ReadonlyLiveTurnView | null }>();
+
+function cacheReadonlyView(conversationId: string, fingerprint: string, view: ReadonlyLiveTurnView | null): void {
+  readonlyViewCache.delete(conversationId);
+  readonlyViewCache.set(conversationId, { fingerprint, view });
+  if (readonlyViewCache.size > READONLY_VIEW_CACHE_MAX_ENTRIES) {
+    readonlyViewCache.delete(readonlyViewCache.keys().next().value!);
+  }
+}
+
 function normalizeTranscriptArgs(raw: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw)) {
@@ -56,11 +68,7 @@ function normalizeTranscriptArgs(raw: Record<string, unknown>): Record<string, u
   return out;
 }
 
-function readTailTranscriptRows(
-  conversationId: string,
-  options: { brainDir?: string; brainDirs?: readonly string[]; appDataDir?: string },
-): Array<Record<string, unknown>> {
-  const text = readSafeTranscriptTail(conversationId, READONLY_TAIL_BYTES, options);
+function parseTailTranscriptRows(text: string | null): Array<Record<string, unknown>> {
   if (!text) return [];
   const rows: Array<Record<string, unknown>> = [];
   for (const line of text.split('\n')) {
@@ -140,13 +148,10 @@ export function readReadonlyAgyLiveTurn(
     ACTIVE_CASCADE_STATUSES.has(rootRow.status) || isTruthyFlag(rootRow.not_fully_idle);
 
   const activeSubagents: SessionSubagentActivity[] = [];
-  for (const row of hierarchy.byId.values()) {
-    if (hierarchy.isTopLevelRow(row) || isTruthyFlag(row.killed)) continue;
+  for (const row of hierarchy.activeDescendantsByRoot.get(conversationId) ?? []) {
     const chainResult = resolveSummaryAncestorChain(row, hierarchy);
     if (chainResult.status !== 'ok' || chainResult.rootRow.conversation_id !== conversationId) continue;
     if (!isAncestorChainAuthorizedForProject(chainResult.chain, conversationId, project)) continue;
-    const subActive = ACTIVE_CASCADE_STATUSES.has(row.status) || isTruthyFlag(row.not_fully_idle);
-    if (!subActive) continue;
     activeSubagents.push({
       conversationId: row.conversation_id,
       agentName: typeof row.agent_name === 'string' && row.agent_name.trim()
@@ -156,11 +161,30 @@ export function readReadonlyAgyLiveTurn(
     });
   }
 
-  const rows = readTailTranscriptRows(conversationId, {
+  const sources = safeTranscriptTailSources(conversationId, {
     ...(options.brainDir !== undefined ? { brainDir: options.brainDir } : {}),
     ...(options.brainDirs !== undefined ? { brainDirs: options.brainDirs } : {}),
     ...(appDataDir ? { appDataDir } : {}),
   });
+  const first = sources.next();
+  const fingerprint = JSON.stringify([
+    canonicalProject, project, rootRow.status, rootRow.not_fully_idle, rootRow.step_count,
+    rootRow.last_modified_time, rootRow.last_user_input_step_index, activeSubagents,
+    first.done ? null : [first.value.path, first.value.fingerprint],
+  ]);
+  const cached = readonlyViewCache.get(conversationId);
+  if (cached?.fingerprint === fingerprint) return cached.view;
+
+  let tail = first.done ? null : readTranscriptTailSource(first.value, READONLY_TAIL_BYTES);
+  // Retry the preferred source on future polls if its open failed during this read.
+  const cacheable = first.done || tail !== null;
+  if (!cacheable) {
+    for (const source of sources) {
+      tail = readTranscriptTailSource(source, READONLY_TAIL_BYTES);
+      if (tail !== null) break;
+    }
+  }
+  const rows = parseTailTranscriptRows(tail);
 
   let lastUserIdx = -1;
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -252,13 +276,16 @@ export function readReadonlyAgyLiveTurn(
       summary: formatThinkingSummary(latestThinking),
     });
   }
-  if (!running && !tools.length && !activeSubagents.length && !rows.length) return null;
+  if (!running && !tools.length && !activeSubagents.length && !rows.length) {
+    if (cacheable) cacheReadonlyView(conversationId, fingerprint, null);
+    return null;
+  }
 
   const contextUsage = extractAgyContextUsageFromRows(rows);
   const previewText = running ? interimTexts.join('\n\n') : '';
   const state = running ? 'running' : 'idle';
   const signature = payloadDigest([anchorId, state, previewText, tools, activeSubagents, contextUsage]);
-  return {
+  const view: ReadonlyLiveTurnView = {
     state,
     anchorId,
     running,
@@ -268,4 +295,6 @@ export function readReadonlyAgyLiveTurn(
     ...(contextUsage ? { contextUsage } : {}),
     signature,
   };
+  if (cacheable) cacheReadonlyView(conversationId, fingerprint, view);
+  return view;
 }

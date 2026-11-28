@@ -5,7 +5,7 @@ import { realpathSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { HistoryArchive } from './history-archive.js';
 import type { MigrationManifest } from './migration.js';
-import { UnifiedStore } from './store.js';
+import { encodeCursor, UnifiedStore } from './store.js';
 import { UnifiedCore } from './service.js';
 import { ClaudeAdapter } from './claude-adapter.js';
 import { codexFilesystemProof, isLocalCodexEndpoint, runtimeApprovalScope } from './codex-approval.js';
@@ -25,10 +25,11 @@ import { AgyAdapter } from './agy-adapter.js';
 import { AgyCatalog } from './agy-catalog.js';
 import { AgyQuotaClient, type AgyQuotaSnapshot } from './agy-quota.js';
 import { AgyAcpTransport } from './agy-transport.js';
+import { agyFileFingerprint } from './agy/catalog-summaries.js';
+import { resolveAgySummariesDbPaths } from './agy/catalog-types.js';
 import { defaultAgyConversationsDir } from './agy/process-guard.js';
 import { AgyCliWaitingDetector } from './agy/cli-waiting-detector.js';
 import { readReadonlyAgyLiveTurn } from './agy/readonly-live-turn.js';
-import { resolveAgySummariesDbPaths } from './agy/catalog-types.js';
 import { collectAgyStatusSnapshot } from './agy/session-status.js';
 import { providerTitlePrefix } from './feishu-cards.js';
 import { DecisionSyncStore } from './decision-sync.js';
@@ -204,6 +205,9 @@ export class UnifiedRuntime {
   get taskHandoff():TaskHandoffService|undefined { return this._taskHandoff; }
   private readonly startupRestorations = new Map<Provider, Promise<void>>();
   private readonly reconnectRestorations = new Set<Provider>();
+  private lastCompactionAt: number | undefined;
+  private legacyEventKeysSlimmed = false;
+  private unknownDeliveryChangeSince: number | undefined;
   private baselinePreparing=false; private readonly recoveryFailedSessions=new Set<string>(); private readonly unavailableProviders=new Set<Provider>(); private readonly providerEverConnected=new Set<Provider>(); private readonly providerWasDisconnected=new Set<Provider>(); private readonly lowQuotaActive=new Set<Provider>(); private lastUnknownDeliverySnapshot={deliveries:0,inbox:0}; private readonly alertedUnknownOperations=new Set<string>(); private readonly inFlightUnknownOpAlerts=new Set<string>(); private readonly restartPending:string[]; private recoveryFailure:string|null=null; private recoveryStarted:Promise<void>|undefined; private timer:ReturnType<typeof setTimeout>|undefined; private usageTimer:ReturnType<typeof setTimeout>|undefined; private polling=false; private inPollCycle=false; private wakePending=false; private wakeScheduled=false; private lastActivityAt=Date.now(); private readonly pollRunner=()=>void this.runPollCycle(); private running:Promise<void>|undefined; private lastError:string|null=null; private closed=false; private closing=false; private closePromise:Promise<void>|undefined; private readonly intakes=new Set<Promise<unknown>>(); private readonly hubTasks=new Set<Promise<unknown>>(); private readonly lock:DatabaseSync; private readonly providers:PlatformPort[]; private readonly sendPort:Pick<FeishuPort,'send'|'update'>; private readonly port:FeishuPort & {authorizedDestination?:(destination:string)=>boolean;lookupTaskTopic?:(destination:string,owner:string)=>unknown;createTaskTopic?:(chatId:string,taskId:string,operationId:string,owner:string)=>Promise<TaskTopicToken>;drainInbound?:(handle:(e:TrustedEnvelope,a:ChannelAction,scope?:string)=>Promise<unknown>)=>Promise<void>;resourceIssues?:()=>Array<{eventId:string;state:string;attempts:number;reason:string}>};
   constructor(readonly config:RuntimeConfig, port:FeishuPort, providers:PlatformPort[], private readonly options:{canDiscover?:(s:Session)=>boolean;resolveDiscoveryProject?:(native:Omit<Session['native'],'nativeSessionId'>,project:string|null)=>string|null;allowDiscovered?:(id:string)=>boolean;canInspectCandidate?:(native:Session['native'],project:string)=>boolean;requireReadonlyHydration?:boolean;allowedProjectRoots?:readonly string[];refresh?:(runtime:UnifiedRuntime)=>Promise<void>;cleanup?:()=>void;isTrustedAgyCliHolder?:(holder:{pid:number;tty:string;cmdline:string;kind:'external_cli'|'bridge_acp';exe?:string})=>boolean;usageHub?:{now?:()=>number;collectSnapshot?:()=>Promise<UsageDashboardPayload|void>;refreshCooldownMs?:number;collectTimeoutMs?:number}}={}) {
     this.providers=providers; this.port=port; validateRuntimeConfig(config);
@@ -257,6 +261,11 @@ export class UnifiedRuntime {
         const showAutoTitles = config.autoMirror?.showTitles === true;
         this.core.presentSession=session=>(!showAutoTitles && this.channel.isAutoPrivateTitle(session.native)) ? {...session,title:`${providerTitlePrefix(session.native.provider)} 会话 · ${payloadDigest(session.native).slice(0,8)}`} : session;
         try {
+          for (const id of this.store.unknownOperationIds()) this.alertedUnknownOperations.add(id);
+          this.lastUnknownDeliverySnapshot = {
+            deliveries: this.channel.pendingDeliveries().length,
+            inbox: this.channel.unknownInbox().length,
+          };
           if (config.decisionSync?.enabled) {
             this._decisionSync = new DecisionSyncStore({
               dbPath: resolveDecisionSyncDbPath(config),
@@ -304,6 +313,12 @@ export class UnifiedRuntime {
           }
           if (config.pendingHub?.enabled) {
             const agyWaitingDetector = new AgyCliWaitingDetector();
+            const cliNoticeTtlMs = config.intervalMs >= 1000 ? 20_000 : 0;
+            let cachedCliNotices: {
+              expiresAt: number;
+              result: PendingCliNotice[] | { notices: PendingCliNotice[]; unknownRefIds: string[] };
+              isStillValid: () => boolean;
+            } | undefined;
             this._pendingHub = new PendingHub({
               dbPath: resolvePendingHubDbPath(config),
               owner: ownerIdentity,
@@ -316,6 +331,10 @@ export class UnifiedRuntime {
                 && !this._taskChannel?.ownsInteractionCard(destination,sessionId,interactionId,messageId),
               shouldDeliverSource: (item) => item.provider === 'decision',
               discoverCliNotices: async () => {
+                if (cachedCliNotices && Date.now() < cachedCliNotices.expiresAt && cachedCliNotices.isStillValid()) {
+                  return cachedCliNotices.result;
+                }
+                cachedCliNotices = undefined;
                 const claudeNative = { provider: 'claude' as const, hostId: config.hostId, serviceId: config.claudeServiceId };
                 const resolveProject = options.resolveDiscoveryProject ?? ((ref, project) => {
                   const sources = config.catalogSources?.filter(source => canonicalDirectory(source.directory) !== null) ?? [];
@@ -331,7 +350,19 @@ export class UnifiedRuntime {
                 if (!inside(config.claudeStateDir, tempRoot) || inside(defaultPresenceDir, tempRoot)) {
                   presenceDirs.push(defaultPresenceDir);
                 }
+                const fingerprints = cliNoticeTtlMs ? new Map<string, string | null>() : undefined;
+                const holderPids = new Set<number>();
+                for (const dir of presenceDirs) fingerprints?.set(dir, agyFileFingerprint(dir));
                 const records = await readWaitingClaudePresence(presenceDirs, Date.now());
+                if (fingerprints) {
+                  for (const { sessionId } of records) {
+                    for (const dir of presenceDirs) {
+                      const path = join(dir, `${sessionId}.json`);
+                      const fingerprint = agyFileFingerprint(path);
+                      if (fingerprint !== 'missing') fingerprints.set(path, fingerprint);
+                    }
+                  }
+                }
                 if (records.length) {
                   const claudeSessions = new Map(this.store.listSessions()
                     .filter(({ native }) => native.provider === 'claude' && native.hostId === config.hostId &&
@@ -356,13 +387,28 @@ export class UnifiedRuntime {
 
                 if (config.agy && config.agy.enabled !== false) {
                   const agyNative = { provider: 'agy' as const, hostId: config.hostId, serviceId: config.agy.serviceId };
+                  const conversationsDir = config.agy.conversationsDir ?? defaultAgyConversationsDir(config.agy.brainDir);
                   const agyScan = agyWaitingDetector.scan({
                     ...(config.agy.summariesDbPath !== undefined ? { summariesDbPath: config.agy.summariesDbPath } : {}),
                     ...(config.agy.brainDir !== undefined ? { brainDir: config.agy.brainDir } : {}),
-                    conversationsDir: config.agy.conversationsDir ?? defaultAgyConversationsDir(config.agy.brainDir),
+                    conversationsDir,
                     ...(config.allowedProjectRoots !== undefined ? { allowedProjectRoots: config.allowedProjectRoots } : {}),
                     ...(options.isTrustedAgyCliHolder !== undefined ? { isTrustedHolder: options.isTrustedAgyCliHolder } : {}),
                   });
+                  if (fingerprints) {
+                    const watchDb = (path: string) => {
+                      fingerprints.set(path, agyFileFingerprint(path));
+                      fingerprints.set(`${path}-wal`, agyFileFingerprint(`${path}-wal`));
+                    };
+                    for (const item of agyScan.notices) {
+                      holderPids.add(item.holder.pid);
+                      watchDb(join(conversationsDir, `${item.waitingConversationId}.db`));
+                    }
+                    for (const id of agyScan.unknownConversationIds) watchDb(join(conversationsDir, `${id}.db`));
+                    if (agyScan.unknownConversationIds.length) {
+                      for (const path of resolveAgySummariesDbPaths(config.agy.summariesDbPath)) watchDb(path);
+                    }
+                  }
                   for (const unknownId of agyScan.unknownConversationIds) {
                     unknownRefIds.push(`cli_notice:agy:${unknownId}`);
                   }
@@ -398,7 +444,21 @@ export class UnifiedRuntime {
                   }
                 }
 
-                return unknownRefIds.length ? { notices, unknownRefIds } : notices;
+                const result = unknownRefIds.length ? { notices, unknownRefIds } : notices;
+                if (fingerprints) {
+                  cachedCliNotices = {
+                    expiresAt: Date.now() + cliNoticeTtlMs,
+                    result,
+                    isStillValid: () => {
+                      for (const pid of holderPids) if (!isPidAlive(pid)) return false;
+                      for (const [path, fingerprint] of fingerprints) {
+                        if (agyFileFingerprint(path) !== fingerprint) return false;
+                      }
+                      return true;
+                    },
+                  };
+                }
+                return result;
               },
               resolveTopicLink: async (sessionId, hubDest) => {
                 if (this._taskChannel && this.port.topicLinkForTask) {
@@ -716,15 +776,42 @@ export class UnifiedRuntime {
     void task.finally(() => this.hubTasks.delete(task));
   }
 
+  compactEventHistory(now = Date.now()): void {
+    if (this.lastCompactionAt !== undefined && now - this.lastCompactionAt < 5 * 60_000) return;
+    if (!this.legacyEventKeysSlimmed) this.legacyEventKeysSlimmed = this.store.slimLegacyEventKeys(5000) < 5000;
+    const minimum = this.channel.minBoundEventCursorBySession();
+    for (const [id, sequence] of this.taskChannel?.minBoundEventCursorBySession() ?? []) {
+      minimum.set(id, Math.min(minimum.get(id) ?? sequence, sequence));
+    }
+    for (const { sessionId } of this.store.listSessions()) {
+      const sequence = this.store.eventWatermark(sessionId);
+      const floor = this.store.eventFloor(sessionId);
+      const retentionFloor = Math.max(0, sequence - 20);
+      const targetFloor = Math.min(minimum.get(sessionId) ?? retentionFloor, retentionFloor);
+      if (targetFloor > floor && sequence - floor >= 50) {
+        this.store.compactEvents(sessionId, encodeCursor(sessionId, targetFloor));
+      }
+    }
+    this.lastCompactionAt = now;
+  }
+
   syncUnknownDeliveryAlerts(): void {
     if (!this._watchHub || this.closing || this.closed) return;
     const deliveries = this.channel.pendingDeliveries().length;
     const inbox = this.channel.unknownInbox().length;
     const prev = this.lastUnknownDeliverySnapshot;
-    if (deliveries !== prev.deliveries || inbox !== prev.inbox) {
-      const nextSnapshot = { deliveries, inbox };
-      this.lastUnknownDeliverySnapshot = nextSnapshot;
-      if (deliveries > 0 || inbox > 0) {
+    const hasUnknown = deliveries > 0 || inbox > 0;
+    const now = Date.now();
+    const debounceMs = this.config.intervalMs >= 1000 ? 15_000 : 0;
+    if (hasUnknown === (prev.deliveries > 0 || prev.inbox > 0)) {
+      this.unknownDeliveryChangeSince = undefined;
+    } else {
+      this.unknownDeliveryChangeSince ??= now;
+    }
+    if (this.unknownDeliveryChangeSince !== undefined && now - this.unknownDeliveryChangeSince >= debounceMs) {
+      this.unknownDeliveryChangeSince = undefined;
+      this.lastUnknownDeliverySnapshot = { deliveries, inbox };
+      if (hasUnknown) {
         this.emitWatchEvent({
           source: 'watch',
           objectId: 'runtime:unknown-deliveries',
@@ -1162,6 +1249,15 @@ export class UnifiedRuntime {
 const canonicalPath=(path:string):string => { const p=resolve(path); return existsSync(p) ? realpathSync(p) : join(realpathSync(dirname(p)),basename(p)); };
 const inside=(child:string,root:string):boolean => {const rel=relative(root,child);return rel==='' || (!isAbsolute(rel) && rel!=='..' && !rel.startsWith(`..${sep}`));};
 
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 function canonicalDirectory(path: string | null): string | null {
   if (!path || !isAbsolute(path)) return null;
   try {
@@ -1289,7 +1385,6 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
   const autoTimeoutStreaks=new Map<string,number>();
   const refreshTimeoutStreaks=new Map<string,number>();
   const agyBrainDir = agyEnabled ? config.agy?.brainDir : undefined;
-  const agySummaryPaths = agyEnabled ? resolveAgySummariesDbPaths(config.agy?.summariesDbPath) : [];
   const lastTranscriptStat = new Map<string, string>();
   const scannedAssistantMessages = new Map<string, number>();
   const agyTranscriptSignature = (nativeSessionId: string): string | null => {
@@ -1297,14 +1392,9 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
     const logsDir = join(agyBrainDir, nativeSessionId, '.system_generated', 'logs');
     let compact = '';
     let full = '';
-    let summaries = '';
-    try { const st = statSync(join(logsDir, 'transcript.jsonl')); compact = `${st.mtimeMs}:${st.size}`; } catch {}
-    try { const st = statSync(join(logsDir, 'transcript_full.jsonl')); full = `${st.mtimeMs}:${st.size}`; } catch {}
-    for (const p of agySummaryPaths) {
-      try { const st = statSync(p); summaries += `${st.mtimeMs}:${st.size};`; } catch {}
-      try { const st = statSync(`${p}-wal`); summaries += `${st.mtimeMs}:${st.size};`; } catch {}
-    }
-    return compact || full || summaries ? `${compact}|${full}|${summaries}` : null;
+    try { const st = statSync(join(logsDir, 'transcript.jsonl')); compact = `${st.dev}:${st.ino}:${st.mtimeMs}:${st.size}`; } catch {}
+    try { const st = statSync(join(logsDir, 'transcript_full.jsonl')); full = `${st.dev}:${st.ino}:${st.mtimeMs}:${st.size}`; } catch {}
+    return `${compact}|${full}`;
   };
   let fastAgyTimer: ReturnType<typeof setInterval> | undefined;
   let fastRefreshing = false;

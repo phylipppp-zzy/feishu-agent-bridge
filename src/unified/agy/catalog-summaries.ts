@@ -1,4 +1,4 @@
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -319,10 +319,32 @@ const SUMMARY_SELECT_SQL = `SELECT
 FROM conversation_summaries`;
 
 export interface AgySummaryHierarchy {
-  byId: Map<string, AgyConversationSummaryRow>;
+  byId: ReadonlyMap<string, AgyConversationSummaryRow>;
   isTopLevelRow: (row: AgyConversationSummaryRow) => boolean;
   resolveTopAncestor: (startRow: AgyConversationSummaryRow) => string | null;
+  activeDescendantsByRoot: ReadonlyMap<string, readonly AgyConversationSummaryRow[]>;
   partialFailure: boolean;
+}
+
+const SUMMARY_CACHE_TTL_MS = 1500;
+const SUMMARY_CACHE_MAX_ENTRIES = 16;
+const summaryHierarchyCache = new Map<string, {
+  fingerprint: string;
+  loadedAt: number;
+  hierarchy: AgySummaryHierarchy;
+}>();
+
+function statFingerprint(stat: Stats): string {
+  return `${stat.dev}:${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+}
+
+export function agyFileFingerprint(path: string): string | null {
+  try {
+    return statFingerprint(lstatSync(path));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'missing' : null;
+  }
 }
 
 /**
@@ -425,24 +447,21 @@ export function isAncestorChainAuthorizedForProject(
   return true;
 }
 
-/**
- * Safely read the trailing `maxBytes` of a conversation's `transcript.jsonl`
- * enforcing authorized brain roots, segment-by-segment non-symlink checks,
- * canonical root containment, and `O_NOFOLLOW`.
- */
-export function readSafeTranscriptTail(
+type TranscriptTailOptions = { brainDir?: string; brainDirs?: readonly string[]; appDataDir?: string };
+type TranscriptTailSource = { path: string; stat: Stats; fingerprint: string };
+
+/** Resolve candidate transcript paths without opening or reading any files. */
+export function* safeTranscriptTailSources(
   conversationId: string,
-  maxBytes: number,
-  options: { brainDir?: string; brainDirs?: readonly string[]; appDataDir?: string },
-): string | null {
+  options: TranscriptTailOptions,
+): Generator<TranscriptTailSource> {
   if (
     !conversationId ||
     conversationId === '.' ||
     conversationId === '..' ||
-    !CONVERSATION_ID_RE.test(conversationId) ||
-    maxBytes <= 0
+    !CONVERSATION_ID_RE.test(conversationId)
   ) {
-    return null;
+    return;
   }
   const dirs = resolveAuthorizedBrainDirs(options);
   for (const dir of dirs) {
@@ -453,7 +472,6 @@ export function readSafeTranscriptTail(
     } catch {
       continue;
     }
-    let fd: number | undefined;
     try {
       const sessionDir = join(canonicalBrainDir, conversationId);
       const sessionStat = lstatSync(sessionDir);
@@ -484,32 +502,54 @@ export function readSafeTranscriptTail(
       if (fileStat.isSymbolicLink() || !fileStat.isFile()) continue;
       const canonicalPath = realpathSync(transcriptPath);
       if (!isInside(canonicalPath, canonicalSessionDir)) continue;
-
-      fd = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const st = fstatSync(fd);
-      if (!st.isFile() || st.size === 0) return '';
-      const toRead = Math.min(st.size, maxBytes);
-      const offset = Math.max(0, st.size - toRead);
-      const buf = Buffer.allocUnsafe(toRead);
-      let bytesRead = 0;
-      while (bytesRead < toRead) {
-        const n = readSync(fd, buf, bytesRead, toRead - bytesRead, offset + bytesRead);
-        if (n <= 0) break;
-        bytesRead += n;
-      }
-      const text = buf.subarray(0, bytesRead).toString('utf8');
-      if (offset > 0) {
-        const firstNl = text.indexOf('\n');
-        return firstNl >= 0 ? text.slice(firstNl + 1) : '';
-      }
-      return text;
+      yield { path: canonicalPath, stat: fileStat, fingerprint: statFingerprint(fileStat) };
     } catch {
       continue;
-    } finally {
-      if (fd !== undefined) {
-        try { closeSync(fd); } catch {}
-      }
     }
+  }
+}
+
+/** Read a verified source, checking that the opened file still matches the resolved path. */
+export function readTranscriptTailSource(source: TranscriptTailSource, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(source.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.dev !== source.stat.dev || st.ino !== source.stat.ino) return null;
+    if (st.size === 0) return '';
+    const toRead = Math.min(st.size, maxBytes);
+    const offset = st.size - toRead;
+    const buf = Buffer.allocUnsafe(toRead);
+    let bytesRead = 0;
+    while (bytesRead < toRead) {
+      const n = readSync(fd, buf, bytesRead, toRead - bytesRead, offset + bytesRead);
+      if (n <= 0) break;
+      bytesRead += n;
+    }
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+    if (offset > 0) {
+      const firstNl = text.indexOf('\n');
+      return firstNl >= 0 ? text.slice(firstNl + 1) : '';
+    }
+    return text;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch {}
+    }
+  }
+}
+
+export function readSafeTranscriptTail(
+  conversationId: string,
+  maxBytes: number,
+  options: TranscriptTailOptions,
+): string | null {
+  if (maxBytes <= 0) return null;
+  for (const source of safeTranscriptTailSources(conversationId, options)) {
+    const text = readTranscriptTailSource(source, maxBytes);
+    if (text !== null) return text;
   }
   return null;
 }
@@ -547,6 +587,14 @@ export function readAgySummaryHierarchy(
   defaultPair?: AgySummariesDefaultPair,
 ): AgySummaryHierarchy {
   const dbPaths = resolveAgySummariesDbPaths(dbPath, defaultPair);
+  const cacheKey = JSON.stringify(dbPaths);
+  const fingerprints = dbPaths.flatMap(path => [agyFileFingerprint(path), agyFileFingerprint(`${path}-wal`)]);
+  const fingerprint = fingerprints.includes(null) ? null : JSON.stringify(fingerprints);
+  const cached = summaryHierarchyCache.get(cacheKey);
+  if (cached?.fingerprint === fingerprint) {
+    const age = Date.now() - cached.loadedAt;
+    if (age >= 0 && age < SUMMARY_CACHE_TTL_MS) return cached.hierarchy;
+  }
   const byId = new Map<string, AgyConversationSummaryRow>();
   let firstError: unknown = null;
   let loadedAny = false;
@@ -598,7 +646,27 @@ export function readAgySummaryHierarchy(
     return null;
   };
 
-  return { byId, isTopLevelRow, resolveTopAncestor, partialFailure: firstError !== null };
+  const activeDescendantsByRoot = new Map<string, AgyConversationSummaryRow[]>();
+  for (const row of byId.values()) {
+    if (isTopLevelRow(row) || isTruthyFlag(row.killed) ||
+        !(ACTIVE_CASCADE_STATUSES.has(row.status) || isTruthyFlag(row.not_fully_idle))) continue;
+    const rootId = resolveTopAncestor(row);
+    if (rootId === null) continue;
+    const rows = activeDescendantsByRoot.get(rootId);
+    if (rows) rows.push(row);
+    else activeDescendantsByRoot.set(rootId, [row]);
+  }
+  const hierarchy: AgySummaryHierarchy = {
+    byId, isTopLevelRow, resolveTopAncestor, activeDescendantsByRoot, partialFailure: firstError !== null,
+  };
+  if (fingerprint !== null) {
+    summaryHierarchyCache.delete(cacheKey);
+    summaryHierarchyCache.set(cacheKey, { fingerprint, loadedAt: Date.now(), hierarchy });
+    if (summaryHierarchyCache.size > SUMMARY_CACHE_MAX_ENTRIES) {
+      summaryHierarchyCache.delete(summaryHierarchyCache.keys().next().value!);
+    }
+  }
+  return hierarchy;
 }
 
 export function readAgySummaries(
