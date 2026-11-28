@@ -84,7 +84,7 @@ test('syncTopicRootTitle updates root card on status transitions and honors cust
   assert.equal(patches[0]!.title, '🟢 初始标题');
 
   // Same state does not re-patch
-  await syncTopicRootTitle(db, port, 'topic:1', scope, base, c => c, async () => {});
+  await syncTopicRootTitle(db, port, 'topic:1', scope, { ...base, title: '同状态的上游标题' }, c => c, async () => {});
   assert.equal(patches.length, 1);
 
   // Transition to running patches root card color and dot

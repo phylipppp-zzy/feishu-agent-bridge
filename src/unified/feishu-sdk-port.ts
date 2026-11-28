@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { parseIncoming, parseCardAction } from '../feishu.js';
 import { parseFeishuAction, parseFeishuText } from './feishu-codec.js';
@@ -21,6 +22,16 @@ import { parseUsageRangeFromText } from './hubs/usage-hub.js';
 import type { Readable } from 'node:stream';
 
 const ROOTLESS_TASK_READ_COMMANDS = new Set(['/help', '/health', '/sessions', '/quota', '/agy', '/agy-status']);
+
+function isAlertDelivery(deliveryId: string): boolean {
+  return /^(?:watch[-:]|usage-auto[-:]|usage:auto:)/.test(deliveryId);
+}
+
+function alertDelay(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const delay = raw?.trim() ? Number(raw) : NaN;
+  return Number.isInteger(delay) && delay >= 0 && delay <= 2_147_483_647 ? delay : fallback;
+}
 
 class ResourceRejected extends Error {}
 class UnsupportedInboundFile extends ResourceRejected {
@@ -312,6 +323,13 @@ export class FeishuSdkPort implements FeishuPort {
   private migrationLocked=false;
   private started = false;
   private closing = false;
+  private readonly deliveryAbort = new AbortController();
+  private readonly alertInterval = alertDelay('FEISHU_ALERT_QUEUE_INTERVAL_MS', 400);
+  private readonly alertCooldown = alertDelay('FEISHU_ALERT_429_COOLDOWN_MS', 5000);
+  private alertQueue = Promise.resolve();
+  private nextAlertAt = 0;
+  private readonly perMessageUpdateLocks = new Map<string, Promise<void>>();
+  private readonly queuedAlertUpdates = new Map<string, { pending: Set<symbol>; tail?: Promise<void> }>();
   private routeGeneration=0;
   private readonly linkCache=new Map<string,{url:string;expires:number}>();
   private readonly linkFlights=new Map<string,Promise<string|null>>();
@@ -397,7 +415,15 @@ export class FeishuSdkPort implements FeishuPort {
         this.remember(deliveryId,response.data.message_id,destination,schema,references);
         return response.data.message_id;
       },
-      update:async(destination,messageId,card,deliveryId,guard)=>{await guard?.();validate(destination);const row=this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined;if(row?.destination!==destination)throw new Error('test message mismatch');const schema=await this.patchCard(messageId,card);this.remember(deliveryId,messageId,destination,schema);},
+      update: (destination, messageId, card, deliveryId, guard) => this.serializeMessageUpdate(messageId, async () => {
+        this.assertOpen();
+        await guard?.();
+        validate(destination);
+        const row = this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId);
+        if (row?.destination !== destination) throw new Error('test message mismatch');
+        const schema = await this.patchCard(messageId, card);
+        this.remember(deliveryId, messageId, destination, schema);
+      }),
       sendFile:async(destination,name,content,deliveryId,guard)=>{if(content.length>1024*1024 || !/^[^/\\\x00-\x1f]{1,80}$/.test(name))throw new Error('test fixture rejected');await guard?.();validate(destination);const uploaded=await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});if(!uploaded?.file_key)throw new Error('test upload outcome unknown');await guard?.();validate(destination);const response=await this.client.im.message.reply({path:{message_id:token.rootId},data:{msg_type:'file',content:JSON.stringify({file_key:uploaded.file_key}),reply_in_thread:true}});rejectCode(response.code);if(!response.data?.message_id)throw new Error('test delivery outcome unknown');this.remember(deliveryId,response.data.message_id,destination);},
       lookupDelivery:async(deliveryId)=>{validate(token.destination);const row=this.db.prepare('SELECT m.destination FROM sdk_deliveries d JOIN sdk_message_routes m ON m.message_id=d.message_id WHERE d.id=?').get(deliveryId) as {destination:string}|undefined;return row?.destination===token.destination?'sent':'unknown';}
     };
@@ -496,7 +522,53 @@ export class FeishuSdkPort implements FeishuPort {
   private recordCardSchema(messageId: string, schema: CardSchema): void {
     this.db.prepare('INSERT INTO sdk_card_schemas(message_id,schema_version) VALUES (?,?) ON CONFLICT(message_id) DO NOTHING').run(messageId,schema);
   }
+  private assertOpen(): void {
+    if (this.closing) throw new Error('SDK port closing');
+  }
+
+  private async queueDelivery<T>(deliveryId: string, write: () => Promise<T>): Promise<T> {
+    this.assertOpen();
+    if (!isAlertDelivery(deliveryId)) return write();
+    const run = this.alertQueue.then(async () => {
+      this.assertOpen();
+      const wait = this.nextAlertAt - Date.now();
+      if (wait > 0) {
+        try {
+          await sleep(wait, undefined, { signal: this.deliveryAbort.signal });
+        } catch (error) {
+          this.assertOpen();
+          throw error;
+        }
+      }
+      this.assertOpen();
+      try {
+        return await write();
+      } catch (error) {
+        if (extractFeishuErrorCode(error) === 230429) {
+          this.nextAlertAt = Math.max(this.nextAlertAt, Date.now() + this.alertCooldown);
+        }
+        throw error;
+      } finally {
+        this.nextAlertAt = Math.max(this.nextAlertAt, Date.now() + this.alertInterval);
+      }
+    });
+    this.alertQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async serializeMessageUpdate(messageId: string, write: () => Promise<void>): Promise<void> {
+    const run = (this.perMessageUpdateLocks.get(messageId) ?? Promise.resolve()).then(write);
+    const lock = run.then(() => undefined, () => undefined);
+    this.perMessageUpdateLocks.set(messageId, lock);
+    try {
+      await run;
+    } finally {
+      if (this.perMessageUpdateLocks.get(messageId) === lock) this.perMessageUpdateLocks.delete(messageId);
+    }
+  }
+
   private remember(id:string, messageId:string|null,destination:string,schema?:CardSchema,references?:CallbackReferences):void {
+    this.assertOpen();
     const prior=messageId ? this.db.prepare('SELECT destination FROM sdk_message_routes WHERE message_id=?').get(messageId) as {destination:string}|undefined : undefined;
     if(prior && prior.destination!==destination) this.routeGeneration++;
     this.db.exec('BEGIN IMMEDIATE');
@@ -514,6 +586,9 @@ export class FeishuSdkPort implements FeishuPort {
     }
   }
   async createTopic(destination:string,sessionId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<string> {
+    return this.queueDelivery(deliveryId, () => this.createTopicNow(destination, sessionId, card, deliveryId, guard));
+  }
+  private async createTopicNow(destination:string,sessionId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<string> {
     this.allowed(destination); const chat=this.route(destination)?.chat_id ?? destination;
     if (!this.destinations.has(chat)) throw new Error('destination unauthorized');
     const existing=this.db.prepare('SELECT destination FROM sdk_topic_routes WHERE chat_id=? AND session_id=?').get(chat,sessionId) as {destination:string}|undefined;
@@ -521,11 +596,13 @@ export class FeishuSdkPort implements FeishuPort {
     // An uncertain root creation must never be replayed automatically.
     if (!this.db.prepare('INSERT OR IGNORE INTO sdk_deliveries VALUES (?,NULL)').run(deliveryId).changes) throw new Error('topic creation outcome unknown');
     await guard?.(); this.allowed(destination);
+    this.allowedTaskOrProduction(destination, deliveryId);
     if (!this.destinations.has(chat)) throw new Error('destination unauthorized');
     const schema = cardSchema(card);
     const {content,references} = packCardCallbacks(encodeCard(card,schema));
     const response=await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:chat,msg_type:'interactive',content}});
     rejectCode(response.code); if(!response.data?.message_id) throw new Error('Feishu topic creation failed or outcome unknown');
+    this.assertOpen();
     const root=response.data.message_id; const key=`topic:${randomUUID()}`;
     this.routeGeneration++;
     this.db.exec('BEGIN IMMEDIATE');
@@ -543,14 +620,24 @@ export class FeishuSdkPort implements FeishuPort {
     return key;
   }
   async send(destination:string, card:ChannelCard, deliveryId:string, guard?:()=>Promise<void>):Promise<string> {
-    await guard?.(); this.allowedTaskOrProduction(destination, deliveryId); const route=this.route(destination); const schema=cardSchema(card); const {content,references}=packCardCallbacks(encodeCard(card,schema));
-    const response = await feishuMessageWrite(() => route
-      ? this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}})
-      : this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}}));
-    if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
-    this.remember(deliveryId,response.data.message_id,destination,schema,references); return response.data.message_id;
+    return this.queueDelivery(deliveryId, async () => {
+      await guard?.();
+      this.allowedTaskOrProduction(destination, deliveryId);
+      const route = this.route(destination);
+      const schema = cardSchema(card);
+      const {content, references} = packCardCallbacks(encodeCard(card, schema));
+      const response = await feishuMessageWrite(() => route
+        ? this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'interactive',content,reply_in_thread:true}})
+        : this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'interactive',content}}));
+      if (!response.data?.message_id) throw new Error('Feishu message send failed or outcome unknown');
+      this.remember(deliveryId,response.data.message_id,destination,schema,references);
+      return response.data.message_id;
+    });
   }
   async sendText(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string> {
+    return this.queueDelivery(deliveryId, () => this.sendTextNow(destination, text, deliveryId, guard));
+  }
+  private async sendTextNow(destination: string, text: string, deliveryId: string, guard?: () => Promise<void>): Promise<string> {
     await guard?.();
     this.allowedTaskOrProduction(destination);
     const route = this.route(destination);
@@ -570,23 +657,72 @@ export class FeishuSdkPort implements FeishuPort {
     return response.data.message_id;
   }
   async update(destination:string,messageId:string,card:ChannelCard,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
-    await guard?.(); this.allowedTaskOrProduction(destination, deliveryId); if(this.callbackDestination(this.route(destination)?.chat_id ?? destination,messageId)!==destination) throw new Error('message route mismatch');
+    this.assertOpen();
+    let queued = this.queuedAlertUpdates.get(messageId);
+    if (!isAlertDelivery(deliveryId)) {
+      const olderAlerts = queued && [...queued.pending];
+      return this.serializeMessageUpdate(messageId, () => this.updateNow(destination, messageId, card, deliveryId, guard, () => {
+        // An authorized user PATCH takes precedence over older alerts that have not started.
+        for (const token of olderAlerts ?? []) queued?.pending.delete(token);
+      }));
+    }
+    if (!queued) this.queuedAlertUpdates.set(messageId, queued = { pending: new Set() });
+    const token = Symbol();
+    queued.pending.add(token);
+    const run = this.queueAlertUpdate(messageId, deliveryId, queued.pending, token, queued.tail,
+      () => this.updateNow(destination, messageId, card, deliveryId, guard));
+    queued.tail = run.then(() => undefined, () => undefined);
+    try {
+      await run;
+    } finally {
+      queued.pending.delete(token);
+      if (!queued.pending.size && this.queuedAlertUpdates.get(messageId) === queued) this.queuedAlertUpdates.delete(messageId);
+    }
+  }
+
+  private async queueAlertUpdate(messageId: string, deliveryId: string, pending: Set<symbol>, token: symbol,
+    priorAlert: Promise<void> | undefined, write: () => Promise<void>): Promise<void> {
+    if (priorAlert) await priorAlert;
+    for (;;) {
+      // Wait for a same-message write outside the alert lane. If a user
+      // update gets the lock during pacing, release the lane before waiting.
+      const lock = this.perMessageUpdateLocks.get(messageId);
+      if (lock) await lock;
+      const written = await this.queueDelivery(deliveryId, async () => {
+        if (!pending.has(token)) throw new Error('alert update superseded by user update');
+        if (this.perMessageUpdateLocks.has(messageId)) return false;
+        await this.serializeMessageUpdate(messageId, write);
+        return true;
+      });
+      if (written) return;
+    }
+  }
+
+  private async updateNow(destination: string, messageId: string, card: ChannelCard, deliveryId: string,
+    guard?: () => Promise<void>, onAuthorized?: () => void): Promise<void> {
+    this.assertOpen();
+    await guard?.();
+    this.allowedTaskOrProduction(destination, deliveryId);
+    if (this.callbackDestination(this.route(destination)?.chat_id ?? destination, messageId) !== destination) throw new Error('message route mismatch');
+    onAuthorized?.();
     const isTitlePatch = deliveryId.startsWith('topic-title:') && this.route(destination)?.root_id === messageId &&
       !card.form && !card.table && card.actions.length === 0;
     const schema = await this.patchCard(messageId,card,isTitlePatch ? async () => {
       await guard?.();
-      this.allowedTaskOrProduction(destination);
+      this.allowedTaskOrProduction(destination, deliveryId);
       const route = this.route(destination);
       if (route?.root_id !== messageId || this.callbackDestination(route.chat_id,messageId) !== destination) throw new Error('message route mismatch');
     } : undefined);
     this.remember(deliveryId,messageId,destination,schema);
   }
   private async patchCard(messageId: string, card: ChannelCard, legacyRootGuard?: () => Promise<void>): Promise<CardSchema> {
+    this.assertOpen();
     const row = this.db.prepare('SELECT schema_version FROM sdk_card_schemas WHERE message_id=?').get(messageId) as {schema_version:string}|undefined;
     const recorded = row?.schema_version;
     if (recorded !== undefined && recorded !== '1.0' && recorded !== '2.0') throw new Error('invalid stored card schema');
     const schema = recorded ?? cardSchema(card);
     const patch = (version: CardSchema) => {
+      this.assertOpen();
       const {content,references}=packCardCallbacks(encodeCard(card,version));
       this.callbackValues.store(messageId,references);
       return this.client.im.message.patch({path:{message_id:messageId},data:{content}});
@@ -606,7 +742,10 @@ export class FeishuSdkPort implements FeishuPort {
     return '2.0';
   }
   async sendFile(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
-    this.allowedTaskOrProduction(destination); await guard?.(); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
+    return this.queueDelivery(deliveryId, () => this.sendFileNow(destination, name, content, deliveryId, guard));
+  }
+  private async sendFileNow(destination:string,name:string,content:Uint8Array,deliveryId:string,guard?:()=>Promise<void>):Promise<void> {
+    await guard?.(); this.allowedTaskOrProduction(destination); const uploaded = await this.client.im.file.create({data:{file_type:'stream',file_name:name,file:Buffer.from(content)}});
     if (!uploaded?.file_key) throw new Error('Feishu upload failed or outcome unknown');
     await guard?.(); this.allowedTaskOrProduction(destination); const route=this.route(destination); const body=JSON.stringify({file_key:uploaded.file_key});
     const sent=route ? await this.client.im.message.reply({path:{message_id:route.root_id},data:{msg_type:'file',content:body,reply_in_thread:true}}) : await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:destination,msg_type:'file',content:body}});
@@ -767,6 +906,6 @@ export class FeishuSdkPort implements FeishuPort {
     if (this.closing) {this.ws.close();throw new Error('SDK port closing');}
     } catch(error) { this.stopReceiving(); throw error; }
   }
-  stopReceiving():void { if(this.closing)return;this.closing=true; this.linkCache.clear(); this.ws.close(); }
+  stopReceiving():void { if(this.closing)return;this.closing=true; this.deliveryAbort.abort(); this.linkCache.clear(); this.ws.close(); }
   close():void { this.stopReceiving();this.closeRequested=true;if (!this.dbClosed && !this.testCreates.size) {this.dbClosed=true; this.db.close();} }
 }

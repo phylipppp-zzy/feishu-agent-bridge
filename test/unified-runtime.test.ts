@@ -456,35 +456,38 @@ for (const provider of ['claude', 'codex', 'agy'] as const) {
       await runtime.core.observe(tool('1', 'succeeded'));
       await runtime.flushInteractive();
       assert.equal(patches.length, 0);
-      t.mock.timers.tick(1499);
+      t.mock.timers.tick(2499);
       await runtime.flushInteractive();
       assert.equal(patches.length, 0);
       t.mock.timers.tick(1);
       await runtime.flushInteractive();
       assert.equal(patches.length, 1);
       assert.deepEqual(patches[0]!.card.executionLog!.lines, ['✓ Bash · pytest', '⏳ Bash · pytest']);
-      t.mock.timers.tick(13_500);
+      const beforeHeartbeat = subscriptions.length;
+      t.mock.timers.tick(57_500);
       await runtime.flushInteractive();
-      assert.match(patches.at(-1)!.card.title, /用时 15秒/);
+      assert.equal(subscriptions.length, beforeHeartbeat + 1, 'heartbeat still refreshes the snapshot');
+      assert.equal(patches.length, 1, 'elapsed time alone does not PATCH the card');
       await runtime.core.observe(tool('2', 'failed'));
       await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1,
         turn: { ...turns, status: 'completed', startedAt: null, endedAt: new Date().toISOString() } });
       await runtime.flushInteractive();
-      t.mock.timers.tick(1500);
+      t.mock.timers.tick(2500);
       await runtime.flushInteractive();
       assert.equal(patches.at(-1)!.card.template, 'green');
+      assert.match(patches.at(-1)!.card.title, /用时 1分00秒/);
       assert.equal(patches.at(-1)!.card.executionLog!.failedCount, 1);
       assert.ok(patches.every(patch => patch.destination === 'chat' && patch.id === first.id && patch.card.schema === '2.0'));
       assert.equal(sent.length, 1);
       assert.equal(dispatches + uploads + pushed.length, 0);
       const after = patches.length;
       const reads = subscriptions.length;
-      t.mock.timers.tick(30_000);
+      t.mock.timers.tick(60_000);
       await runtime.flushInteractive();
       assert.equal(patches.length, after);
       assert.equal(subscriptions.length, reads, 'completion removes the heartbeat');
       await runtime.close();
-      t.mock.timers.tick(30_000);
+      t.mock.timers.tick(60_000);
       assert.equal(subscriptions.length, reads);
     } finally {
       await runtime.close();
@@ -538,7 +541,7 @@ test('runtime coalesces assistant deltas per session and drains the tail without
     await message(1, false, 'other-reply', otherRef);
     await nextImmediate();
     assert.deepEqual(otherUpdates, ['1']);
-    t.mock.timers.tick(349);
+    t.mock.timers.tick(499);
     await nextImmediate();
     assert.deepEqual(updates, ['1']);
     t.mock.timers.tick(1);
@@ -556,7 +559,7 @@ test('runtime coalesces assistant deltas per session and drains the tail without
     await message(14, true);
     await nextImmediate();
     assert.deepEqual(updates, ['1', '10', '11 completed', '12 completed', '14 final completed']);
-    t.mock.timers.tick(350);
+    t.mock.timers.tick(500);
     await nextImmediate();
     assert.equal(updates.length, 5, 'urgent wakes consume queued deltas');
 
@@ -569,7 +572,7 @@ test('runtime coalesces assistant deltas per session and drains the tail without
     await runtime.close();
     assert.equal(updates.at(-1), '17 completed');
     const afterClose = updates.length;
-    t.mock.timers.tick(350);
+    t.mock.timers.tick(500);
     await nextImmediate();
     assert.equal(updates.length, afterClose);
   } finally {

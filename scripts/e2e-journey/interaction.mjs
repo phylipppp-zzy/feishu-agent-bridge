@@ -75,7 +75,7 @@ async function toolProgress(ctx) {
       tool('list', 'succeeded', 'git status');
       tool('lint', 'running', 'npm run lint');
       tool('compare', 'running', 'git diff');
-      const patchIntervalMs = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 1500;
+      const patchIntervalMs = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 2500;
       await ctx.tick();
       await delay(patchIntervalMs + 20);
       await ctx.tick();
@@ -126,7 +126,7 @@ async function toolProgress(ctx) {
       tool('compare', 'succeeded', 'git diff');
       ctx.emitText(topic, complete, { messageId, final: true });
       await ctx.finish(topic);
-      const patchIntervalMs = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 1500;
+      const patchIntervalMs = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 2500;
       await delay(patchIntervalMs + 20);
       await ctx.tick();
       const card = ctx.wire.messages.get(cardId).card;

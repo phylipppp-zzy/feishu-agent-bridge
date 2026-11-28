@@ -181,7 +181,7 @@ test('asynchronous artifact registration patches the completed reply in place wi
       blocks: [{ type: 'text', text: '[报告](report.md)' }] } });
     await runtime.core.observe({ type: 'turn', ref, connectionGeneration: 1, turn: { ...turn, status: 'completed' } });
     await runtime.flushInteractive();
-    t.mock.timers.tick(1500);
+    t.mock.timers.tick(2500);
     await runtime.flushInteractive();
     assert.equal(pushes.length, 1);
     assert.equal(updates.at(-1)?.card.template, 'green');
@@ -195,7 +195,7 @@ test('asynchronous artifact registration patches the completed reply in place wi
     releaseRead();
     await port.drain();
     await runtime.flushInteractive();
-    t.mock.timers.tick(1500);
+    t.mock.timers.tick(2500);
     await runtime.flushInteractive();
     const last = updates.at(-1)!;
     assert.equal(last.id, sends[0]!.id);

@@ -17,7 +17,7 @@ function visibleWrites(ctx, topic, type) {
     (!type || message.type === type)).map(({ message }) => message);
 }
 
-const PATCH_INTERVAL_MS = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 1500;
+const PATCH_INTERVAL_MS = Number(process.env.FEISHU_PATCH_INTERVAL_MS) > 0 ? Number(process.env.FEISHU_PATCH_INTERVAL_MS) : 2500;
 const REJECTION_RETRY_MS = Number(process.env.FEISHU_REJECTION_RETRY_MS) > 0 ? Number(process.env.FEISHU_REJECTION_RETRY_MS) : 3000;
 
 async function waitForPatchWindow(ctx, topic) {
