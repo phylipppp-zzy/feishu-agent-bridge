@@ -393,18 +393,24 @@ export class ClaudeAdapter implements PlatformPort {
       if (providerEvent && !this.closed && this.lives.get(live.id)===live) { const now = new Date().toISOString(), sequence = ++this.sequence; this.emit({ type: 'event', ref, connectionGeneration:live.generation, event: { schemaVersion: 1, eventId: randomUUID(), sessionId: live.id, objectId: live.turn ?? live.id, objectRevision: 0, sequence, type: providerEvent.type, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence), data: providerEvent.data } }); }
       const recordClaudeUsage = (usage: any, modelHint?: unknown, maxHint?: unknown) => {
         if (!usage || typeof usage !== 'object') return;
-        const input = safeNumber(usage.input_tokens) ?? 0;
-        const cacheRead = safeNumber(usage.cache_read_input_tokens) ?? 0;
-        const cacheCreate = safeNumber(usage.cache_creation_input_tokens) ?? 0;
+        const input = safeNumber(usage.input_tokens);
+        const cacheRead = safeNumber(usage.cache_read_input_tokens);
+        const cacheCreate = safeNumber(usage.cache_creation_input_tokens);
         const output = safeNumber(usage.output_tokens) ?? 0;
-        const usedTokens = input + cacheRead + cacheCreate + output;
+        const totalInputTokens = (input ?? 0) + (cacheRead ?? 0) + (cacheCreate ?? 0);
+        const usedTokens = totalInputTokens + output;
         if (usedTokens <= 0) return;
         const model = typeof modelHint === 'string' && modelHint.trim() ? modelHint.trim() : (live.turnModel ?? live.model);
         const maxTokens = typeof maxHint === 'number' && Number.isFinite(maxHint) && maxHint > 0
           ? Math.round(maxHint)
           : resolveModelMaxContextTokens(model, 'claude');
         if (this.contextUsage.size >= 512) this.contextUsage.delete(this.contextUsage.keys().next().value!);
-        this.contextUsage.set(live.id, { usedTokens, maxTokens, ...(model ? { model } : {}) });
+        this.contextUsage.set(live.id, {
+          usedTokens, maxTokens, ...(model ? { model } : {}),
+          ...(totalInputTokens > 0 && input !== null && cacheRead !== null &&
+              (cacheCreate !== null || usage.cache_creation_input_tokens == null)
+            ? { totalInputTokens, cacheReadTokens: cacheRead } : {}),
+        });
       };
       if (!m.parent_tool_use_id && !m.parent_agent_id) {
         if (m.type === 'stream_event' && m.event?.type === 'message_start' && m.event.message?.usage) {

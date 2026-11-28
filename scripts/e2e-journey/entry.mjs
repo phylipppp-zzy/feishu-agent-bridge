@@ -148,9 +148,8 @@ async function blankSession(ctx) {
       });
       const streamed = ctx.emitText(topics.codex, '入口在 `src/index.ts`。');
       await ctx.tick();
-      trace.check('先收到运行中的蓝色卡片', () => {
-        assert.ok(ctx.writes(topics.codex).some(message => message.card.template === 'blue'
-          && message.card.bodyText.includes('src/index.ts')));
+      trace.check('短问答流式文本暂缓创建过程卡', () => {
+        assert.ok(!ctx.writes(topics.codex).some(message => /进行中/.test(message.card.title)));
       });
       ctx.emitText(topics.codex, '入口在 `src/index.ts`。输出在 `outputs/`。', {
         messageId: streamed.messageId, final: true,
@@ -163,7 +162,7 @@ async function blankSession(ctx) {
       }
       trace.check('完成卡为绿色，话题标题同步，短轮次没有额外文本推送', () => {
         assert.ok(ctx.writes(topics.codex).some(message => message.card.template === 'green'
-          && /^Codex · 已完成 · 用时 /.test(message.card.title)));
+          && message.card.title === 'Codex · 回复' && /⏱/.test(message.card.bodyText)));
         assert.equal(wire.messages.get(topics.codex.rootId).card.title, `🟢 ${prompt}`);
         assert.ok(![...wire.messages.values()].some(message => message.type === 'text' && message.rootId === topics.codex.rootId));
       });

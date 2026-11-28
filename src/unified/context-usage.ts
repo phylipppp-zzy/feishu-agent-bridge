@@ -7,6 +7,8 @@ export interface ContextUsageInfo {
   usedTokens: number;
   maxTokens: number;
   model?: string | null;
+  cacheReadTokens?: number | null;
+  totalInputTokens?: number | null;
 }
 
 export interface CompactTurnInfo {
@@ -80,6 +82,14 @@ export function formatContextUsageBadge(
   };
 }
 
+export function formatCacheHitRate(usage?: ContextUsageInfo | null): number | null {
+  const total = usage?.totalInputTokens;
+  const read = usage?.cacheReadTokens;
+  if (typeof total !== 'number' || !Number.isFinite(total) || total <= 0 ||
+      typeof read !== 'number' || !Number.isFinite(read) || read < 0) return null;
+  return Math.round(100 * Math.min(1, read / total));
+}
+
 /**
  * Format a compact, always-visible status banner line for turn cards so users
  * can monitor live context growth during running turns and decide when to /compact.
@@ -101,11 +111,17 @@ export function formatContextStatusLine(
       : '';
   const model = options?.modelBadge?.trim();
   const modelSuffix = model ? ` · 模型 \`${model}\`` : '';
-  return `${icon} 上下文：\`${badge.text}\` \`${bar}\`${hint}${modelSuffix}`;
+  const hitRate = formatCacheHitRate(usage);
+  const cacheSuffix = hitRate === null ? '' : ` · 缓存命中 ${hitRate}%`;
+  return `${icon} 上下文：\`${badge.text}\` \`${bar}\`${cacheSuffix}${hint}${modelSuffix}`;
 }
 
-function safePositiveInt(value: unknown): number {
+export function safePositiveInt(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+export function isTokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 /**
@@ -121,13 +137,16 @@ export function extractAgyContextUsageFromRows(
     const input = safePositiveInt(row.input_tokens);
     const cacheRead = safePositiveInt(row.cache_read_tokens);
     const output = safePositiveInt(row.output_tokens);
-    const usedTokens = input + cacheRead + output;
+    const totalInputTokens = input + cacheRead;
+    const usedTokens = totalInputTokens + output;
     if (usedTokens <= 0) continue;
     const model = typeof row.model === 'string' && row.model.trim() ? row.model.trim() : null;
     return {
       usedTokens,
       maxTokens: resolveModelMaxContextTokens(model, 'agy'),
       ...(model ? { model } : {}),
+      ...(totalInputTokens > 0 && isTokenCount(row.input_tokens) && isTokenCount(row.cache_read_tokens)
+        ? { totalInputTokens, cacheReadTokens: cacheRead } : {}),
     };
   }
   return null;

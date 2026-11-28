@@ -50,11 +50,14 @@ test('running card heartbeats skip elapsed-only writes and preserve the exact fi
     key: ['chat', 's', 'scope', 't'], turn, message, tools: [], provider: 'codex', sessionConnected: true,
   };
   await delivery.renderStreamMessage(input);
+  t.mock.timers.tick(5000);
+  await delivery.renderStreamMessage(input);
+  assert.equal(wakes, 1);
   assert.match(sends[0]!.title, /进行中/);
   assert.doesNotMatch(sends[0]!.title, /用时/);
   for (let i = 1; i <= 3; i++) {
     t.mock.timers.tick(60_000);
-    assert.equal(wakes, i);
+    assert.equal(wakes, i + 1);
     await delivery.renderStreamMessage(input);
   }
   assert.equal(patches.length, 0);
@@ -76,7 +79,11 @@ test('running card heartbeats skip elapsed-only writes and preserve the exact fi
     ...input, turn: { ...turn, status: 'completed', endedAt: new Date(start + 183_000).toISOString() },
   });
   assert.equal(patches.length, 3);
-  assert.match(patches[2]!.title, /已完成 · 用时 3分03秒/);
+  assert.match(patches[2]!.title, /执行过程已完成 · 1 步 · 用时 3分03秒/);
+  assert.equal(patches[2]!.executionLog?.expanded, false);
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1]!.text, 'updated');
+  assert.match(sends[1]!.footer!, /⏱ 3分03秒/);
   const priorWakes = wakes;
   t.mock.timers.tick(60_000);
   assert.equal(wakes, priorWakes);

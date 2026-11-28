@@ -51,7 +51,7 @@ function prepareWorkspace(dir) {
     ownerOpenId: OWNER_OPEN_ID, allowedDestinations: [...destinations], hostId: 'journey-host',
     claudeServiceId: providers.claude.serviceId, codexServiceId: providers.codex.serviceId,
     claudeStateDir: catalogSources[0].directory, codexEndpoint: 'codex-proxy://default', intervalMs: 100,
-    agy: { serviceId: providers.agy.serviceId }, catalogSources, allowedProjectRoots,
+    agy: { serviceId: providers.agy.serviceId }, approvalPolicy: { enabled: false }, catalogSources, allowedProjectRoots,
     outputRoots: [join(projects.bridge, 'outputs')],
     taskTopic: { enabled: true },
     pendingHub: { enabled: true, destination: MAIN_CHAT_ID },

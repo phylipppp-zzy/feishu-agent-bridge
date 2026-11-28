@@ -1,9 +1,9 @@
-import { eventSequence, TurnCardDelivery } from './turn-card-delivery.js';
+import { eventSequence, PROCESS_CARD_TEXT_DELAY_MS, TurnCardDelivery } from './turn-card-delivery.js';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { relative, isAbsolute, sep } from 'node:path';
 import type { UnifiedService } from './adapter.js';
-import type { Answer, Identity, Operation, Provider, WriteContext, Session, SessionSnapshot, Message } from './contracts.js';
+import type { Answer, Identity, Operation, Provider, WriteContext, Session, SessionSnapshot, Message, Turn, Event } from './contracts.js';
 import { payloadDigest, shouldAutoQueueInput } from './contracts.js';
 import { contractError } from './errors.js';
 import { decodeQuestionForm } from './feishu-question-forms.js';
@@ -13,7 +13,7 @@ import { buildSessionPanel, noticePanel } from './feishu-session-panel.js';
 import { NewSessionDrafts } from './new-session-drafts.js';
 import { NewSessionFlow, type NewSessionAction } from './new-session-flow.js';
 import { operationCard, providerDisplayLabel, type ChannelCard } from './feishu-cards.js';
-import { readTurnReply } from './turn-reply.js';
+import { aggregateTurnAssistantMessage, readTurnReply } from './turn-reply.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
 import { FeishuInteractionCards, isResolvedApproval } from './feishu-interaction-cards.js';
 import { FeishuInbox } from './feishu-inbox.js';
@@ -23,8 +23,9 @@ import { buildHealthCard, buildQuotaCard } from './health-card.js';
 import { queryAgyQuota, type AgyQuotaSnapshot } from './agy-quota.js';
 import { buildAgyStatusCard } from './agy-status-card.js';
 import { collectAgyStatusSnapshot, type AgyStatusSnapshot } from './agy/session-status.js';
+import { isTerminalTurn, readToolProgress } from './tool-progress.js';
 import type { ReadonlyLiveTurnView } from './agy/readonly-live-turn.js';
-import { formatCompactModelBadge, turnProgressCard } from './turn-progress-card.js';
+import { formatCompactModelBadge, turnProcessCard } from './turn-progress-card.js';
 import { buildArtifactTreeCard, buildProjectFilesCard } from './artifact-tree-card.js';
 import { inputConfirmationCard, needsOperationNotice, operationFromReceipt, patchOperationCard, pendingSessionAuthorization, publishOperationFeedback, suppressInputFailure, SUPPRESSED_COMPLETED_ACTIONS } from './feishu-operation-notices.js';
 import { BindingExpired, ReadAuthorizationRevoked, TOPIC_TITLE_SCHEMA, setCustomTopicTitle, syncTopicRootTitle } from './topic-title-sync.js';
@@ -85,7 +86,7 @@ export type ChannelAction = (
  | { action: 'input'; text: string; mode: 'new' | 'queue' | 'steer' }
  | { action: 'answer_form'; interactionId:string; revision:number; connectionGeneration:number; fields:Record<string,unknown>; decline?: boolean }
  | { action: 'answer'; interactionId: string; revision: number; connectionGeneration: number; answer: Answer; toolInputDigest: string | null }
- | { action: 'stop'; turnId: string; revision: number; controlGeneration: number; fallbackCurrent?: boolean }
+ | { action: 'stop'; turnId: string; revision: number; controlGeneration: number; fallbackCurrent?: boolean; lockTurn?: boolean }
  | { action: 'legacy_stop' }
  | { action: 'control'; owner: string; strategy: 'wait' | 'interrupt'; revision: number; controlGeneration: number; release?: boolean }
  | { action: 'artifacts'; sessionId?: string; cursor?: string }
@@ -164,7 +165,15 @@ export class FeishuChannel {
     if (!roColumns.some(c => c.name === 'patch_seq')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN patch_seq INTEGER NOT NULL DEFAULT 0');
     if (!roColumns.some(c => c.name === 'baseline_msg_seq')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN baseline_msg_seq INTEGER NOT NULL DEFAULT -1');
     if (!roColumns.some(c => c.name === 'idle_since')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN idle_since INTEGER');
-    if (!roColumns.some(c => c.name === 'final_reject_count')) this.db.exec('ALTER TABLE channel_readonly_live_cards ADD COLUMN final_reject_count INTEGER NOT NULL DEFAULT 0');
+    if (!roColumns.some(c => c.name === 'process_input')) this.db.exec("ALTER TABLE channel_readonly_live_cards ADD COLUMN process_input TEXT NOT NULL DEFAULT '{}'");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS channel_readonly_turn_routes (
+        destination TEXT NOT NULL, session_id TEXT NOT NULL, binding_scope TEXT NOT NULL,
+        anchor_id TEXT NOT NULL, baseline_msg_seq INTEGER NOT NULL, reply_turn_id TEXT NOT NULL,
+        terminal_input TEXT NOT NULL, source_turn_ids TEXT NOT NULL,
+        PRIMARY KEY(destination,session_id,binding_scope,anchor_id)
+      );
+    `);
     for(const table of ['channel_interaction_cards','channel_cursors']) {const fields=this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name:string}>;if(!fields.some(c=>c.name==='binding_scope')) this.db.exec(`ALTER TABLE ${table} ADD COLUMN binding_scope TEXT NOT NULL DEFAULT ''`);}
     this.db.exec('CREATE INDEX IF NOT EXISTS channel_bindings_session ON channel_bindings(session_id,destination)');
     this.turnCards = new TurnCardDelivery(this.db, service, port, {
@@ -726,6 +735,7 @@ export class FeishuChannel {
         this.db.prepare('DELETE FROM channel_bindings WHERE destination=?').run(e.destination);
         this.db.prepare('DELETE FROM channel_cursors WHERE destination=?').run(e.destination);
         this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=?').run(e.destination);
+        this.db.prepare('DELETE FROM channel_readonly_turn_routes WHERE destination=?').run(e.destination);
         this.db.exec('COMMIT');
       } catch(error) { this.db.exec('ROLLBACK'); throw error; }
       this.turnCards.discardOtherScopes(e.destination, this.bindingScope(e.destination));
@@ -940,7 +950,7 @@ export class FeishuChannel {
       await guard();
       const turn = await this.service.getTurn(bound,a.turnId);
       if (turn && ['completed','failed','interrupted'].includes(turn.status)) {
-        const running = a.fallbackCurrent && a.bindingId && a.controlGeneration === session.control.generation
+        const running = a.fallbackCurrent && !a.lockTurn && a.bindingId && a.controlGeneration === session.control.generation
           ? (await this.service.getWorkState(bound)).runningTurns : [];
         if (running.length === 1) stopTurnId = running[0]!.turnId;
         else {
@@ -1135,7 +1145,7 @@ export class FeishuChannel {
       return Number.isSafeInteger(raw) && raw > 0 ? raw : 2500;
     })();
     const readonlyIdleGraceMs = (() => {
-      const raw = Number(process.env.FEISHU_READONLY_IDLE_GRACE_MS);
+      const raw = Number(process.env.FEISHU_READONLY_IDLE_GRACE_MS ?? '15000');
       return Number.isSafeInteger(raw) && raw >= 0 ? raw : 15_000;
     })();
     const isApiRejectionError = (error: unknown): boolean => {
@@ -1154,376 +1164,324 @@ export class FeishuChannel {
       patch_seq: number;
       baseline_msg_seq: number;
       idle_since: number | null;
-      final_reject_count: number;
+      process_input: string;
     };
-    const turnScopedFinalCandidates = (allMsgs: readonly Message[], baselineSeq: number, anchorId?: string): Message[] => {
-      const ordered = [...allMsgs].sort((a, b) => a.sequence - b.sequence || a.messageId.localeCompare(b.messageId));
-      const anchorStepMatch = anchorId ? /:user-(\d+)$/.exec(anchorId) : null;
-      const anchorUserStep = anchorStepMatch ? Number(anchorStepMatch[1]) : null;
-      let nextUserSeq: number | undefined;
-      let sawAssistantAfterBaseline = false;
-      let sawFirstUserAfterBaseline = false;
-      for (const m of ordered) {
-        if (m.sequence <= baselineSeq) continue;
-        if (m.role === 'assistant') {
-          sawAssistantAfterBaseline = true;
-        } else if (m.role === 'user') {
-          const msgStepMatch = /^step-(\d+)$/.exec(m.turnId);
-          const msgStep = msgStepMatch ? Number(msgStepMatch[1]) : null;
-          const isNewerUserStep = anchorUserStep !== null && msgStep !== null && msgStep > anchorUserStep;
-          if (sawAssistantAfterBaseline || sawFirstUserAfterBaseline || isNewerUserStep) {
-            nextUserSeq = m.sequence;
-            break;
-          }
-          sawFirstUserAfterBaseline = true;
-        }
-      }
-      return ordered.filter(
-        (m) =>
-          m.role === 'assistant' &&
-          m.final &&
-          m.sequence > baselineSeq &&
-          (nextUserSeq === undefined || m.sequence < nextUserSeq) &&
-          unseen(m) &&
-          !this.turnCards.isBaselinedMessage(scopeKey, m.messageId, m.revision),
-      );
+    type ReadonlyProcess = {
+      tools: ReadonlyLiveTurnView['tools'];
+      contextUsage?: Exclude<ReadonlyLiveTurnView['contextUsage'], undefined>;
     };
-    const reconcileReadonlyFinalCard = async (
-      session: Session,
-      slot: ReadonlyCardRow,
-      finalCandidates: readonly Message[],
-      tools: ReadonlyLiveTurnView['tools'],
-      turnId: string,
-      now: number,
-      contextUsage?: ReadonlyLiveTurnView['contextUsage'],
-    ): Promise<'sent' | 'retry' | 'fallback' | 'unknown'> => {
-      const finalMsg = finalCandidates.at(-1)!;
-      const finalCard = turnProgressCard({
-        provider: session.native.provider,
-        status: 'completed',
-        schema: '2.0',
-        message: finalMsg,
-        tools,
-        duration: null,
-        files: [],
-        turnId,
-        ...(contextUsage ? { contextUsage } : {}),
-      });
-      const nextSeq = Number(slot.patch_seq) + 1;
-      const deliveryId = `ro-live-final:${payloadDigest([scope, destination, sessionId, slot.card_id, finalMsg.messageId, finalMsg.revision, nextSeq])}`;
-      if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
-        try {
-          await syncGuard();
-          await this.port.update(destination, slot.card_id, this.stampCard(destination, finalCard), deliveryId, syncGuard);
-        } catch (error) {
-          if (isApiRejectionError(error)) {
-            this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-            const nextRejects = Number(slot.final_reject_count) + 1;
-            if (nextRejects >= 2) {
-              this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-                .run(destination, sessionId, scope);
-              return 'fallback';
-            }
-            this.db.prepare(
-              'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
-            ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
-            return 'retry';
+    type ReadonlyTerminal = ReadonlyProcess & { turn: Turn };
+    type ReadonlyRoute = Pick<ReadonlyCardRow, 'anchor_id' | 'baseline_msg_seq'> & {
+      reply_turn_id: string;
+      terminal_input: string;
+      source_turn_ids: string;
+    };
+    const readonlySlot = this.db.prepare(`SELECT anchor_id,card_id,signature,updated_at,patch_seq,baseline_msg_seq,idle_since,process_input
+      FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?`);
+    const clearReadonlySlot = this.db.prepare(`DELETE FROM channel_readonly_live_cards
+      WHERE destination=? AND session_id=? AND binding_scope=? AND anchor_id=?`);
+    const readonlyRoutes = this.db.prepare(`SELECT anchor_id,baseline_msg_seq,reply_turn_id,terminal_input,source_turn_ids
+      FROM channel_readonly_turn_routes WHERE destination=? AND session_id=? AND binding_scope=?
+      ORDER BY baseline_msg_seq DESC,rowid DESC`);
+    const saveReadonlyRoute = this.db.prepare(`INSERT INTO channel_readonly_turn_routes VALUES (?,?,?,?,?,?,?,?)
+      ON CONFLICT(destination,session_id,binding_scope,anchor_id)
+      DO UPDATE SET terminal_input=excluded.terminal_input,source_turn_ids=excluded.source_turn_ids`);
+    const processCreateId = (anchorId: string) => `ro-live-send:${payloadDigest([scope, destination, sessionId, anchorId])}`;
+    const anchorStep = (anchorId: string) => /:user-(\d+)$/.exec(anchorId)?.[1];
+    const turnScopedMessages = (ordered: readonly Message[], baselineSeq: number, anchorId: string, nextStep?: number): Message[] => {
+      const step = anchorStep(anchorId);
+      let sawUser = false;
+      const candidates: Message[] = [];
+      let lo = 0;
+      let hi = ordered.length;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (ordered[mid]!.sequence <= baselineSeq) lo = mid + 1;
+        else hi = mid;
+      }
+      for (let index = lo; index < ordered.length; index++) {
+        const m = ordered[index]!;
+        const messageStep = /^step-(\d+)$/.exec(m.turnId)?.[1];
+        if (messageStep !== undefined && nextStep !== undefined && Number(messageStep) >= nextStep) break;
+        if (m.role === 'user') {
+          if (step !== undefined && messageStep !== undefined) {
+            if (Number(messageStep) > Number(step)) break;
+            if (Number(messageStep) < Number(step)) continue;
           }
-          throw error;
+          if (sawUser || candidates.length) break;
+          sawUser = true;
+        } else if (m.role === 'assistant' &&
+          (step === undefined || messageStep === undefined || Number(messageStep) > Number(step)) &&
+          !this.turnCards.isBaselinedMessage(scopeKey, m.messageId, m.revision)) {
+          candidates.push(m);
         }
-        await syncGuard();
-        this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
-        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-          .run(destination, sessionId, scope);
-        return 'sent';
       }
-      // Delivery row already exists (e.g. prior transport timeout left 'unknown'): reconcile via port.lookupDelivery!
-      const prior = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(deliveryId) as { state: string } | undefined;
-      if (prior?.state === 'sent') {
-        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-          .run(destination, sessionId, scope);
-        return 'sent';
-      }
-      if (prior?.state === 'unknown') {
-        const outcome = this.port.lookupDelivery ? await this.port.lookupDelivery(deliveryId) : 'unknown';
-        await syncGuard();
-        if (outcome === 'sent') {
-          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
-          this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-            .run(destination, sessionId, scope);
-          return 'sent';
-        }
-        // In-place PATCH to an existing card_id is idempotent on Feishu (never duplicates a card):
-        // when lookupDelivery returns 'not_sent' or 'unknown' (e.g. FeishuSdkPort after PATCH timeout),
-        // advance patch_seq to retry idempotently (falling back to fresh delivery after 2 retries).
-        this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-        const nextRejects = Number(slot.final_reject_count) + 1;
-        if (nextRejects >= 2) {
-          this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-            .run(destination, sessionId, scope);
-          return 'fallback';
-        }
-        this.db.prepare(
-          'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
-        ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
-        return 'retry';
-      }
-      return 'unknown';
+      return candidates;
     };
     const syncReadonlyLiveCard = async (
       session: Session,
-      snapshotMessages: readonly Message[] | null,
-    ): Promise<{ handledIds: Set<string>; deferredIds: Set<string>; liveRunning: boolean }> => {
+      snapshot: SessionSnapshot | null,
+      events: readonly Event[] = [],
+      baselineOnly = false,
+    ): Promise<{ handledIds: Set<string>; skipTurnIds: Set<string>; liveRunning: boolean }> => {
       const handledIds = new Set<string>();
-      const deferredIds = new Set<string>();
-      if (!this.channelOptions.readReadonlyLiveTurn || !isCliReadonly(session)) {
-        this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=?').run(destination);
-        return { handledIds, deferredIds, liveRunning: false };
-      }
+      const skipTurnIds = new Set<string>();
+      const result = (liveRunning = false) => ({ handledIds, skipTurnIds, liveRunning });
       this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND binding_scope<>?').run(destination, scope);
-      if (!allowedPush()) {
-        return { handledIds, deferredIds, liveRunning: false };
-      }
+      this.db.prepare('DELETE FROM channel_readonly_turn_routes WHERE destination=? AND binding_scope<>?').run(destination, scope);
+      const cliReadonly = isCliReadonly(session);
       let live: ReadonlyLiveTurnView | null = null;
-      try {
-        live = await this.channelOptions.readReadonlyLiveTurn(session);
-      } catch {
-        live = {
-          state: 'unavailable',
-          anchorId: 'unavailable',
-          running: false,
-          previewText: '',
-          tools: [],
-          activeSubagents: [],
-          signature: 'unavailable',
-        };
+      if (cliReadonly && this.channelOptions.readReadonlyLiveTurn) {
+        try {
+          live = await this.channelOptions.readReadonlyLiveTurn(session);
+        } catch {
+          live = { state: 'unavailable', anchorId: 'unavailable', running: false, previewText: '', tools: [], activeSubagents: [], signature: 'unavailable' };
+        }
       }
       await syncGuard();
-      const existing = this.db.prepare(
-        `SELECT anchor_id, card_id, signature, updated_at, patch_seq, baseline_msg_seq, idle_since, final_reject_count
-         FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?`,
-      ).get(destination, sessionId, scope) as ReadonlyCardRow | undefined;
-
-      if (live?.state === 'unavailable') {
-        // Keep existing readonly slot intact and defer this turn's final messages until reader recovers
-        // so normal TurnCardDelivery does not emit a duplicate second card while summaries is unreadable.
-        if (existing && snapshotMessages) {
-          for (const m of turnScopedFinalCandidates(snapshotMessages, Number(existing.baseline_msg_seq), existing.anchor_id)) {
-            deferredIds.add(m.messageId);
-          }
-        }
-        return { handledIds, deferredIds, liveRunning: false };
-      }
-
+      let active = readonlySlot.get(...scopeKey) as ReadonlyCardRow | undefined;
+      const routes = readonlyRoutes.all(...scopeKey) as ReadonlyRoute[];
       const liveRunning = live?.state === 'running';
+      const hasWork = Boolean(live?.tools.some(tool => tool.tool !== 'thinking' || tool.phase === 'running') || live?.activeSubagents.length);
+      const displayLive = liveRunning && (hasWork || Boolean(live?.previewText));
+      if (!active && !routes.length && (!cliReadonly || !this.channelOptions.readReadonlyLiveTurn)) return result();
+      if (!snapshot && !active && !displayLive) return result(liveRunning);
+      const snap = snapshot ?? (await this.service.getSnapshot(sessionId)).value;
+      await syncGuard();
+      const ordered = [...snap.messages].sort((a, b) => a.sequence - b.sequence || a.messageId.localeCompare(b.messageId));
+      const routesByAnchor = new Map(routes.map(route => [route.anchor_id, route]));
+      const anchorSteps = new Set([...routesByAnchor.keys(), active?.anchor_id, live?.anchorId]
+        .flatMap(anchor => anchor ? [anchorStep(anchor)] : []).filter(step => step !== undefined));
+      const eventTurns = new Set<string>();
+      for (const e of events) {
+        if (e.type === 'turn.updated') eventTurns.add(e.objectId);
+        else if (e.type === 'tool.updated' || e.type === 'artifact.available') {
+          const id = e.type === 'tool.updated' ? readToolProgress(e.data)?.turnId : (e.data as { turnId?: string } | undefined)?.turnId;
+          if (id) eventTurns.add(id);
+        }
+      }
+      const turns = new Map(snap.turns?.map(turn => [turn.turnId, turn]));
+      for (const e of events) {
+        if (e.type !== 'turn.updated' || turns.has(e.objectId)) continue;
+        const turn = e.data as Turn | undefined;
+        if (turn && isTerminalTurn(turn.status)) turns.set(e.objectId, { ...turn, turnId: e.objectId });
+      }
+      const timing = new Map(snap.turnProgress?.timing.map(turn => [turn.turnId, turn]));
+      const knownHandled = new Set<string>();
+      const mark = (messages: readonly Message[], handled: boolean) => {
+        for (const m of messages) {
+          skipTurnIds.add(m.turnId || m.messageId);
+          if (handled && m.final) handledIds.add(m.messageId);
+        }
+      };
+      // AGY history may represent the CLI prompt itself as a completed step.
+      if (session.native.provider === 'agy') {
+        const assistantTurns = new Set(ordered.filter(m => m.role === 'assistant').map(m => m.turnId || m.messageId));
+        for (const m of ordered) {
+          const id = m.turnId || m.messageId;
+          const status = turns.get(id)?.status;
+          if (m.role === 'user' && /^step-\d+$/.test(id) &&
+            (cliReadonly || anchorSteps.has(id.slice('step-'.length))) &&
+            !assistantTurns.has(id) && status !== 'failed' && status !== 'interrupted') skipTurnIds.add(id);
+        }
+      }
       const now = Date.now();
-      const hasWork = Boolean(live && live.state === 'running' && (live.tools.length > 0 || live.activeSubagents.length > 0));
-
-      if (hasWork && live) {
-        let activeRow = existing;
-        // If a NEW turn started while a previous turn's readonly slot is still open, close the old slot first!
-        if (activeRow && activeRow.anchor_id !== live.anchorId) {
-          const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
-          await syncGuard();
-          const prevTurnFinals = turnScopedFinalCandidates(allMsgs, Number(activeRow.baseline_msg_seq), activeRow.anchor_id);
-          if (prevTurnFinals.length > 0) {
-            const outcome = await reconcileReadonlyFinalCard(session, activeRow, prevTurnFinals, [], activeRow.anchor_id, now);
-            if (outcome === 'sent') {
-              for (const m of prevTurnFinals) handledIds.add(m.messageId);
-              activeRow = undefined;
-            } else if (outcome === 'fallback') {
-              activeRow = undefined;
-            } else {
-              for (const m of prevTurnFinals) deferredIds.add(m.messageId);
-              return { handledIds, deferredIds, liveRunning };
-            }
-          } else {
-            this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-              .run(destination, sessionId, scope);
-            activeRow = undefined;
+      const terminalWithoutReply = (anchorId: string): Turn | undefined => {
+        const step = anchorStep(anchorId);
+        const promptTurnId = step === undefined ? undefined : `step-${step}`;
+        const prompt = ordered.find(m => m.role === 'user' && m.turnId === promptTurnId);
+        // AGY can emit synthetic completed steps for prompts. A failure or interruption
+        // is sufficient terminal evidence when it explicitly identifies this anchor.
+        return [...turns.values()].find(turn => (turn.status === 'failed' || turn.status === 'interrupted') &&
+          (turn.turnId === anchorId || turn.turnId === promptTurnId || prompt && turn.inputId === prompt.messageId));
+      };
+      const reconcileReadonlyFinalCard = async (
+        slot: ReadonlyCardRow | ReadonlyRoute,
+        candidates: readonly Message[],
+        liveView: ReadonlyLiveTurnView | null,
+        route?: ReadonlyRoute,
+        releaseWithoutProcess = false,
+      ): Promise<boolean> => {
+        const last = candidates.findLast(m => m.final);
+        const aliases = new Set<string>(route ? JSON.parse(route.source_turn_ids) as string[] : []);
+        const emptyFailure = terminalWithoutReply(slot.anchor_id);
+        const sourceId = last ? last.turnId || last.messageId : emptyFailure?.turnId;
+        const sourceTurn = emptyFailure ?? (sourceId ? turns.get(sourceId) : undefined);
+        const sourceTiming = (sourceTurn && timing.get(sourceTurn.turnId)) ?? (sourceId ? timing.get(sourceId) : undefined);
+        const turnId = route?.reply_turn_id ?? sourceId ?? slot.anchor_id;
+        const process = 'process_input' in slot ? JSON.parse(slot.process_input) as Partial<ReadonlyProcess> : {};
+        const previous = route ? JSON.parse(route.terminal_input) as ReadonlyTerminal : undefined;
+        const terminal: ReadonlyTerminal = {
+          ...process,
+          ...previous,
+          turn: {
+            turnId, sessionId,
+            status: sourceTurn?.status === 'failed' || sourceTurn?.status === 'interrupted' ? sourceTurn.status : previous?.turn.status ?? 'completed',
+            inputId: null, outputIds: [], model: sourceTurn?.model ?? previous?.turn.model ?? null,
+            // Imported AGY step timestamps can name a single transcript observation.
+            startedAt: sourceTurn?.startedAt && sourceTurn.startedAt !== sourceTurn.endedAt
+              ? sourceTurn.startedAt : previous?.turn.startedAt ?? null,
+            endedAt: sourceTurn?.endedAt ?? previous?.turn.endedAt ?? new Date(now).toISOString(),
+          },
+          tools: liveView?.tools.length ? liveView.tools : previous?.tools ?? process.tools ?? [],
+          ...(liveView?.contextUsage ? { contextUsage: liveView.contextUsage } : {}),
+        };
+        for (const m of candidates) if (m.final) aliases.add(m.turnId || m.messageId);
+        if (sourceId) aliases.add(sourceId);
+        for (const alias of aliases) { knownHandled.add(alias); skipTurnIds.add(alias); }
+        skipTurnIds.add(turnId);
+        saveReadonlyRoute.run(...scopeKey, slot.anchor_id, slot.baseline_msg_seq, turnId, JSON.stringify(terminal), JSON.stringify([...aliases]));
+        const message = last && sourceId ? aggregateTurnAssistantMessage(candidates, sourceId) : undefined;
+        const key: [...typeof scopeKey, string] = [...scopeKey, turnId];
+        let ready = false;
+        try {
+          ready = await this.turnCards.finalizeTurnCard({
+            ...terminal, key, message, timing: sourceTiming, provider: session.native.provider, isCliReadonly: true,
+            ...('card_id' in slot && slot.card_id ? { processCardId: slot.card_id } : {}),
+          });
+          mark(candidates, ready);
+          return ready;
+        } finally {
+          // The persisted route can finish delivery after a transport error, even after the next CLI turn starts.
+          if (releaseWithoutProcess && (ready || this.turnCards.hasPendingFinalization(key))) {
+            clearReadonlySlot.run(...scopeKey, slot.anchor_id);
           }
         }
-        const interimMessage: Message | undefined = live.previewText
-          ? {
-              messageId: live.anchorId,
-              sessionId,
-              turnId: live.anchorId,
-              role: 'assistant',
-              blocks: [{ type: 'text', text: live.previewText }],
-              sequence: 0,
-              revision: 0,
-              final: false,
-              source: 'readonly_live',
-            }
-          : undefined;
-        const card = turnProgressCard({
-          provider: session.native.provider,
-          status: 'running',
-          schema: '2.0',
-          message: interimMessage,
-          tools: live.tools,
-          duration: null,
-          files: [],
-          turnId: live.anchorId,
-          activeSubagents: live.activeSubagents,
-          allowFullReplyButton: false,
-          ...(live.contextUsage ? { contextUsage: live.contextUsage } : {}),
-        });
-        if (!activeRow) {
-          const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
+      };
+      const steps = [...new Set([...anchorSteps].map(Number))].sort((a, b) => a - b);
+      const nextSteps = new Map(steps.slice(0, -1).map((step, index) => [step, steps[index + 1]]));
+      const scopedMessages = (slot: Pick<ReadonlyCardRow, 'anchor_id' | 'baseline_msg_seq'>) =>
+        turnScopedMessages(ordered, slot.baseline_msg_seq, slot.anchor_id, nextSteps.get(Number(anchorStep(slot.anchor_id))));
+      // Resolve late history against the original CLI anchor, including the idle-grace placeholder.
+      for (const route of routes) {
+        const aliases = JSON.parse(route.source_turn_ids) as string[];
+        for (const alias of aliases) skipTurnIds.add(alias);
+        skipTurnIds.add(route.reply_turn_id);
+        if (route.anchor_id === active?.anchor_id) continue;
+        const candidates = scopedMessages(route)
+          .filter(m => !handledIds.has(m.messageId) && !knownHandled.has(m.turnId || m.messageId));
+        if (candidates.some(m => m.final && unseen(m)) ||
+          this.turnCards.hasPendingFinalization([...scopeKey, route.reply_turn_id]) ||
+          aliases.some(id => eventTurns.has(id)) || eventTurns.has(route.reply_turn_id)) {
+          await reconcileReadonlyFinalCard(route, candidates, null, route);
+        }
+      }
+      const activeTerminal = active && terminalWithoutReply(active.anchor_id);
+      if (activeTerminal) skipTurnIds.add(activeTerminal.turnId);
+
+      if (active) {
+        const route = routesByAnchor.get(active.anchor_id);
+        const finishing = route || activeTerminal || !liveRunning || live?.anchorId !== active.anchor_id;
+        let releaseWithoutProcess = false;
+        // A previous request can have reached Feishu before its returned message ID was journaled.
+        const id = processCreateId(active.anchor_id);
+        const delivery = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(id);
+        if (!active.card_id && delivery) {
+          const receipt = delivery.state === 'sent' ? 'sent' : await this.port.lookupDelivery?.(id) ?? 'unknown';
           await syncGuard();
-          let baselineSeq = -1;
-          for (const m of allMsgs) {
-            if (m.role === 'assistant' && m.final && m.sequence > baselineSeq) baselineSeq = m.sequence;
-          }
-          const deliveryId = `ro-live-send:${payloadDigest([scope, destination, sessionId, live.anchorId])}`;
-          if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
-            let cardId: string | void;
-            try {
-              await syncGuard();
-              cardId = await this.port.send(destination, this.stampCard(destination, card), deliveryId, syncGuard);
-            } catch (error) {
-              if (isApiRejectionError(error)) {
-                this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-                return { handledIds, deferredIds, liveRunning };
-              }
-              throw error;
-            }
+          if (receipt === 'sent') {
+            const cardId = await this.port.lookupMessageId?.(id);
             await syncGuard();
-            this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
             if (cardId) {
-              this.db.prepare(
-                `INSERT OR REPLACE INTO channel_readonly_live_cards
-                 (destination, session_id, binding_scope, anchor_id, card_id, signature, updated_at, patch_seq, baseline_msg_seq, idle_since, final_reject_count)
-                 VALUES (?,?,?,?,?,?,?,0,?,NULL,0)`,
-              ).run(destination, sessionId, scope, live.anchorId, cardId, live.signature, now, baselineSeq);
-              activeRow = {
-                anchor_id: live.anchorId,
-                card_id: cardId,
-                signature: live.signature,
-                updated_at: now,
-                patch_seq: 0,
-                baseline_msg_seq: baselineSeq,
-                idle_since: null,
-                final_reject_count: 0,
-              };
+              this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);
+              this.db.prepare(`UPDATE channel_readonly_live_cards SET card_id=? WHERE destination=? AND session_id=? AND binding_scope=?`).run(cardId, ...scopeKey);
+              active = { ...active, card_id: cardId };
             }
+          } else if (receipt === 'not_sent') {
+            this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(id);
           }
-        } else {
-          if (activeRow.idle_since !== null) {
-            this.db.prepare('UPDATE channel_readonly_live_cards SET idle_since=NULL WHERE destination=? AND session_id=? AND binding_scope=?')
-              .run(destination, sessionId, scope);
-            activeRow = { ...activeRow, idle_since: null };
-          }
-          if (activeRow.signature !== live.signature && now - Number(activeRow.updated_at) >= readonlyPatchIntervalMs) {
-            const nextSeq = Number(activeRow.patch_seq) + 1;
-            const deliveryId = `ro-live-upd:${payloadDigest([scope, destination, sessionId, activeRow.card_id, nextSeq])}`;
-            if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
-              try {
-                await syncGuard();
-                await this.port.update(destination, activeRow.card_id, this.stampCard(destination, card), deliveryId, syncGuard);
-              } catch (error) {
-                if (isApiRejectionError(error)) {
-                  this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-                  this.db.prepare(
-                    'UPDATE channel_readonly_live_cards SET patch_seq=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
-                  ).run(nextSeq, now, destination, sessionId, scope);
-                  return { handledIds, deferredIds, liveRunning };
-                }
-                throw error;
-              }
-              await syncGuard();
-              this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
-              this.db.prepare(
-                'UPDATE channel_readonly_live_cards SET signature=?, updated_at=?, patch_seq=?, idle_since=NULL WHERE destination=? AND session_id=? AND binding_scope=?',
-              ).run(live.signature, now, nextSeq, destination, sessionId, scope);
+          if (receipt !== 'not_sent' && !active.card_id) {
+            if (!finishing) {
+              mark(scopedMessages(active), false);
+              return result(liveRunning);
             }
+            releaseWithoutProcess = true;
           }
         }
-        // Defer ONLY this turn's post-baseline intermediate final messages while running.
-        if (activeRow && snapshotMessages) {
-          for (const m of turnScopedFinalCandidates(snapshotMessages, Number(activeRow.baseline_msg_seq), activeRow.anchor_id)) {
-            deferredIds.add(m.messageId);
-          }
+        if (live?.state === 'unavailable' && !activeTerminal && !route && !releaseWithoutProcess) {
+          mark(scopedMessages(active), false);
+          return result();
         }
-        return { handledIds, deferredIds, liveRunning };
+        if (finishing) {
+          const candidates = scopedMessages(active);
+          const idleSince = active.idle_since ?? now;
+          if (active.idle_since === null) {
+            this.db.prepare(`UPDATE channel_readonly_live_cards SET idle_since=? WHERE destination=? AND session_id=? AND binding_scope=?`).run(idleSince, ...scopeKey);
+          }
+          if (cliReadonly && this.channelOptions.readReadonlyLiveTurn && !releaseWithoutProcess && !route &&
+            !activeTerminal && !candidates.some(m => m.final) && !liveRunning && now - idleSince < readonlyIdleGraceMs) {
+            mark(candidates, false);
+            return result();
+          }
+          const matchingLive = live?.anchorId === active.anchor_id ? live : null;
+          const ready = await reconcileReadonlyFinalCard(active, candidates, matchingLive, route, releaseWithoutProcess);
+          if (!releaseWithoutProcess) {
+            if (!ready) return result(liveRunning);
+            clearReadonlySlot.run(...scopeKey, active.anchor_id);
+          }
+          if (activeTerminal && live?.anchorId === active.anchor_id) return result();
+          active = undefined;
+        }
       }
+      if (!liveRunning || !live || routesByAnchor.has(live.anchorId)) return result(liveRunning);
+      if (!active && (!displayLive || !allowedPush())) return result(liveRunning);
+      if (!active) {
+        // Capture already delivered output only. New intermediate DONE steps may be present on this very poll.
+        const baselineSeq = Math.max(-1, ...ordered.filter(m => m.role === 'assistant' && m.final &&
+          (baselineOnly || !unseen(m) || this.turnCards.isBaselinedMessage(scopeKey, m.messageId, m.revision))).map(m => m.sequence));
+        this.db.prepare(`INSERT OR IGNORE INTO channel_readonly_live_cards
+          (destination,session_id,binding_scope,anchor_id,card_id,signature,updated_at,baseline_msg_seq)
+          VALUES (?,?,?,?,'','',?,?)`).run(...scopeKey, live.anchorId, now, baselineSeq);
+        active = readonlySlot.get(...scopeKey) as ReadonlyCardRow;
+      }
+      mark(scopedMessages(active), false);
+      if (active.idle_since !== null) {
+        this.db.prepare(`UPDATE channel_readonly_live_cards SET idle_since=NULL WHERE destination=? AND session_id=? AND binding_scope=?`).run(...scopeKey);
+      }
+      if (!active.card_id && !hasWork && (!live.previewText || now - active.updated_at < PROCESS_CARD_TEXT_DELAY_MS)) return result(liveRunning);
+      if (active.card_id && (active.signature === live.signature || now - active.updated_at < readonlyPatchIntervalMs)) return result(liveRunning);
+      if (!allowedPush()) return result(liveRunning);
 
-      if (existing && (!live || live.state === 'idle')) {
-        const allMsgs = snapshotMessages ?? (await this.service.getSnapshot(sessionId)).value.messages;
+      const process = JSON.stringify({ tools: live.tools, ...(live.contextUsage ? { contextUsage: live.contextUsage } : {}) });
+      this.db.prepare(`UPDATE channel_readonly_live_cards SET process_input=? WHERE destination=? AND session_id=? AND binding_scope=?`)
+        .run(process, ...scopeKey);
+      const card = this.stampCard(destination, turnProcessCard({
+        provider: session.native.provider, status: 'running', schema: '2.0', duration: null, files: [],
+        message: live.previewText ? {
+          messageId: live.anchorId, sessionId, turnId: live.anchorId, role: 'assistant',
+          blocks: [{ type: 'text', text: live.previewText }], sequence: 0, revision: 0, final: false, source: 'readonly_live',
+        } : undefined,
+        tools: live.tools, turnId: live.anchorId, activeSubagents: live.activeSubagents, isCliReadonly: true,
+        ...(live.contextUsage ? { contextUsage: live.contextUsage } : {}),
+      }));
+      const nextSeq = Number(active.patch_seq) + 1;
+      const id = active.card_id
+        ? `ro-live-upd:${payloadDigest([scope, destination, sessionId, active.card_id, nextSeq])}`
+        : processCreateId(live.anchorId);
+      if (!this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(id).changes) {
+        // A repeated PATCH to the same process card is safe after an ambiguous transport failure.
+        if (active.card_id) this.db.prepare(`UPDATE channel_readonly_live_cards SET patch_seq=? WHERE destination=? AND session_id=? AND binding_scope=?`).run(nextSeq, ...scopeKey);
+        return result(liveRunning);
+      }
+      let cardId = active.card_id;
+      try {
         await syncGuard();
-        const finalCandidates = turnScopedFinalCandidates(allMsgs, Number(existing.baseline_msg_seq), existing.anchor_id);
-
-        if (finalCandidates.length > 0) {
-          const outcome = await reconcileReadonlyFinalCard(
-            session,
-            existing,
-            finalCandidates,
-            live?.tools ?? [],
-            live?.anchorId ?? existing.anchor_id,
-            now,
-            live?.contextUsage,
-          );
-          if (outcome === 'sent') {
-            for (const m of finalCandidates) handledIds.add(m.messageId);
-          } else if (outcome === 'retry' || outcome === 'unknown') {
-            for (const m of finalCandidates) deferredIds.add(m.messageId);
-          }
-          // outcome === 'fallback': slot deleted, neither handled nor deferred -> TurnCardDelivery sends fresh card.
-          return { handledIds, deferredIds, liveRunning };
-        }
-
-        // Summaries may flip to IDLE slightly before Core history refresh delivers the final assistant message.
-        const idleSince = existing.idle_since ?? now;
-        if (existing.idle_since === null) {
-          this.db.prepare('UPDATE channel_readonly_live_cards SET idle_since=? WHERE destination=? AND session_id=? AND binding_scope=?')
-            .run(idleSince, destination, sessionId, scope);
-        }
-        if (now - idleSince < readonlyIdleGraceMs) {
-          return { handledIds, deferredIds, liveRunning };
-        }
-
-        const doneCard = turnProgressCard({
-          provider: session.native.provider,
-          status: 'completed',
-          schema: '2.0',
-          message: undefined,
-          tools: live?.tools ?? [],
-          duration: null,
-          files: [],
-          turnId: existing.anchor_id,
-          allowFullReplyButton: false,
-          ...(live?.contextUsage ? { contextUsage: live.contextUsage } : {}),
-        });
-        const nextSeq = Number(existing.patch_seq) + 1;
-        const deliveryId = `ro-live-done:${payloadDigest([scope, destination, sessionId, existing.card_id, existing.anchor_id, nextSeq])}`;
-        if (this.db.prepare("INSERT OR IGNORE INTO channel_deliveries VALUES (?, 'unknown')").run(deliveryId).changes) {
-          try {
-            await syncGuard();
-            await this.port.update(destination, existing.card_id, this.stampCard(destination, doneCard), deliveryId, syncGuard);
-          } catch (error) {
-            if (isApiRejectionError(error)) {
-              this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(deliveryId);
-              const nextRejects = Number(existing.final_reject_count) + 1;
-              if (nextRejects >= 2) {
-                this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-                  .run(destination, sessionId, scope);
-              } else {
-                this.db.prepare(
-                  'UPDATE channel_readonly_live_cards SET patch_seq=?, final_reject_count=?, updated_at=? WHERE destination=? AND session_id=? AND binding_scope=?',
-                ).run(nextSeq, nextRejects, now, destination, sessionId, scope);
-              }
-              return { handledIds, deferredIds, liveRunning };
-            }
-            throw error;
-          }
-          await syncGuard();
-          this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(deliveryId);
-          this.db.prepare('DELETE FROM channel_readonly_live_cards WHERE destination=? AND session_id=? AND binding_scope=?')
-            .run(destination, sessionId, scope);
-        }
+        if (cardId) await this.port.update(destination, cardId, card, id, syncGuard);
+        else cardId = await this.port.send(destination, card, id, syncGuard) ?? '';
+      } catch (error) {
+        if (!isApiRejectionError(error)) throw error;
+        this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(id);
+        return result(liveRunning);
       }
-      return { handledIds, deferredIds, liveRunning };
+      await syncGuard();
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.prepare("UPDATE channel_deliveries SET state='sent' WHERE delivery_id=?").run(id);
+        this.db.prepare(`UPDATE channel_readonly_live_cards SET card_id=?,signature=?,updated_at=?,patch_seq=?
+          WHERE destination=? AND session_id=? AND binding_scope=?`).run(cardId, live.signature, now, nextSeq, ...scopeKey);
+        this.db.exec('COMMIT');
+      } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+      return result(liveRunning);
     };
     const deliverCliPrompts = async (session: Session, candidates: readonly Message[]) => {
       if (this.accessMode(destination) !== 'read_only' || !candidates.length) return;
@@ -1605,7 +1563,7 @@ export class FeishuChannel {
         const userMessages = snapshot.value.messages.filter(message => message.role === 'user' && messageIds.has(message.messageId) && unseen(message));
         await deliverCliPrompts(snapshot.value.session, userMessages);
         const messages = snapshot.value.messages.filter(message => message.role === 'assistant' && messageIds.has(message.messageId) && unseen(message));
-        const roResult = await syncReadonlyLiveCard(snapshot.value.session, snapshot.value.messages);
+        const roResult = await syncReadonlyLiveCard(snapshot.value.session, snapshot.value, events.events);
         const unseenPostDeferred = snapshot.value.messages.filter(
           (message) =>
             message.role === 'assistant' &&
@@ -1613,14 +1571,16 @@ export class FeishuChannel {
             unseen(message) &&
             !this.turnCards.isBaselinedMessage(scopeKey, message.messageId, message.revision) &&
             !roResult.handledIds.has(message.messageId) &&
-            !roResult.deferredIds.has(message.messageId) &&
+            !roResult.skipTurnIds.has(message.turnId || message.messageId) &&
             !messages.some((existingMsg) => existingMsg.messageId === message.messageId),
         );
         const remainingMessages = [
-          ...messages.filter(message => !roResult.handledIds.has(message.messageId) && !roResult.deferredIds.has(message.messageId)),
+          ...messages.filter(message => !roResult.handledIds.has(message.messageId) && !roResult.skipTurnIds.has(message.turnId || message.messageId)),
           ...unseenPostDeferred,
         ];
-        await this.turnCards.sync(scopeKey, snapshot.value, events.events, remainingMessages, allowedPush);
+        await this.turnCards.sync(scopeKey, snapshot.value, events.events, remainingMessages, allowedPush, undefined, {
+          isCliReadonly: isCliReadonly(snapshot.value.session), skipTurnIds: roResult.skipTurnIds,
+        });
         await syncGuard();
         await syncTitle(snapshot.value, roResult.liveRunning);
         if (reconcileReleasedReadonly(snapshot.value.session)) return true;
@@ -1631,8 +1591,10 @@ export class FeishuChannel {
         const hasTurnFailure=visible.some(event=>event.type==='turn.updated' && (event.data as {status?:string}|null)?.status==='failed');
         for (const event of events.events) {
           await syncGuard();
-          if (event.type === 'message.updated' || event.type === 'tool.updated' || event.type === 'artifact.available' ||
-            event.type === 'turn.updated' && (event.data as {status?:string} | undefined)?.status === 'completed') continue;
+          if (event.type === 'message.updated' || event.type === 'tool.updated' || event.type === 'artifact.available') continue;
+        // The reply card presents terminal status. Interruption feedback also reports residual background work.
+        const turnStatus = event.type === 'turn.updated' ? (event.data as {status?: Turn['status']} | undefined)?.status : undefined;
+        if (turnStatus === 'completed' || turnStatus === 'failed') continue;
           const data=event.data && typeof event.data==='object' ? event.data as Record<string,unknown> : {};
           const op=event.type.startsWith('operation.') ? operationFromReceipt(data) : null;
           if (op && await suppressInputFailure(this.service,op)) continue;
@@ -1673,13 +1635,17 @@ export class FeishuChannel {
       if (expiredFrom !== undefined) {
         await deliverCliPrompts(snapshot.value.session, snapshot.value.messages.filter(m => m.role === 'user' && unseen(m)));
       }
+      const roResult = await syncReadonlyLiveCard(snapshot.value.session, snapshot.value, [], expiredFrom === undefined);
       await this.turnCards.sync(scopeKey, snapshot.value, [], snapshot.value.messages.filter(m =>
-        m.role === 'assistant' && (expiredFrom !== undefined ? unseen(m) : !m.final &&
+        m.role === 'assistant' && !roResult.skipTurnIds.has(m.turnId || m.messageId) && (expiredFrom !== undefined ? unseen(m) : !m.final &&
           snapshot.value.turnProgress?.timing.some(t => t.turnId === m.turnId && t.liveStartSequence !== null && t.liveEndSequence === null))),
-        allowedPush, expiredFrom);
+        allowedPush, expiredFrom, { isCliReadonly: isCliReadonly(snapshot.value.session), skipTurnIds: roResult.skipTurnIds });
       await syncGuard();
       for (const m of snapshot.value.messages) {
-        if (expiredFrom === undefined || m.final) remember.run(destination,sessionId,m.messageId,m.revision);
+        if ((expiredFrom === undefined || m.final) &&
+          (m.role !== 'assistant' || !roResult.skipTurnIds.has(m.turnId || m.messageId) || roResult.handledIds.has(m.messageId))) {
+          remember.run(destination, sessionId, m.messageId, m.revision);
+        }
       }
       for (const i of snapshot.value.interactions) await this.interactionCards.render(destination,sessionId,i.interactionId,scope,allowWaiting);
       cursor = snapshot.cursor;
