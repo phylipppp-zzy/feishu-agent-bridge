@@ -268,13 +268,51 @@ function summarizeSpecialTool(tool: string, data: Record<string, unknown>): stri
   }
 }
 
+export const THINKING_SUMMARY_MAX_CHARS = 1200;
+const THINKING_EXCERPT_MAX_CHARS = 1180;
+
+function trimLeadingBoundary(tail: string): string {
+  const chars = Array.from(tail);
+  const windowLimit = Math.min(chars.length, 80);
+  // Prefer a paragraph/line break near the start of the tail window.
+  for (let i = 0; i < windowLimit; i++) {
+    if (chars[i] === '\n') {
+      const rest = chars.slice(i + 1).join('').trimStart();
+      if (rest.length >= 20) return rest;
+    }
+  }
+  // Otherwise prefer sentence punctuation or whitespace so we never slice mid-word (e.g. "…ities").
+  for (let i = 0; i < windowLimit; i++) {
+    const ch = chars[i]!;
+    if (/[。！？.!?]/.test(ch)) {
+      const rest = chars.slice(i + 1).join('').trimStart();
+      if (rest.length >= 20) return rest;
+    }
+  }
+  for (let i = 0; i < windowLimit; i++) {
+    if (/\s/.test(chars[i]!)) {
+      const rest = chars.slice(i + 1).join('').trimStart();
+      if (rest.length >= 20) return rest;
+    }
+  }
+  return tail.trimStart();
+}
+
 export function formatThinkingSummary(raw: string): string {
-  const clean = raw.replace(/[\p{Cc}\p{Cf}\p{Cs}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+  const clean = raw
+    .replace(/\r\n?/g, '\n')
+    .replace(/(?!\n)[\p{Cc}\p{Cf}\p{Cs}]+/gu, ' ')
+    .split('\n')
+    .map(line => line.replace(/[ \t]+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
   if (!clean) return '🧠 正在深度思考…';
   const chars = Array.from(clean);
-  const maxContent = 112;
-  const excerpt = chars.length > maxContent ? `…${chars.slice(-(maxContent - 1)).join('')}` : clean;
-  return `🧠 ${excerpt}`;
+  if (chars.length <= THINKING_EXCERPT_MAX_CHARS) return `🧠 ${clean}`;
+  const rawTail = chars.slice(-(THINKING_EXCERPT_MAX_CHARS - 1)).join('');
+  const snapped = trimLeadingBoundary(rawTail);
+  return `🧠 …${snapped}`;
 }
 
 export function summarizeTool(name: unknown, input: unknown, project?: string): Pick<ToolProgress, 'tool' | 'summary'> {
@@ -292,7 +330,11 @@ export function readToolProgress(value: unknown): ToolProgress | undefined {
   if (typeof turnId !== 'string' || !turnId || turnId.length > 512 ||
       typeof callId !== 'string' || !callId || callId.length > 512 ||
       !phases.includes(phase as ToolPhase) || typeof tool !== 'string' || toolName(tool) !== tool ||
-      typeof summary !== 'string' || !summary || [...summary].length > 120 || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(summary)) return;
+      typeof summary !== 'string' || !summary) return;
+  const maxLen = tool === 'thinking' ? THINKING_SUMMARY_MAX_CHARS : 120;
+  if ([...summary].length > maxLen) return;
+  const controlCheck = tool === 'thinking' ? summary.replace(/\n/g, '') : summary;
+  if (/[\p{Cc}\p{Cf}\p{Cs}]/u.test(controlCheck)) return;
   return { turnId, callId, phase: phase as ToolPhase, tool, summary };
 }
 

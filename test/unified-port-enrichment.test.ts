@@ -214,11 +214,18 @@ test('asynchronous artifact registration patches the completed reply in place wi
     assert.equal(files.length, 0);
     assert.deepEqual(errors, []);
     assert.ok([sends[0]!, ...updates].every(({ card }) => (encodeCard(card) as { schema: string }).schema === '2.0'));
-    const button = last.card.actions.find((a: { value: { action: string } }) => a.value.action === 'file');
+    const button = last.card.actions.find((a: { value: { action: string } }) => a.value.action === 'artifacts');
     assert.ok(button);
-    assert.equal(button.label, '发送文件：report.md');
-    assert.equal(button.value.action, 'file');
-    await runtime.channel.handle(env('send-file'), button.value);
+    assert.equal(button.label, '📎 发送文件');
+    assert.equal(button.value.action, 'artifacts');
+    assert.equal(button.value.newCard, true);
+    await runtime.channel.handle(env('open-files'), button.value);
+    assert.equal(sends.length, 3, 'clicking 发送文件 must send a new card below the reply card');
+    const pickerCard = sends[2]!.card;
+    assert.match(pickerCard.text, /report\.md/);
+    const fileBtn = pickerCard.actions.find((a: { value: { action: string } }) => a.value.action === 'file');
+    assert.ok(fileBtn);
+    await runtime.channel.handle(env('send-file'), fileBtn.value);
     assert.deepEqual(files, [Buffer.from('utf-8 正文', 'utf8')]);
   } finally {
     releaseRead();

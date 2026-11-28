@@ -29,6 +29,7 @@ import { agyFileFingerprint } from './agy/catalog-summaries.js';
 import { resolveAgySummariesDbPaths } from './agy/catalog-types.js';
 import { defaultAgyConversationsDir } from './agy/process-guard.js';
 import { AgyCliWaitingDetector } from './agy/cli-waiting-detector.js';
+import { readDelegatedSessionActivity } from './agy/delegated-status.js';
 import { readReadonlyAgyLiveTurn } from './agy/readonly-live-turn.js';
 import { collectAgyStatusSnapshot } from './agy/session-status.js';
 import { providerTitlePrefix } from './feishu-cards.js';
@@ -239,6 +240,12 @@ export class UnifiedRuntime {
             conversationsDir: agyConfig?.conversationsDir ?? defaultAgyConversationsDir(agyConfig?.brainDir),
           }),
           ...(agyConfig && agyConfig.enabled !== false ? {
+            readActiveSubagents: (session: Session) => {
+              if (session.native.provider !== 'agy') return undefined;
+              return readDelegatedSessionActivity(session.native.nativeSessionId, session.project, {
+                ...(agyConfig.summariesDbPath !== undefined ? { summariesDbPath: agyConfig.summariesDbPath } : {}),
+              });
+            },
             readReadonlyLiveTurn: (session: Session) => {
               if (session.native.provider !== 'agy') return null;
               return readReadonlyAgyLiveTurn(session.native.nativeSessionId, session.project, {
@@ -1355,6 +1362,10 @@ export async function createIntegratedRuntime(config:RuntimeConfig, port:FeishuP
       let returnedProject:string; try {returnedProject=realpathSync(s.project);} catch {throw contractError('outcome_unknown','provider project unavailable');}
       if(returnedProject!==project || !pin(s)) {discardRef(s.native);throw contractError('outcome_unknown','provider create project mismatch');}
       configure(s); return ack;
+    }
+    override async getContextUsage(ref:Session['native']) {
+      if(!namespace(ref,this.provider)) return null;
+      return super.getContextUsage(ref);
     }
     override async resume(ref:Session['native']) {
       await this.read(ref); const ack=await super.resume(ref);

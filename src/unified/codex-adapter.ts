@@ -271,7 +271,7 @@ export class CodexAdapter implements PlatformPort {
     if (m.method === 'item/reasoning/summaryTextDelta' && isString(p.turnId) && typeof p.delta === 'string' && this.active.has(thread)) {
       const rkey = `${thread}\0${p.turnId}`;
       const buf = this.reasoningBuffers.get(rkey) ?? { text: '', lastEmitAt: 0 };
-      buf.text = (buf.text + p.delta).slice(-600);
+      buf.text = (buf.text + p.delta).slice(-2400);
       const now = Date.now();
       if (buf.lastEmitAt === 0 || now - buf.lastEmitAt >= 1_500) {
         buf.lastEmitAt = now;

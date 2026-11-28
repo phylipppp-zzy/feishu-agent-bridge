@@ -372,6 +372,24 @@ export class AgyAcpTransport {
     }
   }
 
+  /**
+   * Drop an orphaned `session/prompt` pending RPC for `sessionId` without degrading the transport.
+   * Used when disk evidence proves the turn already finished after AGY dropped the RPC response.
+   */
+  abandonSessionPrompt(sessionId: string): boolean {
+    if (!sessionId) return false;
+    let abandoned = false;
+    for (const [id, entry] of [...this.pending.entries()]) {
+      if (entry.sessionId === sessionId && entry.method === 'session/prompt') {
+        this.pending.delete(id);
+        this.clearPendingTimers(entry);
+        entry.resolve({ stopReason: 'end_turn', reconciled: true });
+        abandoned = true;
+      }
+    }
+    return abandoned;
+  }
+
   /** Send a JSON-RPC 2.0 notification (no `id`) over the active ACP connection. */
   notify(method: string, params?: unknown): void {
     if (!method || typeof method !== 'string') {

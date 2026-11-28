@@ -192,7 +192,7 @@ test('turn progress keeps active delegated calls before main completion and coll
     '- ⏳ ⚡ Codex MCP \\(astra · 代码审查\\)（进行中）',
     '- ⏳ 🤖 派发子代理：Astra Auditor（进行中）',
     '- ⏳ 🤖 派发子代理：Early Long Runner（进行中）',
-    '- ✓ 🤖 派发子代理：Auditor 7（已完成）',
+    '- ✓ 🤖 派发子代理：Auditor 7（已派发）',
   ]);
   assert.match(card.text, /另有 3 项子代理\/Codex 记录/);
   assert.doesNotMatch(card.text, /Auditor [012]|lookup_paper/);
@@ -244,12 +244,13 @@ test('tool tracker keeps the Codex MCP summary when completion omits or clears A
   assert.ok(jobDone?.type === 'event');
   assert.equal((jobDone.event.data as ToolProgress).summary, '⚡ Codex MCP (等待作业 …314ddb40)');
 
-  // P2: Unified 8-item budget shared between delegated tools and active session subagents.
-  const eightDoneTools: ToolProgress[] = Array.from({ length: 8 }, (_, idx) => ({
+  // P2: Unified 8-item budget shared between delegated tools and active session subagents,
+  // while succeeded invoke_subagent launch echoes are superseded once live subagent rows exist.
+  const eightWaitTools: ToolProgress[] = Array.from({ length: 8 }, (_, idx) => ({
     turnId: 'turn',
-    callId: `done-${idx}`,
+    callId: `wait-${idx}`,
     phase: 'succeeded',
-    ...summarizeTool('invoke_subagent', { Role: `Finished ${idx}` }),
+    ...summarizeTool('call_mcp_tool', { ServerName: 'codex-bridge_codex', ToolName: 'codex_job', Arguments: { action: 'wait', job_id: `job-20261126-11185${idx}-314ddb4${idx}` } }),
   }));
   const threeActiveSubs = [
     { conversationId: 'sub-11111111', agentName: 'Active Sub A', status: 'running' },
@@ -261,7 +262,7 @@ test('tool tracker keeps the Codex MCP summary when completion omits or clears A
     status: 'running',
     schema: '2.0',
     message: undefined,
-    tools: eightDoneTools,
+    tools: eightWaitTools,
     duration: null,
     files: [],
     turnId: 'turn',

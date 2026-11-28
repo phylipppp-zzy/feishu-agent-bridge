@@ -465,11 +465,12 @@ export class TurnCardDelivery {
       try { files = await this.service.findRegisteredReplyFiles?.(sessionId, message.blocks) ?? []; }
       catch { /* File actions are optional; the persisted reply can still be delivered. */ }
     }
-    let contextUsage = input.contextUsage ?? prior?.contextUsage ?? null;
-    if (!prior?.contextUsage && input.contextUsage === undefined) {
+    let contextUsage = input.contextUsage ?? null;
+    if (input.contextUsage === undefined) {
       try { contextUsage = await this.service.getContextUsage?.(sessionId) ?? null; }
       catch { /* Context data is optional. */ }
     }
+    if (!contextUsage) contextUsage = prior?.contextUsage ?? null;
     let modelBadge = '';
     try {
       const settings = await this.service.getConfirmedSettings?.(sessionId);

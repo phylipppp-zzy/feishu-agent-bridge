@@ -71,6 +71,10 @@ export interface SessionSubagentActivity {
   conversationId: string;
   agentName: string;
   status: string;
+  kind?: 'subagent' | 'dispatch_job';
+  activity?: string;
+  elapsedSec?: number;
+  engine?: 'agy' | 'codex';
 }
 
 type CardState = {
@@ -113,6 +117,50 @@ function formatRunningNote(active: readonly ToolProgress[]): string | undefined 
   return `⏳ 正在执行：${latest.summary}${extra}`;
 }
 
+function isSubagentActiveStatus(status: string): boolean {
+  const s = status.trim().toLowerCase();
+  return !s || s === 'running' || s === 'queued' || s === 'busy' || s.includes('running');
+}
+
+function formatSubagentActivityLine(sub: SessionSubagentActivity): { active: boolean; line: string } {
+  const label = sub.agentName?.trim() || `子代理 ${sub.conversationId.slice(0, 8)}`;
+  const active = isSubagentActiveStatus(sub.status);
+  const s = sub.status.trim().toLowerCase();
+  const elapsed = typeof sub.elapsedSec === 'number' && Number.isFinite(sub.elapsedSec) && sub.elapsedSec >= 0
+    ? formatDuration(sub.elapsedSec * 1000)
+    : '';
+  const detailParts: string[] = [];
+  if (s === 'queued') detailParts.push('排队中');
+  else if (active) detailParts.push('运行中');
+  else if (s === 'completed' || s === 'idle') detailParts.push('已完成');
+  else if (s === 'timed_out') detailParts.push('已超时');
+  else if (s === 'cancelled') detailParts.push('已取消');
+  else detailParts.push('失败');
+  if (elapsed) detailParts.push(elapsed);
+  if (active && sub.activity?.trim()) detailParts.push(escapeCardMarkdown(sub.activity.trim()));
+  const icon = active ? '⏳' : (s === 'completed' || s === 'idle') ? '✓' : s === 'cancelled' ? '—' : '✗';
+  if (sub.kind === 'dispatch_job') {
+    const engineBadge = sub.engine === 'agy' ? '⚡ AGY' : '⚡ Codex';
+    return {
+      active,
+      line: `- ${icon} ${engineBadge} \\[${escapeCardMarkdown(label)}\\]（${detailParts.join(' · ')}）`,
+    };
+  }
+  const rolePrefix = active ? '🤖 会话级活跃子代理：' : '🤖 子代理：';
+  return {
+    active,
+    line: `- ${icon} ${rolePrefix}${escapeCardMarkdown(label)}（${detailParts.join(' · ')}）`,
+  };
+}
+
+function isAsyncDispatchLaunch(item: ToolProgress): boolean {
+  if (item.tool === 'invoke_subagent') return true;
+  if ((item.tool === 'call_mcp_tool' || item.tool.startsWith('mcp_')) && isDispatchSummary(item.summary)) {
+    return !/(?:等待作业|查询作业|取消作业|作业列表|状态查询)/.test(item.summary);
+  }
+  return false;
+}
+
 function formatDelegatedStatus(
   tools: readonly ToolProgress[],
   activeSubagents?: readonly SessionSubagentActivity[],
@@ -124,24 +172,31 @@ function formatDelegatedStatus(
       deduped.set(item.callId, item);
     }
   }
+  const hasRealSubagents = Boolean(activeSubagents?.some(s => s.kind !== 'dispatch_job'));
+  const hasRealDispatchJobs = Boolean(activeSubagents?.some(s => s.kind === 'dispatch_job'));
   const combined: Array<{ active: boolean; line: string }> = [];
-  for (const item of [...deduped.values()].reverse()) {
-    combined.push({
-      active: !isTerminalTool(item.phase),
-      line: `- ${TOOL_ICONS[item.phase]} ${escapeCardMarkdown(item.summary)}（${TOOL_PHASE_LABELS[item.phase]}）`,
-    });
-  }
   if (activeSubagents?.length) {
     const seenSubIds = new Set<string>();
     for (const sub of activeSubagents) {
       if (seenSubIds.has(sub.conversationId)) continue;
       seenSubIds.add(sub.conversationId);
-      const label = sub.agentName?.trim() || `子代理 ${sub.conversationId.slice(0, 8)}`;
-      combined.push({
-        active: true,
-        line: `- ⏳ 🤖 会话级活跃子代理：${escapeCardMarkdown(label)}（运行中）`,
-      });
+      combined.push(formatSubagentActivityLine(sub));
     }
+  }
+  for (const item of [...deduped.values()].reverse()) {
+    const isSubagentLaunch = item.tool === 'invoke_subagent';
+    const isMcpDispatchLaunch = !isSubagentLaunch && isAsyncDispatchLaunch(item);
+    // Once real runtime status is available, omit succeeded async launch echoes so we show real status instead of dispatch echoes.
+    if (item.phase === 'succeeded' && ((isSubagentLaunch && hasRealSubagents) || (isMcpDispatchLaunch && hasRealDispatchJobs))) {
+      continue;
+    }
+    const phaseLabel = item.phase === 'succeeded' && (isSubagentLaunch || isMcpDispatchLaunch)
+      ? '已派发'
+      : TOOL_PHASE_LABELS[item.phase];
+    combined.push({
+      active: !isTerminalTool(item.phase),
+      line: `- ${TOOL_ICONS[item.phase]} ${escapeCardMarkdown(item.summary)}（${phaseLabel}）`,
+    });
   }
   combined.sort((a, b) => Number(!a.active) - Number(!b.active));
   const maxItems = 8;
@@ -195,13 +250,23 @@ function replyPreview(message: Message | undefined, allowFullReplyButton = true)
   return formatCardReplyBody(raw, allowFullReplyButton);
 }
 
-function replyActions(files: readonly Artifact[], fullReplyAnchor?: string): ChannelCardAction[] {
+function replyActions(
+  files: readonly Artifact[],
+  fullReplyAnchor?: string,
+  options?: { sessionId?: string; messageId?: string },
+): ChannelCardAction[] {
   const actions: ChannelCardAction[] = [];
   if (fullReplyAnchor) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: fullReplyAnchor } });
-  for (const file of files.slice(0, 3)) {
-    const name = [...file.name];
-    actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,
-      value: { action: 'file', artifactId: file.artifactId, contentVersion: file.contentVersion } });
+  if (files.length > 0) {
+    actions.push({
+      label: files.length > 1 ? `📎 发送文件 (${files.length})` : '📎 发送文件',
+      value: {
+        action: 'artifacts',
+        newCard: true,
+        ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+        ...(options?.messageId ? { messageId: options.messageId } : {}),
+      },
+    });
   }
   return actions;
 }
@@ -303,7 +368,10 @@ export function turnFinalReplyCard(state: TurnCardState): ChannelCard {
   const preview = replyPreview(message, canReadFiles);
   const actions: ChannelCardAction[] = [];
   if (isCliReadonly) actions.push({ label: '一键接入并续聊', value: { action: 'upgrade' } });
-  if (canReadFiles) actions.push(...replyActions(state.files, preview.truncated ? message?.messageId : undefined));
+  if (canReadFiles) actions.push(...replyActions(state.files, preview.truncated ? message?.messageId : undefined, {
+    ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+    ...(message?.messageId ? { messageId: message.messageId } : {}),
+  }));
   if (!isCliReadonly && state.sessionConnected) {
     if (!isCompact) actions.push(compactAction(contextUsage));
     actions.push({ label: '切换模型', value: { action: 'models' } });
@@ -403,7 +471,9 @@ export function turnProgressCard({
       : (preview.text || (status === 'completed'
           ? (count ? `完成 ${count} 项工具操作` : '本轮处理完成。')
           : '本轮未形成完整回复。'));
-  const actions = replyActions(files, preview.truncated && allowFullReplyButton ? message?.messageId : undefined);
+  const actions = replyActions(files, preview.truncated && allowFullReplyButton ? message?.messageId : undefined, {
+    ...(message?.messageId ? { messageId: message.messageId } : {}),
+  });
   if (allowCompactButton && !isCompact) actions.push(compactAction(contextUsage, running));
   const lines = stepLines(logTools, count);
   const executionLog = (logTools.length > 0 || runningNote || thinkingSummary)

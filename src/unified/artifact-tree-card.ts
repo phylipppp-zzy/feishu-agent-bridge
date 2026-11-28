@@ -35,6 +35,8 @@ export interface ArtifactTreeCardOptions {
   projectDir?: string;
   cursor?: string;
   sessionId?: string;
+  messageId?: string;
+  pinnedKeys?: readonly string[];
 }
 
 export interface ArtifactTreeCardResult {
@@ -67,6 +69,8 @@ export function buildArtifactTreeCard(
       pathKey: item.relativePath || item.name,
     };
   };
+  const pinnedSet = new Set(options.pinnedKeys ?? []);
+  const itemKey = (item: Artifact): string => `${item.relativePath || item.name}\0${item.contentVersion}`;
   const pathCounts = new Map<string, number>();
   const byDir = new Map<string, Artifact[]>();
   for (const item of deduped) {
@@ -77,7 +81,10 @@ export function buildArtifactTreeCard(
     byDir.set(dir, list);
   }
   const sortedDirs = [...byDir.keys()].sort((x, y) => (x === '.' ? -1 : y === '.' ? 1 : x.localeCompare(y)));
-  const ordered = sortedDirs.flatMap((dir) => byDir.get(dir)!);
+  const grouped = sortedDirs.flatMap((dir) => byDir.get(dir)!);
+  const ordered = pinnedSet.size
+    ? [...grouped.filter(item => pinnedSet.has(itemKey(item))), ...grouped.filter(item => !pinnedSet.has(itemKey(item)))]
+    : grouped;
 
   const PAGE_SIZE = 8;
   const total = ordered.length;
@@ -104,27 +111,33 @@ export function buildArtifactTreeCard(
     text = `默认目录：${projectDir}\n\n暂无可下载文件。\n提示：如需浏览项目目录，可发送 /ls 或 /ls <子目录>。`;
   } else {
     if (totalPages > 1) headerLines.push(`共 ${total} 个文件（第 ${currentPage}/${totalPages} 页）`);
-    const pageGroups: Array<{ dir: string; entries: Array<{ item: Artifact; num: number; filename: string; pathKey: string }> }> = [];
+    const pageGroups: Array<{ dir: string; entries: Array<{ item: Artifact; num: number; filename: string; pathKey: string; pinned: boolean }> }> = [];
     for (const [idx, item] of pageItems.entries()) {
       const { dir, filename, pathKey } = splitRel(item);
       const num = idx + 1;
+      const pinned = pinnedSet.has(itemKey(item));
       let group = pageGroups.find((g) => g.dir === dir);
       if (!group) {
         group = { dir, entries: [] };
         pageGroups.push(group);
       }
-      group.entries.push({ item, num, filename, pathKey });
+      group.entries.push({ item, num, filename, pathKey, pinned });
       const needsHash = (pathCounts.get(pathKey) ?? 0) > 1;
       const label = needsHash
         ? `${num}. ${truncateLabel(filename, 14)} (${item.contentVersion.slice(0, 6)})`
         : `${num}. ${truncateLabel(filename, 20)}`;
       actions.push({ label, value: { action: 'file', artifactId: item.artifactId, contentVersion: item.contentVersion } });
     }
+    const navBase = {
+      action: 'artifacts',
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.messageId ? { messageId: options.messageId } : {}),
+    };
     if (prevCursor !== null) {
-      actions.push({ label: '上一页', value: { action: 'artifacts', ...(options.sessionId ? { sessionId: options.sessionId } : {}), cursor: prevCursor } });
+      actions.push({ label: '上一页', value: { ...navBase, cursor: prevCursor } });
     }
     if (nextCursor !== null) {
-      actions.push({ label: '下一页', value: { action: 'artifacts', ...(options.sessionId ? { sessionId: options.sessionId } : {}), cursor: nextCursor } });
+      actions.push({ label: '下一页', value: { ...navBase, cursor: nextCursor } });
     }
     const treeLines: string[] = [];
     for (const group of pageGroups) {
@@ -132,13 +145,14 @@ export function buildArtifactTreeCard(
       for (const [entryIdx, entry] of group.entries.entries()) {
         const branch = entryIdx === group.entries.length - 1 ? '└──' : '├──';
         const hashSuffix = (pathCounts.get(entry.pathKey) ?? 0) > 1 ? ` · ${entry.item.contentVersion.slice(0, 6)}` : '';
-        treeLines.push(`${branch} ${entry.num}. ${entry.filename} (${formatHumanSize(entry.item.size)})${hashSuffix}`);
+        const pinnedTag = entry.pinned ? ' [本轮]' : '';
+        treeLines.push(`${branch} ${entry.num}. ${entry.filename} (${formatHumanSize(entry.item.size)})${hashSuffix}${pinnedTag}`);
       }
     }
     text = `${headerLines.join('\n')}\n\n${treeLines.join('\n')}`;
   }
   return {
-    card: { title: '文件', format: 'plain', text, actions },
+    card: { title: pinnedSet.size ? '发送文件 · 对话产物' : '文件', format: 'plain', text, actions },
     items: pageItems,
     nextCursor,
   };

@@ -132,6 +132,7 @@ export type ActiveTurnState = {
   lastThinkingEmitAt?: number;
   inFlightServerRequests?: number;
   awaitingAsyncWakeup?: boolean;
+  baselineUserStepIndex?: number | null;
   inProgressToolCalls: Set<string>;
   toolCalls: Map<string, Obj>;
   fullToolCalls: Set<string>;
