@@ -135,13 +135,24 @@ test('dual cards render live context, archive thinking and tool steps, and place
   assert.equal(archive.statusBanner, undefined);
   assert.deepEqual(archive.actions, []);
   assert.doesNotMatch(archive.text, /最终结论/);
+  assert.match(archive.text, /^\*\*🧠 思考过程\*\*\n先排查 SQLite 卡死根因，再核对 PATCH 幂等逻辑。\n\n过程已归档，最终回复见下方卡片。$/);
   const archiveWire = encodeCard(archive) as Wire;
   const panel = archiveWire.body.elements[0];
   assert.equal(panel?.tag, 'collapsible_panel');
   assert.equal(panel.expanded, false);
-  assert.match(panel.elements?.[0]?.content ?? '', /思考过程/);
-  assert.match(panel.elements?.[1]?.content ?? '', /1\. ✅ \*\*读取文件\*\*/);
-  assert.match(panel.elements?.[1]?.content ?? '', /2\. ✅ \*\*执行命令\*\*/);
+  assert.doesNotMatch(panel.elements?.[0]?.content ?? '', /思考过程/);
+  assert.match(panel.elements?.[0]?.content ?? '', /1\. ✅ \*\*读取文件\*\*/);
+  assert.match(panel.elements?.[0]?.content ?? '', /2\. ✅ \*\*执行命令\*\*/);
+  const bodyEl = archiveWire.body.elements.find(e => e.tag === 'markdown' && e.content?.includes('思考过程'));
+  assert.ok(bodyEl, 'archived process card must render thinking directly in visible body');
+
+  const thinkingOnlyArchive = turnProcessCard({
+    ...state,
+    tools: [state.tools[0]!],
+  });
+  const thinkingOnlyWire = encodeCard(thinkingOnlyArchive) as Wire;
+  assert.equal(thinkingOnlyWire.body.elements.some(e => e.tag === 'collapsible_panel'), false);
+  assert.match(thinkingOnlyArchive.text, /^\*\*🧠 思考过程\*\*\n先排查 SQLite 卡死根因，再核对 PATCH 幂等逻辑。/);
 
   const reply = turnFinalReplyCard(state);
   assert.equal(reply.title, 'Antigravity · 回复');
