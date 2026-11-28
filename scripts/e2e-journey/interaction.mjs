@@ -57,12 +57,16 @@ async function toolProgress(ctx) {
       await ctx.start(topic, '运行核心测试，结束后给我简短总结');
       tool('pytest', 'running', 'pytest tests/');
       await ctx.tick();
-      const message = ctx.cards(topic).findLast(item => item.card.bodyText.includes('Bash · pytest tests/'));
+      const message = ctx.cards(topic).findLast(item => item.card.collapsiblePanels[0]?.bodyText.includes('Bash · pytest tests/'));
       trace.check('正文前已发出蓝色 Schema 2.0 进度卡', () => {
         assert.ok(message, '缺少工具先于正文时的进度卡');
         assert.equal(message.card.schema, '2.0');
         assert.equal(message.card.template, 'blue');
-        assert.match(message.card.bodyText, /⏳ 正在执行：Bash · pytest tests\/.*\n正在处理…/);
+        assert.match(message.card.collapsiblePanels[0].bodyText, /⏳ 正在执行：Bash · pytest tests\//);
+        assert.match(message.card.bodyText, /正在处理…/);
+        const stop = message.card.buttons.find(button => button.label === '⏹ 中断当前回复');
+        assert.equal(stop?.value.action, 'stop');
+        assert.equal(stop.value.turnId, ctx.turn(topic).turnId);;
         assert.equal(message.card.collapsiblePanels[0]?.expanded, true);
       });
       cardId = message.id;
@@ -89,11 +93,11 @@ async function toolProgress(ctx) {
         assert.equal(current.patchCount - prior.patchCount, 1);
         assert.ok(patchDelayMs >= patchIntervalMs, `卡片更新间隔为 ${patchDelayMs}ms`);
       });
-      trace.check('并行状态在折叠面板外，两个成功及一个失败在顶部展开的执行步骤内', () => {
-        assert.match(card.bodyText, /⏳ 正在执行：Bash · git diff（另有 1 项并行）/);
+      trace.check('并行状态及成功失败步骤均在顶部展开的执行记录内', () => {
         assert.doesNotMatch(card.bodyText, /✗|✓/);
         const [panel] = card.collapsiblePanels;
         assert.equal(panel?.expanded, true);
+        assert.match(panel.bodyText, /⏳ 正在执行：Bash · git diff（另有 1 项并行）/);
         assert.equal(panel.title, '**执行步骤（5 项，失败 1 项）**');
         assert.match(panel.bodyText, /✅ \*\*Bash\*\* · pytest tests\//);
         assert.match(panel.bodyText, /✅ \*\*Bash\*\* · git status/);
@@ -121,7 +125,7 @@ async function toolProgress(ctx) {
       });
     });
 
-    await trace.step('7.3 等待本轮结束，查看同一张进度卡保留了多少正文', async () => {
+    await trace.step('7.3 等待本轮结束，比较归档过程卡和最终回复', async () => {
       tool('lint', 'succeeded', 'npm run lint');
       tool('compare', 'succeeded', 'git diff');
       ctx.emitText(topic, complete, { messageId, final: true });
@@ -130,11 +134,18 @@ async function toolProgress(ctx) {
       await delay(patchIntervalMs + 20);
       await ctx.tick();
       const card = ctx.wire.messages.get(cardId).card;
-      trace.check('同一张卡已转为绿色完成态，写出全部八段正文', () => {
-        assert.match(card.title, /^Codex · 已完成/);
+      trace.check('原过程卡折叠归档，话题底部新发完整最终回复', () => {
+        assert.match(card.title, /^Codex · 执行过程已完成/);
         assert.equal(card.template, 'green');
-        assert.equal(card.bodyText.trim(), complete.trim());
         assert.equal(card.collapsiblePanels[0].title, '**执行步骤（5 项，失败 1 项）**');
+        assert.equal(card.collapsiblePanels[0].expanded, false);
+        assert.doesNotMatch(card.bodyText, /第 1 段输出已接收/);
+        assert.ok(!card.buttons.some(button => button.label === '⏹ 中断当前回复'));
+        const reply = ctx.writes(topic).findLast(message => message.card.title === 'Codex · 回复');
+        assert.ok(reply);
+        assert.notEqual(reply.id, cardId);
+        assert.equal(reply.card.raw.body.elements[0].content.trim(), complete.trim());
+        assert.match(reply.card.raw.body.elements[2].content, /🔧 5 步（失败 1）/);
       });
     });
   });

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { CodexTransport, type SocketFactory } from '../src/unified/codex-transport.js';
 import { CodexAdapter } from '../src/unified/codex-adapter.js';
+import { formatCacheHitRate } from '../src/unified/context-usage.js';
 import { codexFilesystemProof } from '../src/unified/codex-approval.js';
 import { interactionCard } from '../src/unified/feishu-cards.js';
 import type { DispatchGuard, PlatformObservation } from '../src/unified/adapter.js';
@@ -43,6 +44,40 @@ function nextInteraction(adapter: CodexAdapter): Promise<Interaction> {
     });
   });
 }
+test('Codex reports last-request cache hits for inclusive and exclusive input counts', async () => {
+  const { sockets, transport, adapter } = setup();
+  try {
+    await transport.connect();
+    await adapter.resume(ref);
+    const cases = [
+      { last: { inputTokens: 100, cachedInputTokens: 80, outputTokens: 10 }, cache: 80, denominator: 100, rate: 80, context: 110 },
+      { last: { inputTokens: 20, cachedInputTokens: 80, outputTokens: 10 }, cache: 80, denominator: 100, rate: 80, context: 110 },
+      { last: { inputTokens: 0, cachedInputTokens: 80, outputTokens: 10 }, cache: 80, denominator: 80, rate: 100, context: 90 },
+      { last: { inputTokens: -1, cachedInputTokens: 80, outputTokens: 10 }, rate: null, context: 90 },
+      { last: { inputTokens: 100, cachedInputTokens: 0, outputTokens: 10 }, cache: 0, denominator: 100, rate: 0, context: 110 },
+      { last: { inputTokens: 100, outputTokens: 10 }, rate: null, context: 110 },
+      { last: { inputTokens: 100, cachedInputTokens: -1, outputTokens: 10 }, rate: null, context: 110 },
+      { last: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 10 }, rate: null, context: 10 },
+    ];
+    for (const { last, cache, denominator, rate, context } of cases) {
+      sockets[0]!.message({ method: 'thread/tokenUsage/updated', params: {
+        threadId: ref.nativeSessionId, tokenUsage: { last, modelContextWindow: 200_000 },
+      } });
+      const usage = await adapter.getContextUsage(ref);
+      assert.equal(usage?.usedTokens, context);
+      assert.equal(usage?.totalInputTokens, denominator);
+      assert.equal(usage?.cacheReadTokens, cache);
+      assert.equal(formatCacheHitRate(usage), rate);
+    }
+    sockets[0]!.message({ method: 'thread/tokenUsage/updated', params: {
+      threadId: ref.nativeSessionId, tokenUsage: { total: { inputTokens: 200, cachedInputTokens: 100, totalTokens: 220 } },
+    } });
+    assert.equal(formatCacheHitRate(await adapter.getContextUsage(ref)), null);
+  } finally {
+    transport.close();
+  }
+});
+
 test('disconnect makes in-flight outcome unknown without replay', async () => { const { sockets, transport } = setup(); await transport.connect(); const p = transport.request('thread/start', {}); sockets[0]!.close(); await assert.rejects(p, errorCode('outcome_unknown')); await transport.connect(); assert.deepEqual(sockets[1]!.sent.map(x => x.method), ['initialize', 'initialized']); transport.close(); });
 test('multiple questions and multiple answers use native schema and await resolved', async () => {
   const { sockets, transport, adapter, events } = setup(); await transport.connect(); await adapter.resume(ref); sockets[0]!.message(question); const i = lastInteraction(events); assert.equal(i.kind, 'question_group'); if (i.kind !== 'question_group') throw Error(); assert.equal(i.questions[0]!.multiple, null);

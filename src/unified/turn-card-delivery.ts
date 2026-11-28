@@ -6,7 +6,7 @@ import type { ChannelCard } from './feishu-cards.js';
 import { isTerminalTurn, readToolProgress, type ToolProgress } from './tool-progress.js';
 import { aggregateTurnAssistantMessage } from './turn-reply.js';
 import type { CompactTurnInfo, ContextUsageInfo } from './context-usage.js';
-import { completionText, formatCompactModelBadge, formatDuration, replyText, turnProgressCard, type SessionSubagentActivity } from './turn-progress-card.js';
+import { formatCompactModelBadge, replyText, turnFinalReplyCard, turnProcessCard, type SessionSubagentActivity } from './turn-progress-card.js';
 import { timestampMs, type TurnTiming, type TurnToolCounts } from './turn-progress-store.js';
 
 function positiveEnvMs(name: string, fallback: number): number {
@@ -17,20 +17,42 @@ function positiveEnvMs(name: string, fallback: number): number {
 }
 
 export const LONG_TURN_NOTICE_MS = 120_000;
+export const PROCESS_CARD_TEXT_DELAY_MS = positiveEnvMs('FEISHU_PROCESS_CARD_DELAY_MS', 5_000);
 const PATCH_INTERVAL_MS = positiveEnvMs('FEISHU_PATCH_INTERVAL_MS', 2_500);
 const HEARTBEAT_MS = 60_000;
 const REJECTION_RETRY_MS = positiveEnvMs('FEISHU_REJECTION_RETRY_MS', 3_000);
 
 type BindingKey = [destination: string, sessionId: string, scope: string];
 type SlotKey = [...BindingKey, turnId: string];
-type Slot = { card_id: string | null; updated_at: number; current_message: string; latest_sequence: number };
+type Slot = { card_id: string | null; final: number; updated_at: number; current_message: string; latest_sequence: number };
+type ProcessDelivery = 'ready' | 'retry_later' | 'abandoned';
+type ReplyDelivery = 'sent' | 'retry_later' | 'rejected';
+type ReplySlot = { card_id: string | null; delivery_id: string; signature: string; updated_at: number };
 type SlotMessage = Pick<Message, 'messageId' | 'sequence' | 'revision' | 'final'>;
+type ReplySignature = {
+  digest: string;
+  message?: SlotMessage | undefined;
+  startedAtMs: number | null;
+  endedAtMs: number | null;
+  completedAtMs: number;
+  status: Turn['status'];
+  compactInfo?: CompactTurnInfo | undefined;
+  contextUsage?: ContextUsageInfo | undefined;
+  modelBadge?: string | undefined;
+  toolCounts?: TurnToolCounts;
+};
 type CardAttempt = {
   view: View; message?: SlotMessage | undefined; plain: boolean; retryAfter: number;
-  attempts?: number; replaced?: boolean; supersededDeliveries?: string[];
+  attempts?: number; unknownPatchAttempts?: number; replaced?: boolean; supersededDeliveries?: string[];
 };
 type View = { schema: '1.0' | '2.0'; status: Turn['status'] | null; title: string; signature: string; content_signature?: string; delivery: string; dirty: number };
-type PendingFinalization = { turn: Turn; timing?: TurnTiming | undefined };
+type PendingFinalization = Partial<Omit<TurnView, 'key' | 'provider' | 'sessionConnected' | 'interrupt'>> & {
+  turn: Turn;
+  tools: ToolProgress[];
+  replyRetryAfter?: number;
+  replyPlain?: boolean;
+  replyRateLimitAttempts?: number;
+};
 
 interface Dependencies {
   guard(key: BindingKey): Promise<void>;
@@ -48,6 +70,10 @@ interface TurnView {
   toolCounts?: TurnToolCounts | undefined;
   provider: SessionSnapshot['session']['native']['provider'];
   sessionConnected?: boolean;
+  isCliReadonly?: boolean;
+  interrupt?: { revision: number; controlGeneration: number };
+  processCardId?: string;
+  contextUsage?: ContextUsageInfo | null;
   activeSubagents?: readonly SessionSubagentActivity[] | undefined;
 }
 
@@ -61,6 +87,11 @@ export function eventSequence(sessionId: string, cursor: string | undefined): nu
 
 const streamId = (key: SlotKey): string => `stream:${payloadDigest([key[2], key[0], key[1], key[3]])}`;
 const deliveryId = (prefix: string, key: SlotKey): string => `${prefix}:${payloadDigest(key)}`;
+const readReplySignature = (slot: ReplySlot | undefined): ReplySignature | undefined =>
+  slot?.signature.startsWith('{') ? JSON.parse(slot.signature) as ReplySignature : undefined;
+const slotMessage = (message: Message | undefined): SlotMessage | undefined => message && {
+  messageId: message.messageId, sequence: message.sequence, revision: message.revision, final: message.final,
+};
 
 function apiRejection(error: unknown): { platformCode?: number } | undefined {
   const failure = error as { deliveryKind?: string; platformCode?: number } | null;
@@ -80,6 +111,7 @@ export class TurnCardDelivery {
     turnId?: string;
   }>();
   private closed = false;
+  private readonly finalizing = new Set<string>();
   private viewSchemaReady = false;
   constructor(private readonly db: DatabaseSync, private readonly service: UnifiedService,
     private readonly port: FeishuPort, private readonly deps: Dependencies) {
@@ -105,6 +137,9 @@ export class TurnCardDelivery {
       CREATE TABLE IF NOT EXISTS channel_turn_pending_finalization (destination TEXT NOT NULL, session_id TEXT NOT NULL,
         binding_scope TEXT NOT NULL, turn_id TEXT NOT NULL, terminal_input TEXT NOT NULL,
         PRIMARY KEY(destination,session_id,binding_scope,turn_id));
+      CREATE TABLE IF NOT EXISTS channel_turn_reply_cards (destination TEXT NOT NULL, session_id TEXT NOT NULL,
+        binding_scope TEXT NOT NULL, turn_id TEXT NOT NULL, card_id TEXT, delivery_id TEXT NOT NULL,
+        signature TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(destination,session_id,binding_scope,turn_id));
     `);
   }
   /** Record that the user triggered /compact so its turn card renders before/after context without hijacking other turns. */
@@ -269,6 +304,28 @@ export class TurnCardDelivery {
     return this.db.prepare('SELECT * FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?')
       .get(...key) as Slot | undefined;
   }
+  private replySlot(key: SlotKey): ReplySlot | undefined {
+    return this.db.prepare(`SELECT card_id,delivery_id,signature,updated_at FROM channel_turn_reply_cards
+      WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).get(...key) as ReplySlot | undefined;
+  }
+  private pendingFinalization(key: SlotKey): PendingFinalization | undefined {
+    const row = this.db.prepare(`SELECT terminal_input FROM channel_turn_pending_finalization
+      WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).get(...key) as { terminal_input: string } | undefined;
+    return row && JSON.parse(row.terminal_input) as PendingFinalization;
+  }
+  hasPendingFinalization(key: SlotKey): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM channel_turn_pending_finalization
+      WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).get(...key));
+  }
+  private clearFinalization(key: SlotKey): void {
+    this.db.prepare(`DELETE FROM channel_turn_pending_finalization
+      WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).run(...key);
+  }
+  private saveFinalization(key: SlotKey, input: PendingFinalization): void {
+    this.db.prepare(`INSERT INTO channel_turn_pending_finalization VALUES (?,?,?,?,?)
+      ON CONFLICT(destination,session_id,binding_scope,turn_id) DO UPDATE SET terminal_input=excluded.terminal_input
+      WHERE terminal_input<>excluded.terminal_input`).run(...key, JSON.stringify(input));
+  }
   private view(key: SlotKey): View | undefined {
     if (!this.viewSchemaReady) {
       const columns = this.db.prepare('PRAGMA table_info(channel_turn_card_views)').all();
@@ -339,7 +396,7 @@ export class TurnCardDelivery {
     this.db.prepare("DELETE FROM channel_deliveries WHERE delivery_id=? AND state='unknown'").run(id);
   }
   private async writeCard(key: SlotKey, card: ChannelCard, cardId: string | null, attempt: CardAttempt,
-    guard: () => Promise<void>, prepareSlot?: () => void): Promise<boolean> {
+    guard: () => Promise<void>, prepareSlot?: () => void): Promise<ProcessDelivery> {
     const [destination] = key;
     const { view, plain } = attempt;
     const id = view.delivery;
@@ -351,15 +408,18 @@ export class TurnCardDelivery {
         this.saveAttempt(key, attempt);
       }
     });
-    if (!claimed) return false;
+    if (!claimed) return 'retry_later';
     try {
       const payload = this.deps.stamp(destination, plain ? { ...card, format: 'plain' } : card);
       if (cardId) await this.port.update(destination, cardId, payload, id, guard);
       else cardId = await this.port.send(destination, payload, id, guard) ?? null;
     } catch (error) {
       const failure = apiRejection(error);
-      if (!failure) throw error;
-      const terminal = isTerminalTurn(view.status ?? undefined);
+      if (!failure) {
+        await guard();
+        if (isTerminalTurn(view.status ?? undefined)) this.schedule(key, Date.now());
+        throw error;
+      }
       const attempts = (attempt.attempts ?? 0) + Number(failure.platformCode === 230429);
       let retry: CardAttempt | undefined;
       if (failure.platformCode === 230099 && !plain) {
@@ -367,18 +427,13 @@ export class TurnCardDelivery {
       } else if (failure.platformCode === 230429 && attempts <= 6) {
         const delay = Math.min(30_000, REJECTION_RETRY_MS * 2 ** (attempts - 1));
         retry = { ...attempt, attempts, retryAfter: Date.now() + delay };
-      } else if (cardId !== null && terminal && !attempt.replaced) {
-        retry = { ...attempt, attempts, plain: true, replaced: true,
-          view: { ...view, delivery: `${id}:replace` }, retryAfter: 0 };
       }
       await guard();
       this.journal(() => {
         if (retry?.view.delivery === id) this.clearUnknown(id);
-        else {
-          this.db.prepare("UPDATE channel_deliveries SET state='rejected' WHERE delivery_id=?").run(id);
-          this.db.prepare("INSERT OR IGNORE INTO channel_delivery_diagnostics VALUES (?, 'api_rejected', ?)")
-            .run(id, failure.platformCode ?? null);
-        }
+        else this.db.prepare("UPDATE channel_deliveries SET state='rejected' WHERE delivery_id=?").run(id);
+        this.db.prepare("INSERT OR REPLACE INTO channel_delivery_diagnostics VALUES (?, 'api_rejected', ?)")
+          .run(id, failure.platformCode ?? null);
         if (retry) this.saveAttempt(key, retry);
         else {
           this.saveView(key, { ...view, dirty: 0 });
@@ -388,34 +443,104 @@ export class TurnCardDelivery {
       });
       if (!retry) {
         this.cancel(key);
-        return terminal;
+        return 'abandoned';
       }
       if (!retry.retryAfter) return this.writeCard(key, card, retry.replaced ? null : cardId, retry, guard);
       this.schedule(key, retry.retryAfter);
-      return false;
+      return 'retry_later';
     }
     await guard();
     this.confirmCard(key, attempt, cardId);
-    return true;
+    return 'ready';
   }
-  private async putCard(input: TurnView): Promise<boolean> {
-    const { key, message, tools, toolCounts, provider, timing, sessionConnected } = input;
-    const [destination, sessionId] = key;
+  private async cardState(input: TurnView, status: Turn['status'], schema: '1.0' | '2.0', prior?: ReplySignature) {
+    const { key, message, tools, toolCounts, provider, timing, sessionConnected, interrupt } = input;
+    const [, sessionId, scope] = key;
+    const terminal = isTerminalTurn(status);
+    const start = timing?.startedMs ?? timestampMs(input.turn?.startedAt) ?? prior?.startedAtMs ?? null;
+    const end = timing?.endedMs ?? timestampMs(input.turn?.endedAt) ?? prior?.endedAtMs ?? null;
+    const duration = terminal && start !== null && end !== null && end >= start ? end - start : null;
+    let files: Artifact[] = [];
+    if (message && terminal) {
+      try { files = await this.service.findRegisteredReplyFiles?.(sessionId, message.blocks) ?? []; }
+      catch { /* File actions are optional; the persisted reply can still be delivered. */ }
+    }
+    let contextUsage = input.contextUsage ?? prior?.contextUsage ?? null;
+    if (!prior?.contextUsage && input.contextUsage === undefined) {
+      try { contextUsage = await this.service.getContextUsage?.(sessionId) ?? null; }
+      catch { /* Context data is optional. */ }
+    }
+    let modelBadge = '';
+    try {
+      const settings = await this.service.getConfirmedSettings?.(sessionId);
+      modelBadge = formatCompactModelBadge(
+        input.turn?.model ?? settings?.model ?? contextUsage?.model,
+        settings?.preferences?.reasoningEffort ?? settings?.preferences?.effort,
+      );
+    } catch {
+      modelBadge = formatCompactModelBadge(input.turn?.model ?? contextUsage?.model);
+    }
+    const compactInfo = prior?.compactInfo ?? this.resolveCompactInfo(sessionId, input.turn, key[3], start, contextUsage);
+    if (!input.turn?.model) modelBadge = prior?.modelBadge ?? modelBadge;
+    const isCliReadonly = input.isCliReadonly ?? scope.includes('"access_mode":"read_only"');
+    return {
+      provider, status, schema, message, tools, toolCounts: toolCounts ?? (tools.length === 0 ? prior?.toolCounts : undefined),
+      duration, files, turnId: key[3], sessionId,
+      sessionConnected: Boolean(sessionConnected), isCliReadonly,
+      startedAtMs: start, endedAtMs: end, completedAtMs: end ?? prior?.completedAtMs ?? Date.now(),
+      ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
+      ...(modelBadge ? { modelBadge } : {}),
+      ...(contextUsage ? { contextUsage } : {}),
+      ...(compactInfo ? { compactInfo } : {}),
+      ...(status === 'running' && !isCliReadonly && sessionConnected && interrupt ? {
+        stopAction: { label: '⏹ 中断当前回复',
+          value: { action: 'stop', turnId: key[3], ...interrupt, lockTurn: true } },
+      } : {}),
+    };
+  }
+
+  private async putCard(input: TurnView): Promise<ProcessDelivery> {
+    const { key, message, tools, sessionConnected } = input;
+    const status = input.turn?.status ?? 'running';
+    const terminal = isTerminalTurn(status);
     const binding: BindingKey = [key[0], key[1], key[2]];
     const guard = () => this.deps.guard(binding);
     let current = this.slot(key);
     let old = this.view(key);
     let cardId = current?.card_id ?? null;
     const firstId = streamId(key);
-    const finalId = deliveryId('turn-final', key);
+    const finalId = deliveryId('turn-process-final', key);
     let pending = this.attempt(key);
     let rejected = false;
     const staleDeliveries: string[] = [];
+    const abandonUnknown = (view: View): ProcessDelivery => {
+      this.journal(() => {
+        // Keep the ambiguous write visible for reconciliation while settling the process view locally.
+        this.db.prepare("INSERT OR IGNORE INTO channel_delivery_diagnostics VALUES (?, 'unknown', NULL)").run(view.delivery);
+        this.saveView(key, {
+          ...view, status, dirty: 0, delivery: view.delivery.startsWith(finalId) ? view.delivery : finalId,
+        });
+        this.db.prepare(`DELETE FROM channel_turn_card_attempts
+          WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).run(...key);
+      });
+      return 'abandoned';
+    };
     if (pending) {
       const receipt = await this.deliveryState(pending.view.delivery);
       await guard();
-      if (receipt === 'unknown') {
-        const pendingTerminal = isTerminalTurn(pending.view.status ?? undefined);
+      const pendingTerminal = isTerminalTurn(pending.view.status ?? undefined);
+      if (terminal && (pending.replaced || !pending.view.delivery.startsWith(finalId)) && receipt !== 'unknown' && receipt !== 'sent') {
+        // A queued retry under a live or legacy delivery key cannot serve as the archive write.
+        this.journal(() => {
+          if (receipt === 'not_sent') this.clearUnknown(pending!.view.delivery);
+          this.db.prepare(`DELETE FROM channel_turn_card_attempts
+            WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).run(...key);
+          if (!cardId) this.db.prepare(`DELETE FROM channel_stream_cards
+            WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?`).run(...key);
+        });
+        if (!cardId) return 'ready';
+        pending = undefined;
+      } else if (receipt === 'unknown') {
         // An interrupted non-terminal PATCH on an existing cardId is fully superseded by any newer/terminal
         // view because im.message.patch is an idempotent full-card replacement. Discard the stale attempt so
         // completed/failed/interrupted turns never deadlock behind an orphaned running heartbeat PATCH.
@@ -424,7 +549,7 @@ export class TurnCardDelivery {
           const patchAt = current!.updated_at + PATCH_INTERVAL_MS;
           if (patchAt > Date.now()) {
             this.schedule(key, patchAt);
-            return false;
+            return 'retry_later';
           }
           if (pending.supersededDeliveries?.length) staleDeliveries.push(...pending.supersededDeliveries);
           staleDeliveries.push(pending.view.delivery);
@@ -435,28 +560,24 @@ export class TurnCardDelivery {
           if (old) old = { ...old, signature: '', dirty: 1 };
           pending = undefined;
         } else {
-          const canRetryIdempotentPatch =
-            cardId !== null &&
-            !pending.replaced &&
-            pendingTerminal &&
-            (pending.attempts ?? 0) < 3;
-          if (!canRetryIdempotentPatch) return false;
-          if (pending.retryAfter > Date.now()) {
-            this.schedule(key, pending.retryAfter);
-            return false;
-          }
-          const nextAttempt = (pending.attempts ?? 0) + 1;
+          if (!terminal) return 'abandoned';
+          if (cardId === null || pending.replaced || !pendingTerminal) return abandonUnknown(pending.view);
+          const previousRetry = /:patch-retry-(\d+)(?::plain)?$/.exec(pending.view.delivery);
+          const unknownAttempts = pending.unknownPatchAttempts ?? (previousRetry ? Number(previousRetry[1]) : 0);
+          if (unknownAttempts >= 3) return abandonUnknown(pending.view);
+          const nextAttempt = unknownAttempts + 1;
           const retryDelivery = `${finalId}:patch-retry-${nextAttempt}`;
           const nextSuperseded = [...new Set([...(pending.supersededDeliveries ?? []), pending.view.delivery])];
           const nextPending: CardAttempt = {
             ...pending,
-            attempts: nextAttempt,
+            unknownPatchAttempts: nextAttempt,
             retryAfter: Date.now() + Math.min(20_000, 5_000 * 2 ** (nextAttempt - 1)),
             supersededDeliveries: nextSuperseded,
             view: { ...pending.view, delivery: retryDelivery },
           };
           this.saveAttempt(key, nextPending);
-          pending = nextPending;
+          this.schedule(key, nextPending.retryAfter);
+          return 'retry_later';
         }
       } else if (receipt === 'sent') {
         if (!cardId || pending.replaced) {
@@ -469,7 +590,7 @@ export class TurnCardDelivery {
         pending = undefined;
       } else if (pending.retryAfter > Date.now()) {
         this.schedule(key, pending.retryAfter);
-        return false;
+        return 'retry_later';
       } else if (receipt === 'not_sent') {
         this.clearUnknown(pending.view.delivery);
       }
@@ -477,8 +598,13 @@ export class TurnCardDelivery {
       // Older versions recorded the target view before the Feishu request settled.
       const receipt = await this.deliveryState(old.delivery);
       await guard();
+      if (terminal && old.delivery.startsWith(finalId) && old.dirty === 0) {
+        return receipt === 'sent' ? 'ready' : 'abandoned';
+      }
       if (receipt === 'unknown') {
-        if (!cardId || isTerminalTurn(old.status ?? undefined)) return false;
+        if (!cardId || isTerminalTurn(old.status ?? undefined)) {
+          return terminal ? abandonUnknown(old) : 'abandoned';
+        }
         staleDeliveries.push(old.delivery);
         old = { ...old, signature: '', dirty: 1 };
       } else {
@@ -487,6 +613,11 @@ export class TurnCardDelivery {
           this.clearUnknown(old.delivery);
           old = { ...old, status: null, title: '', signature: '', dirty: 1 };
           this.saveView(key, old);
+          if (!cardId && isTerminalTurn(input.turn?.status)) {
+            this.db.prepare(`DELETE FROM channel_stream_cards
+              WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?`).run(...key);
+            return 'ready';
+          }
         } else if (receipt === 'sent' && !cardId) {
           cardId = await this.port.lookupMessageId?.(old.delivery) ?? null;
           await guard();
@@ -495,77 +626,60 @@ export class TurnCardDelivery {
         }
       }
     }
-    const status = isTerminalTurn(old?.status ?? undefined) ? old!.status! : input.turn?.status ??
-      (old?.status === 'running' || message && !message.final ? 'running' : undefined);
-    const terminal = isTerminalTurn(status);
-    if (rejected && isTerminalTurn(old?.status ?? undefined)) return true;
-    if (rejected && !terminal) return false;
-    const ticking = status === 'running' && sessionConnected &&
-      (input.turn?.status === 'running' || message?.final === false);
-    if (!ticking) this.cancel(key);
+    if (rejected && (old?.delivery.startsWith(finalId) || !terminal)) return 'abandoned';
     const now = Date.now();
-    const schema = old?.schema ?? (current ? '1.0' : '2.0');
-    const start = timing?.startedMs ?? timestampMs(input.turn?.startedAt);
-    const end = timing?.endedMs ?? timestampMs(input.turn?.endedAt);
-    const elapsed = start !== null && end !== null && end >= start ? end - start : null;
-    let files: Artifact[] = [];
-    if (message && (terminal || !input.turn && message.final)) {
-      try { files = await this.service.findRegisteredReplyFiles?.(sessionId, message.blocks) ?? []; }
-      catch { /* File actions are optional; the persisted reply can still be delivered. */ }
-    }
-    let contextUsage: ContextUsageInfo | null = null;
-    try {
-      contextUsage = await this.service.getContextUsage?.(sessionId) ?? null;
-    } catch {
-      contextUsage = null;
-    }
-    let modelBadge = '';
-    try {
-      const settings = await this.service.getConfirmedSettings?.(sessionId);
-      modelBadge = formatCompactModelBadge(
-        input.turn?.model ?? settings?.model ?? contextUsage?.model,
-        settings?.preferences?.reasoningEffort ?? settings?.preferences?.effort,
-      );
-    } catch {
-      modelBadge = formatCompactModelBadge(input.turn?.model ?? contextUsage?.model);
-    }
-    const compactInfo = this.resolveCompactInfo(sessionId, input.turn, key[3], start, contextUsage);
+    const schema = old?.schema ?? (cardId && !input.processCardId ? '1.0' : '2.0');
+    const state = await this.cardState(input, status, schema);
     await guard();
-    const allowCompactButton = sessionConnected && !key[2].includes('"access_mode":"read_only"');
-    const card = turnProgressCard({
-      provider, status, schema, message, tools, toolCounts, duration: terminal ? elapsed : null, files, turnId: key[3],
-      allowCompactButton,
-      ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
-      ...(modelBadge ? { modelBadge } : {}),
-      ...(contextUsage ? { contextUsage } : {}),
-      ...(compactInfo ? { compactInfo } : {}),
-    });
-    const learnedDuration = isTerminalTurn(status) && card.title.includes(' · 用时 ') && !old?.title.includes(' · 用时 ');
-    if (old?.title && isTerminalTurn(old.status ?? undefined) && !learnedDuration) card.title = old.title;
+    if (!terminal && (this.replySlot(key) || this.hasPendingFinalization(key))) return 'abandoned';
+    if (status === 'queued') return 'abandoned';
+    if (!terminal && !cardId && !pending && !old?.delivery) {
+      const immediate = tools.some(tool => tool.tool !== 'thinking' || tool.phase === 'running') ||
+        (input.toolCounts?.totalTools ?? 0) > tools.filter(tool => tool.tool === 'thinking').length ||
+        Boolean(input.activeSubagents?.length || state.compactInfo?.isCompact || key[3].startsWith('wakeup:'));
+      if (!immediate) {
+        if (!message?.blocks.some(block => block.type === 'text' && block.text.trim())) return 'abandoned';
+        const started = current?.updated_at || now;
+        if (!current) {
+          this.db.prepare("INSERT OR IGNORE INTO channel_stream_cards VALUES (?,?,?,?,NULL,0,?,0,'',0)").run(...key, started);
+          current = this.slot(key);
+        }
+        if (started + PROCESS_CARD_TEXT_DELAY_MS > now) {
+          this.schedule(key, started + PROCESS_CARD_TEXT_DELAY_MS);
+          return 'retry_later';
+        }
+      }
+    }
+    this.cancel(key);
+    // For terminal processing an existing Feishu message ID is required, even when creation just reconciled.
+    if (terminal && !cardId) return 'abandoned';
+    if (terminal && !pending && old?.delivery.startsWith(finalId) &&
+      await this.deliveryState(old.delivery) === 'sent') return 'ready';
+    const card = turnProcessCard(state);
     const signature = payloadDigest(card);
-    const contentSignature = payloadDigest([status ?? null, {
-      ...card,
-      title: elapsed === null ? card.title : card.title.replace(` · 用时 ${formatDuration(elapsed)}`, ''),
-    }]);
+    const contentSignature = payloadDigest([status, card]);
     const heartbeat = () => {
-      if (ticking && start !== null) this.schedule(key, Math.max(now + 1, start + (Math.floor((now - start) / HEARTBEAT_MS) + 1) * HEARTBEAT_MS));
+      const start = state.startedAtMs;
+      if (!terminal && sessionConnected && start !== null) {
+        this.schedule(key, Math.max(now + 1, start + (Math.floor((now - start) / HEARTBEAT_MS) + 1) * HEARTBEAT_MS));
+      }
     };
-    if (!pending && old?.status === (status ?? null) && staleDeliveries.length === 0 &&
+    if (!terminal && !pending && old?.status === status && staleDeliveries.length === 0 &&
       (old.signature === signature || (!terminal && old.status === 'running' && old.content_signature === contentSignature))) {
       if (old.dirty || !old.content_signature) this.saveView(key, { ...old, dirty: 0, content_signature: contentSignature });
       heartbeat();
-      return true;
+      return 'ready';
     }
-    if (!pending && current && current.updated_at + PATCH_INTERVAL_MS > now) {
+    if (!pending && cardId && current && current.updated_at + PATCH_INTERVAL_MS > now) {
       this.saveView(key, { schema, status: old?.status ?? null, title: old?.title ?? '', signature: old?.signature ?? '',
         content_signature: staleDeliveries.length ? '' : old?.content_signature ?? '', delivery: old?.delivery ?? firstId, dirty: 1 });
       this.schedule(key, current.updated_at + PATCH_INTERVAL_MS);
-      return false;
+      return 'retry_later';
     }
     // A confirmed create can be patched only when its message ID is known.
-    if (!cardId && old?.signature && !rejected && !pending?.replaced) return false;
+    if (!cardId && old?.signature && !rejected && !pending?.replaced) return 'abandoned';
     const uniqueStale = [...new Set([...(pending?.supersededDeliveries ?? []), ...staleDeliveries])];
-    const id = terminal && !isTerminalTurn(old?.status ?? undefined) ? finalId
+    const id = terminal ? finalId
       : cardId
         ? `turn-update:${payloadDigest(uniqueStale.length ? [key, old?.delivery ?? firstId, signature, uniqueStale] : [key, old?.delivery ?? firstId, signature])}`
         : firstId;
@@ -574,15 +688,15 @@ export class TurnCardDelivery {
       ...(uniqueStale.length ? { supersededDeliveries: uniqueStale } : {}),
       view: { schema, status: status ?? null, title: card.title, signature, content_signature: contentSignature,
         delivery: pending?.view.delivery ?? id, dirty: 1 },
-      message: message && { messageId: message.messageId, sequence: message.sequence, revision: message.revision, final: message.final },
-      plain: pending?.plain ?? false, retryAfter: 0,
+      message: slotMessage(message),
+      plain: pending?.plain ?? false, retryAfter: pending?.retryAfter ?? 0,
     };
     const ready = await this.writeCard(key, card, attempt.replaced ? null : cardId, attempt, guard, () => {
       if (!current) this.db.prepare("INSERT INTO channel_stream_cards VALUES (?,?,?,?,NULL,0,0,0,'',0)").run(...key);
       this.saveView(key, old ? { ...old, dirty: 1 }
         : { schema, status: null, title: '', signature: '', delivery: '', dirty: 1 });
     });
-    if (ready) heartbeat();
+    if (ready === 'ready') heartbeat();
     return ready;
   }
   private recordSlot(key: SlotKey, cardId: string | null, message?: SlotMessage): void {
@@ -591,48 +705,210 @@ export class TurnCardDelivery {
       .run(cardId, Date.now(), message?.messageId ?? '', message?.sequence ?? 0, message?.revision ?? 0, Number(!!message?.final), ...key);
   }
 
-  renderStreamMessage(input: TurnView): Promise<boolean> { return this.putCard(input); }
-
-  finalizeTurnCard(input: TurnView): Promise<boolean> {
-    return this.putCard(input);
+  async renderStreamMessage(input: TurnView): Promise<boolean> {
+    if (this.replySlot(input.key) || this.hasPendingFinalization(input.key)) return false;
+    return await this.putCard(input) === 'ready';
   }
 
-  private async maybeSendCompletionNotice(input: TurnView, allowed: () => boolean): Promise<boolean> {
-    const { key, timing, tools, toolCounts, message } = input;
-    const id = deliveryId('turn-push', key);
-    const receipt = await this.deliveryState(id);
-    if (receipt === 'sent' || receipt === 'suppressed') return true;
-    if (receipt === 'unknown') return false;
-    const guard = () => this.deps.guard([key[0], key[1], key[2]]);
-    await guard();
-    const baseline = this.db.prepare('SELECT sequence FROM channel_turn_baseline WHERE destination=? AND session_id=? AND binding_scope=?')
-      .get(key[0], key[1], key[2]) as { sequence: number } | undefined;
-    const report = timing && timing.startedMs !== null && timing.endedMs !== null && timing.liveStartSequence !== null &&
-      timing.liveEndSequence !== null && timing.liveStartSequence > (baseline?.sequence ?? 0) ? timing : null;
-    const duration = report ? report.endedMs! - report.startedMs! : 0;
-    const policy = report && this.db.prepare(`SELECT allowed FROM channel_turn_notice_policy
-      WHERE destination=? AND session_id=? AND binding_scope=? AND sequence<? ORDER BY sequence DESC LIMIT 1`)
-      .get(key[0], key[1], key[2], report.liveEndSequence!) as { allowed: number } | undefined;
-    const eligible = allowed() && policy?.allowed !== 0 && this.port.isTopicDestination?.(key[0]) !== false;
-    // The snapshot can finish a live turn before the matching end observation arrives.
-    if (eligible && timing?.liveEndSequence === null && (timing.liveStartSequence ?? 0) > (baseline?.sequence ?? 0)) return false;
-    const suppress = !eligible || duration < LONG_TURN_NOTICE_MS;
-    let claimed = false;
-    if (receipt === 'not_sent') {
+  async finalizeTurnCard(input: TurnView): Promise<boolean> {
+    const { key, processCardId } = input;
+    const id = streamId(key);
+    if (this.finalizing.has(id)) return false;
+    this.finalizing.add(id);
+    try {
+      const guard = () => this.deps.guard([key[0], key[1], key[2]]);
+      await guard();
+      const old = this.view(key);
+      if (!this.replySlot(key) && !processCardId) {
+        const slot = this.slot(key);
+        const settledView = old && isTerminalTurn(old.status ?? undefined) && !old.delivery.startsWith('turn-process-final:') &&
+          (old.dirty === 0 || await this.deliveryState(old.delivery) !== 'not_sent');
+        const settledSlot = !old && slot?.card_id != null && Number(slot.final) === 1;
+        if (settledView || settledSlot) {
+          await guard();
+          this.clearFinalization(key);
+          this.cancel(key);
+          return true;
+        }
+      }
+      await guard();
+      const prior = this.pendingFinalization(key);
+      const turn = input.turn ?? prior?.turn ?? {
+        turnId: key[3], sessionId: key[1], status: readReplySignature(this.replySlot(key))?.status ?? 'completed', startedAt: null, endedAt: null,
+        model: null, inputId: null, outputIds: [],
+      };
+      if (!isTerminalTurn(turn.status)) throw new Error('Expected a terminal turn for reply card finalization');
+      const previousMessage = prior?.message;
+      const message = !input.message || previousMessage?.messageId === input.message.messageId &&
+        previousMessage.revision > input.message.revision ? previousMessage : input.message;
+      const saved: PendingFinalization = {
+        ...prior,
+        turn: { ...turn, startedAt: turn.startedAt ?? prior?.turn.startedAt ?? null, endedAt: turn.endedAt ?? prior?.turn.endedAt ?? null },
+        message,
+        timing: input.timing && prior?.timing ? {
+          ...input.timing,
+          startedMs: input.timing.startedMs ?? prior.timing.startedMs,
+          endedMs: input.timing.endedMs ?? prior.timing.endedMs,
+        } : input.timing ?? prior?.timing,
+        tools: input.tools.length ? input.tools : prior?.tools ?? [],
+        toolCounts: input.toolCounts ?? prior?.toolCounts,
+        ...(processCardId ? { processCardId } : {}),
+        ...(input.isCliReadonly !== undefined ? { isCliReadonly: input.isCliReadonly } : {}),
+        ...(input.contextUsage !== undefined ? { contextUsage: input.contextUsage } : {}),
+        ...(input.activeSubagents?.length ? { activeSubagents: input.activeSubagents } : {}),
+      };
       this.journal(() => {
-        this.clearUnknown(id);
-        claimed = this.claim(id, suppress ? 'suppressed' : 'unknown');
+        this.saveFinalization(key, saved);
+        if (saved.processCardId) {
+          this.db.prepare(`INSERT INTO channel_stream_cards VALUES (?,?,?,?,?,0,0,0,'',0)
+            ON CONFLICT(destination,session_id,binding_scope,message_id)
+            DO UPDATE SET card_id=COALESCE(channel_stream_cards.card_id,excluded.card_id)`).run(...key, saved.processCardId);
+        }
       });
-    } else {
-      claimed = this.claim(id, suppress ? 'suppressed' : 'unknown');
+      this.cancel(key);
+      const fullInput = { ...input, ...saved };
+      const process = this.slot(key);
+      // A deferred text-only slot is only a timer bookmark. Discard it when the turn finishes first.
+      const attemptedProcess = this.attempt(key) || old?.delivery && await this.deliveryState(old.delivery) !== 'rejected';
+      await guard();
+      if (process?.card_id || attemptedProcess) {
+        if (await this.putCard(fullInput) === 'retry_later') return false;
+      } else if (process) {
+        this.db.prepare(`DELETE FROM channel_stream_cards
+          WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?`).run(...key);
+      }
+      await guard();
+      if (await this.putReplyCard(fullInput, saved, guard) === 'retry_later') return false;
+      this.clearFinalization(key);
+      return true;
+    } finally {
+      this.finalizing.delete(id);
     }
-    if (suppress || !claimed) return suppress && claimed;
-    const text = completionText(duration, message, toolCounts?.totalTools ?? tools.length);
-    if (this.port.sendText) await this.port.sendText(key[0], text, id, guard);
-    else await this.port.send(key[0], { title: text, text: '', format: 'plain', actions: [] }, id, guard);
+  }
+
+  private async putReplyCard(input: TurnView, pending: PendingFinalization, guard: () => Promise<void>): Promise<ReplyDelivery> {
+    const { key } = input;
+    if ((pending.replyRetryAfter ?? 0) > Date.now()) {
+      this.schedule(key, pending.replyRetryAfter!);
+      return 'retry_later';
+    }
+    const createId = deliveryId('turn-reply', key);
+    let previous = this.replySlot(key);
+    const previousDelivery = previous?.delivery_id ?? createId;
+    const receipt = await this.deliveryState(previousDelivery);
+    let cardId = previous?.card_id ?? null;
+    if (receipt === 'sent' && !cardId) cardId = await this.port.lookupMessageId?.(previousDelivery) ?? null;
     await guard();
-    this.delivered(id);
-    return true;
+    if (receipt === 'rejected' || receipt === 'suppressed') return 'rejected';
+    if (receipt === 'unknown' && (!cardId || previousDelivery === createId)) return 'retry_later';
+    if (receipt === 'sent' && !cardId) return 'sent';
+    if (cardId && previous && !previous.card_id) {
+      const backfilled = this.db.prepare(`UPDATE channel_turn_reply_cards SET card_id=?
+        WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=? AND delivery_id=? AND card_id IS NULL`)
+        .run(cardId, ...key, previousDelivery);
+      if (!backfilled.changes) return 'retry_later';
+      previous = { ...previous, card_id: cardId };
+    }
+    const prior = readReplySignature(previous);
+    const message = slotMessage(input.message);
+    const staleMessage = prior?.message && (!message || message.sequence < prior.message.sequence ||
+      message.messageId === prior.message.messageId && (message.revision < prior.message.revision || prior.message.final && !message.final));
+    if (staleMessage) return receipt === 'sent' ? 'sent' : 'retry_later';
+    const state = await this.cardState(input, pending.turn.status, '2.0', prior);
+    const card = turnFinalReplyCard(state);
+    const digest = payloadDigest(card);
+    // This signature stores the displayed count. cardState only reuses it when no tool rows need filtering.
+    const toolCounts = {
+      turnId: key[3],
+      totalTools: Math.max(0, (state.toolCounts?.totalTools ?? state.tools.length) -
+        state.tools.filter(tool => tool.tool === 'thinking').length),
+      failedTools: state.toolCounts?.failedTools ?? state.tools.filter(tool => tool.tool !== 'thinking' && tool.phase === 'failed').length,
+    };
+    // Keep the evidence used for a later reply refresh with the digest. The Core remains the source of the body.
+    const signature = JSON.stringify({
+      digest, message, startedAtMs: state.startedAtMs, endedAtMs: state.endedAtMs,
+      completedAtMs: state.completedAtMs, status: state.status, compactInfo: state.compactInfo,
+      contextUsage: state.contextUsage, modelBadge: state.modelBadge, toolCounts,
+    } satisfies ReplySignature);
+    await guard();
+    const matches = (current: ReplySlot | undefined) => current?.delivery_id === previous?.delivery_id &&
+      current?.signature === previous?.signature && current?.card_id === previous?.card_id && current?.updated_at === previous?.updated_at;
+    if (receipt === 'sent' && (prior?.digest ?? previous?.signature) === digest) {
+      if (previous && previous.signature !== signature && matches(this.replySlot(key))) {
+        this.db.prepare(`UPDATE channel_turn_reply_cards SET signature=?
+          WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=? AND delivery_id=? AND updated_at=?`)
+          .run(signature, ...key, previousDelivery, previous.updated_at);
+      }
+      return 'sent';
+    }
+
+    const id = cardId ? receipt === 'sent'
+      ? `turn-reply-update:${payloadDigest([key, previousDelivery, digest])}` : previousDelivery : createId;
+    const updatedAt = Math.max(Date.now(), (previous?.updated_at ?? 0) + 1);
+    if (receipt === 'unknown' && cardId && previous && previous.updated_at + REJECTION_RETRY_MS > Date.now()) {
+      // PATCH is safe to reapply to the same message. Give an in-flight write time to record its receipt first.
+      this.schedule(key, previous.updated_at + REJECTION_RETRY_MS);
+      return 'retry_later';
+    }
+    const saveReply = () => this.db.prepare('INSERT OR REPLACE INTO channel_turn_reply_cards VALUES (?,?,?,?,?,?,?,?)')
+      .run(...key, cardId, id, signature, updatedAt);
+    let claimed = false;
+    this.journal(() => {
+      if (!matches(this.replySlot(key))) return;
+      const inLedger = this.db.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(id) as { state: string } | undefined;
+      if ((receipt === 'not_sent' || receipt === 'unknown' && cardId) && inLedger?.state === 'unknown') this.clearUnknown(id);
+      claimed = this.claim(id);
+      if (claimed) saveReply();
+    });
+    if (!claimed) return 'retry_later';
+    try {
+      const payload = this.deps.stamp(key[0], pending.replyPlain ? { ...card, format: 'plain' } : card);
+      if (cardId) await this.port.update(key[0], cardId, payload, id, guard);
+      else cardId = await this.port.send(key[0], payload, id, guard) ?? null;
+    } catch (error) {
+      const failure = apiRejection(error);
+      if (!failure) {
+        await guard();
+        if (cardId) this.schedule(key, updatedAt + REJECTION_RETRY_MS);
+        throw error;
+      }
+      const plain = failure.platformCode === 230099 && !pending.replyPlain;
+      const attempts = (pending.replyRateLimitAttempts ?? 0) + 1;
+      const rateLimited = failure.platformCode === 230429 && attempts <= 6;
+      await guard();
+      let recorded = false;
+      this.journal(() => {
+        if (this.replySlot(key)?.updated_at !== updatedAt) return;
+        recorded = true;
+        if (plain || rateLimited) {
+          this.clearUnknown(id);
+          if (plain) pending.replyPlain = true;
+          if (rateLimited) {
+            pending.replyRateLimitAttempts = attempts;
+            pending.replyRetryAfter = Date.now() + Math.min(30_000, REJECTION_RETRY_MS * 2 ** (attempts - 1));
+          }
+          this.saveFinalization(key, pending);
+        } else {
+          this.db.prepare("UPDATE channel_deliveries SET state='rejected' WHERE delivery_id=?").run(id);
+          this.db.prepare("INSERT OR IGNORE INTO channel_delivery_diagnostics VALUES (?, 'api_rejected', ?)")
+            .run(id, failure.platformCode ?? null);
+        }
+      });
+      if (!recorded) return 'retry_later';
+      if (plain) return this.putReplyCard(input, pending, guard);
+      if (rateLimited) this.schedule(key, pending.replyRetryAfter!);
+      return rateLimited ? 'retry_later' : 'rejected';
+    }
+    await guard();
+    let confirmed = false;
+    this.journal(() => {
+      if (this.replySlot(key)?.updated_at === updatedAt) {
+        this.delivered(id);
+        saveReply();
+        confirmed = true;
+      }
+    });
+    return confirmed ? 'sent' : 'retry_later';
   }
 
   async sendFullReply(key: BindingKey, message: Message, guard: () => Promise<void>,
@@ -654,13 +930,17 @@ export class TurnCardDelivery {
   }
 
   async sync(key: BindingKey, snapshot: SessionSnapshot, events: readonly Event[],
-    messages: readonly Message[], allowed: () => boolean, expiredFrom?: number): Promise<void> {
+    messages: readonly Message[], _allowed: () => boolean, expiredFrom?: number,
+    options?: { isCliReadonly?: boolean; skipTurnIds?: ReadonlySet<string> }): Promise<void> {
     const [destination, sessionId, scope] = key;
     await this.backfillReadonlyBaseline(key);
     const turns = new Map(snapshot.turns?.map(turn => [turn.turnId, turn]));
     const snapshotTurns = new Set(turns.keys());
     const { session } = snapshot;
+    const isCliReadonly = options?.isCliReadonly ?? scope.includes('"access_mode":"read_only"');
     const sessionConnected = session.control?.input === 'available' && session.status !== 'read_only' && session.status !== 'unreachable';
+    const interrupt = !isCliReadonly && sessionConnected && session.capabilities?.interrupt?.status === 'available'
+      ? { revision: session.revision, controlGeneration: session.control.generation } : undefined;
     const timing = new Map(snapshot.turnProgress?.timing.map(turn => [turn.turnId, turn]));
     const toolCounts = new Map(snapshot.turnProgress?.toolCounts?.map(counts => [counts.turnId, counts]));
     const tools = new Map<string, ToolProgress[]>();
@@ -681,11 +961,12 @@ export class TurnCardDelivery {
       } else if (event.type === 'tool.updated') {
         const update = readToolProgress(event.data);
         if (update) ids.add(update.turnId);
-      } else if (event.type === 'artifact.available' && data?.turnId && this.slot([...key, data.turnId])) {
+      } else if (event.type === 'artifact.available' && data?.turnId && this.replySlot([...key, data.turnId])) {
         ids.add(data.turnId);
       }
     }
-    for (const turn of turns.values()) if (turn.status === 'running' && tools.has(turn.turnId) ||
+    for (const turn of turns.values()) if (turn.status === 'running' && (tools.has(turn.turnId) ||
+      turn.turnId.startsWith('wakeup:') || this.compactBaselines.size > 0) ||
       expiredFrom !== undefined && (timing.get(turn.turnId)?.liveEndSequence ?? 0) > expiredFrom) ids.add(turn.turnId);
     const active = this.db.prepare(`SELECT s.message_id AS turn_id FROM channel_stream_cards s
       LEFT JOIN channel_turn_card_views v ON v.destination=s.destination AND v.session_id=s.session_id
@@ -700,20 +981,24 @@ export class TurnCardDelivery {
     for (const { turn_id } of active) ids.add(turn_id);
     const pending = this.db.prepare(`SELECT turn_id,terminal_input FROM channel_turn_pending_finalization
       WHERE destination=? AND session_id=? AND binding_scope=?`).all(...key) as { turn_id: string; terminal_input: string }[];
+    const savedFinalizations = new Map<string, PendingFinalization>();
     for (const { turn_id, terminal_input } of pending) {
       const saved = JSON.parse(terminal_input) as PendingFinalization;
+      savedFinalizations.set(turn_id, saved);
       ids.add(turn_id);
-      if (!snapshotTurns.has(turn_id) && !isTerminalTurn(turns.get(turn_id)?.status)) turns.set(turn_id, saved.turn);
+      if (!isTerminalTurn(turns.get(turn_id)?.status)) turns.set(turn_id, saved.turn);
       if (saved.timing && (!timing.has(turn_id) ||
         saved.timing.liveEndSequence !== null && timing.get(turn_id)?.liveEndSequence === null)) timing.set(turn_id, saved.timing);
     }
     if (expiredFrom !== undefined) {
-      const recent = this.db.prepare(`SELECT message_id FROM channel_stream_cards
+      const recent = this.db.prepare(`SELECT turn_id FROM channel_turn_reply_cards
         WHERE destination=? AND session_id=? AND binding_scope=? ORDER BY updated_at DESC LIMIT 32`)
-        .all(...key) as { message_id: string }[];
-      for (const slot of recent) ids.add(slot.message_id);
+        .all(...key) as { turn_id: string }[];
+      for (const slot of recent) ids.add(slot.turn_id);
     }
+    for (const id of options?.skipTurnIds ?? []) ids.delete(id);
     const replies = new Map<string, Message[]>();
+    const baselinedTurns = new Set<string>();
     const baselineMessage = this.db.prepare(`SELECT revision FROM channel_turn_baseline_messages
       WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?`);
     for (const message of snapshot.messages) {
@@ -721,7 +1006,10 @@ export class TurnCardDelivery {
       if (message.role !== 'assistant' || message.sessionId !== sessionId || !ids.has(id)) continue;
       // Automatic read-only mirrors exclude the history captured when they were attached.
       const atBaseline = baselineMessage.get(...key, message.messageId);
-      if (atBaseline && Number(atBaseline.revision) >= message.revision) continue;
+      if (atBaseline && Number(atBaseline.revision) >= message.revision) {
+        baselinedTurns.add(id);
+        continue;
+      }
       const items = replies.get(id) ?? [];
       items.push(message);
       replies.set(id, items);
@@ -738,30 +1026,24 @@ export class TurnCardDelivery {
     if (subagentReader && (session.status === 'running' || [...ids].some(id => !isTerminalTurn(turns.get(id)?.status)))) {
       try { activeSubagents = await subagentReader(); } catch { /* Optional subagent snapshot */ }
     }
+    if (activeSubagents?.length) {
+      for (const turn of turns.values()) if (turn.status === 'running' && !options?.skipTurnIds?.has(turn.turnId)) ids.add(turn.turnId);
+    }
     for (const id of ids) {
       const slot: SlotKey = [...key, id];
       const previous = this.slot(slot);
-      const message = aggregateTurnAssistantMessage(replies.get(id) ?? [], id);
+      const saved = savedFinalizations.get(id);
+      const message = aggregateTurnAssistantMessage(replies.get(id) ?? [], id) ?? saved?.message;
       const turn = turns.get(id);
-      const calls = tools.get(id) ?? [];
-      if (message && previous && message.sequence < previous.latest_sequence) continue;
-      if (!message && !previous && turn?.status !== 'completed' && (!calls.length || !turn || turn.status === 'queued')) continue;
+      const calls = tools.get(id) ?? saved?.tools ?? [];
+      if (!message && !previous && !saved && baselinedTurns.has(id) && !this.replySlot(slot)) continue;
+      if (message && previous && message.sequence < previous.latest_sequence && !isTerminalTurn(turn?.status)) continue;
+      if (!message && !previous && !isTerminalTurn(turn?.status) && turn?.status !== 'running') continue;
       const input = { key: slot, turn, message, timing: timing.get(id), tools: calls, toolCounts: toolCounts.get(id),
-        provider: session.native.provider, sessionConnected, ...(activeSubagents?.length ? { activeSubagents } : {}) };
-      if (turn && isTerminalTurn(turn.status)) {
-        // The cursor can advance ahead of a throttled PATCH. Keep the terminal
-        // decision recoverable independently of the card's dirty flag.
-        await this.deps.guard(key);
-        this.db.prepare(`INSERT INTO channel_turn_pending_finalization VALUES (?,?,?,?,?)
-          ON CONFLICT(destination,session_id,binding_scope,turn_id) DO UPDATE SET terminal_input=excluded.terminal_input
-          WHERE terminal_input<>excluded.terminal_input`).run(...slot, JSON.stringify({ turn, timing: input.timing }));
-        const ready = await this.finalizeTurnCard(input);
-        // Record disabled notices even while a final PATCH is throttled.
-        const settled = turn.status !== 'completed' || (!allowed() || ready) && await this.maybeSendCompletionNotice(input, allowed);
-        if (ready && settled) {
-          this.db.prepare(`DELETE FROM channel_turn_pending_finalization
-            WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?`).run(...slot);
-        }
+        provider: session.native.provider, sessionConnected, isCliReadonly: saved?.isCliReadonly ?? isCliReadonly,
+        ...(interrupt ? { interrupt } : {}), ...(activeSubagents?.length ? { activeSubagents } : {}) };
+      if (isTerminalTurn(turn?.status) || !turn && (message?.final || input.timing?.endedMs != null)) {
+        await this.finalizeTurnCard(input);
       } else {
         await this.renderStreamMessage(input);
       }

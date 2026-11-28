@@ -46,6 +46,8 @@ test('long automatic reply uploads exact UTF-8 only on a full_reply click', asyn
     assert.match(reply.text, /\n```\n\n> .*已省略[^\n]*\n\n```\n/);
     assert.equal(reply.text.match(/^```/gm)?.length, 4);
     assert.ok(cardContentBytes(reply.text) <= CARD_REPLY_BUDGET_BYTES);
+    assert.match(reply.footer, /🔧 0 步 · 🕒 \d{2}:\d{2}/);
+    assert.doesNotMatch(reply.text, /🔧 0 步/);
     const action = parseFeishuAction(reply.actions.find((button: any) => button.label === '发送完整正文 (.txt)').value);
     await channel.handle(env('forged'), { action: 'full_reply', messageId: 'foreign' });
     assert.equal(uploads.length, 0);

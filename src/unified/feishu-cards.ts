@@ -70,10 +70,12 @@ export interface ChannelCard {
     thinking?: string;
     expanded?: boolean;
     position?: 'top' | 'bottom';
+    collapseSummary?: boolean;
   };
   form?: QuestionForm;
   title: string;
   text: string;
+  footer?: string;
   table?: ChannelCardTable;
   actions: ChannelCardAction[];
 }

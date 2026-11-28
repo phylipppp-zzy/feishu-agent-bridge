@@ -7,12 +7,13 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { AgyCliWaitingDetector, CORTEX_STEP_STATUS_WAITING, isTrustedAgyCliHolder } from '../src/unified/agy/cli-waiting-detector.js';
 import { readAgySummaries, readAgySummaryHierarchy } from '../src/unified/agy/catalog-summaries.js';
-import { readReadonlyAgyLiveTurn } from '../src/unified/agy/readonly-live-turn.js';
+import { readReadonlyAgyLiveTurn, type ReadonlyLiveTurnView } from '../src/unified/agy/readonly-live-turn.js';
 import type { AgySessionHolder } from '../src/unified/agy/process-guard.js';
-import type { Capabilities, NativeSessionRef, Session } from '../src/unified/contracts.js';
-import type { PlatformObservation, PlatformPort } from '../src/unified/adapter.js';
+import type { Capabilities, Event, Message, NativeSessionRef, Session, SessionSnapshot, Turn } from '../src/unified/contracts.js';
+import type { PlatformObservation, PlatformPort, UnifiedService } from '../src/unified/adapter.js';
 import type { ChannelCard } from '../src/unified/feishu-cards.js';
-import type { FeishuPort } from '../src/unified/feishu-channel.js';
+import { FeishuChannel, type FeishuPort } from '../src/unified/feishu-channel.js';
+import { FeishuApiRejected } from '../src/unified/feishu-sdk-port.js';
 import { PendingHub } from '../src/unified/hubs/pending-hub.js';
 import { UnifiedRuntime, type RuntimeConfig } from '../src/unified/runtime.js';
 
@@ -585,7 +586,7 @@ test('Gate 2: Real child process /proc + real SQLite WAL (without checkpoint or 
   }
 });
 
-test('Gate 2: Readonly display-only live turn projection shows subagents/Codex MCP in Feishu card with ZERO writes to Core.turns', async () => {
+test('Gate 2: read-only CLI process and reply share delivery with history sync, including late replies', async t => {
   const root = mkdtempSync(join(tmpdir(), 'agy-ro-live-g2-'));
   try {
     const project = join(root, 'repo');
@@ -623,6 +624,10 @@ test('Gate 2: Readonly display-only live turn projection shows subagents/Codex M
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
         content: '我先派发子代理与 Codex MCP 并行核查。',
+        input_tokens: 10_000,
+        cache_read_tokens: 90_000,
+        output_tokens: 100,
+        model: 'gemini-4-neon',
         tool_calls: [
           { name: 'invoke_subagent', args: { Role: '"Astra Auditor"' } },
           { name: 'call_mcp_tool', args: { ServerName: '"codex-bridge_codex"', ToolName: '"codex_engineer"', Arguments: { tier: 'sol' } } },
@@ -639,18 +644,21 @@ test('Gate 2: Readonly display-only live turn projection shows subagents/Codex M
     const sent: Array<{ id: string; card: ChannelCard }> = [];
     const updated: Array<{ id: string; card: ChannelCard }> = [];
     let seq = 0;
+    const writes: string[] = [];
     const port: FeishuPort = {
       isTopicDestination: d => d.startsWith('topic:'),
-      send: async (_d, card) => {
+      send: async (_d, card, deliveryId) => {
+        writes.push(deliveryId);
         const id = `om_ro_${++seq}`;
         sent.push({ id, card });
         return id;
       },
-      update: async (_d, id, card) => {
-        if (rejectFinalOnce && card.template === 'green') {
+      update: async (_d, id, card, deliveryId) => {
+        if (rejectFinalOnce && deliveryId.startsWith('turn-process-final:')) {
           rejectFinalOnce = false;
           throw Object.assign(new Error('rate limited'), { deliveryKind: 'api_rejected', platformCode: 230429 });
         }
+        writes.push(deliveryId);
         updated.push({ id, card });
       },
       sendFile: async () => {},
@@ -711,6 +719,11 @@ test('Gate 2: Readonly display-only live turn projection shows subagents/Codex M
       assert.equal(rt.store.listTurns(roSession.sessionId).length, 0, 'readonly projection must NEVER insert fake running turns into Core.turns');
       const liveCard = sent.find(s => /子代理与 Codex 状态/.test(s.card.text));
       assert.ok(liveCard, 'expected running readonly card with subagent/Codex status');
+      assert.equal(liveCard.card.title, 'Antigravity (CLI) · 进行中 · neon');
+      assert.deepEqual(liveCard.card.headerTags, [{ text: '💻 CLI 运行', color: 'wathet' }]);
+      assert.equal(liveCard.card.executionLog?.expanded, true);
+      assert.match(liveCard.card.statusBanner ?? '', /缓存命中 90%/);
+      assert.deepEqual(liveCard.card.actions, []);
       assert.match(liveCard.card.text, /Astra Auditor/);
       assert.match(liveCard.card.text, /Codex MCP/);
       assert.match(liveCard.card.text, /会话级活跃子代理：astra-auditor/);
@@ -788,8 +801,7 @@ test('Gate 2: Readonly display-only live turn projection shows subagents/Codex M
       await rt.channel.sync('topic:ro-1');
       assert.equal(updated.length, countAfterA + 1, 'A -> B -> A -> B revisit must issue a fresh PATCH');
 
-      // Stage 2: Final response lands in transcript + summaries becomes IDLE -> 1st PATCH is rejected (230429),
-      // 2nd sync MUST retry and deliver the final reply on the SAME card (ZERO lost final message!).
+      // Inject one rejected archive PATCH. The reply waits for the successful archive.
       createSummariesDb(summariesDb, [
         {
           conversation_id: cid,
@@ -856,18 +868,142 @@ test('Gate 2: Readonly display-only live turn projection shows subagents/Codex M
         interactions: [],
       });
       await new Promise(r => setTimeout(r, 5));
-      // 1st sync hits injected 230429 api_rejected -> must keep slot and NOT mark final message known
       await rt.channel.sync('topic:ro-1');
       assert.equal(updated.some(u => u.id === liveCard.id && u.card.template === 'green'), false);
-      // 2nd sync retries final PATCH and succeeds on the same card!
+      assert.equal(sent.filter(s => s.card.title === 'Antigravity (CLI) · 回复').length, 0);
+      const realNow = Date.now;
+      let offset = 31_000;
+      const clock = t.mock.method(Date, 'now', () => realNow() + offset);
       await rt.channel.sync('topic:ro-1');
 
-      const finalPatch = updated.filter(u => u.id === liveCard.id).at(-1);
-      assert.ok(finalPatch, 'expected in-place PATCH retry on the same readonly card');
-      assert.equal(finalPatch.card.template, 'green');
-      assert.equal(finalPatch.card.text, '全部核查完成，最终结论已就绪。');
-      assert.doesNotMatch(finalPatch.card.text, /子代理与 Codex 状态/);
+      const archive = updated.filter(u => u.id === liveCard.id).at(-1);
+      assert.ok(archive, 'expected archive PATCH on the original readonly card');
+      assert.match(archive.card.title, /^Antigravity \(CLI\) · 执行过程已完成/);
+      assert.equal(archive.card.executionLog?.expanded, false);
+      assert.match(archive.card.text, /过程已归档/);
+      assert.doesNotMatch(archive.card.text, /最终结论|我先派发/);
+      assert.deepEqual(archive.card.actions, []);
+      const reply = sent.find(s => s.card.title === 'Antigravity (CLI) · 回复');
+      assert.ok(reply);
+      assert.notEqual(reply.id, archive.id);
+      assert.equal(reply.card.text, '全部核查完成，最终结论已就绪。');
+      assert.deepEqual(reply.card.headerTags, [{ text: '💻 CLI 镜像', color: 'wathet' }]);
+      assert.match(reply.card.footer ?? '', /🔧 2 步.*🕒 \d\d:\d\d.*💻 电脑终端 CLI/);
+      assert.deepEqual(reply.card.actions.map(a => a.value.action), ['upgrade', 'panel']);
+      const archiveIndex = writes.findIndex(id => id.startsWith('turn-process-final:'));
+      assert.ok(archiveIndex >= 0 && writes[archiveIndex + 1]?.startsWith('turn-reply:'));
       assert.equal(rt.store.listTurns(roSession.sessionId).length, 0, 'Core.turns must remain untouched by readonly projection');
+      const channelDb = new DatabaseSync(config.channelDb);
+      try {
+        assert.deepEqual(
+          channelDb.prepare('SELECT turn_id,card_id FROM channel_turn_reply_cards').all().map(row => [row.turn_id, row.card_id]),
+          [['step-5', reply.id]],
+        );
+      } finally { channelDb.close(); }
+      const replay = (turnId: string, messageId: string) => rt.store.observeTurn({
+        turnId, sessionId: roSession.sessionId, status: 'completed',
+        inputId: null, outputIds: [messageId], model: null, startedAt: null, endedAt: null,
+      });
+      replay('step-5', 'final-msg-ro-1');
+      await rt.channel.sync('topic:ro-1');
+      assert.equal(sent.filter(s => s.card.title === 'Antigravity (CLI) · 回复').length, 1);
+
+      // Idle grace settles a new process before history has any final assistant message.
+      const setRun = (running: boolean, step = 10) => createSummariesDb(summariesDb, [{
+        conversation_id: cid, title: 'CLI Research Run',
+        workspace_uris: JSON.stringify([`file://${project}`]),
+        status: running ? 'CASCADE_RUN_STATUS_RUNNING' : 'CASCADE_RUN_STATUS_IDLE',
+        not_fully_idle: running ? 1 : 0, last_user_input_step_index: step,
+      }]);
+      setRun(true);
+      writeTranscript(brainDir, cid, [
+        { step_index: 10, source: 'USER', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>第二轮</USER_REQUEST>' },
+        { step_index: 11, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
+          tool_calls: [{ name: 'read_file', args: { path: 'notes.md' } }] },
+        { step_index: 12, source: 'MODEL', type: 'GENERIC', status: 'DONE', content: 'ok' },
+      ]);
+      await rt.channel.sync('topic:ro-1');
+      const nextProcess = sent.findLast(s => s.card.title.startsWith('Antigravity (CLI) · 进行中'));
+      assert.ok(nextProcess && nextProcess.id !== liveCard.id);
+      setRun(false);
+      await rt.channel.sync('topic:ro-1');
+      offset += 31_000;
+      await rt.channel.sync('topic:ro-1');
+      const placeholder = sent.findLast(s => s.card.title === 'Antigravity (CLI) · 回复');
+      assert.ok(placeholder && placeholder.id !== reply.id);
+      assert.equal(placeholder.card.text, '已完成 1 项工具操作。');
+
+      rt.store.applyHistoryRefresh(rt.store.getSession(roSession.sessionId), 0, {
+        session: roSession,
+        messages: [
+          {
+            messageId: 'second-prompt', sessionId: roSession.sessionId, turnId: 'step-10', role: 'user',
+            blocks: [{ type: 'text', text: '第二轮' }], sequence: 3, revision: 1, final: true, source: 'transcript',
+          },
+          {
+            messageId: 'second-late-final', sessionId: roSession.sessionId, turnId: 'step-13', role: 'assistant',
+            blocks: [{ type: 'text', text: '迟到的第二轮最终正文' }], sequence: 4, revision: 1, final: true, source: 'transcript',
+          },
+        ],
+        turns: [],
+        interactions: [],
+      });
+      offset += 31_000;
+      await rt.channel.sync('topic:ro-1');
+      assert.equal(updated.findLast(u => u.id === placeholder.id)?.card.text, '迟到的第二轮最终正文');
+      assert.equal(sent.filter(s => s.card.title === 'Antigravity (CLI) · 回复').length, 2);
+      replay('step-13', 'second-late-final');
+      await rt.channel.sync('topic:ro-1');
+      assert.equal(sent.filter(s => s.card.title === 'Antigravity (CLI) · 回复').length, 2);
+
+      // A complete pure Q&A arriving entirely between two reads has one CLI reply.
+      setRun(false, 20);
+      writeTranscript(brainDir, cid, [
+        { step_index: 20, source: 'USER', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>快捷问答</USER_REQUEST>' },
+        { step_index: 21, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: '快捷回复。' },
+      ]);
+      rt.store.applyHistoryRefresh(rt.store.getSession(roSession.sessionId), 0, {
+        session: roSession,
+        messages: [
+          {
+            messageId: 'fast-prompt', sessionId: roSession.sessionId, turnId: 'step-20', role: 'user',
+            blocks: [{ type: 'text', text: '快捷问答' }], sequence: 5, revision: 1, final: true, source: 'transcript',
+          },
+          {
+            messageId: 'fast-final', sessionId: roSession.sessionId, turnId: 'step-21', role: 'assistant',
+            blocks: [{ type: 'text', text: '快捷回复。' }], sequence: 6, revision: 1, final: true, source: 'transcript',
+          },
+        ],
+        turns: [],
+        interactions: [],
+      });
+      await rt.channel.sync('topic:ro-1');
+      const fast = sent.filter(s => s.card.title === 'Antigravity (CLI) · 回复');
+      assert.equal(fast.length, 3);
+      assert.equal(fast.at(-1)?.card.text, '快捷回复。');
+      assert.match(fast.at(-1)?.card.footer ?? '', /电脑终端 CLI/);
+      assert.equal(sent.filter(s => s.card.title.startsWith('Antigravity (CLI) · 进行中')).length, 2);
+
+      // A terminal observation can arrive before the summaries row leaves RUNNING.
+      setRun(true, 30);
+      writeTranscript(brainDir, cid, [
+        { step_index: 30, source: 'USER', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>失败的工具轮</USER_REQUEST>' },
+        { step_index: 31, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
+          tool_calls: [{ name: 'read_file', args: { path: 'missing.md' } }] },
+      ]);
+      await rt.channel.sync('topic:ro-1');
+      const failedProcess = sent.findLast(s => s.card.title.startsWith('Antigravity (CLI) · 进行中'))!;
+      const beforeFailure = writes.length;
+      rt.store.observeTurn({
+        turnId: 'step-30', sessionId: roSession.sessionId, status: 'failed',
+        inputId: null, outputIds: [], model: null, startedAt: null, endedAt: null,
+      });
+      await rt.channel.sync('topic:ro-1');
+      assert.match(updated.findLast(u => u.id === failedProcess.id)?.card.title ?? '', /执行过程失败/);
+      assert.equal(sent.at(-1)?.card.text, '本轮执行失败，未形成完整回复。');
+      assert.match(writes[beforeFailure] ?? '', /^turn-process-final:/);
+      assert.match(writes[beforeFailure + 1] ?? '', /^turn-reply:/);
+      clock.mock.restore();
     } finally {
       if (prevInterval === undefined) delete process.env.FEISHU_PATCH_INTERVAL_MS;
       else process.env.FEISHU_PATCH_INTERVAL_MS = prevInterval;
@@ -1053,7 +1189,7 @@ test('Gate 1: Dual summaries DB nanosecond tie-break, symlink fallback, partial 
   }
 });
 
-test('Gate 2: Readonly multi-turn refresh preserves both turns, unavailable defers without duplicate card, and timeout reconciles via lookupDelivery', async () => {
+test('Gate 2: read-only multi-turn refresh isolates replies and reconciles an ambiguous archive PATCH', async t => {
   const root = mkdtempSync(join(tmpdir(), 'agy-ro-reconcile-'));
   try {
     const project = join(root, 'repo');
@@ -1086,7 +1222,7 @@ test('Gate 2: Readonly multi-turn refresh preserves both turns, unavailable defe
     ]);
 
     let simulateTimeoutOnce = false;
-    let lookupResult: 'sent' | 'not_sent' | 'unknown' = 'sent';
+    let lookupResult: 'sent' | 'unknown' = 'sent';
     let lookupCalls = 0;
     const sent: Array<{ id: string; card: ChannelCard }> = [];
     const updated: Array<{ id: string; card: ChannelCard }> = [];
@@ -1201,15 +1337,29 @@ test('Gate 2: Readonly multi-turn refresh preserves both turns, unavailable defe
       lookupResult = 'unknown'; // Matches real FeishuSdkPort behavior after PATCH timeout
       await assert.rejects(() => rt.channel.sync('topic:ro-mt'), /network timeout/);
 
-      // Next sync sees lookupDelivery='unknown' -> clears unknown & schedules idempotent retry; following sync completes PATCH on same card!
+      // A retry reuses the process message ID after backoff, then sends the reply separately.
+      const realNow = Date.now;
+      let offset = 0;
+      t.mock.method(Date, 'now', () => realNow() + offset);
       await rt.channel.sync('topic:ro-mt');
       assert.equal(lookupCalls, 1, 'must query port.lookupDelivery to reconcile timed-out PATCH');
+      assert.equal(updated.some(u => u.id === liveCard1.id && u.card.template === 'green'), false);
+      offset = 5_000;
       await rt.channel.sync('topic:ro-mt');
-      const retriedGreen = updated.filter(u => u.id === liveCard1.id && u.card.template === 'green').at(-1);
-      assert.ok(retriedGreen && retriedGreen.card.text === 'TURN_1_FINAL_BODY', 'unknown PATCH timeout must converge idempotently on same card');
-      // Subsequent sync is a clean no-op
+      const archive = updated.findLast(u => u.id === liveCard1.id && u.card.template === 'green');
+      assert.ok(archive);
+      assert.match(archive.card.text, /过程已归档/);
+      assert.equal(archive.card.executionLog?.expanded, false);
+      for (const text of ['TURN_1_FINAL_BODY', 'TURN_2_FINAL_BODY']) {
+        const replies = sent.filter(s => s.card.text === text);
+        assert.equal(replies.length, 1);
+        assert.notEqual(replies[0]!.id, liveCard1.id);
+        assert.equal(replies[0]!.card.title, 'Antigravity (CLI) · 回复');
+      }
+      const sendCount = sent.length;
       await rt.channel.sync('topic:ro-mt');
       assert.equal(lookupCalls, 1);
+      assert.equal(sent.length, sendCount);
     } finally {
       if (prevInterval === undefined) delete process.env.FEISHU_PATCH_INTERVAL_MS;
       else process.env.FEISHU_PATCH_INTERVAL_MS = prevInterval;
@@ -1218,4 +1368,242 @@ test('Gate 2: Readonly multi-turn refresh preserves both turns, unavailable defe
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+function readonlyDeliveryFixture(t: import('node:test').TestContext) {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const root = mkdtempSync(join(tmpdir(), 'agy-ro-delivery-'));
+  const path = join(root, 'channel.sqlite');
+  const destination = 'topic:ro-delivery';
+  const sessionId = 'session-ro-delivery';
+  const avail = { status: 'available' as const };
+  const unsup = { status: 'unsupported' as const, reason: 'read-only' };
+  const session: Session = {
+    sessionId,
+    native: { provider: 'agy', hostId: 'h', serviceId: 'agy', nativeSessionId: 'cli-test' },
+    project: root, title: 'CLI session', status: 'read_only', revision: 1,
+    capabilities: { view: avail, send: unsup, queue: unsup, steer: unsup, answer: unsup, approve: unsup,
+      interrupt: unsup, handoff: unsup, files: avail, config: unsup },
+    control: { serviceId: 'agy', owner: null, input: 'unavailable', generation: 1, operationId: null, reason: null },
+  };
+  const events: Event[] = [];
+  const messages: Message[] = [];
+  const turns: Turn[] = [];
+  const snapshot: SessionSnapshot = { session, messages, turns, interactions: [] };
+  const cursor = () => String(events.length);
+  const service = {
+    getSession: async () => session,
+    getSnapshot: async () => ({ value: snapshot, cursor: cursor() }),
+    subscribeEvents: async (_id: string, from: string) => ({
+      status: 'events', events: events.slice(Number(from)), cursor: cursor(),
+    }),
+  } as unknown as UnifiedService;
+  const recordEvent = (type: string, objectId: string, data: unknown) => {
+    const sequence = events.length + 1;
+    const now = new Date().toISOString();
+    events.push({ schemaVersion: 1, eventId: String(sequence), sessionId, objectId, objectRevision: 1, sequence,
+      type, data, occurredAt: now, receivedAt: now, operationId: null, cursor: String(sequence) });
+  };
+  let liveReadCount = 0;
+  let live: ReadonlyLiveTurnView | null = null;
+  const writes: Array<{ id: string; delivery: string; card: ChannelCard }> = [];
+  const port: FeishuPort = {
+    async send(_dest, card, delivery) {
+      const id = `card-${writes.length + 1}`;
+      writes.push({ id, delivery, card });
+      return id;
+    },
+    async update(_dest, id, card, delivery) { writes.push({ id, delivery, card }); },
+    async lookupDelivery() { return 'unknown'; },
+    async sendFile() {},
+  };
+  const open = () => new FeishuChannel(service, port, async () => true, path, undefined, false, {
+    onProgressWake: () => {},
+    readReadonlyLiveTurn: () => { liveReadCount++; return live; },
+  });
+  let channel = open();
+  const identity = { source: 'feishu', subject: 'owner' };
+  channel.importMigrationBinding('cli-delivery', { destination, sessionId, bindingId: 'bind-cli', owner: identity });
+  const db = new DatabaseSync(path);
+  t.after(() => { channel.close(); db.close(); rmSync(root, { recursive: true, force: true }); });
+  return {
+    db, port, writes, session,
+    useInteractiveBinding() { db.prepare("UPDATE channel_bindings SET access_mode='interactive' WHERE destination=?").run(destination); },
+    sync: () => channel.sync(destination),
+    restart() { channel.close(); channel = open(); },
+    unbind: () => channel.handle({ destination, identity, eventId: 'unbind' }, { action: 'unbind' }),
+    readCount: () => liveReadCount,
+    start(step: number) {
+      const anchorId = `cli-live:cli-test:user-${step}`;
+      live = { state: 'running', anchorId, running: true, previewText: '', activeSubagents: [], signature: anchorId,
+        tools: [{ turnId: anchorId, callId: 'tool', tool: 'read_file', summary: 'Read notes.md', phase: 'running' }] };
+    },
+    stop() { live = null; },
+    message(step: number, text: string, role: Message['role'] = 'assistant') {
+      const turnId = `step-${step}`;
+      const message: Message = { messageId: turnId, sessionId, turnId, sequence: step, revision: 1, role,
+        blocks: [{ type: 'text', text }], source: 'transcript', final: true };
+      messages.push(message);
+      recordEvent('message.updated', message.messageId, message);
+    },
+    timing(step: number) {
+      const turn: Turn = { turnId: `step-${step}`, sessionId, status: 'completed', inputId: null, outputIds: [], model: null,
+        startedAt: new Date(Date.now() - 60_000).toISOString(), endedAt: new Date().toISOString() };
+      turns.push(turn);
+      recordEvent('turn.updated', turn.turnId, turn);
+    },
+    replies: () => writes.filter(write => write.delivery.startsWith('turn-reply:')),
+    pending: () => db.prepare('SELECT turn_id FROM channel_turn_pending_finalization').all().map(row => row.turn_id),
+  };
+}
+
+test('readonly routes retry pending finalization with no new events or unseen messages', async t => {
+  const x = readonlyDeliveryFixture(t);
+  x.start(1);
+  await x.sync();
+  x.stop();
+  x.message(2, 'final reply');
+  t.mock.timers.tick(2500);
+  await x.sync();
+  const [reply] = x.replies();
+  assert.ok(reply);
+  assert.deepEqual(x.pending(), []);
+  assert.ok(x.db.prepare("SELECT 1 FROM channel_known_messages WHERE message_id='step-2'").get());
+
+  const update = x.port.update;
+  let rejected = false;
+  x.port.update = async (...args) => {
+    if (!rejected && args[3].startsWith('turn-reply-update:')) {
+      rejected = true;
+      throw new FeishuApiRejected(230429);
+    }
+    await update(...args);
+  };
+  x.timing(2);
+  await x.sync();
+  assert.equal(rejected, true);
+  assert.deepEqual(x.pending(), ['step-2']);
+  assert.equal(x.db.prepare('SELECT COUNT(*) AS n FROM channel_readonly_live_cards').get()?.n, 0);
+
+  t.mock.timers.tick(Number(process.env.FEISHU_REJECTION_RETRY_MS ?? 3000));
+  await x.sync();
+  assert.deepEqual(x.pending(), []);
+  assert.equal(x.replies().length, 1);
+  const patched = x.writes.findLast(write => write.delivery.startsWith('turn-reply-update:'));
+  assert.equal(patched?.id, reply.id);
+  assert.match(patched?.card.footer ?? '', /⏱/);
+});
+
+test('ambiguous readonly process creation releases its slot and never resends the process', async t => {
+  const x = readonlyDeliveryFixture(t);
+  const send = x.port.send;
+  let attemptedProcess = '';
+  let rejectReplyOnce = true;
+  x.port.send = async (...args) => {
+    if (args[2].startsWith('ro-live-send:') && !attemptedProcess) {
+      attemptedProcess = args[2];
+      throw new Error('process acknowledgement lost');
+    }
+    assert.notEqual(args[2], attemptedProcess);
+    if (args[2].startsWith('turn-reply:') && rejectReplyOnce) {
+      rejectReplyOnce = false;
+      throw new FeishuApiRejected(230429);
+    }
+    return send(...args);
+  };
+
+  x.start(1);
+  await assert.rejects(x.sync(), /process acknowledgement lost/);
+  assert.equal(x.db.prepare('SELECT card_id FROM channel_readonly_live_cards').get()?.card_id, '');
+  x.restart();
+  x.message(2, 'first reply after lost process acknowledgement');
+  x.start(3);
+  await x.sync();
+
+  assert.equal(x.db.prepare('SELECT anchor_id FROM channel_readonly_live_cards').get()?.anchor_id, 'cli-live:cli-test:user-3');
+  assert.deepEqual(x.pending(), ['step-2']);
+  assert.equal(x.replies().length, 0);
+  t.mock.timers.tick(Number(process.env.FEISHU_REJECTION_RETRY_MS ?? 3000));
+  await x.sync();
+  assert.equal(x.replies().length, 1);
+  assert.equal(x.replies()[0]?.card.text, 'first reply after lost process acknowledgement');
+  assert.equal(x.writes.some(write => write.delivery.startsWith('turn-process-final:')), false);
+  assert.deepEqual(x.pending(), []);
+});
+
+test('an ambiguous readonly process releases its slot when reply delivery also times out', async t => {
+  const x = readonlyDeliveryFixture(t);
+  const send = x.port.send;
+  let processDelivery = '';
+  let replyDelivery = '';
+  x.port.send = async (...args) => {
+    if (args[2].startsWith('ro-live-send:') && !processDelivery) {
+      processDelivery = args[2];
+      throw new Error('process acknowledgement lost');
+    }
+    assert.notEqual(args[2], processDelivery);
+    const id = await send(...args);
+    if (args[2].startsWith('turn-reply:')) {
+      replyDelivery = args[2];
+      throw new Error('reply acknowledgement lost');
+    }
+    return id;
+  };
+  x.start(1);
+  await assert.rejects(x.sync(), /process acknowledgement lost/);
+  x.message(2, 'reply received by Feishu');
+  x.start(3);
+  await assert.rejects(x.sync(), /reply acknowledgement lost/);
+  assert.equal(x.db.prepare('SELECT anchor_id FROM channel_readonly_live_cards').get(), undefined);
+  assert.deepEqual(x.pending(), ['step-2']);
+  x.port.lookupDelivery = async id => id === replyDelivery ? 'sent' : 'unknown';
+  x.port.lookupMessageId = async id => x.writes.find(write => write.delivery === id)?.id ?? null;
+  await x.sync();
+  assert.equal(x.replies().length, 1);
+  assert.deepEqual(x.pending(), []);
+  assert.equal(x.db.prepare('SELECT anchor_id FROM channel_readonly_live_cards').get()?.anchor_id, 'cli-live:cli-test:user-3');
+});
+
+test('same-scope CLI takeover archives its process and retains reply routing until unbind', async t => {
+  const x = readonlyDeliveryFixture(t);
+  x.useInteractiveBinding();
+  x.start(1);
+  await x.sync();
+  const processCard = x.writes.find(write => write.delivery.startsWith('ro-live-send:'));
+  assert.ok(processCard);
+  const scope = x.db.prepare('SELECT binding_scope FROM channel_readonly_live_cards').get()?.binding_scope;
+  const liveReads = x.readCount();
+  x.session.status = 'idle';
+  x.message(1, 'CLI prompt', 'user');
+  x.timing(1);
+  x.message(2, 'first final');
+  t.mock.timers.tick(2500);
+  await x.sync();
+  assert.equal(x.readCount(), liveReads, 'interactive projection stops consulting the CLI live reader');
+  assert.equal(x.db.prepare('SELECT COUNT(*) AS n FROM channel_readonly_live_cards').get()?.n, 0);
+  assert.equal(x.db.prepare('SELECT binding_scope FROM channel_readonly_turn_routes').get()?.binding_scope, scope);
+  const archived = x.writes.find(write => write.delivery.startsWith('turn-process-final:'));
+  assert.equal(archived?.id, processCard.id);
+  assert.deepEqual(archived.card.headerTags, [{ text: '💻 CLI 镜像', color: 'wathet' }]);
+  assert.equal(x.replies().length, 1, 'the synthetic turn for the old CLI prompt does not send a reply');
+  const [reply] = x.replies();
+  assert.equal(reply?.card.text, 'first final');
+
+  x.db.exec(`INSERT INTO channel_readonly_turn_routes
+    SELECT destination,session_id,'stale',anchor_id,baseline_msg_seq,reply_turn_id,terminal_input,source_turn_ids
+    FROM channel_readonly_turn_routes`);
+  x.message(3, 'late final');
+  await x.sync();
+  assert.equal(x.readCount(), liveReads);
+  assert.equal(x.replies().length, 1);
+  assert.equal(x.writes.findLast(write => write.delivery.startsWith('turn-reply-update:'))?.id, reply?.id);
+  assert.match(x.writes.at(-1)?.card.text ?? '', /late final/);
+  assert.equal(x.db.prepare('SELECT COUNT(*) AS n FROM channel_readonly_turn_routes').get()?.n, 1);
+  x.message(4, 'interactive input', 'user');
+  x.timing(4);
+  await x.sync();
+  assert.equal(x.replies().length, 2, 'the retained CLI route does not skip a new interactive turn');
+  assert.doesNotMatch(x.replies()[1]?.card.title ?? '', /\(CLI\)/);
+  await x.unbind();
+  assert.equal(x.db.prepare('SELECT COUNT(*) AS n FROM channel_readonly_turn_routes').get()?.n, 0);
 });

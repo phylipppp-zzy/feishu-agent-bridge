@@ -68,9 +68,40 @@ class TestFixtureChannel extends FeishuChannel {
     this.repairDb.exec('BEGIN IMMEDIATE');try{const row=this.repairDb.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=? AND owner_source=? AND owner_subject=?').get(destination,'feishu',owner) as {session_id:string;binding_id:string;revision:number;access_mode:string}|undefined;if(!row||row.session_id!==sessionId||row.access_mode!=='interactive')throw new Error('test binding unavailable');const existing=this.repairDb.prepare('SELECT 1 FROM channel_cursors WHERE destination=?').get(destination);const known=(this.repairDb.prepare('SELECT COUNT(*) AS n FROM channel_known_messages WHERE destination=?').get(destination) as {n:number}).n;if(!existing&&known===0)this.repairDb.prepare('INSERT INTO channel_cursors(destination,session_id,cursor,binding_scope) VALUES (?,?,?,?)').run(destination,sessionId,cursor,JSON.stringify(row));this.repairDb.exec('COMMIT');}catch(error){this.repairDb.exec('ROLLBACK');throw error;}
   }
   async repairKnownFixture(token:TestLaneToken,message:Message,originalOperationId:string,operationId:string,sdk:FeishuSdkPort):Promise<{status:'sent'|'unknown'}> {
-    const prior=this.repairDb.prepare('SELECT operation_id,state FROM test_fixture_repairs WHERE original_operation_id=? OR operation_id=?').get(originalOperationId,operationId) as {operation_id:string;state:string}|undefined;if(prior){if(prior.operation_id!==operationId)throw new Error('test repair already claimed');return {status:prior.state==='sent'?'sent':'unknown'};}
-    const destination=token.destination;let scope='',deliveryId='';this.repairDb.exec('BEGIN IMMEDIATE');try{const row=this.repairDb.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=? AND owner_source=? AND owner_subject=?').get(destination,'feishu',token.owner) as {session_id:string;binding_id:string;revision:number;access_mode:string}|undefined;if(!row||row.session_id!=='s'||row.access_mode!=='interactive')throw new Error('test repair binding changed');scope=JSON.stringify(row);const cursor=this.repairDb.prepare('SELECT cursor,binding_scope FROM channel_cursors WHERE destination=? AND session_id=?').get(destination,'s') as {cursor:string;binding_scope:string}|undefined;const known=this.repairDb.prepare('SELECT message_id,revision FROM channel_known_messages WHERE destination=? AND session_id=?').all(destination,'s') as Array<{message_id:string;revision:number}>;if(cursor?.cursor!=='1'||cursor.binding_scope!==scope||known.length!==1||known[0]!.message_id!==message.messageId||known[0]!.revision!==message.revision)throw new Error('test repair original proof unavailable');for(const table of ['channel_deliveries','channel_stream_cards','channel_inbox','channel_pending'])if((this.repairDb.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {n:number}).n!==0)throw new Error('test repair attempt already exists');deliveryId=`stream:${payloadDigest([scope,destination,'s',message.turnId||message.messageId])}`;const updateId=`stream-update:${payloadDigest([scope,destination,'s',message.messageId,message.revision])}`;if(!sdk.testDeliveryEvidence(token,[deliveryId,updateId]).unattempted)throw new Error('test repair SDK attempt exists');this.repairDb.prepare("INSERT INTO test_fixture_repairs VALUES (?,?,?,?,?,?,'claimed')").run(operationId,originalOperationId,destination,scope,message.messageId,deliveryId);this.repairDb.exec('COMMIT');}catch(error){this.repairDb.exec('ROLLBACK');throw error;}
-    try{await this.turnCards.renderStreamMessage({key:[destination,'s',scope,message.turnId||message.messageId],message,tools:[],provider:token.provider ?? 'codex'});const delivery=this.repairDb.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(deliveryId) as {state:string}|undefined;const stream=this.repairDb.prepare('SELECT card_id FROM channel_stream_cards WHERE destination=? AND session_id=? AND binding_scope=? AND message_id=?').get(destination,'s',scope,message.turnId||message.messageId) as {card_id:string|null}|undefined;if(delivery?.state!=='sent'||!stream?.card_id||!sdk.testDeliveryKnown(token,deliveryId))return {status:'unknown'};this.repairDb.prepare("UPDATE test_fixture_repairs SET state='sent' WHERE operation_id=? AND state='claimed'").run(operationId);return {status:'sent'};}catch{return {status:'unknown'};}
+    const prior=this.repairDb.prepare('SELECT operation_id,state FROM test_fixture_repairs WHERE original_operation_id=? OR operation_id=?').get(originalOperationId,operationId) as {operation_id:string;state:string}|undefined;
+    if(prior){
+      if(prior.operation_id!==operationId)throw new Error('test repair already claimed');
+      return {status:prior.state==='sent'?'sent':'unknown'};
+    }
+    const destination=token.destination;
+    const turnId=message.turnId||message.messageId;
+    let scope='',deliveryId='';
+    this.repairDb.exec('BEGIN IMMEDIATE');
+    try{
+      const row=this.repairDb.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=? AND owner_source=? AND owner_subject=?').get(destination,'feishu',token.owner) as {session_id:string;binding_id:string;revision:number;access_mode:string}|undefined;
+      if(!row||row.session_id!=='s'||row.access_mode!=='interactive')throw new Error('test repair binding changed');
+      scope=JSON.stringify(row);
+      const cursor=this.repairDb.prepare('SELECT cursor,binding_scope FROM channel_cursors WHERE destination=? AND session_id=?').get(destination,'s') as {cursor:string;binding_scope:string}|undefined;
+      const known=this.repairDb.prepare('SELECT message_id,revision FROM channel_known_messages WHERE destination=? AND session_id=?').all(destination,'s') as Array<{message_id:string;revision:number}>;
+      if(cursor?.cursor!=='1'||cursor.binding_scope!==scope||known.length!==1||known[0]!.message_id!==message.messageId||known[0]!.revision!==message.revision)throw new Error('test repair original proof unavailable');
+      for(const table of ['channel_deliveries','channel_stream_cards','channel_turn_reply_cards','channel_turn_pending_finalization','channel_inbox','channel_pending']){
+        if((this.repairDb.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {n:number}).n!==0)throw new Error('test repair attempt already exists');
+      }
+      deliveryId=`turn-reply:${payloadDigest([destination,'s',scope,turnId])}`;
+      const legacyStreamId=`stream:${payloadDigest([scope,destination,'s',turnId])}`;
+      const legacyUpdateId=`stream-update:${payloadDigest([scope,destination,'s',message.messageId,message.revision])}`;
+      if(!sdk.testDeliveryEvidence(token,[legacyStreamId,legacyUpdateId,deliveryId]).unattempted)throw new Error('test repair SDK attempt exists');
+      this.repairDb.prepare("INSERT INTO test_fixture_repairs VALUES (?,?,?,?,?,?,'claimed')").run(operationId,originalOperationId,destination,scope,message.messageId,deliveryId);
+      this.repairDb.exec('COMMIT');
+    }catch(error){this.repairDb.exec('ROLLBACK');throw error;}
+    try{
+      await this.turnCards.finalizeTurnCard({key:[destination,'s',scope,turnId],message,tools:[],provider:token.provider ?? 'codex',sessionConnected:true});
+      const delivery=this.repairDb.prepare('SELECT state FROM channel_deliveries WHERE delivery_id=?').get(deliveryId) as {state:string}|undefined;
+      const reply=this.repairDb.prepare('SELECT card_id FROM channel_turn_reply_cards WHERE destination=? AND session_id=? AND binding_scope=? AND turn_id=?').get(destination,'s',scope,turnId) as {card_id:string|null}|undefined;
+      if(delivery?.state!=='sent'||!reply?.card_id||!sdk.testDeliveryKnown(token,deliveryId))return {status:'unknown'};
+      this.repairDb.prepare("UPDATE test_fixture_repairs SET state='sent' WHERE operation_id=? AND state='claimed'").run(operationId);
+      return {status:'sent'};
+    }catch{return {status:'unknown'};}
   }
   override close():void{try{this.repairDb.close();}finally{super.close();}}
 }

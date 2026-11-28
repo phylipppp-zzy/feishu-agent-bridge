@@ -2,7 +2,7 @@ import { codexToolProgress, formatThinkingSummary, nativeTimestamp, ToolProgress
 import {deriveTitleFromInputBlocks} from './session-title.js';
 import {textAttachmentBlock} from './text-attachment.js';
 import { randomUUID } from 'node:crypto';
-import { resolveModelMaxContextTokens, type ContextUsageInfo } from './context-usage.js';
+import { isTokenCount, resolveModelMaxContextTokens, safePositiveInt, type ContextUsageInfo } from './context-usage.js';
 import type { DispatchGuard, PlatformAcknowledgement, PlatformObservation, PlatformPort, PlatformInputBlock } from './adapter.js';
 import { answerDigest, payloadDigest, questionDeclineAction, type ResponseEvidence, type ModelOption, type Answer, type Artifact, type Capabilities, type Interaction, type Message, type NativeSessionRef, type Session, type SessionSnapshot, type Turn, type TurnResidual } from './contracts.js';
 import { contractError } from './errors.js';
@@ -245,19 +245,26 @@ export class CodexAdapter implements PlatformPort {
     }
     if (m.method === 'thread/tokenUsage/updated' && p.tokenUsage && typeof p.tokenUsage === 'object') {
       const tu = p.tokenUsage as Obj;
-      const last = (tu.last && typeof tu.last === 'object' ? tu.last : tu.total) as Obj | undefined;
-      const total = typeof last?.totalTokens === 'number' && Number.isFinite(last.totalTokens)
-        ? Math.round(last.totalTokens)
-        : (typeof last?.inputTokens === 'number' ? Math.round(last.inputTokens) : 0) +
-          (typeof last?.cachedInputTokens === 'number' ? Math.round(last.cachedInputTokens) : 0) +
-          (typeof last?.outputTokens === 'number' ? Math.round(last.outputTokens) : 0);
+      const last = (tu.last && typeof tu.last === 'object' ? tu.last : undefined) as Obj | undefined;
+      const usage = last ?? tu.total;
+      const rawInput = safePositiveInt(last?.inputTokens);
+      const rawCache = safePositiveInt(last?.cachedInputTokens);
+      const totalInputTokens = rawCache > rawInput ? rawInput + rawCache : rawInput;
+      const total = typeof usage?.totalTokens === 'number' && Number.isFinite(usage.totalTokens)
+        ? Math.round(usage.totalTokens)
+        : (last ? totalInputTokens : safePositiveInt(usage?.inputTokens) + safePositiveInt(usage?.cachedInputTokens)) +
+          safePositiveInt(usage?.outputTokens);
       const model = this.settings.get(thread)?.model ?? (typeof info?.model === 'string' ? info.model : null);
       const maxWindow = typeof tu.modelContextWindow === 'number' && Number.isFinite(tu.modelContextWindow) && tu.modelContextWindow > 0
         ? Math.round(tu.modelContextWindow)
         : resolveModelMaxContextTokens(model, 'codex');
       if (total > 0) {
         if (this.contextUsage.size >= 512) this.contextUsage.delete(this.contextUsage.keys().next().value!);
-        this.contextUsage.set(thread, { usedTokens: total, maxTokens: maxWindow, ...(model ? { model } : {}) });
+        this.contextUsage.set(thread, {
+          usedTokens: total, maxTokens: maxWindow, ...(model ? { model } : {}),
+          ...(totalInputTokens > 0 && isTokenCount(last?.inputTokens) && isTokenCount(last?.cachedInputTokens)
+            ? { totalInputTokens, cacheReadTokens: rawCache } : {}),
+        });
       }
       return;
     }

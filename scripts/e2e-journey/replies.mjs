@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ToolProgressTracker } from '../../src/unified/tool-progress.ts';
 
-function completionCard(ctx, topic, pattern = /已完成/) {
+function completionCard(ctx, topic, pattern = /· 回复$/) {
   const message = ctx.writes(topic).findLast(({ card }) => pattern.test(card.title));
   assert.ok(message, `未收到${pattern}卡片`);
   return message;
@@ -121,7 +121,7 @@ function assertFileDelivery(ctx, topic, namePattern, content, mark) {
 
 async function longReplies(ctx) {
   const { trace, topics: { codex, claude }, providers, wire } = ctx;
-  await trace.stage(10, '多段聚合、长文完整渲染、文件直发、120 秒锁屏提醒与限流容错', async () => {
+  await trace.stage(10, '多段聚合、双卡归档、长文完整渲染、文件直发与限流容错', async () => {
     await trace.step('10.1 请求分三次报告实验进展，期间穿插两次工具步骤', async () => {
       const turn = await ctx.start(codex, '请分阶段汇报实验进展');
       const parts = ['先核对数据来源。', '再分析失败样本。', '最后补充回归结论。'];
@@ -140,16 +140,23 @@ async function longReplies(ctx) {
       }
       await ctx.finish(codex);
       await waitForPatchWindow(ctx, codex);
-      trace.check('完成卡顶部为执行步骤与分隔线，底部按原顺序保留三段回复和段落空行', () => {
-        const { card } = completionCard(ctx, codex);
-        assert.equal(card.template, 'green');
-        const elems = card.raw.body.elements;
-        assert.equal(elems[0].tag, 'collapsible_panel');
-        assert.equal(elems[1].tag, 'hr');
-        assert.equal(elems[2].content, parts.join('\n\n'));
+      trace.check('过程卡先折叠归档，随后独立发送完整回复和尾栏', () => {
+        const archive = completionCard(ctx, codex, /执行过程已完成/);
+        const reply = completionCard(ctx, codex);
+        assert.notEqual(archive.id, reply.id);
+        const writes = ctx.writes(codex);
+        assert.ok(writes.findIndex(write => write.id === archive.id && /执行过程已完成/.test(write.card.title)) <
+          writes.findIndex(write => write.id === reply.id));
+        assert.equal(archive.method, 'im.message.patch');
+        assert.equal(reply.card.template, 'green');
+        assert.equal(archive.card.collapsiblePanels[0].expanded, false);
+        assert.deepEqual(reply.card.collapsiblePanels, []);
+        assert.equal(reply.card.raw.body.elements[0].content, parts.join('\n\n'));
+        assert.equal(reply.card.raw.body.elements[1].tag, 'hr');
+        assert.match(reply.card.raw.body.elements[2].content, /🔧 2 步/);
       });
       trace.check('执行步骤保留路径标识符并转义 Markdown 格式字符', () => {
-        const { card } = completionCard(ctx, codex);
+        const { card } = completionCard(ctx, codex, /执行过程已完成/);
         assert.equal(card.collapsiblePanels[0].bodyText,
           '1. ✅ **Read** · /workspace/feishu-agent-bridge/gui-rl/task_result\n2. ✅ **Read** · &lt;文件&gt; &amp; \\_字面文本\\_');
       });
@@ -199,7 +206,10 @@ async function longReplies(ctx) {
       trace.check('预览符合线协议，保留首尾，且省略提示位于成对围栏之外', () => {
         assert.equal(Buffer.byteLength(ultra), 26_000);
         assert.ok(Buffer.byteLength(ultraCard.content) < 30_000);
-        const body = ultraCard.card.raw.body.elements.filter(el => el.tag === 'markdown').map(el => el.content).join('\n\n');
+        const elements = ultraCard.card.raw.body.elements;
+        const divider = elements.findIndex(element => element.tag === 'hr');
+        assert.ok(divider > 0);
+        const body = elements.slice(0, divider).map(element => element.content).join('\n\n');
         assert.match(body, /^HEAD_ANCHOR/);
         assert.match(body, /TAIL_ANCHOR$/);
         assert.match(body, /\n```\n\n> .*已省略[^\n]*\n\n```\n/);
@@ -220,7 +230,11 @@ async function longReplies(ctx) {
     const streamMessageId = 'journey-feishu-fault-recovery';
     const finalText = '## 限流后仍然完整\n\n- **第一项**\n- 第二项\n\nFAULT_RECOVERY_TAIL';
     await trace.step('10.4 启动流式回复并收到进行中卡片', async () => {
-      await ctx.start(codex, '输出验证报告，模拟飞书限流');
+      const turn = await ctx.start(codex, '输出验证报告，模拟飞书限流');
+      const tracker = new ToolProgressTracker();
+      const generation = ctx.runtime.store.connectionGeneration(codex.sessionId);
+      providers.codex.emit(tracker.observe(codex.ref, generation, turn.turnId, 'fault-tool',
+        'succeeded', { tool: 'Read', summary: 'Read · validation report' }));
       ctx.emitText(codex, '正在整理验证报告……', { messageId: streamMessageId });
       await ctx.settle();
       progressCard = completionCard(ctx, codex, /进行中/);
@@ -237,14 +251,14 @@ async function longReplies(ctx) {
       await ctx.finish(codex);
       trace.check('限流后的进行中卡片保留，终态等待重试', () => {
         assert.match(wire.messages.get(progressCard.id).card.title, /进行中/);
-        assert.ok(!ctx.writes(codex).some(({ card }) => /已完成/.test(card?.title ?? '')));
+        assert.ok(!ctx.writes(codex).some(({ card }) => /执行过程已完成|· 回复$/.test(card?.title ?? '')));
       });
     });
     await trace.step('10.4 等待 3 秒退避，重试 PATCH 时注入 230099', async () => {
       wire.fault('im.message.patch', 230099);
       await delay(REJECTION_RETRY_MS + 50);
       await ctx.tick();
-      trace.check('两次 API 拒绝后原卡片以纯文本更新，完整正文和终态均保留', () => {
+      trace.check('两次 API 拒绝后原过程卡以纯文本归档，最终正文在独立回复卡', () => {
         const attempts = wire.calls.slice(failureOffset).filter(call =>
           call.method === 'im.message.patch' && call.message?.id === progressCard.id);
         assert.deepEqual(attempts.map(call => call.response?.code), [230429, 230099, 0]);
@@ -252,10 +266,14 @@ async function longReplies(ctx) {
         assert.equal(write.id, progressCard.id);
         assert.match(write.card.title, /已完成/);
         assert.equal(write.card.template, 'green');
-        const block = write.card.raw.body.elements[0];
+        const block = write.card.raw.body.elements.find(element => element.text?.tag === 'plain_text');
         assert.equal(block.tag, 'div');
         assert.equal(block.text.tag, 'plain_text');
-        assert.equal(block.text.content, finalText);
+        assert.match(block.text.content, /过程已归档/);
+        assert.doesNotMatch(write.card.bodyText, /FAULT_RECOVERY_TAIL/);
+        const reply = completionCard(ctx, codex);
+        assert.notEqual(reply.id, progressCard.id);
+        assert.equal(reply.card.raw.body.elements[0].content, finalText);
       });
     });
 
@@ -267,7 +285,7 @@ async function longReplies(ctx) {
       await waitForPatchWindow(ctx, claude);
       trace.check('12 秒回复为绿色完成卡，话题内无额外文本通知', () => {
         const { card } = completionCard(ctx, claude);
-        assert.match(card.title, /用时 12秒/);
+        assert.match(card.raw.body.elements[2].content, /⏱ 12秒/);
         assert.equal(card.template, 'green');
         assert.equal(visibleWrites(ctx, claude, 'text').length, 0);
       });
@@ -280,12 +298,11 @@ async function longReplies(ctx) {
         { startedAt: turn.startedAt, endedAt: turn.endedAt });
       await waitForPatchWindow(ctx, claude);
       await ctx.tick();
-      trace.check('150 秒回复只发送一条极简完成提醒，不截断正文片段', () => {
-        assert.match(completionCard(ctx, claude).card.title, /用时 2分30秒/);
-        const pushes = visibleWrites(ctx, claude, 'text');
-        assert.equal(pushes.length, 1);
-        assert.equal(JSON.parse(pushes[0].content).text,
-          '✅ 本轮已完成（用时 2分30秒），完整结论见上方回复卡。');
+      trace.check('150 秒回复尾栏显示耗时且话题没有额外文本通知', () => {
+        const { card } = completionCard(ctx, claude);
+        assert.equal(card.raw.body.elements[0].content, `# ${firstLine}\n\n附录。`);
+        assert.match(card.raw.body.elements[2].content, /⏱ 2分30秒/);
+        assert.equal(visibleWrites(ctx, claude, 'text').length, 0);
       });
     });
 
@@ -318,9 +335,13 @@ async function longReplies(ctx) {
         { tool: 'call_mcp_tool', summary: '⚡ Codex MCP (sol · 工程实现)' }));
       await ctx.finish(agy, '联合排查完成，最终结论已收口。');
       await waitForPatchWindow(ctx, agy);
-      trace.check('完成态同一卡片收起顶部状态面板，仅保留干净最终正文', () => {
+      trace.check('原过程卡归档并折叠，独立回复卡显示最终正文', () => {
         const done = completionCard(ctx, agy);
-        assert.equal(done.id, liveCard.id);
+        assert.notEqual(done.id, liveCard.id);
+        const archive = wire.messages.get(liveCard.id).card;
+        assert.match(archive.title, /执行过程已完成/);
+        assert.equal(archive.collapsiblePanels[0].expanded, false);
+        assert.doesNotMatch(archive.bodyText, /等待回报…/);
         assert.equal(done.card.template, 'green');
         assert.match(done.card.bodyText, /联合排查完成，最终结论已收口。/);
         assert.doesNotMatch(done.card.bodyText, /子代理与 Codex 状态/);
@@ -354,8 +375,8 @@ async function isolatedSessions(ctx) {
       await waitForPatchWindow(ctx, codex);
       await waitForPatchWindow(ctx, agy);
       trace.check('两个完成卡分别发往正确根消息，跨话题写入次数为零', () => {
-        assert.equal(completionCard(ctx, codex).card.bodyText, codeText);
-        assert.equal(completionCard(ctx, agy).card.bodyText, agyText);
+        assert.equal(completionCard(ctx, codex).card.raw.body.elements[0].content, codeText);
+        assert.equal(completionCard(ctx, agy).card.raw.body.elements[0].content, agyText);
         assert.equal(ctx.writes(codex).filter(write => write.content.includes('AGY_TOPIC_ONLY')).length, 0);
         assert.equal(ctx.writes(agy).filter(write => write.content.includes('CODEX_TOPIC_ONLY')).length, 0);
         const allMessages = [...wire.messages.values()];
@@ -409,6 +430,26 @@ async function isolatedSessions(ctx) {
         assert.ok(upgradeCard);
         assert.ok(upgradeCard.card.buttons.some(button => button.label.includes('接入并续聊')));
         assert.ok(ctx.cards(null).some(message => message.card.buttons.some(button => button.url)));
+      });
+    });
+    await trace.step('11.3 电脑端完成短问答，飞书只读话题镜像回复', async () => {
+      const { ref } = desktopTopic;
+      const turnId = 'journey-cli-short-turn';
+      providers.codex.emit({ type: 'turn', ref, turn: {
+        turnId, sessionId: ref.nativeSessionId, startedAt: new Date().toISOString(), endedAt: null,
+        status: 'running', inputId: null, model: null, outputIds: [],
+      } });
+      await ctx.settle();
+      await ctx.finish(desktopTopic, '电脑端短回复。', { turnId });
+      trace.check('只读镜像仅发送一张 CLI 回复卡并显示安全操作', () => {
+        const replies = ctx.writes(desktopTopic).filter(write => /^Codex \(CLI\) ·/.test(write.card.title));
+        assert.equal(replies.length, 1);
+        const { card } = replies[0];
+        assert.equal(card.title, 'Codex (CLI) · 回复');
+        assert.equal(card.raw.body.elements[0].content, '电脑端短回复。');
+        assert.match(card.raw.body.elements[2].content, /💻 电脑终端 CLI/);
+        assert.equal(card.header.text_tag_list[0].text.content, '💻 CLI 镜像');
+        assert.deepEqual(card.buttons.map(button => button.value.action), ['upgrade', 'panel']);
       });
     });
     await trace.step('11.3 在只读桌面话题打开 /status', async () => {
@@ -474,7 +515,7 @@ async function isolatedSessions(ctx) {
       await ctx.finish(desktopTopic, '请求已恢复，可以继续。');
       await waitForPatchWindow(ctx, desktopTopic);
       trace.check('同一会话可继续执行，回复正常完成', () => {
-        assert.equal(completionCard(ctx, desktopTopic).card.bodyText, '请求已恢复，可以继续。');
+        assert.equal(completionCard(ctx, desktopTopic).card.raw.body.elements[0].content, '请求已恢复，可以继续。');
         assert.equal(runtime.store.getSession(desktopTopic.sessionId).status, 'idle');
       });
     });

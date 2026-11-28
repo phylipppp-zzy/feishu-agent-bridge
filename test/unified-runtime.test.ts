@@ -388,7 +388,7 @@ test('read-only rejection is durable and does not starve later authorized work',
 });
 
 for (const provider of ['claude', 'codex', 'agy'] as const) {
-  test(`${provider} tool-only progress wakes only its topic, then preserves the completed card and schema`, async t => {
+  test(`${provider} tool-only progress wakes only its topic, then archives the process and sends the reply`, async t => {
     t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
     const { ToolProgressTracker } = await import('../src/unified/tool-progress.js');
     const { encodeCard } = await import('../src/unified/feishu-card-wire.js');
@@ -442,7 +442,7 @@ for (const provider of ['claude', 'codex', 'agy'] as const) {
       const first = sent[0]!;
       assert.equal(first.destination, 'chat');
       assert.equal(first.card.template, 'blue');
-      assert.equal(first.card.text, '正在处理…');
+      assert.match(first.card.text, /电脑终端 CLI 正在运行…/);
       assert.equal(first.card.schema, '2.0');
       assert.match(first.card.executionLog!.runningNote!, /Bash · pytest/);
       const wire = encodeCard(first.card) as { schema: string; body: { elements: Array<Record<string, unknown>> } };
@@ -477,8 +477,15 @@ for (const provider of ['claude', 'codex', 'agy'] as const) {
       assert.equal(patches.at(-1)!.card.template, 'green');
       assert.match(patches.at(-1)!.card.title, /用时 1分00秒/);
       assert.equal(patches.at(-1)!.card.executionLog!.failedCount, 1);
+      assert.equal(patches.at(-1)!.card.executionLog!.expanded, false);
       assert.ok(patches.every(patch => patch.destination === 'chat' && patch.id === first.id && patch.card.schema === '2.0'));
-      assert.equal(sent.length, 1);
+      assert.equal(sent.length, 2);
+      const reply = sent[1]!;
+      assert.equal(reply.destination, 'chat');
+      assert.notEqual(reply.id, first.id);
+      assert.equal(reply.card.schema, '2.0');
+      assert.equal(reply.card.text, '已完成 2 项工具操作。');
+      assert.match(reply.card.footer ?? '', /🔧 2 步（失败 1） · ⏱ 1分00秒/);
       assert.equal(dispatches + uploads + pushed.length, 0);
       const after = patches.length;
       const reads = subscriptions.length;

@@ -416,7 +416,8 @@ test('explicit panel and turn-card stops stay scoped to the selected turn', asyn
   assert.ok(stops.every(action => !Object.hasOwn(action.value,'fallbackCurrent')));
   await f.transport.request('test/finish',{stopReason:'end_turn'});
   await until(() => f.snapshot().turns.find(turn => turn.turnId === first.turnId && turn.status === 'completed'), 'first turn completed');
-  for (const value of [stops[0]!.value,turnCard]) {
+  assert.throws(() => parseFeishuAction({...original,lockTurn:'true'}),/invalid/);
+  for (const value of [stops[0]!.value,turnCard,{...original,lockTurn:true}]) {
     assert.deepEqual(await f.act(parseFeishuAction(value)),{status:'already_finished',turnStatus:'completed'});
   }
   assert.equal((await f.core.getTurn(f.sessionId,'other-turn'))?.status,'running');

@@ -167,9 +167,7 @@ export function sanitizeCardMarkdownLinks(markdown: string): { text: string; rew
 }
 
 export const CARD_REPLY_BUDGET_BYTES = 20_000;
-const OMISSION = '\n\n> …（中间内容已省略，点击底部「发送完整正文 (.txt)」查看全文）…\n\n';
-
-export function formatCardReplyBody(markdown: string): { text: string; truncated: boolean } {
+export function formatCardReplyBody(markdown: string, allowFullReplyButton = true): { text: string; truncated: boolean } {
   const { text } = sanitizeCardMarkdownLinks(markdown);
   if (cardContentBytes(text) <= CARD_REPLY_BUDGET_BYTES) return { text, truncated: false };
 
@@ -177,7 +175,10 @@ export function formatCardReplyBody(markdown: string): { text: string; truncated
   // Reserve space for up to three fence lines around the omitted section.
   const maxMarker = fences.reduce((size, fence) => Math.max(size, fence.marker.length), 3);
   const repairBudget = 3 * (Math.min(maxMarker, 300) + cardContentBytes('\n'));
-  const budget = CARD_REPLY_BUDGET_BYTES - cardContentBytes(OMISSION) - repairBudget;
+  const omission = allowFullReplyButton
+    ? '\n\n> …（中间内容已省略，点击底部「发送完整正文 (.txt)」查看全文）…\n\n'
+    : '\n\n> …（中间内容已省略）…\n\n';
+  const budget = CARD_REPLY_BUDGET_BYTES - cardContentBytes(omission) - repairBudget;
   let head = headByBytes(text, Math.floor(budget * 0.7), cardContentBytes);
   let tail = tailByBytes(text, Math.ceil(budget * 0.3), cardContentBytes);
   const headBreak = head.lastIndexOf('\n');
@@ -208,5 +209,5 @@ export function formatCardReplyBody(markdown: string): { text: string; truncated
     else if (tailStart <= last.start) tail = text.slice(tailStart, last.start);
   }
 
-  return { text: head.trimEnd() + OMISSION + tail, truncated: true };
+  return { text: head.trimEnd() + omission + tail, truncated: true };
 }

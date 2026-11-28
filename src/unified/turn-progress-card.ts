@@ -7,13 +7,16 @@ import {
   type ContextUsageInfo,
 } from './context-usage.js';
 import { escapeCardMarkdown } from './feishu-card-wire.js';
-import { providerBadgeColor, providerDisplayLabel, type ChannelCard, type ChannelCardHeaderTag } from './feishu-cards.js';
-import { isTerminalTool, type ToolProgress } from './tool-progress.js';
+import { providerBadgeColor, providerDisplayLabel, type ChannelCard, type ChannelCardAction, type ChannelCardHeaderTag } from './feishu-cards.js';
+import { isTerminalTool, isTerminalTurn, type ToolProgress } from './tool-progress.js';
 import type { TurnToolCounts } from './turn-progress-store.js';
 
 import { formatCardReplyBody } from './turn-reply.js';
 
 const LOG_SIZE = 15;
+const SHANGHAI_CLOCK = new Intl.DateTimeFormat('en-GB', {
+  hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Shanghai',
+});
 const DELEGATED_TOOLS = new Set([
   'invoke_subagent', 'run_workflow', 'swarm', 'swarm_wait', 'manage_subagents', 'manage_task', 'send_message',
 ]);
@@ -86,6 +89,15 @@ type CardState = {
   modelBadge?: string | undefined;
   contextUsage?: ContextUsageInfo | null | undefined;
   compactInfo?: CompactTurnInfo | undefined;
+};
+
+export type TurnCardState = CardState & {
+  isCliReadonly?: boolean | undefined;
+  sessionConnected?: boolean | undefined;
+  sessionId?: string | undefined;
+  completedAtMs?: number | null | undefined;
+  stopAction?: ChannelCardAction | undefined;
+  isWakeup?: boolean | undefined;
 };
 
 function formatRunningNote(active: readonly ToolProgress[]): string | undefined {
@@ -170,6 +182,155 @@ function formatCompactResultText(compactInfo: CompactTurnInfo, replyPreview: str
   return replyPreview ? `${summaryLine}\n\n${replyPreview}` : summaryLine;
 }
 
+function countTools(tools: readonly ToolProgress[], toolCounts?: TurnToolCounts) {
+  const realTools = tools.filter(tool => tool.tool !== 'thinking');
+  const count = Math.max(0, (toolCounts?.totalTools ?? tools.length) - (tools.length - realTools.length));
+  const failedCount = toolCounts?.failedTools ?? realTools.filter(tool => tool.phase === 'failed').length;
+  return { realTools, count, failedCount };
+}
+
+function replyPreview(message: Message | undefined, allowFullReplyButton = true) {
+  const raw = message?.blocks.map(block => block.type === 'text' ? block.text :
+    `[文件 ${escapeCardMarkdown(block.artifactId)}]`).join('\n') ?? '';
+  return formatCardReplyBody(raw, allowFullReplyButton);
+}
+
+function replyActions(files: readonly Artifact[], fullReplyAnchor?: string): ChannelCardAction[] {
+  const actions: ChannelCardAction[] = [];
+  if (fullReplyAnchor) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: fullReplyAnchor } });
+  for (const file of files.slice(0, 3)) {
+    const name = [...file.name];
+    actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,
+      value: { action: 'file', artifactId: file.artifactId, contentVersion: file.contentVersion } });
+  }
+  return actions;
+}
+
+function compactAction(contextUsage: CardState['contextUsage'], running = false): ChannelCardAction {
+  const pct = formatContextUsageBadge(contextUsage)?.pct ?? 0;
+  const pctSuffix = pct >= 80 ? ` (${pct}%)` : '';
+  return {
+    label: running ? `🗜️ 排队压缩上下文${pctSuffix}` : `🗜️ 压缩上下文${pctSuffix}`,
+    type: pct >= 80 ? 'primary' : 'default',
+    value: { action: 'compact' },
+  };
+}
+
+function stepLines(logTools: readonly ToolProgress[], count: number): string[] {
+  const lines = logTools.slice(-LOG_SIZE).map(tool => `${TOOL_ICONS[tool.phase]} ${tool.summary}`);
+  if (count > lines.length && logTools.length > 0) lines.unshift(`已省略较早的 ${count - lines.length} 项`);
+  return lines;
+}
+
+function turnHeader(state: TurnCardState, running: boolean) {
+  const { provider, isCliReadonly } = state;
+  const prefix = providerDisplayLabel(provider) + (isCliReadonly ? ' (CLI)' : '');
+  const headerTags: ChannelCardHeaderTag[] | undefined = isCliReadonly
+    ? [{ text: running ? '💻 CLI 运行' : '💻 CLI 镜像', color: 'wathet' }]
+    : undefined;
+  const isCompact = Boolean(state.compactInfo?.isCompact);
+  const isWakeup = state.isWakeup ?? Boolean(state.turnId?.startsWith('wakeup:'));
+  const model = state.modelBadge?.trim() || formatCompactModelBadge(state.contextUsage?.model);
+  return { prefix, headerTags, isCompact, isWakeup, model };
+}
+
+export function turnProcessCard(state: TurnCardState): ChannelCard {
+  const { status, tools, toolCounts, contextUsage, duration, isCliReadonly } = state;
+  const running = !isTerminalTurn(status);
+  const { prefix, headerTags, isCompact, isWakeup, model } = turnHeader(state, running);
+  const { realTools, count, failedCount } = countTools(tools, toolCounts);
+  const lines = stepLines(realTools, count);
+  const thinking = extractThinkingSummary(tools);
+  const runningTools = running ? tools.filter(tool => tool.phase === 'running') : [];
+  const runningNote = formatRunningNote(runningTools.filter(tool => tool.tool !== 'thinking'));
+  const executionLog = {
+    count, lines, failedCount, position: 'top' as const, expanded: running,
+    ...(thinking ? { thinking } : {}),
+    ...(runningNote ? { runningNote } : {}),
+    collapseSummary: true,
+  };
+  const badge = model ? ` · ${model}` : '';
+  const delegatedStatus = formatDelegatedStatus(realTools, running ? state.activeSubagents : undefined);
+  if (running) {
+    const heading = isCompact ? '正在压缩上下文' : isWakeup ? '后台唤醒进行中' : '进行中';
+    const statusBanner = formatContextStatusLine(contextUsage);
+    const preview = replyPreview(state.message, false).text;
+    const idleBody = isCompact ? '🗜️ 正在压缩对话上下文，请稍候…'
+      : runningTools.some(tool => tool.tool === 'post_message' || tool.tool === 'read_board') ? '🐝 Swarm 多代理协作进行中…'
+        : runningTools.some(tool => tool.tool === 'thinking') && !runningNote ? '🧠 正在深度思考…'
+          : isWakeup ? '🤖 后台异步唤醒处理中…'
+            : isCliReadonly ? '💻 电脑终端 CLI 正在运行…' : '正在处理…';
+    return {
+      schema: state.schema,
+      title: `${prefix} · ${heading}${badge}`,
+      template: 'blue',
+      ...(headerTags ? { headerTags } : {}),
+      ...(statusBanner ? { statusBanner } : {}),
+      executionLog,
+      text: [delegatedStatus, preview].filter(Boolean).join('\n\n---\n\n') || idleBody,
+      actions: !isCliReadonly && state.sessionConnected && state.stopAction ? [state.stopAction] : [],
+    };
+  }
+  const heading = isCompact ? '压缩过程已完成' : status === 'failed' ? '执行过程失败'
+    : status === 'interrupted' ? '执行过程已中断' : '执行过程已完成';
+  const steps = count > 0 ? ` · ${count} 步` : '';
+  const elapsed = duration === null ? '' : ` · 用时 ${formatDuration(duration)}`;
+  return {
+    schema: state.schema,
+    title: `${prefix} · ${heading}${steps}${elapsed}${badge}`,
+    template: status === 'failed' ? 'red' : status === 'interrupted' ? 'grey' : 'green',
+    ...(headerTags ? { headerTags } : {}),
+    executionLog,
+    text: ['过程已归档，最终回复见下方卡片。', delegatedStatus].filter(Boolean).join('\n\n'),
+    actions: [],
+  };
+}
+
+function formatClockTime(ms: number): string {
+  return SHANGHAI_CLOCK.format(new Date(Number.isFinite(ms) ? ms : Date.now()));
+}
+
+export function turnFinalReplyCard(state: TurnCardState): ChannelCard {
+  const { status, message, tools, toolCounts, contextUsage, duration, isCliReadonly } = state;
+  const { prefix, headerTags, isCompact, isWakeup, model } = turnHeader(state, false);
+  const { count, failedCount } = countTools(tools, toolCounts);
+  const heading = status === 'failed' ? '执行失败' : status === 'interrupted' ? '已中断'
+    : isCompact ? '上下文已压缩' : isWakeup ? '后台唤醒回复' : '回复';
+  const fallback = status === 'failed' ? '本轮执行失败，未形成完整回复。'
+    : status === 'interrupted' ? '本轮已中断，未形成完整回复。'
+      : count ? `已完成 ${count} 项工具操作。` : '本轮处理完成。';
+  const canReadFiles = Boolean(isCliReadonly || state.sessionConnected);
+  const preview = replyPreview(message, canReadFiles);
+  const actions: ChannelCardAction[] = [];
+  if (isCliReadonly) actions.push({ label: '一键接入并续聊', value: { action: 'upgrade' } });
+  if (canReadFiles) actions.push(...replyActions(state.files, preview.truncated ? message?.messageId : undefined));
+  if (!isCliReadonly && state.sessionConnected) {
+    if (!isCompact) actions.push(compactAction(contextUsage));
+    actions.push({ label: '切换模型', value: { action: 'models' } });
+  }
+  if ((isCliReadonly || state.sessionConnected) && state.sessionId) {
+    actions.push({ label: '会话控制', value: { action: 'panel', sessionId: state.sessionId } });
+  }
+  const stats = [
+    model ? `🧠 ${escapeCardMarkdown(model)}` : '',
+    `🔧 ${count} 步${failedCount ? `（失败 ${failedCount}）` : ''}`,
+    duration === null ? '' : `⏱ ${formatDuration(duration)}`,
+    `🕒 ${formatClockTime(state.completedAtMs ?? Date.now())}`,
+    isCliReadonly ? '💻 电脑终端 CLI' : '',
+  ].filter(Boolean).join(' · ');
+  return {
+    schema: state.schema,
+    title: `${prefix} · ${heading}`,
+    template: status === 'failed' ? 'red' : status === 'interrupted' ? 'grey' : 'green',
+    ...(headerTags ? { headerTags } : {}),
+    text: isCompact && status === 'completed' && state.compactInfo
+      ? formatCompactResultText(state.compactInfo, preview.text.trim())
+      : preview.text.trim() ? preview.text : fallback,
+    footer: [formatContextStatusLine(contextUsage), stats].filter(Boolean).join('\n'),
+    actions,
+  };
+}
+
 export function turnProgressCard({
   provider,
   status,
@@ -191,9 +352,7 @@ export function turnProgressCard({
   const isWakeup = Boolean(turnId?.startsWith('wakeup:'));
   const isCompact = Boolean(compactInfo?.isCompact);
   const visibleTools = tools.filter(tool => !(tool.tool === 'thinking' && tool.phase !== 'running'));
-  const totalThinkingCount = tools.filter(tool => tool.tool === 'thinking').length;
-  const count = Math.max(0, (toolCounts?.totalTools ?? tools.length) - totalThinkingCount);
-  const failedCount = toolCounts?.failedTools ?? visibleTools.filter(tool => tool.phase === 'failed').length;
+  const { realTools: logTools, count, failedCount } = countTools(tools, toolCounts);
   const running = status === 'running' || status === 'queued' || status === undefined && !message?.final;
   const elapsed = duration === null ? '' : ` · 用时 ${formatDuration(duration)}`;
   const interruptedElapsed = duration !== null && duration >= 5000 ? elapsed : '';
@@ -219,9 +378,7 @@ export function turnProgressCard({
   if (ctxBadge) headerTags.push({ text: `上下文 ${ctxBadge.text}`, color: ctxBadge.color });
   const statusBanner = formatContextStatusLine(contextUsage, { modelBadge: cleanModelBadge }) ?? undefined;
 
-  const raw = message?.blocks.map(block => block.type === 'text' ? block.text :
-    `[文件 ${escapeCardMarkdown(block.artifactId)}]`).join('\n') ?? '';
-  const preview = formatCardReplyBody(raw);
+  const preview = replyPreview(message);
   const active = running ? visibleTools.filter(tool => tool.phase === 'running') : [];
   const activeReal = active.filter(tool => tool.tool !== 'thinking');
   const onlyThinking = active.length > 0 && activeReal.length === 0;
@@ -246,25 +403,9 @@ export function turnProgressCard({
       : (preview.text || (status === 'completed'
           ? (count ? `完成 ${count} 项工具操作` : '本轮处理完成。')
           : '本轮未形成完整回复。'));
-  const actions: ChannelCard['actions'] = [];
-  if (preview.truncated && message && allowFullReplyButton) actions.push({ label: '发送完整正文 (.txt)', value: { action: 'full_reply', messageId: message.messageId } });
-  for (const file of files.slice(0, 3)) {
-    const name = [...file.name];
-    actions.push({ label: `发送文件：${name.length > 22 ? name.slice(0, 21).join('') + '…' : file.name}`,
-      value: { action: 'file', artifactId: file.artifactId, contentVersion: file.contentVersion } });
-  }
-  if (allowCompactButton && !isCompact) {
-    const highUsage = Boolean(ctxBadge && ctxBadge.pct >= 80);
-    const pctSuffix = highUsage && ctxBadge ? ` (${ctxBadge.pct}%)` : '';
-    actions.push({
-      label: running ? `🗜️ 排队压缩上下文${pctSuffix}` : `🗜️ 压缩上下文${pctSuffix}`,
-      type: highUsage ? 'primary' : 'default',
-      value: { action: 'compact' },
-    });
-  }
-  const logTools = visibleTools.filter(tool => tool.tool !== 'thinking');
-  const lines = logTools.slice(-LOG_SIZE).map(tool => `${TOOL_ICONS[tool.phase]} ${tool.summary}`);
-  if (count > lines.length && logTools.length > 0) lines.unshift(`已省略较早的 ${count - lines.length} 项`);
+  const actions = replyActions(files, preview.truncated && allowFullReplyButton ? message?.messageId : undefined);
+  if (allowCompactButton && !isCompact) actions.push(compactAction(contextUsage, running));
+  const lines = stepLines(logTools, count);
   const executionLog = (logTools.length > 0 || runningNote || thinkingSummary)
     ? {
         count: logTools.length > 0 ? Math.max(logTools.length, count) : 0,

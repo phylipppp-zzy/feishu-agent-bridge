@@ -165,10 +165,12 @@ function parseAction(value: unknown): RuntimeTrustedAction {
     case 'attach': if ((value.provider === 'claude' || value.provider === 'codex' || value.provider === 'agy') && str(value.hostId) && str(value.serviceId) && str(value.nativeSessionId) && (value.mode === 'read_only' || value.mode === 'interactive')) return {action:'attach',provider:value.provider,hostId:value.hostId,serviceId:value.serviceId,nativeSessionId:value.nativeSessionId,mode:value.mode}; break;
     case 'stop':
       if (str(value.turnId) && counter(value.revision) && counter(value.controlGeneration) &&
-          (value.fallbackCurrent === undefined || typeof value.fallbackCurrent === 'boolean')) {
+          (value.fallbackCurrent === undefined || typeof value.fallbackCurrent === 'boolean') &&
+          (value.lockTurn === undefined || typeof value.lockTurn === 'boolean')) {
         const taskScope = parseTaskScope(value, false);
         return {action:'stop',turnId:value.turnId,revision:value.revision,controlGeneration:value.controlGeneration,
-          ...(value.fallbackCurrent === true ? {fallbackCurrent:true} : {}),...(taskScope ?? {})};
+          ...(value.fallbackCurrent === true ? {fallbackCurrent:true} : {}),
+          ...(value.lockTurn === true ? {lockTurn:true} : {}),...(taskScope ?? {})};
       }
       break;
     case 'cancel': if (str(value.inputId) && counter(value.revision) && counter(value.controlGeneration)) { const taskScope = parseTaskScope(value, false); return {action:'cancel',inputId:value.inputId,revision:value.revision,controlGeneration:value.controlGeneration,...(taskScope ?? {})}; } break;

@@ -21,7 +21,9 @@ export async function verifyStatusAfterFailure(ctx, topic) {
     await openPanel();
     trace.check('面板显示真实运行失败且没有重复的发送输入失败回执', () => {
       assertStatus('failed', '执行失败', 'red');
-      assert.ok(ctx.writes(topic).some(({ card }) => card.title === '会话更新' && card.bodyText.includes('运行失败')));
+      const failedReplies = ctx.writes(topic).filter(({ card }) => /· 执行失败$/.test(card.title));
+      assert.equal(failedReplies.length, 1);
+      assert.match(failedReplies[0].card.bodyText, /本轮执行失败，未形成完整回复。/);
       assert.ok(!ctx.writes(topic).some(({ card }) =>
         card.title === '操作回执' && card.bodyText.includes('发送输入：失败')));
     });

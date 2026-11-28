@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { ClaudeAdapter } from '../src/unified/claude-adapter.js';
+import { formatCacheHitRate } from '../src/unified/context-usage.js';
 import type { Interaction, WriteContext } from '../src/unified/contracts.js';
 import { createIntegratedRuntime } from '../src/unified/runtime.js';
 import { evaluateApproval, resolveApprovalFacts, type ApprovalContext, type ApprovalRequest, type ApprovalScope, type GateDecision } from '../src/unified/approval-policy.js';
@@ -41,6 +42,38 @@ function fixture(approvalPolicy?: ApprovalScope) {
   return { adapter, guard, events, writes, get options() { return options; }, get prompt() { return prompt; },
     push: (m: any) => push(m), end: () => end(), nextInteraction };
 }
+
+test('Claude counts cache creation in the input denominator and leaves missing cache reads unknown', async () => {
+  const f = fixture();
+  const created = await f.adapter.create('/tmp', null);
+  const ref = created.createdSession!.native;
+  async function report(usage: Record<string, number>) {
+    f.push({ type: 'stream_event', parent_tool_use_id: null, event: {
+      type: 'message_start', message: { id: 'message', model: 'claude-sonnet-4-6', usage },
+    } });
+    await tick();
+    return f.adapter.getContextUsage(ref);
+  }
+  try {
+    const usage = await report({ input_tokens: 10, cache_read_input_tokens: 70, cache_creation_input_tokens: 20, output_tokens: 17 });
+    assert.equal(usage?.usedTokens, 117);
+    assert.equal(usage?.totalInputTokens, 100);
+    assert.equal(usage.cacheReadTokens, 70);
+    assert.equal(formatCacheHitRate(usage), 70);
+    assert.equal(formatCacheHitRate(await report({ input_tokens: 10, cache_read_input_tokens: 0 })), 0);
+    assert.equal(formatCacheHitRate(await report({ input_tokens: 10, output_tokens: 5 })), null);
+    assert.equal(formatCacheHitRate(await report({ input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 5 })), null);
+    for (const malformed of [{ cache_read_input_tokens: -1 }, { cache_creation_input_tokens: -1 }]) {
+      const usage = await report({ input_tokens: 10, cache_read_input_tokens: 70, cache_creation_input_tokens: 20, ...malformed });
+      assert.ok(usage);
+      assert.equal(usage.totalInputTokens, undefined);
+      assert.equal(usage.cacheReadTokens, undefined);
+      assert.equal(formatCacheHitRate(usage), null);
+    }
+  } finally {
+    await f.adapter.close();
+  }
+});
 
 test('SDK input guarded; tool approval denial and native result are separately observed', async () => {
   const f = fixture(); const id = (await f.adapter.create('/tmp', null)).nativeReference!; const ref = { provider: 'claude' as const, hostId: 'host', serviceId: 'service', nativeSessionId: id };

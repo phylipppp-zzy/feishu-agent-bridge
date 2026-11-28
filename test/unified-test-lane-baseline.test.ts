@@ -5,3 +5,44 @@ const oldRoot=process.env.LANE_OLD_RELEASE;
 async function oldModules(){if(!oldRoot)throw Error('set LANE_OLD_RELEASE');return {OldSdk:(await import(pathToFileURL(join(oldRoot,'dist/src/unified/feishu-sdk-port.js')).href)).FeishuSdkPort,OldLane:(await import(pathToFileURL(join(oldRoot,'dist/src/unified/test-lane.js')).href)).TestLaneRuntime};}
 async function legacyFixture(){const {OldSdk,OldLane}=await oldModules(),dir=mkdtempSync(join(tmpdir(),'test-old-final-')),db=join(dir,'sdk');const sdk=new OldSdk({appId:'app',appSecret:'fake'},db,new Set(['chat']),'owner'),replies=fake(sdk);const lane=new OldLane(sdk,join(dir,'lane'),'owner',1000,[db]);const token=await lane.create('codex','chat','create');lane.trigger('codex','final','original-final');await lane.tick();assert.equal(replies.length,0);await lane.close();sdk.close();return {dir,db,token}}
 for(const mode of ['success','sdk-null-initial','sdk-null-update','channel-unknown','claim','send-unknown','sent-ledger-fail','binding-changed','closed','wrong-original','channel-slot'] as const)test(`legacy exact fixture repair: ${mode}`,async(t)=>{if(!oldRoot){t.skip('set LANE_OLD_RELEASE to immutable f846');return}const {dir,db,token}=await legacyFixture();let sdk=new FeishuSdkPort({appId:'app',appSecret:'fake'},db,new Set(['chat']),'owner');const replies=fake(sdk as any,mode==='send-unknown'?'unknown':'ok');let lane=new TestLaneRuntime(sdk,join(dir,'lane'),'owner',1000,[db]);try{const fixture=(lane as any).entries.get('codex').fixture,message=fixture.recoveryCandidate('original-final');assert.ok(message);const channelDb=join(dir,'lane','codex-channel.sqlite'),c=new DatabaseSync(channelDb);const row:any=c.prepare('SELECT session_id,binding_id,revision,access_mode FROM channel_bindings WHERE destination=?').get(token.destination),scope=JSON.stringify(row),initial=`stream:${payloadDigest([scope,token.destination,'s',message.turnId||message.messageId])}`,update=`stream-update:${payloadDigest([scope,token.destination,'s',message.messageId,message.revision])}`;if(mode==='sdk-null-initial'||mode==='sdk-null-update')(sdk as any).db.prepare('INSERT INTO sdk_deliveries VALUES (?,NULL)').run(mode==='sdk-null-initial'?initial:update);if(mode==='binding-changed')c.prepare("UPDATE channel_bindings SET binding_id='changed' WHERE destination=?").run(token.destination);if(mode==='closed')sdk.closeTestTopic(token);if(mode==='channel-slot')c.prepare('INSERT INTO channel_stream_cards VALUES (?,?,?,?,NULL,0,0,0,?,?)').run(token.destination,'s',scope,message.turnId,message.messageId,message.sequence);if(mode==='channel-unknown')c.prepare("INSERT INTO channel_deliveries VALUES (?,'unknown')").run(initial);if(mode==='sent-ledger-fail')c.exec("CREATE TRIGGER fail_repair_sent BEFORE UPDATE OF state ON test_fixture_repairs BEGIN SELECT RAISE(FAIL,'test'); END");if(mode==='claim')c.prepare("INSERT INTO test_fixture_repairs VALUES (?,?,?,?,?,?,'claimed')").run('repair','original-final',token.destination,scope,message.messageId,initial);const before=c.prepare('SELECT cursor,binding_scope FROM channel_cursors').get(),known=c.prepare('SELECT message_id,revision FROM channel_known_messages').all();c.close();if(['sdk-null-initial','sdk-null-update','channel-unknown','binding-changed','closed','wrong-original','channel-slot'].includes(mode)){await assert.rejects(lane.repair('codex',mode==='wrong-original'?'other-original':'original-final','repair'));assert.equal(replies.length,0);}else {const result=await lane.repair('codex','original-final','repair');assert.equal(result.status,mode==='success'?'sent':'unknown');const again=await lane.repair('codex','original-final','repair');assert.equal(again.status,result.status);assert.equal(replies.length,mode==='claim'?0:1);await lane.close();lane=new TestLaneRuntime(sdk,join(dir,'lane'),'owner',1000,[db]);assert.equal((await lane.repair('codex','original-final','repair')).status,result.status);assert.equal(replies.length,mode==='claim'?0:1);}const afterDb=new DatabaseSync(channelDb,{readOnly:true});try{assert.deepEqual(afterDb.prepare('SELECT cursor,binding_scope FROM channel_cursors').get(),before);assert.deepEqual(afterDb.prepare('SELECT message_id,revision FROM channel_known_messages').all(),known);}finally{afterDb.close();}}finally{await lane.close();sdk.close();rmSync(dir,{recursive:true,force:true})}});
+
+test('fixture repair delivers one standalone terminal reply for a known but unwritten message', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'test-repair-reply-'));
+  const sdkPath = join(dir, 'sdk');
+  const lanePath = join(dir, 'lane');
+  const sdk = new FeishuSdkPort({ appId: 'app', appSecret: 'fake' }, sdkPath, new Set(['chat']), 'owner');
+  const replies = fake(sdk);
+  let lane = new TestLaneRuntime(sdk, lanePath, 'owner', 1000, [sdkPath]);
+  try {
+    const token = await lane.create('codex', 'chat', 'create');
+    lane.trigger('codex', 'final', 'original-final');
+    const message = (lane as any).entries.get('codex').fixture.recoveryCandidate('original-final');
+    assert.ok(message);
+    const dbPath = join(lanePath, 'codex-channel.sqlite');
+    {
+      using db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE channel_cursors SET cursor='1' WHERE destination=? AND session_id='s'").run(token.destination);
+      db.prepare('INSERT INTO channel_known_messages VALUES (?,?,?,?)').run(token.destination, 's', message.messageId, message.revision);
+    }
+    assert.deepEqual(await lane.repair('codex', 'original-final', 'repair'), { status: 'sent' });
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].path.message_id, token.rootId);
+    const card = JSON.parse(replies[0].data.content);
+    assert.equal(card.header.title.content, 'Codex · 回复');
+    assert.equal(card.body.elements[0].content, '这是测试回复。');
+    {
+      using db = new DatabaseSync(dbPath, { readOnly: true });
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM channel_stream_cards').get()?.n, 0);
+      assert.match(String(db.prepare('SELECT delivery_id FROM channel_turn_reply_cards').get()?.delivery_id), /^turn-reply:/);
+    }
+    await lane.close();
+    lane = new TestLaneRuntime(sdk, lanePath, 'owner', 1000, [sdkPath]);
+    assert.deepEqual(await lane.repair('codex', 'original-final', 'repair'), { status: 'sent' });
+    await lane.tick();
+    assert.equal(replies.length, 1);
+  } finally {
+    await lane.close();
+    sdk.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
